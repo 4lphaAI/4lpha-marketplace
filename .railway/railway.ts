@@ -45,6 +45,8 @@ export default defineRailway(() => {
     DATA_PLANE_URL,
     FEE_TREASURY_ADDRESS: "0x7e41F09dF5cb1Ec9323bC101D3a9e65bE4e510AD",
     FEE_BPS: "100",
+    VENUE_PANCAKE_ROUTER_V3: "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+    VENUE_WBNB: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
     GRID_ENABLED: "true",
     LP_ENABLED: "true",
     // DEMO MODE. Simulated grid/trading agents on live prices: no session, no
