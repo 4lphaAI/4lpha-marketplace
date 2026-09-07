@@ -1,0 +1,41 @@
+node_modules/
+dist/
+*.log
+
+.env*
+!.env.example
+
+.spike-state*.json
+
+# Research artifacts pulled down while verifying contract ABIs.
+tree.json
+
+# dev-stack session facts. Public data only, but machine-local.
+.provision-state.json
+
+# Throwaway probes. NEVER committed: they run raw SQL against DATABASE_URL and
+# pin addresses by hand rather than from config (PHASE3.7-AUDIT A1).
+scripts/tmp/
+
+# Derived: unpacked Claude Design bundle (regenerate from design/*.html)
+scratch-design/
+
+# The marketing film projects (Remotion). Local-only: they carry their own
+# node_modules (a junction), a full brand/font/sprite asset set and rendered
+# mp4s, none of which belong in this repo's history.
+marketing-video/
+marketing-video-v2/
+
+# Stray Next.js build output. The web app ignores its own; this one appears
+# when next runs with the repo root as cwd.
+/.next/
+
+# Claude Code machine-local state. launch.json is shared on purpose.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+
+# Claude Design standalone exports. Multi-megabyte generated HTML kept locally
+# as the visual reference; the components ported out of them are the source of
+# truth in this repo.
+*Marketplace Standalone.html

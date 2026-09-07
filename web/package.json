@@ -1,0 +1,47 @@
+{
+  "name": "4lpha-marketplace-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@altananetwork/sdk": "0.7.0",
+    "@rainbow-me/rainbowkit": "^2.2.11",
+    "@tanstack/react-query": "^5.102.8",
+    "@x402/core": "^2.24.0",
+    "@x402/evm": "^2.24.0",
+    "@x402/svm": "^2.24.0",
+    "lightweight-charts": "5.2.1",
+    "next": "16.3.4",
+    "porto": "0.2.37",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "viem": "^2.56.1",
+    "wagmi": "^2.19.5",
+    "decode-uri-component": "file:vendor/decode-uri-component-compat"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@types/react": "19.1.12",
+    "@types/react-dom": "19.1.9",
+    "happy-dom": "^20.13.2",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  },
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10 <11"
+  },
+  "overrides": {
+    "axios": "1.18.0",
+    "ws@>=8.0.0 <8.21.0": "8.21.0",
+    "decode-uri-component": "$decode-uri-component"
+  },
+  "packageManager": "npm@10.9.4"
+}

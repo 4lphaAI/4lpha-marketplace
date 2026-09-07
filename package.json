@@ -1,0 +1,63 @@
+{
+  "name": "4lpha-execution",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Execution plane for the 4lpha BNB Chain agent marketplace: agent wallets, scoped sessions, and self-custodial recovery.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "overrides": {
+    "tmp": "0.2.7"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index-server.ts",
+    "serve": "node --import tsx --env-file-if-exists=.env src/index-server.ts",
+    "start": "node --env-file-if-exists=.env dist/index-server.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "test:billing-postgres": "node --import tsx --test test/integration/billing.postgres.integration.ts",
+    "test:trade-hire-postgres": "node --import tsx --test test/integration/tradeHire.postgres.integration.ts",
+    "spike": "tsx scripts/spike-altana.ts",
+    "provision": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/provision-agent.ts",
+    "live-trade": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-trade.ts",
+    "register-passkey": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/register-passkey-agent.ts",
+    "dev-stack": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/dev-stack.ts",
+    "lp-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/lp-worker.ts",
+    "trade-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/trade-worker.ts",
+    "demo-worker": "node --import tsx --env-file-if-exists=.env scripts/demo-worker.ts",
+    "live-lp": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-lp-entry.ts",
+    "live-grid": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-grid.ts",
+    "probe-lp-rpc": "node --import tsx scripts/probe-lp-rpc.ts",
+    "add-spend-limit": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/owner-add-spend-limit.ts",
+    "spike-venus-reconstruct": "node --import tsx scripts/spike-venus-reconstruct.ts",
+    "provision-venus": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/provision-venus-agent.ts",
+    "provision-billing": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/provision-billing.ts",
+    "venus-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/venus-worker.ts",
+    "billing-worker": "node --import tsx --env-file-if-exists=.env scripts/billing-worker.ts",
+    "billing-status": "node --import tsx --env-file-if-exists=.env scripts/billing-status.ts",
+    "billing-reconcile": "node --import tsx --env-file-if-exists=.env scripts/billing-reconcile.ts",
+    "live-venus": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-venus.ts",
+    "dev-plane": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local src/index-server.ts"
+  },
+  "dependencies": {
+    "@altananetwork/sdk": "0.7.0",
+    "@hono/node-server": "^2.1.0",
+    "@x402/core": "2.23.0",
+    "@x402/evm": "2.23.0",
+    "@x402/fetch": "2.23.0",
+    "hono": "^4.13.1",
+    "pg": "^8.23.0",
+    "porto": "0.2.37",
+    "viem": "2.55.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/pg": "^8.21.0",
+    "es-module-lexer": "^2.3.2",
+    "solc": "0.8.30",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

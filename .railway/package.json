@@ -1,0 +1,9 @@
+{
+  "name": "4lpha-railway-iac",
+  "private": true,
+  "type": "module",
+  "description": "Local tooling for `railway config plan|apply` (.railway/railway.ts). Not part of the execution plane build.",
+  "dependencies": {
+    "railway": "*"
+  }
+}

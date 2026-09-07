@@ -1,0 +1,95 @@
+{
+  "schema": "4lpha.aws-roles-anywhere-helper-provenance.v1",
+  "capturedAt": "2026-08-28",
+  "upstream": {
+    "repository": "https://github.com/aws/rolesanywhere-credential-helper",
+    "tag": "v1.8.4",
+    "commit": "98b276b61378af7d233b077f0fe5d44e85253ece"
+  },
+  "linuxAmd64Artifact": {
+    "url": "https://rolesanywhere.amazonaws.com/releases/1.8.4/X86_64/Linux/Amzn2023/aws_signing_helper",
+    "bytes": 12094568,
+    "sha256": "b7568acd6e1517a4e1adaee68d52bfd6284a0e5305677166cd83d43a07c815c9",
+    "magicHex": "7f454c46"
+  },
+  "publishedSource": [
+    {
+      "path": "cmd/credential_process.go",
+      "bytes": 1289,
+      "sha256": "448ef3a1d511121d5fed7aee570c7bc14e61739274d5d0914298ca89cead7d7d"
+    },
+    {
+      "path": "cmd/credentials.go",
+      "bytes": 11942,
+      "sha256": "e98167fc9b1d87d781c128e631b11735c4d820180704666135f60736a73eb7f7"
+    },
+    {
+      "path": "aws_signing_helper/credentials.go",
+      "bytes": 6196,
+      "sha256": "5f476fa2fc1e1270282518e98d8655407823efdebfdd9377319384a34956017a"
+    },
+    {
+      "path": "aws_signing_helper/signer.go",
+      "bytes": 30231,
+      "sha256": "c3e4e71b7bfe396eb4c5b8054f7f4288912788aa99b206c2abc663116433e8d8"
+    }
+  ],
+  "credentialProcess": {
+    "use": "credential-process [flags]",
+    "declaredFlagsInSourceOrder": [
+      "role-arn",
+      "profile-arn",
+      "trust-anchor-arn",
+      "session-duration",
+      "region",
+      "endpoint",
+      "no-verify-ssl",
+      "with-proxy",
+      "debug",
+      "certificate",
+      "private-key",
+      "intermediates",
+      "cert-selector",
+      "system-store-name",
+      "use-latest-expiring-certificate",
+      "pkcs11-lib",
+      "reuse-pin",
+      "tpm-key-password",
+      "no-tpm-key-password",
+      "role-session-name",
+      "pkcs8-password"
+    ],
+    "acceptedArgvTemplate": [
+      "credential-process",
+      "--certificate",
+      "/run/4lpha/roles-anywhere/certificate.pem",
+      "--private-key",
+      "/run/4lpha/roles-anywhere/private-key.pem",
+      "--trust-anchor-arn",
+      "<manifest.trustAnchorArn>",
+      "--profile-arn",
+      "<manifest.profileArn>",
+      "--role-arn",
+      "<manifest.runtimeRoleArn>",
+      "--session-duration",
+      "900",
+      "--region",
+      "<manifest.region>"
+    ],
+    "stdoutConstruction": "encoding/json.Marshal(CredentialProcessOutput) followed by fmt.Print(string(buf))",
+    "memberOrder": [
+      "Version",
+      "AccessKeyId",
+      "SecretAccessKey",
+      "SessionToken",
+      "Expiration"
+    ],
+    "terminalBytes": "none",
+    "redactedStdout": {
+      "encoding": "base64-of-exact-utf8-bytes",
+      "bytes": 174,
+      "base64": "eyJWZXJzaW9uIjoxLCJBY2Nlc3NLZXlJZCI6IkFTSUFYWFhYWFhYWFhYWFhYWFhYWCIsIlNlY3JldEFjY2Vzc0tleSI6IlJFREFDVEVEX1NFQ1JFVF9BQ0NFU1NfS0VZIiwiU2Vzc2lvblRva2VuIjoiUkVEQUNURURfU0VTU0lPTl9UT0tFTiIsIkV4cGlyYXRpb24iOiIyMDMwLTAxLTAyVDAzOjA0OjA1WiJ9",
+      "usableCredential": false
+    }
+  }
+}

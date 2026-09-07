@@ -1,0 +1,39 @@
+# Marketplace runtime image for the execution plane's Railway services that the
+# reviewed launcher image (`Dockerfile`) does not cover: that launcher knows
+# four roles (api / lp-worker / venus-worker / billing-worker-once) and refuses
+# any other, so the trading worker and the ERC-8004 identity worker have no
+# role there.
+#
+# This image runs the TypeScript sources directly under `tsx` and is selected
+# per service by the Railway infrastructure-as-code file `.railway/railway.ts`
+# (`railway config plan|apply`), whose per-service `startCommand` picks the
+# entry:
+#   execution-api    node --import tsx src/index-server.ts
+#   lp-worker        node --import tsx scripts/lp-worker.ts
+#   trade-worker     node --import tsx scripts/trade-worker.ts
+#   identity-worker  node --import tsx scripts/erc8004-identity.ts migrate
+#                    && node --import tsx scripts/erc8004-worker.ts --daemon
+#
+# Billing stays OFF on every service built from this image (BILLING_ENABLED
+# unset or `off`): the clean-exec launcher exists for billing ON and is not
+# used here. The build context is the same closed `.dockerignore` allowlist the
+# reviewed image uses (verified by src/deployment/dockerContext.ts), so no env
+# file, test, spec or agent note can enter. Secrets arrive as Railway variables.
+
+FROM node:22-bookworm-slim
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+# devDependencies on purpose: `tsx` (the TypeScript loader) is one of them.
+RUN npm ci --include=dev --no-audit --no-fund
+
+COPY src ./src
+COPY scripts ./scripts
+
+ENV NODE_ENV=production
+# Smoke: the loader resolves the ESM `.js`-suffixed TypeScript import graph.
+RUN node --import tsx -e "await import('./src/railway/roles.ts')"
+
+USER node
+EXPOSE 8090
+CMD ["node", "--import", "tsx", "src/index-server.ts"]

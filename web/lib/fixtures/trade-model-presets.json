@@ -1,0 +1,26 @@
+{
+  "blue-chip": {
+    "perTradeWei": "2000000000000000",
+    "maxPositions": 3,
+    "capitalWei": "10000000000000000",
+    "minConfidence": 80
+  },
+  "mid-cap": {
+    "perTradeWei": "2000000000000000",
+    "maxPositions": 3,
+    "capitalWei": "10000000000000000",
+    "minConfidence": 80
+  },
+  "degen": {
+    "perTradeWei": "2000000000000000",
+    "maxPositions": 3,
+    "capitalWei": "10000000000000000",
+    "minConfidence": 75
+  },
+  "sigma": {
+    "perTradeWei": "2000000000000000",
+    "maxPositions": 3,
+    "capitalWei": "10000000000000000",
+    "minConfidence": 72
+  }
+}

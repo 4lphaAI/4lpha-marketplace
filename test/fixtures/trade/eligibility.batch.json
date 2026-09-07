@@ -1,0 +1,11 @@
+{
+  "data": [
+    { "address": "0x0000000000000000000000000000000000000001", "eligible": true, "reason": "allowlist", "source": "allowlist", "venue": null, "fourmeme": null, "flap": null, "checkedAt": 1788390000000, "cached": false },
+    { "address": "0x0000000000000000000000000000000000000002", "eligible": true, "reason": "binance_alpha", "source": "binance-alpha", "venue": null, "fourmeme": null, "flap": null, "checkedAt": 1788390000000, "cached": false },
+    { "address": "0x0000000000000000000000000000000000000003", "eligible": true, "reason": "fourmeme_factory", "source": "fourmeme", "venue": "fourmeme-bonding", "fourmeme": {}, "flap": null, "checkedAt": 1788390000000, "cached": false },
+    { "address": "0x0000000000000000000000000000000000000004", "eligible": true, "reason": "flap_portal", "source": "flap", "venue": "flap-bonding", "fourmeme": null, "flap": {}, "checkedAt": 1788390000000, "cached": false },
+    { "address": "0x0000000000000000000000000000000000000005", "eligible": false, "reason": "chain_unavailable", "source": null, "venue": null, "fourmeme": null, "flap": null, "checkedAt": 1788390000000, "cached": false },
+    { "address": "0x0000000000000000000000000000000000000006", "eligible": true, "reason": "fourmeme_factory", "source": "fourmeme", "venue": "pancake-v2", "fourmeme": {}, "flap": null, "checkedAt": 1788390000000, "cached": false }
+  ],
+  "meta": { "requested": 6, "eligible": 5 }
+}

@@ -1,0 +1,17 @@
+{
+  "data": [
+    { "address": "0x0000000000000000000000000000000000000001", "symbol": "ONEB", "lane": "bstocks", "source": "static", "marketHours": "us-equities" },
+    { "address": "0x0000000000000000000000000000000000000002", "symbol": "TWOB", "lane": "bstocks", "source": "static", "marketHours": "us-equities" },
+    { "address": "0x0000000000000000000000000000000000000003", "symbol": "THREEB", "lane": "bstocks", "source": "static", "marketHours": "us-equities" },
+    { "address": "0x0000000000000000000000000000000000000004", "symbol": "FOURB", "lane": "bstocks", "source": "static", "marketHours": "us-equities" },
+    { "address": "0x0000000000000000000000000000000000000005", "symbol": "FIVEB", "lane": "bstocks", "source": "static", "marketHours": "us-equities" },
+    { "address": "0x0000000000000000000000000000000000000006", "symbol": "SIXB", "lane": "bstocks", "source": "static", "marketHours": "us-equities" }
+  ],
+  "meta": {
+    "total": 6,
+    "lane": "bstocks",
+    "lanes": {
+      "bstocks": { "count": 6, "staleness": "fresh", "asOf": null, "source": "static" }
+    }
+  }
+}

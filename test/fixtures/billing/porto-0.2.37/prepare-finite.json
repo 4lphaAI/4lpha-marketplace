@@ -1,0 +1,1 @@
+{"schema":"4lpha.porto-0.2.37.prepare-sanitized.v1","chainId":56,"orchestrator":"0xaf140d0416a994aebb3fa6212b16ce6700f09751","orchestratorVersion":"0.5.5","quoteExpiryClass":"finite-bounded","intentExpiryClass":"finite-bounded","intentToQuoteDeltaSec":"-20","capabilitiesPresent":true,"contextPresent":true,"typedDataPresent":true}

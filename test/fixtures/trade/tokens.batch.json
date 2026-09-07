@@ -1,0 +1,11 @@
+{
+  "data": [
+    { "address": "0x0000000000000000000000000000000000000001", "priceUsd": 10, "marketCapUsd": 2000000000, "volume24hUsd": 600, "holders": 100, "priceChange24hPct": 1, "symbol": "ONEB", "updatedFields": ["marketCapUsd", "volume24hUsd"], "asOf": 1788390000000, "source": "bstocks-prices", "staleness": "fresh" },
+    { "address": "0x0000000000000000000000000000000000000002", "priceUsd": 20, "marketCapUsd": 2000000000, "volume24hUsd": 500, "holders": 200, "priceChange24hPct": 2, "symbol": "TWOB", "updatedFields": ["marketCapUsd", "volume24hUsd"], "asOf": 1788390000000, "source": "bstocks-prices", "staleness": "fresh" },
+    { "address": "0x0000000000000000000000000000000000000003", "priceUsd": 30, "marketCapUsd": 2000000000, "volume24hUsd": 400, "holders": 300, "priceChange24hPct": 3, "symbol": "THREEB", "updatedFields": ["marketCapUsd", "volume24hUsd"], "asOf": 1788390000000, "source": "bstocks-prices", "staleness": "fresh" },
+    { "address": "0x0000000000000000000000000000000000000004", "priceUsd": 40, "marketCapUsd": 2000000000, "volume24hUsd": 300, "holders": 400, "priceChange24hPct": 4, "symbol": "FOURB", "updatedFields": ["marketCapUsd", "volume24hUsd"], "asOf": 1788390000000, "source": "bstocks-prices", "staleness": "fresh" },
+    { "address": "0x0000000000000000000000000000000000000005", "priceUsd": 50, "marketCapUsd": 2000000000, "volume24hUsd": 200, "holders": 500, "priceChange24hPct": 5, "symbol": "FIVEB", "updatedFields": ["marketCapUsd", "volume24hUsd"], "asOf": 1788390000000, "source": "bstocks-prices", "staleness": "fresh" },
+    { "address": "0x0000000000000000000000000000000000000006", "priceUsd": 60, "marketCapUsd": 2000000000, "volume24hUsd": 100, "holders": 600, "priceChange24hPct": 6, "symbol": "SIXB", "updatedFields": ["marketCapUsd", "volume24hUsd"], "asOf": 1788390000000, "source": "bstocks-prices", "staleness": "fresh" }
+  ],
+  "meta": { "requested": 6, "found": 6, "missing": 0 }
+}

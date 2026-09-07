@@ -1,0 +1,35 @@
+{
+  "data": {
+    "nativeMeter": {
+      "readable": true,
+      "metered": false,
+      "nativeGranted": true,
+      "buysRefused": false,
+      "note": "This session's native spend limit is not set at the DAY period, so the daily exit reserve does not apply and no trade is gated on it. NOTE: a period LONGER than a day (a weekly cap) can still exhaust and strand an exit, and this check does not model that — it reads the day row only. Provisioning always writes a day row, so this state means the session was granted by hand or elsewhere."
+    },
+    "id": "agent-grid-routes",
+    "ownerAddress": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+    "ownerAddressIsPayable": true,
+    "walletAddress": "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+    "custodyModel": "self-eoa",
+    "status": "armed",
+    "httpRuntimeProfile": "unbound-v1",
+    "caps": null,
+    "session": {
+      "publicKey": "0x04abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "expiresAt": 1900003600,
+      "allowedCalls": [
+        { "to": "0x7777777777777777777777777777777777777777" },
+        { "to": "0x5555555555555555555555555555555555555555", "selector": "approve(address,uint256)" },
+        { "to": "0x2222222222222222222222222222222222222222", "selector": "approve(address,uint256)" }
+      ],
+      "spendCaps": [
+        { "limit": "1000000000000000000", "period": "day" },
+        { "limit": "1461501637330902918203684832716283019655932542976", "period": "day", "token": "0x5555555555555555555555555555555555555555" },
+        { "limit": "1461501637330902918203684832716283019655932542976", "period": "day", "token": "0x2222222222222222222222222222222222222222" }
+      ]
+    },
+    "createdAt": 1900000000000,
+    "updatedAt": 1900000000000
+  }
+}

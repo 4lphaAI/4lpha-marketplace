@@ -1,0 +1,53 @@
+{
+  "data": {
+    "positions": [],
+    "sequences": [],
+    "quota": {
+      "limit": 4,
+      "used": 0,
+      "remaining": 4,
+      "releasedInWindow": 0,
+      "exhausted": false,
+      "oldestSlotFreesAtMs": null,
+      "minMinutesBetweenExits": 30,
+      "nextEligibleAtMs": null,
+      "automationRunning": true
+    },
+    "priceTriggers": [],
+    "grid": {
+      "pool": {
+        "token0": "0x2222222222222222222222222222222222222222",
+        "token1": "0x5555555555555555555555555555555555555555",
+        "fee": 2500
+      },
+      "poolAddress": null,
+      "wbnbIsToken0": true,
+      "tickSpacing": 50,
+      "buyRange": { "tickLower": 500, "tickUpper": 1000 },
+      "sellRange": { "tickLower": -1000, "tickUpper": -500 },
+      "maxFlipsPerDay": 12,
+      "minNetEdgeBps": 0,
+      "levelsPartitionedBy": "level",
+      "levels": [],
+      "level": null,
+      "blockedBySequence": null,
+      "latency": {
+        "workerIntervalMs": 60000,
+        "confirmationMs": 120000,
+        "minMinutesBetweenExits": 30
+      },
+      "quota": { "limit": 12, "used": 0, "remaining": 12 },
+      "cycles": {
+        "available": true,
+        "recorded": 0,
+        "roundTrips": 0,
+        "rows": [],
+        "note": "Derived telemetry: a row can be lost if the post-confirm write fails; counts are a lower bound."
+      },
+      "pnl": { "realisedQuoteWei": null, "overRoundTrips": 0 },
+      "estimates": { "markToMarketQuoteWei": null, "holdBenchmarkQuoteWei": null, "asOfTick": null, "asOfMs": null },
+      "restart": "No live level. Sign gridArm (POST /agents/:id/lp/grid/arm) with a native budgetWei and the agent places the next level itself, single-sided into the signed buyRange."
+    },
+    "settingsDigest": "0x7640fa1ef363f9955c13c4892486db252f137c6eeecfc92cc30922277063f0ca"
+  }
+}

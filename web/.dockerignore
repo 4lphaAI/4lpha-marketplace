@@ -1,0 +1,17 @@
+# Deny env files categorically — the CLAUDE.md `.env.local` trap. Runtime
+# secrets come from Railway variables, never from a file in the image.
+.env
+.env.*
+*.local
+# Build artefacts and deps are produced inside the image.
+node_modules
+.next
+out
+coverage
+# Not needed to build.
+.git
+.gitignore
+*.test.ts
+*.test.tsx
+vitest.config.ts
+README.md

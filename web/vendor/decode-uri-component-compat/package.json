@@ -1,0 +1,19 @@
+{
+  "name": "@4lpha/decode-uri-component-compat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CommonJS/ESM bridge to the upstream security-fixed URI decoder",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "require": "./index.cjs"
+    }
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "decode-uri-component-patched": "npm:decode-uri-component@0.5.0"
+  }
+}
