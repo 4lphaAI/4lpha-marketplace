@@ -59,6 +59,7 @@ import {
   resolveLendingRpcUrls,
   resolveLendingRuntimeConfig,
 } from "../src/ops/config.js";
+import { resolveVenues } from "../src/ops/venues.js";
 import { resolveLpAddresses, resolveLpRpcUrls } from "../src/lp/readers.js";
 import { resolveLpRailConfig } from "../src/lp/rails.js";
 import { buildLendingServerDeps } from "../src/lending/wiring.js";
@@ -174,9 +175,19 @@ async function main(): Promise<void> {
     );
   }
 
+  const venues = resolveVenues({
+    chainId: network.chainId,
+    overrides: {
+      pancakeRouterV3: process.env["VENUE_PANCAKE_ROUTER_V3"] ?? "",
+      wbnb: process.env["VENUE_WBNB"] ?? "",
+    },
+    keyStore: network.keyStore as Address,
+  });
   const lpAddresses = resolveLpAddresses(process.env, {
     chainId: network.chainId,
     keyStore: network.keyStore as Address,
+    ...(venues.pancakeRouterV3 === undefined ? {} : { routerV3: venues.pancakeRouterV3 }),
+    ...(venues.wbnb === undefined ? {} : { wbnb: venues.wbnb }),
   });
   const rails = resolveLpRailConfig(process.env);
   if (!rails.ok) {
