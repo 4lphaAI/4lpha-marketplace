@@ -105,10 +105,14 @@ export const AGENTS: Agent[] = [
     tier: "verified", status: "live", explainer: "trade",
     tagline: "Trades established $1B+ tokens and bStocks with filters.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 203, price: "0 Fees", priceUnit: "this month" },
-  { id: "health-guard", name: "Health Guard", categoryId: "health", protocol: "Venus", tier: "verified", status: "warning", explainer: "lending",
-    tagline: "Watches your Venus health factor & avoid liquidated.",
-    metricValue: "37", metricTone: "flat", metricLabel: "POSITIONS SAVED", hiredCount: 1204, price: "$8", priceUnit: "per month",
-    statusLine: "Repaying 240 USDT — health factor hit 1.18" },
+  // MARKETPLACE-LENDING-AGENT §2.3: the mock's "37 positions saved", 1204
+  // hires, "$8 per month" and "Repaying 240 USDT — health factor hit 1.18" were
+  // design chrome with no source. Rescues saved are not tracked as a catalogue
+  // metric, nobody has hired this yet (`LENDING_ENABLED` is off), and v1 charges
+  // no fee — so the card says each of those instead of inventing a number.
+  { id: "health-guard", name: "Health Guard", categoryId: "health", protocol: "Venus", tier: "verified", status: "live", explainer: "lending",
+    tagline: "Repays your Venus debt from a reserve before liquidation reaches you.",
+    metricValue: "—", metricTone: "flat", metricLabel: "RESCUES (NOT TRACKED)", hiredCount: 0, price: "0 Fees", priceUnit: "this month" },
 ];
 
 export const HIRED: HiredAgent[] = [

@@ -13,6 +13,15 @@ export function createProvisioningWorker(input: {
   readonly evidence: GrantEvidenceReader;
   readonly keyStore: Address;
   readonly tradeSettings?: Pick<TradeSettingsStore, "putInitialIfAbsentOrSameDigest">;
+  /** MARKETPLACE-LENDING-AGENT R3.3(3) — the 60 s sweep's half of the seam. */
+  readonly lendingSettings?: Pick<
+    import("../store/venusSettings.js").VenusSettingsStore,
+    "get" | "put"
+  >;
+  readonly lendingGuards?: Pick<
+    import("../store/lendingGuards.js").LendingGuardStore,
+    "putInitialIfAbsentOrSame"
+  >;
   readonly nowSec?: () => number;
   readonly onError?: (message: string) => void;
 }) {
@@ -36,6 +45,8 @@ export function createProvisioningWorker(input: {
             keyStore: input.keyStore,
             nowSec: nowSec(),
             ...(input.tradeSettings === undefined ? {} : { tradeSettings: input.tradeSettings }),
+            ...(input.lendingSettings === undefined ? {} : { lendingSettings: input.lendingSettings }),
+            ...(input.lendingGuards === undefined ? {} : { lendingGuards: input.lendingGuards }),
             signal: AbortSignal.timeout(PROVISIONING_EVIDENCE_TIMEOUT_MS),
           });
         } catch (error) {

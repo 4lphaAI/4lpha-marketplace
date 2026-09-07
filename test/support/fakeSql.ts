@@ -27,6 +27,10 @@
  * conjuncts.
  */
 import type { SqlClient, SqlResult } from "../../src/store/sql.js";
+// FIXREVIEW F4: the lending status predicates are DERIVED from the same
+// transition table the real statements interpolate, so the "restated by hand"
+// hazard this file warns about cannot apply to them: there is one list.
+import { LENDING_GUARD_CAS_SOURCES } from "../../src/store/lendingGuards.js";
 
 type Row = Record<string, unknown>;
 
@@ -88,6 +92,13 @@ export class FakeSqlClient implements SqlClient {
   readonly #venusSettings = new Map<string, Row>();
   readonly #venusObservations = new Map<string, Row>();
   readonly #venusActions = new Map<string, Row>();
+  /** MARKETPLACE-LENDING-AGENT: the guard row and its four satellite tables. */
+  readonly #lendingGuards = new Map<string, Row>();
+  readonly #lendingRescues = new Map<string, Row>();
+  readonly #lendingActions = new Map<string, Row>();
+  readonly #lendingSnapshots = new Map<string, Row>();
+  readonly #lendingSettings = new Map<string, Row>();
+  readonly #lendingObservations = new Map<string, Row>();
   readonly #billingState = new Map<string, Row>();
   readonly #billingAccounts = new Map<string, Row>();
   readonly #billingUsageIdentities = new Map<string, Row>();
@@ -288,6 +299,12 @@ export class FakeSqlClient implements SqlClient {
     this.#venusSettings.clear();
     this.#venusObservations.clear();
     this.#venusActions.clear();
+    this.#lendingGuards.clear();
+    this.#lendingRescues.clear();
+    this.#lendingActions.clear();
+    this.#lendingSnapshots.clear();
+    this.#lendingSettings.clear();
+    this.#lendingObservations.clear();
     this.#billingState.clear();
     this.#billingAccounts.clear();
     this.#billingUsageIdentities.clear();
@@ -1000,6 +1017,128 @@ export class FakeSqlClient implements SqlClient {
         return this.#venusActionsInsert(params);
       case "venusActions.usageSince":
         return this.#venusActionsUsageSince(params);
+
+      /* ---- MARKETPLACE-LENDING-AGENT ---- */
+      //
+      // Each transition below is a SEPARATE static statement in the store, with
+      // its own tag and its own `status in (...)` literal, and each predicate is
+      // re-stated by hand here. As everywhere in this file: it dispatches on the
+      // tag and NEVER PARSES THE SQL, so editing a real `where` clause without
+      // editing its twin leaves that edit with ZERO executed coverage.
+      case "lendingGuards.putInitial":
+        return this.#lendingGuardsInsert(params);
+      case "lendingGuards.get":
+        return this.#lendingGuardsGet(params);
+      case "lendingGuards.listForWorker":
+        return [...this.#lendingGuards.values()]
+          .filter((row) =>
+            ["arming", "armed", "held", "retiring"].includes(String(row["status"])))
+          .sort((left, right) => (String(left["agent_id"]) < String(right["agent_id"]) ? -1 : 1))
+          .map((row) => structuredClone(row));
+      case "lendingGuards.arm":
+        // FIXREVIEW F4: the accepted-source list is the DERIVED one.
+        return this.#lendingGuardsTransition(params, LENDING_GUARD_CAS_SOURCES.armCas, (row) => ({
+          ...row,
+          status: "arming", hold: null, close_reason: null,
+          budget_wei: params[4], reserve_bps: params[5],
+          supply_native_wei: params[6], reserve_native_wei: params[7],
+          mint_usdt_wei: params[8], pre_arm_vusdt_wei: params[9],
+          pre_arm_exchange_rate: params[10], arm_journal_key: params[11],
+          arm_block: null, arm_block_source: null, arm_tx_hash: null,
+          hold_clear_consecutive: 0,
+        }));
+      case "lendingGuards.finishArm":
+        return this.#lendingGuardsTransition(params, LENDING_GUARD_CAS_SOURCES.finishArm, (row) => ({
+          ...row,
+          status: params[4], hold: params[5], close_reason: params[6],
+          // FIXREVIEW F7: `arm_block_source = $10`, written with the figure.
+          arm_block: params[7], arm_block_source: params[9] ?? null,
+          arm_tx_hash: params[8], hold_clear_consecutive: 0,
+        }));
+      case "lendingGuards.setHold":
+        // `status in ('armed','held')`, and
+        // `arm_block = coalesce(arm_block, $7::numeric)` — FIXREVIEW F1's
+        // one-way write, restated by hand exactly as this file restates every
+        // predicate, because it never parses the SQL.
+        return this.#lendingGuardsTransition(params, LENDING_GUARD_CAS_SOURCES.setHold, (row) => ({
+          ...row,
+          status: params[4],
+          hold: params[5],
+          // FIXREVIEW F5: setting OR clearing a hold restarts the count.
+          hold_clear_consecutive: 0,
+          arm_block: row["arm_block"] ?? params[6] ?? null,
+          // FIXREVIEW F7: `case when arm_block is null then $8 else & end` 
+          // the label is written only by the statement that first sets the block.
+          arm_block_source:
+            (row["arm_block"] ?? null) === null
+              ? (params[7] ?? null)
+              : (row["arm_block_source"] ?? null),
+        }));
+      case "lendingGuards.beginRetire":
+        // `status in ('armed','held','retiring')` — AUDIT B-H1: a partial
+        // retire parks at `retiring` and its own refusal says "retire again
+        // when the pool refills", so the gate must accept it.
+        return this.#lendingGuardsTransition(
+          params,
+          LENDING_GUARD_CAS_SOURCES.beginRetire,
+          (row) => ({ ...row, status: "retiring" }),
+        );
+      case "lendingGuards.finishRetire":
+        return this.#lendingGuardsTransition(params, LENDING_GUARD_CAS_SOURCES.finishRetire, (row) => ({
+          ...row, status: params[4], hold: params[5], close_reason: params[6],
+          hold_clear_consecutive: 0,
+        }));
+      case "lendingGuards.noteHoldClear":
+        // FIXREVIEW F5. `status in ('held')`  a literal in the real
+        // statement too, because this writer moves NO status and so has no
+        // row in the transition table to derive from.
+        return this.#lendingGuardsTransition(params, ["held"], (row) => ({
+          ...row, hold_clear_consecutive: Number(params[4]),
+        }));
+      case "lendingGuards.close":
+        // FIXREVIEW F4: narrowed to the DERIVED sources  the three it used
+        // to accept were driven by nothing.
+        return this.#lendingGuardsTransition(
+          params,
+          LENDING_GUARD_CAS_SOURCES.close,
+          (row) => ({ ...row, status: "closed", hold: null, close_reason: params[4] }),
+        );
+      case "lendingGuards.claim":
+        return this.#lendingGuardsClaim(params);
+      case "lendingGuards.restoreClaim":
+        return this.#lendingGuardsRestoreClaim(params);
+      case "lendingGuards.fence":
+        // `pg_advisory_xact_lock(classid, hashtext(key))` — the global
+        // transaction lock this client already holds stands in for it.
+        return [];
+      case "lendingRescues.insert":
+        return this.#lendingRescuesInsert(params);
+      case "lendingRescues.list":
+        return this.#lendingRescuesList(params);
+      case "lendingActions.charge":
+        return this.#lendingActionsCharge(params);
+      case "lendingActions.usageSince":
+        return this.#lendingActionsUsage(params);
+      case "lendingActions.lastOfKind":
+        return this.#lendingActionsLastOfKind(params);
+      case "lendingSnapshots.put":
+        return this.#lendingSnapshotsPut(params);
+      case "lendingSnapshots.get":
+        return this.#lendingSnapshotsGet(params);
+      case "lendingSettings.get":
+        return this.#namespacedSettingsGet(this.#lendingSettings, params);
+      case "lendingSettings.put":
+        return this.#namespacedSettingsPut(this.#lendingSettings, params);
+      case "lendingSettings.listForWorker":
+        return [...this.#lendingSettings.values()]
+          .sort((left, right) => (String(left["agent_id"]) < String(right["agent_id"]) ? -1 : 1))
+          .map((row) => structuredClone(row));
+      case "lendingObservations.get":
+        return this.#namespacedObservationsGet(this.#lendingObservations, params);
+      case "lendingObservations.put":
+        return this.#namespacedObservationsPut(this.#lendingObservations, params);
+      case "lendingObservations.delete":
+        return this.#namespacedObservationsDelete(this.#lendingObservations, params);
       case "lpEvidence.schemaVerify":
         return [{ tables_ok: true, charge_columns_ok: true,
           legacy_columns_absent: true, cleanup_pair_ok: true, cleanup_check_ok: true,
@@ -1330,6 +1469,268 @@ export class FakeSqlClient implements SqlClient {
           : 1,
       )
       .map((row) => structuredClone(row));
+  }
+
+  /* ----- lending ----- */
+
+  /** `on conflict (agent_id) do nothing returning …` — an existing id returns []. */
+  #lendingGuardsInsert(params: readonly unknown[]): Row[] {
+    const agentId = params[0] as string;
+    if (this.#lendingGuards.has(agentId)) return [];
+    const nowMs = String(params[7]);
+    const row: Row = {
+      agent_id: agentId,
+      owner_address: params[1],
+      guarded_account: params[2],
+      reserve_token: params[3],
+      debt_markets: jsonbParam(params[4]),
+      status: "provisioning-guard",
+      hold: null,
+      reserve_cap_wei: String(params[5]),
+      reserve_bps: Number(params[6]),
+      budget_wei: "0",
+      supply_native_wei: "0",
+      reserve_native_wei: "0",
+      mint_usdt_wei: "0",
+      pre_arm_vusdt_wei: "0",
+      pre_arm_exchange_rate: "0",
+      arm_journal_key: null,
+      arm_block: null,
+      arm_block_source: null,
+      arm_tx_hash: null,
+      hold_clear_consecutive: 0,
+      last_action_at_ms: null,
+      action_seq: 0,
+      close_reason: null,
+      row_version: 1,
+      created_at_ms: nowMs,
+      updated_at_ms: nowMs,
+    };
+    this.#lendingGuards.set(agentId, row);
+    return [structuredClone(row)];
+  }
+
+  #lendingGuardsGet(params: readonly unknown[]): Row[] {
+    const row = this.#lendingGuards.get(params[0] as string);
+    if (row === undefined || !sameOwner(row["owner_address"], params[1])) return [];
+    return [structuredClone(row)];
+  }
+
+  /**
+   * `update … where agent_id = $1 and owner_address = $2 and row_version = $4
+   * and status in (…)`. The status list is passed in by the dispatch arm above,
+   * mirroring that statement's own literal.
+   */
+  #lendingGuardsTransition(
+    params: readonly unknown[],
+    allowedFrom: readonly string[],
+    mutate: (row: Row) => Row,
+  ): Row[] {
+    const agentId = params[0] as string;
+    const row = this.#lendingGuards.get(agentId);
+    if (row === undefined) return [];
+    if (!sameOwner(row["owner_address"], params[1])) return [];
+    if (Number(row["row_version"]) !== Number(params[3])) return [];
+    if (!allowedFrom.includes(String(row["status"]))) return [];
+    const next: Row = {
+      ...mutate(row),
+      row_version: Number(row["row_version"]) + 1,
+      updated_at_ms: String(params[2]),
+    };
+    this.#lendingGuards.set(agentId, next);
+    return [structuredClone(next)];
+  }
+
+  /**
+   * The R3.7 claim: `where … and (last_action_at_ms is null or
+   * last_action_at_ms <= $3 - $4) returning action_seq`.
+   */
+  #lendingGuardsClaim(params: readonly unknown[]): Row[] {
+    const agentId = params[0] as string;
+    const row = this.#lendingGuards.get(agentId);
+    if (row === undefined || !sameOwner(row["owner_address"], params[1])) return [];
+    const nowMs = BigInt(params[2] as number | string);
+    const floorMs = BigInt(params[3] as number | string);
+    const last = row["last_action_at_ms"];
+    if (last !== null && last !== undefined && BigInt(last as string | number) > nowMs - floorMs) {
+      return [];
+    }
+    const next: Row = {
+      ...row,
+      last_action_at_ms: String(nowMs),
+      action_seq: Number(row["action_seq"]) + 1,
+      row_version: Number(row["row_version"]) + 1,
+      updated_at_ms: String(nowMs),
+    };
+    this.#lendingGuards.set(agentId, next);
+    return [{ action_seq: next["action_seq"] }];
+  }
+
+  /**
+   * The AUDIT C-H1 restore: `set last_action_at_ms = $4 … where agent_id = $1
+   * and owner_address = $2 and action_seq = $3 returning action_seq`.
+   *
+   * The `action_seq` predicate is the whole point and is re-stated here by
+   * hand: a restore from a cycle that has since been overtaken by a real claim
+   * must change NOTHING.
+   */
+  #lendingGuardsRestoreClaim(params: readonly unknown[]): Row[] {
+    const agentId = params[0] as string;
+    const row = this.#lendingGuards.get(agentId);
+    if (row === undefined || !sameOwner(row["owner_address"], params[1])) return [];
+    if (Number(row["action_seq"]) !== Number(params[2])) return [];
+    const previous = params[3];
+    const next: Row = {
+      ...row,
+      last_action_at_ms: previous === null || previous === undefined
+        ? null
+        : String(previous),
+      row_version: Number(row["row_version"]) + 1,
+      updated_at_ms: String(params[4]),
+    };
+    this.#lendingGuards.set(agentId, next);
+    return [{ action_seq: next["action_seq"] }];
+  }
+
+  #lendingRescuesInsert(params: readonly unknown[]): Row[] {
+    const id = params[0] as string;
+    if (this.#lendingRescues.has(id)) return [];
+    this.#lendingRescues.set(id, {
+      rescue_id: id, agent_id: params[1], owner_address: params[2], journal_key: params[3],
+      market: params[4], amount_wei: String(params[5]),
+      hf_before: params[6] === null ? null : String(params[6]),
+      hf_after: params[7] === null ? null : String(params[7]),
+      achieved_hf: params[8] === null ? null : String(params[8]),
+      tx_hash: params[9], effect: params[10], partial: params[11],
+      conditions: jsonbParam(params[12]), created_at_ms: String(params[13]),
+    });
+    return [];
+  }
+
+  #lendingRescuesList(params: readonly unknown[]): Row[] {
+    return [...this.#lendingRescues.values()]
+      .filter(
+        (row) =>
+          sameOwner(row["owner_address"], params[0]) && row["agent_id"] === params[1],
+      )
+      .sort((left, right) =>
+        BigInt(right["created_at_ms"] as string) > BigInt(left["created_at_ms"] as string) ? 1 : -1,
+      )
+      .slice(0, Number(params[2]))
+      .map((row) => structuredClone(row));
+  }
+
+  #lendingActionsCharge(params: readonly unknown[]): Row[] {
+    const id = params[0] as string;
+    if (this.#lendingActions.has(id)) return [];
+    this.#lendingActions.set(id, {
+      action_id: id, agent_id: params[1], owner_address: params[2],
+      kind: params[3], charged_at_ms: String(params[4]),
+    });
+    return [];
+  }
+
+  /** `where owner_address = $1 and agent_id = $2 and kind = 'rescue' and charged_at_ms >= $3` */
+  #lendingActionsUsage(params: readonly unknown[]): Row[] {
+    const since = BigInt(params[2] as number | string);
+    return [...this.#lendingActions.values()]
+      .filter(
+        (row) =>
+          sameOwner(row["owner_address"], params[0])
+          && row["agent_id"] === params[1]
+          && row["kind"] === "rescue"
+          && BigInt(row["charged_at_ms"] as string) >= since,
+      )
+      .sort((left, right) =>
+        BigInt(left["charged_at_ms"] as string) < BigInt(right["charged_at_ms"] as string) ? -1 : 1,
+      )
+      .map((row) => ({ charged_at_ms: row["charged_at_ms"] }));
+  }
+
+  /**
+   * `where owner_address = $1 and agent_id = $2 and kind = $3
+   *  order by charged_at_ms desc limit 1` (FIXREVIEW F3).
+   */
+  #lendingActionsLastOfKind(params: readonly unknown[]): Row[] {
+    const rows = [...this.#lendingActions.values()]
+      .filter(
+        (row) =>
+          sameOwner(row["owner_address"], params[0])
+          && row["agent_id"] === params[1]
+          && row["kind"] === params[2],
+      )
+      .sort((left, right) =>
+        BigInt(left["charged_at_ms"] as string) > BigInt(right["charged_at_ms"] as string) ? -1 : 1,
+      );
+    const row = rows[0];
+    return row === undefined ? [] : [{ action_id: row["action_id"] }];
+  }
+
+  #lendingSnapshotsPut(params: readonly unknown[]): Row[] {
+    const agentId = params[0] as string;
+    const existing = this.#lendingSnapshots.get(agentId);
+    if (existing !== undefined && !sameOwner(existing["owner_address"], params[1])) return [];
+    this.#lendingSnapshots.set(agentId, {
+      agent_id: agentId, owner_address: params[1], block_number: String(params[2]),
+      observed_at_ms: String(params[3]), snapshot: jsonbParam(params[4]),
+    });
+    return [];
+  }
+
+  #lendingSnapshotsGet(params: readonly unknown[]): Row[] {
+    const row = this.#lendingSnapshots.get(params[0] as string);
+    if (row === undefined || !sameOwner(row["owner_address"], params[1])) return [];
+    return [structuredClone(row)];
+  }
+
+  /**
+   * The namespaced settings/observation stores are the VENUS classes with a
+   * table parameter, so their statements are byte-identical apart from the
+   * table name and the tag — and these handlers are the Venus ones with the
+   * map passed in.
+   */
+  #namespacedSettingsGet(map: Map<string, Row>, params: readonly unknown[]): Row[] {
+    const row = map.get(params[0] as string);
+    if (row === undefined || row["owner_address"] !== params[1]) return [];
+    return [structuredClone(row)];
+  }
+
+  #namespacedSettingsPut(map: Map<string, Row>, params: readonly unknown[]): Row[] {
+    const agentId = params[0] as string;
+    const existing = map.get(agentId);
+    if (existing !== undefined && existing["owner_address"] !== params[1]) return [];
+    const row: Row = {
+      agent_id: agentId, owner_address: params[1], params: jsonbParam(params[2]),
+      digest: params[3], updated_at: params[4],
+    };
+    map.set(agentId, row);
+    return [structuredClone(row)];
+  }
+
+  #namespacedObservationsGet(map: Map<string, Row>, params: readonly unknown[]): Row[] {
+    const row = map.get(`${params[0] as string} ${params[1] as string}`);
+    if (row === undefined || row["owner_address"] !== params[2]) return [];
+    return [structuredClone(row)];
+  }
+
+  #namespacedObservationsPut(map: Map<string, Row>, params: readonly unknown[]): Row[] {
+    const key = `${params[0] as string} ${params[1] as string}`;
+    const existing = map.get(key);
+    if (existing !== undefined && existing["owner_address"] !== params[2]) return [];
+    map.set(key, {
+      agent_id: params[0], kind: params[1], owner_address: params[2],
+      evaluated_at_ms: String(params[3]), observation: jsonbParam(params[4]),
+      updated_at: params[5],
+    });
+    return [{ agent_id: params[0] }];
+  }
+
+  #namespacedObservationsDelete(map: Map<string, Row>, params: readonly unknown[]): Row[] {
+    const key = `${params[0] as string} ${params[1] as string}`;
+    const row = map.get(key);
+    if (row === undefined || row["owner_address"] !== params[2]) return [];
+    map.delete(key);
+    return [];
   }
 
   /* ----- lp settings ----- */
@@ -2429,9 +2830,10 @@ export class FakeSqlClient implements SqlClient {
           row["agent_id"] === params[0] &&
           row["decision_id"] === params[1] &&
           // `kind in ('execute','trade','lp','venusRepay','venusSupply',
-          // 'venusClaim','venusClaimRepayLeg')`: one decisionId namespace across
-          // every money route. Mirrors journal.ts's SQL literal by hand — the
-          // journal.lp and journal.venus tests pin the two against each other.
+          // 'venusClaim','venusClaimRepayLeg','billingCollect','lending')`: one
+          // decisionId namespace across every money route. Mirrors journal.ts's
+          // SQL literal by hand — the journal.lp, journal.venus and
+          // lending.journal tests pin the two against each other.
           (row["kind"] === "execute" ||
             row["kind"] === "trade" ||
             row["kind"] === "lp" ||
@@ -2439,7 +2841,8 @@ export class FakeSqlClient implements SqlClient {
             row["kind"] === "venusSupply" ||
             row["kind"] === "venusClaim" ||
             row["kind"] === "venusClaimRepayLeg" ||
-            row["kind"] === "billingCollect"),
+            row["kind"] === "billingCollect" ||
+            row["kind"] === "lending"),
       )
       .sort((a, b) => asTime(a["created_at"]) - asTime(b["created_at"]));
     const row = matches[0];

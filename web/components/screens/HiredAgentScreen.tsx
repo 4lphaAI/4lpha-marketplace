@@ -9,6 +9,7 @@ import { CHART_INTERVALS, emptyRungPairs, liveRungValueWei, relativeTime, rungFi
 import { REVIEWED_MAJORS_56, formatAtomic, midpointWbnbUsdtPrice, rangePrices, reviewedPair, type ReviewedPair, priceAtTick } from "@/lib/exec/pairs";
 import { gridModelLabel } from "@/lib/grid/economics";
 import { useAgentDetail, type ChartUnit, type UseAgentDetailResult } from "@/lib/exec/use-agent-detail";
+import { useMockAgentDetail } from "@/lib/mock/use-mock-agent-detail";
 import { usePublicClient } from "wagmi";
 import { NFPM_56 } from "@/lib/exec/pairs";
 import { listWalletPositionIds, readOnChainPosition, readWalletLegBalances, type OnChainPosition, type OnChainPositionRead } from "@/lib/altana/position-reader";
@@ -17,6 +18,7 @@ import { useOwnerActions } from "@/lib/exec/use-owner-actions";
 import type { TradeSettings } from "@/lib/trade";
 import { TradeAgentDetail } from "@/components/trade/TradeAgentDetail";
 import { LpAgentDetail } from "@/components/agent/LpAgentDetail";
+import { LendingAgentDetail } from "@/components/agent/LendingAgentDetail";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
 import {
   EMPTY_REMOVE_PROGRESS,
@@ -47,6 +49,7 @@ type Fill = { readonly motion: DetailMotion; readonly side: "buy" | "sell" };
 
 const TICK_ASK = "var(--warn)", TICK_BID = "var(--cat-grid)";
 const LP_HIRE_STORAGE_KEY = "4lpha:lp-hire:v1";
+const LENDING_HIRE_STORAGE_KEY = "4lpha:lending-hire:v1";
 const DESIGN_NEUTRAL_BAR_HEIGHTS = [38, 46, 42, 54, 50, 62, 58, 74, 66, 82, 96, 98, 90, 114, 96, 106, 94, 86, 96, 102, 78, 70, 62, 54, 58, 50, 46, 42, 38, 34] as const;
 
 function Panel({ title, right, children, pad = 0, className = "" }: { readonly title?: React.ReactNode; readonly right?: React.ReactNode; readonly children: React.ReactNode; readonly pad?: number; readonly className?: string }) {
@@ -714,7 +717,9 @@ function usePairIcons(token0: string | undefined, token1: string | undefined): R
 }
 
 export function HiredAgentScreen({ agentId, go }: Props) {
-  const detail = useAgentDetail(agentId);
+  // `?mock=1` swaps the VIEW for the recording fixture and nothing else; with
+  // the flag absent this is the real result by identity.
+  const detail = useMockAgentDetail(useAgentDetail(agentId), agentId);
   const owner = useOwnerActions();
   const [tab, setTab] = useState<Tab>("Overview");
   const [delegatedUnit, setDelegatedUnit] = useState<"USD" | "BNB">("USD");
@@ -759,6 +764,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   // AUDIT H3: the persisted hire discriminator is authoritative; trade-v1 agents remain runtime-unbound.
   const trading = view?.hireSizingName === "trade-v1";
   const lpAgent = view?.hireSizingName === "lp-v1";
+  const lendingAgent = view?.hireSizingName === "lending-v1";
 
   useEffect(() => {
     removeStorageCheckpointRef.current = null;
@@ -1399,6 +1405,29 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     />;
   }
 
+  if (lendingAgent) {
+    return <LendingAgentDetail
+      identityStatus={identityStatus}
+      agentId={agentId}
+      go={go}
+      detail={detail}
+      view={view}
+      busy={busy}
+      message={statusMessage}
+      actionsDisabled={actionsDisabled}
+      removeDisabled={actionsDisabled || remove.kind === "blocked" || !removeProgressHydrated}
+      removeTitle={remove.kind === "blocked" ? remove.message : undefined}
+      removeLabel={removeActionLabel(remove, removed)}
+      removeCallsId={removeCallsId}
+      removeTransactionHash={removeTransactionHash}
+      signedOut={detail.state === "signed-out" || detail.state === "auth-expired"}
+      onTogglePause={() => void togglePause()}
+      onRemove={() => {
+        if (remove.kind === "check-revoke" || window.confirm(removeConfirmText(remove))) void runRemove();
+      }}
+    />;
+  }
+
   if (lpAgent) {
     return <LpAgentDetail
       identityStatus={identityStatus}
@@ -1474,8 +1503,10 @@ export function HiredAgentScreen({ agentId, go }: Props) {
                 agentId={agentId}
                 readHeaders={detail.readHeaders}
                 go={go}
-                storageKey={view?.hireSizingName === "lp-v1" ? LP_HIRE_STORAGE_KEY : undefined}
-                deployPath={view?.hireSizingName === "lp-v1" ? "/deploy/lp" : "/deploy/grid"}
+                storageKey={view?.hireSizingName === "lp-v1" ? LP_HIRE_STORAGE_KEY
+                  : view?.hireSizingName === "lending-v1" ? LENDING_HIRE_STORAGE_KEY : undefined}
+                deployPath={view?.hireSizingName === "lp-v1" ? "/deploy/lp"
+                  : view?.hireSizingName === "lending-v1" ? "/deploy/lending" : "/deploy/grid"}
               />
             : <Button variant="danger" icon={<Icon name="revoke" size={15} />} disabled={actionsDisabled || remove.kind === "blocked" || !removeProgressHydrated} title={remove.kind === "blocked" ? remove.message : undefined} onClick={() => {
                 if (remove.kind === "check-revoke" || window.confirm(removeConfirmText(remove))) void runRemove();
@@ -1515,8 +1546,12 @@ export function HiredAgentScreen({ agentId, go }: Props) {
 
       {tab === "Overview" && <GridDetail detail={detail} view={liveView} onChain={onChain} discovered={discovered} emptyRungs={emptyRungs} busy={busy} closePositionNow={closePositionNow} />}
 
+      {/* The design export put a "Health factor" chart in the GRID column. It
+          was always empty here — a grid agent has no health factor — and the
+          lending guard now renders its own on `LendingAgentDetail`, so the
+          placeholder is gone rather than dashed (MARKETPLACE-LENDING-AGENT §9). */}
       {tab === "Run log" && (
-        <div className="fl-detail-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.4fr) minmax(0,1fr)", gap: 16, alignItems: "start" }}>
+        <div className="fl-detail-grid" style={{ display: "grid", gap: 16, alignItems: "start" }}>
           <section style={{ border: "1px solid var(--border-card)", borderRadius: "var(--radius-md)", background: "var(--surface-card)", padding: "8px 20px 16px" }}>
             {sequences.map((sequence) => {
               const time = relativeTime(sequence.updatedAt, detail.asOfMs ?? Date.now());
@@ -1524,9 +1559,6 @@ export function HiredAgentScreen({ agentId, go }: Props) {
               return <ActivityRow key={sequence.sequenceId} timeline title={sequence.kind} detail={sequence.state} time={time.text} {...(txHash === undefined ? {} : { txHash: short(txHash), href: `https://bscscan.com/tx/${txHash}` })} />;
             })}
           </section>
-          <ChartFrame title="Health factor" value="—" height={150} color="var(--cat-health)"
-            series={[]} axis={["—", "—", "—"]}
-            stale={<>—</>} />
         </div>
       )}
     </div>

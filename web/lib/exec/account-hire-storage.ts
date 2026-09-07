@@ -10,7 +10,10 @@ export function assertHireOwner(envelope: OwnerActionEnvelope, owner: string | u
   }
 }
 
-const POINTERS = ["4lpha:trade-hire:v2", "4lpha:grid-hire:v1", "4lpha:lp-hire:v1"];
+// CLOSED literal (MARKETPLACE-LENDING-AGENT L5): a hire pointer outside this
+// list is never owner-scoped, so an account switch would hand one owner's
+// recovery pointer to the next.
+const POINTERS = ["4lpha:trade-hire:v2", "4lpha:grid-hire:v1", "4lpha:lp-hire:v1", "4lpha:lending-hire:v1"];
 const INITIALIZED = "4lpha:account-hire-scoped:v1";
 function scoped(k: string, owner: string): string { return `${k}:owner:${owner.toLowerCase()}`; }
 

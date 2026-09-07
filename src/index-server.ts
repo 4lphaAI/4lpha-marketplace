@@ -59,6 +59,12 @@ import {
   closeVenusServerDeps,
   type BuiltVenusServerDeps,
 } from "./venus/wiring.js";
+import {
+  buildLendingServerDeps,
+  closeLendingServerDeps,
+  type BuiltLendingServerDeps,
+} from "./lending/wiring.js";
+import { resolveLendingEnabled } from "./ops/config.js";
 import { resolveLpRpcUrls } from "./lp/readers.js";
 import { createKeyStoreReader } from "./account/keyStoreReader.js";
 import { createBalanceReader } from "./account/balanceReader.js";
@@ -314,6 +320,39 @@ const venusBuilt: BuiltVenusServerDeps | undefined = await buildVenusServerDeps(
   network: lpReaderNetwork,
 });
 
+// MARKETPLACE-LENDING-AGENT §8.5. The SAME PHASE4-AUDIT A1 lesson the Venus
+// wiring above records: `createServer` registers the lending routes only when
+// `deps.lending` is present, so a boot that resolved the flag and forgot to
+// pass the deps would make `LENDING_ENABLED=true` enable NOTHING while the
+// server looked healthy. `resolveLendingEnabled` is also the one place
+// `LP_ENABLED` and `HIRE_ENABLED` are required, so calling it here makes those
+// throws reachable — the router, WBNB and the QuoterV2 all come from the LP
+// venue, and the guard's only entry is the lending-v1 hire.
+const lendingBuilt: BuiltLendingServerDeps | undefined =
+  lpBuilt === undefined
+    ? (resolveLendingEnabled(process.env), undefined)
+    : await buildLendingServerDeps({
+        env: process.env,
+        network: lpReaderNetwork,
+        lpVenue: {
+          routerV3: lpBuilt.addresses.routerV3,
+          wbnb: lpBuilt.addresses.wbnb,
+          quoterV2: lpBuilt.addresses.quoterV2,
+          factoryV3: lpBuilt.addresses.factory,
+          maxSagaSlippageBps: lpBuilt.railsResult.ok
+            ? lpBuilt.railsResult.config.maxSagaSlippageBps
+            : 0,
+        },
+      });
+if (lendingBuilt !== undefined && !lpBuilt!.railsResult.ok) {
+  throw new Error(
+    "LENDING_ENABLED is true but the LP manipulation rails are unset, so "
+      + "`maxSagaSlippageBps` — the ONE floor every lending swap leg is derived "
+      + "from — has no value. A guard whose swaps have no slippage floor must "
+      + "not boot.",
+  );
+}
+
 // The retirement finalizer owns a separate pool so that its journal, position,
 // reservation and sequence mutations share ONE pinned transaction.  No
 // DATABASE_URL means the dev-memory participant is selected only when both
@@ -382,6 +421,18 @@ console.log(
     : `[execution-plane] venus=on comptroller=${venusBuilt.venue.comptroller} ` +
         `vbnb=${venusBuilt.venue.vBnb} markets=${Object.keys(venusBuilt.marketIndex).length} ` +
         `interval=${venusBuilt.intervalMs}ms`,
+);
+
+// Which lending posture is live. The preview-secret line matters: absent, the
+// hire refuses `preview-receipt-unavailable`, and an operator should read that
+// here rather than discover it at a customer's first Deploy.
+console.log(
+  lendingBuilt === undefined
+    ? "[execution-plane] lending=off"
+    : `[execution-plane] lending=on vusdt=${lendingBuilt.venue.vUsdt} `
+      + `usdt=${lendingBuilt.venue.usdt} pool=${lendingBuilt.venue.swapPool} `
+      + `fee=${lendingBuilt.venue.swapFeeTier} interval=${lendingBuilt.intervalMs}ms `
+      + `preview-secret=${lendingBuilt.previewSecret === null ? "MISSING — hires will refuse" : "configured"}`,
 );
 
 console.log(
@@ -508,6 +559,20 @@ const app = createServer({
     ...(preBindRetirementFinalizer === undefined ? {} : { preBindRetirementFinalizer }),
   } }),
   ...(venusBuilt === undefined ? {} : { venus: venusBuilt }),
+  ...(lendingBuilt === undefined ? {} : { lending: {
+    guards: lendingBuilt.guards,
+    settingsStore: lendingBuilt.settingsStore,
+    observations: lendingBuilt.observations,
+    readers: lendingBuilt.readers,
+    venue: lendingBuilt.venue,
+    intervalMs: lendingBuilt.intervalMs,
+    maxObservationAgeMs: lendingBuilt.maxObservationAgeMs,
+    maxSagaSlippageBps: lendingBuilt.maxSagaSlippageBps,
+    previewSecret: lendingBuilt.previewSecret,
+    // AUDIT A-M2: the boot-read routing census, forwarded so S1's session spec
+    // can assert it. Absent only when the composition injected its readers.
+    ...(lendingBuilt.routing === undefined ? {} : { routing: lendingBuilt.routing }),
+  } }),
   ...(billingBuilt === undefined ? {} : { billingOwner: billingBuilt.owner }),
   keyStoreReader,
   balanceReader,
@@ -567,6 +632,13 @@ const provisioningWorker = hireEvidence === undefined ? undefined : createProvis
   evidence: hireEvidence,
   keyStore,
   ...(tradeSettingsStore === undefined ? {} : { tradeSettings: tradeSettingsStore }),
+  // R3.3(3): the 60 s sweep materializes a lending hire's settings and guard
+  // row exactly as the owner READ does, so a browser that never re-reads still
+  // converges.
+  ...(lendingBuilt === undefined ? {} : {
+    lendingSettings: lendingBuilt.settingsStore,
+    lendingGuards: lendingBuilt.guards,
+  }),
   onError: (message) => console.warn(`[execution-plane] hire convergence failed: ${message}`),
 });
 const provisioningTimer = provisioningWorker === undefined ? undefined : setInterval(() => {
@@ -614,6 +686,8 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   // below: `closeVenusServerDeps` already settles each one on its own, so a
   // single failing pool cannot strand the others.
   await closeVenusServerDeps(venusBuilt);
+  // The lending stores, on the same terms and for the same reason.
+  await closeLendingServerDeps(lendingBuilt);
   // Closed in dependency order; each `close` is independent, so one failure must
   // not strand the others.
   for (const closeable of [

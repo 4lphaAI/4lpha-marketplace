@@ -21,6 +21,9 @@ import { HireLpDeploy } from "@/components/deploy/HireLpDeploy";
 import { HireTradeDeploy } from "@/components/deploy/HireTradeDeploy";
 import { DemoTradeDeploy } from "@/components/deploy/DemoTradeDeploy";
 import { DemoAgentPanel } from "@/components/demo/DemoAgentPanel";
+import { HireLendingDeploy } from "@/components/deploy/HireLendingDeploy";
+import { GuardedAccountSection } from "@/components/deploy/GuardedAccountSection";
+import { lendingControlNumber } from "@/lib/lending/form";
 import { TradeModelSelect } from "@/components/deploy/TradeModelSelect";
 import { MAX_INSTRUCTIONS_ENCODED_BYTES,
   MIN_TRADE_CAPITAL_WEI, MIN_TRADE_ENTRY_WEI, checkBoundedText,
@@ -84,13 +87,17 @@ const PRESETS = {
     { id: "blue", label: "Custom", note: "Manually select a pool for the LP Agent to manage the position.",
       set: { capital: "0.02", rebalanceOn: true, compoundOn: true, tpOn: false, tpPercent: "40", slOn: false, slPercent: "25", rebalanceMode: "Both ways", rebalanceCooldown: "5", rebalanceCooldownUnit: "mins", minFees: "10", primary: MODELS[0], fallback: MODELS[1] } },
   ],
+  // The thresholds are the OPERATOR's ruling of 2026-09-06 (spec §0.6 / OQ2):
+  // 1.20 / 1.50, not the mock's 1.18 / 1.60. `checkEvery` is gone — the cadence
+  // is the operator's boot config, never a control. Every value here clears the
+  // plane's own bounds (trigger 1.05..3.0, target >= trigger + 0.05).
   health: [
     { id: "conservative", label: "Conservative", note: "Acts early, restores a large buffer.",
-      set: { trigger: "1.35", target: "1.90", checkEvery: "15", maxRepay: "400" } },
+      set: { trigger: "1.35", target: "1.90", maxRepay: "400", reservePct: "30" } },
     { id: "balanced", label: "Balanced", note: "Standard buffer for BNB collateral.",
-      set: { trigger: "1.18", target: "1.60", checkEvery: "30", maxRepay: "240" } },
+      set: { trigger: "1.20", target: "1.50", maxRepay: "240", reservePct: "20" } },
     { id: "aggressive", label: "Aggressive", note: "Keeps capital deployed, thinner margin of safety.",
-      set: { trigger: "1.08", target: "1.35", checkEvery: "10", maxRepay: "150" } },
+      set: { trigger: "1.10", target: "1.35", maxRepay: "150", reservePct: "15" } },
   ],
 };
 
@@ -225,33 +232,44 @@ const CONFIG = {
       { k: "skillFile", label: "Add Skill", type: "skillFile", v: null },
     ] },
   ],
+  /*
+   * MARKETPLACE-LENDING-AGENT §2.1 as amended by R2.17 — every control here maps
+   * to a wire field the owner SIGNS, and §2.2's removals render NOTHING: gas
+   * priority, slippage (the saga rail is the plane's, not the owner's), the
+   * alerts checkbox (no notification channel exists), the oracle deviation guard
+   * (the plane already reproduces the protocol's deviation-bounded prices and
+   * refuses `protocol-mismatch`), max gas price, the flash-loan checkbox, Lista,
+   * and the collateral/debt asset pickers (the CHAIN says what the guarded
+   * account holds — the owner does not choose).
+   *
+   * "Lending market", "Repay from", "Check every" and "Daily repay limit
+   * (derived)" are read-only text and are rendered by `HireLendingDeploy`, not
+   * as fields: none of them is a choice, and a select the owner cannot change is
+   * a lie about what they control.
+   */
   health: [
-    { title: "Position", fields: [
-      { k: "market", label: "Lending market", type: "select", v: "Venus", options: ["Venus", "Lista", "Venus and Lista"] },
-      { k: "collateral", label: "Collateral asset", type: "select", v: "BNB", options: ["BNB", "BTCB", "ETH", "slisBNB"] },
-      { k: "debt", label: "Debt asset", type: "select", v: "USDT", options: ["USDT", "USDC", "lisUSD"] },
+    { title: "Agent", fields: [
+      { k: "agentName", label: "Agent name", type: "text", v: "Lending Agent 01" },
+      { k: "capital", label: "Total capital", type: "stepper", v: "0.05", step: 0.01, min: 0.01, suffix: "BNB" },
+    ] },
+    { title: "Guarded account", fields: [
+      { k: "guarded", type: "hidden", v: null },
     ] },
     { title: "Triggers", fields: [
-      { k: "trigger", label: "Act below health factor", type: "num", v: "1.18" },
-      { k: "target", label: "Restore health factor to", type: "num", v: "1.60" },
-      { k: "checkEvery", label: "Check every", type: "num", v: "30", suffix: "sec" },
+      { k: "trigger", label: "Act below health factor", type: "num", v: "1.20" },
+      { k: "target", label: "Restore health factor to", type: "num", v: "1.50" },
+    ] },
+    { title: "Reserve", fields: [
+      // W6: `floor` turns OFF NumStepper's blur clamp, so a typed value out of
+      // range stays on screen in red and is refused — never quietly rewritten.
+      { k: "reservePct", label: "Reserve kept as BNB", type: "stepper", v: "20", step: 5, min: 10, max: 50, floor: 10, suffix: "%",
+        hint: "The rest is swapped to USDT and supplied to Venus, where it earns while it waits." },
     ] },
     { title: "Repair", fields: [
-      { k: "source", label: "Repay from", type: "select", v: "Wallet USDT", options: ["Wallet USDT", "Vault balance", "Sell collateral"] },
       { k: "maxRepay", label: "Max repay per event", type: "num", v: "240", prefix: "$" },
-      { k: "dailyRepay", label: "Daily repay limit", type: "num", v: "1,000", prefix: "$" },
-      { k: "maxActions", label: "Max actions per day", type: "num", v: "6" },
-    ] },
-    { title: "Execution", fields: [
-      { k: "gas", label: "Gas priority", type: "select", v: "High", options: ["Low", "Standard", "High"] },
-      { k: "slippage", label: "Slippage tolerance", type: "num", v: "1", suffix: "%" },
-      { k: "alerts", label: "check", type: "check", v: true, text: "Send an alert every time the agent repays or the factor drops." },
-    ] },
-    { title: "Advanced settings", adv: true, note: "Guards that decide when a repay is safe to send at all.", fields: [
-      { k: "oracleDev", label: "Oracle deviation guard", type: "num", v: "2", suffix: "%", hint: "Hold off when the feed and market price disagree by more." },
-      { k: "maxGas", label: "Max gas price", type: "num", v: "5", suffix: "gwei" },
-      { k: "cooldown", label: "Cooldown between repays", type: "num", v: "120", suffix: "sec" },
-      { k: "flash", label: "check", type: "check", v: false, text: "Allow a flash-loan repay when the wallet balance is short." },
+      { k: "rescueCount", label: "Rescues to reserve gas for", type: "stepper", v: "6", step: 1, min: 1, max: 24, floor: 1,
+        hint: "The guard will still rescue beyond this — refusing a rescue is the trap it exists to avoid." },
+      { k: "cooldown", label: "Cooldown between repays", type: "stepper", v: "300", step: 60, min: 300, max: 86400, floor: 300, suffix: "sec" },
     ] },
   ],
 };
@@ -1304,7 +1322,12 @@ function DeployAgentScreen({ kind, go }) {
           {primary.map((s) =>
             (id === "grid" || (id === "lp" && preset === "blue")) && s.title === "Pool"
               ? <LivePoolSection key="live-pool" value={livePool} onChange={selectLivePool} />
-              : <Group key={s.title} section={s} values={values} set={set} preset={preset} overrides={fieldOverrides} />)}
+              // MARKETPLACE-LENDING-AGENT R2.20 / R3.3: the guarded-account
+              // stage is the FIRST thing the lending form asks for, swapped in
+              // for its section exactly as the live pool picker is for "Pool".
+              : id === "health" && s.title === "Guarded account"
+                ? <GuardedAccountSection key="guarded-account" value={values.guarded} onChange={(next) => set("guarded", next)} />
+                : <Group key={s.title} section={s} values={values} set={set} preset={preset} overrides={fieldOverrides} />)}
         </div>
         {id === "lp" && preset === "wide" ? (
           <div style={{ marginTop: 16, padding: "12px 14px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)", color: "var(--text-subtle)", font: "var(--weight-regular) var(--text-sm)/1.4 var(--font-sans)" }}>
@@ -1329,7 +1352,11 @@ function DeployAgentScreen({ kind, go }) {
           </div>
         ) : null}
 
-        {id !== "grid" && id !== "trading" && id !== "lp" ? (
+        {/* §2.2: the sandbox panel and its `SIM.health` rows are design chrome.
+            "Render nothing that reads as a measured number" — so the lending
+            form has no sandbox at all, exactly as grid, trading and LP have
+            none. */}
+        {id !== "grid" && id !== "trading" && id !== "lp" && id !== "health" ? (
         <div style={{ marginTop: 24, paddingTop: 20, borderTop: "1px solid var(--line-1)", display: "grid", gap: 14 }}>
           <span className="fl-eyebrow">Sandbox</span>
           <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)", marginTop: -6, maxWidth: "70ch" }}>{active.simNote}</p>
@@ -1422,6 +1449,23 @@ function DeployAgentScreen({ kind, go }) {
               ready: values.lpRangeReady === true
                 && values.lpRangePoolAddress === livePool?.pool.toLowerCase(),
             } : null}
+            go={go}
+          />
+        ) : id === "health" ? (
+          <HireLendingDeploy
+            mode={mode}
+            agentName={String(values.agentName ?? "Lending Agent")}
+            capitalBnb={String(values.capital ?? "0")}
+            guarded={values.guarded ?? null}
+            triggerHf={String(values.trigger ?? "1.20")}
+            targetHf={String(values.target ?? "1.50")}
+            maxRepayUsd={String(values.maxRepay ?? "")}
+            /* W6: NO silent clamps. The typed value goes through as typed; an
+               out-of-range one is REFUSED by `buildLendingForm` inside the hire
+               component, which disables Deploy and names the legal range. */
+            rescueReserveCount={Math.round(lendingControlNumber(values.rescueCount, 6))}
+            cooldownSeconds={Math.round(lendingControlNumber(values.cooldown, 300))}
+            reserveBps={Math.round(lendingControlNumber(values.reservePct, 20) * 100)}
             go={go}
           />
         ) : (

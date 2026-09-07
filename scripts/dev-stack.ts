@@ -70,6 +70,13 @@ import { MemoryLpSequenceStore } from "../src/store/lpSequences.js";
 import { MemoryLpSettingsStore } from "../src/store/lpSettings.js";
 import { MemoryLpObservationStore } from "../src/store/lpObservations.js";
 import { buildLpServerDeps, type BuiltLpServerDeps } from "../src/lp/wiring.js";
+import { buildLendingServerDeps } from "../src/lending/wiring.js";
+import { resolveLendingEnabled } from "../src/ops/config.js";
+import {
+  nextLendingCycleDelayMs,
+  runLendingWorkerOnce,
+  type LendingWorkerDeps,
+} from "../src/lending/worker.js";
 import { resolveLpRpcUrls } from "../src/lp/readers.js";
 import {
   createLpWorkerState,
@@ -504,6 +511,51 @@ async function main(): Promise<void> {
       : `[dev-stack] lp=on rails=${lpBuilt.railsResult.ok ? "configured" : "MISSING — LP money routes will refuse"}`,
   );
 
+  // MARKETPLACE-LENDING-AGENT §8.5 — the OFFLINE REHEARSAL wiring.
+  //
+  // `rehearsal: true` is the named carve-out that lets this stack run over
+  // MEMORY stores with no `DATABASE_URL`. It is passed HERE and nowhere else;
+  // the production composition site never passes it, so a durable deployment
+  // that merely forgot the database still refuses to boot.
+  const lendingWanted = process.argv.includes("--lending-worker");
+  const lendingBuilt = lpBuilt === undefined
+    ? (resolveLendingEnabled(process.env), undefined)
+    : await buildLendingServerDeps({
+        env: process.env,
+        network: {
+          chain: network.chain,
+          chainId: network.chainId,
+          publicRpcUrl: network.publicRpcUrl,
+        },
+        rehearsal: true,
+        lpVenue: {
+          routerV3: lpBuilt.addresses.routerV3,
+          wbnb: lpBuilt.addresses.wbnb,
+          quoterV2: lpBuilt.addresses.quoterV2,
+          factoryV3: lpBuilt.addresses.factory,
+          maxSagaSlippageBps: lpBuilt.railsResult.ok
+            ? lpBuilt.railsResult.config.maxSagaSlippageBps
+            : 0,
+        },
+      });
+  if (lendingWanted && lendingBuilt === undefined) {
+    throw new Error("--lending-worker requires LENDING_ENABLED=true (which requires LP_ENABLED and HIRE_ENABLED).");
+  }
+  console.log(
+    lendingBuilt === undefined
+      ? "[dev-stack] lending=off (LENDING_ENABLED not set)"
+      : `[dev-stack] lending=on (REHEARSAL: memory stores, dying with this process) `
+        + `vusdt=${lendingBuilt.venue.vUsdt} usdt=${lendingBuilt.venue.usdt} `
+        + `pool=${lendingBuilt.venue.swapPool} fee=${lendingBuilt.venue.swapFeeTier}`,
+  );
+  if (lendingBuilt !== undefined) {
+    console.log(
+      "[dev-stack] NOTE: the lending hire route needs Postgres and this stack has none, so "
+      + "no guard row can be created here through S1. The rehearsal exercises the worker's "
+      + "decision layer, the read side and the dry-run gate — never the restart property.",
+    );
+  }
+
   const dataPlane = new HttpDataPlaneClient({
     baseUrl: dataPlaneUrl,
     ...(process.env["DATA_PLANE_TOKEN"]?.trim()
@@ -544,6 +596,17 @@ async function main(): Promise<void> {
     dataPlane,
     ...(lpBuilt === undefined ? {} : { lp: lpBuilt.lp }),
     ...(demoWiring === null ? {} : { demo: demoWiring.server }),
+    ...(lendingBuilt === undefined ? {} : { lending: {
+      guards: lendingBuilt.guards,
+      settingsStore: lendingBuilt.settingsStore,
+      observations: lendingBuilt.observations,
+      readers: lendingBuilt.readers,
+      venue: lendingBuilt.venue,
+      intervalMs: lendingBuilt.intervalMs,
+      maxObservationAgeMs: lendingBuilt.maxObservationAgeMs,
+      maxSagaSlippageBps: lendingBuilt.maxSagaSlippageBps,
+      previewSecret: lendingBuilt.previewSecret,
+    } }),
     config,
   });
 
@@ -683,6 +746,59 @@ async function main(): Promise<void> {
       void tick();
     };
     setTimeout(() => void tick(), workerBoot.intervalMs);
+  }
+
+  // Optional in-process LENDING worker (`--lending-worker`), over the SAME
+  // memory stores the routes above were given — so a guard read over HTTP is
+  // the guard this worker is deciding about. `--lending-worker-dry-run` runs
+  // the decision layer with the dry-run gate on, writing nothing at all.
+  if (lendingWanted && lendingBuilt !== undefined) {
+    const lendingDryRun = process.argv.includes("--lending-worker-dry-run");
+    const lendingDeps: LendingWorkerDeps = {
+      agentStore,
+      journal,
+      killswitch,
+      provider,
+      guards: lendingBuilt.guards,
+      settingsStore: lendingBuilt.settingsStore,
+      observations: lendingBuilt.observations,
+      readers: lendingBuilt.readers,
+      venue: lendingBuilt.venue,
+      intervalMs: lendingBuilt.intervalMs,
+      maxObservationAgeMs: lendingBuilt.maxObservationAgeMs,
+      agentConcurrency: lendingBuilt.agentConcurrency,
+      maxSagaSlippageBps: lendingBuilt.maxSagaSlippageBps,
+      now: Date.now,
+      dryRun: lendingDryRun,
+      log: (outcome) =>
+        console.log(
+          `[dev-stack lending-worker] agent=${outcome.agentId} action=${outcome.action} `
+          + `${outcome.condition === undefined ? "" : `condition=${outcome.condition} `}`
+          + `reason=${outcome.reason}`,
+        ),
+    };
+    console.log(
+      `[dev-stack] lending-worker running in-process every ${lendingBuilt.intervalMs}ms`
+      + `${lendingDryRun ? " (dry-run)" : ""}`,
+    );
+    const lendingTick = async (): Promise<void> => {
+      const startedAt = Date.now();
+      try {
+        await runLendingWorkerOnce(lendingDeps);
+      } catch (error) {
+        console.error(
+          `[dev-stack lending-worker] cycle failed: ${error instanceof Error ? error.message : "unknown"}`,
+        );
+      }
+      await new Promise((resolve) =>
+        setTimeout(
+          resolve,
+          nextLendingCycleDelayMs(startedAt, Date.now(), lendingBuilt.intervalMs),
+        ),
+      );
+      void lendingTick();
+    };
+    setTimeout(() => void lendingTick(), lendingBuilt.intervalMs);
   }
 }
 

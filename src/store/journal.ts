@@ -167,7 +167,27 @@ export type JournalKind =
   | "lpArm"
   | "tradeSettings"
   | "tradeExit"
-  | "tradeDrain";
+  | "tradeDrain"
+  // MARKETPLACE-LENDING-AGENT R2.1 (closing REVIEW B1). THREE owner-action
+  // rows and ONE money kind, and the four had to be enumerated together
+  // because they land in the same six hand-maintained places the Venus note
+  // above names: this union, {@link MONEY_KINDS}, the Postgres `getByDecision`
+  // SQL literal, `test/support/fakeSql.ts`'s copy of that filter,
+  // {@link LOCAL_ONLY_KINDS}, and `resolveRow`'s callsId branch.
+  //
+  // The three owner actions are `ownerMutation`'s unconditional rows and never
+  // carry money — the arm and the retire open and settle their OWN `"lending"`
+  // money row INSIDE `act`, exactly as `lpArm` does for kind `lp`. Making them
+  // money kinds would park every ambiguous owner action as a permanent UNKNOWN
+  // that `ownerMutation`'s unconditional `markCommitted` cannot reach.
+  | "lendingArm"
+  | "lendingSettings"
+  | "lendingRetire"
+  // The ONE money kind for EVERY session-key submission this phase makes: the
+  // arm batch, every rescue batch, and the retire batch. `lendingRescue` does
+  // NOT exist as a kind — one namespace, `lending:<agentId>:<day>:<n>`, so a
+  // decision id used by a rescue can never be reused by the retire.
+  | "lending";
 
 /**
  * Kinds that move money under a session key.
@@ -194,6 +214,11 @@ export const MONEY_KINDS: ReadonlySet<JournalKind> = new Set<JournalKind>([
   "venusClaim",
   "venusClaimRepayLeg",
   "billingCollect",
+  // MARKETPLACE-LENDING-AGENT R2.1. The lending guard submits through the same
+  // `executeViaSession` relay as `trade` and `lp`, records a `callsId`, and
+  // shares this decision-id namespace so a decision used on `/trade` cannot be
+  // reused by a lending rescue with the replay check silently passing.
+  "lending",
 ]);
 
 /** Journal states that HOLD budget. Only `ROLLED_BACK` releases it. */
@@ -283,6 +308,17 @@ export const LOCAL_ONLY_KINDS: ReadonlySet<JournalKind> = new Set<JournalKind>([
   "tradeSettings",
   "tradeExit",
   "tradeDrain",
+  // MARKETPLACE-LENDING-AGENT R2.1, and the FOURTH time this file records the
+  // same trap: `ownerMutation` journals a row of the route's kind
+  // unconditionally, so an interrupted `POST /lending/arm` whose kind were
+  // missing here becomes a permanent UNKNOWN row with no `callsId` that
+  // `resolveUnknown` refuses (it verifies `lp` rows only). The MONEY the arm
+  // and the retire attach lives in the kind-`lending` row they open and settle
+  // inside `act`; these rows record only that a signed action was consumed,
+  // and the `lending_guards` row holds the truth about what it started.
+  "lendingArm",
+  "lendingSettings",
+  "lendingRetire",
 ]);
 
 /**
@@ -2361,7 +2397,7 @@ export class PostgresExecutionJournal implements ExecutionJournal {
       `/* journal.getByDecision */
        select ${JOURNAL_COLUMNS}
        from execution_journal
-       where agent_id = $1 and decision_id = $2 and kind in ('execute', 'trade', 'lp', 'venusRepay', 'venusSupply', 'venusClaim', 'venusClaimRepayLeg', 'billingCollect')
+       where agent_id = $1 and decision_id = $2 and kind in ('execute', 'trade', 'lp', 'venusRepay', 'venusSupply', 'venusClaim', 'venusClaimRepayLeg', 'billingCollect', 'lending')
        order by created_at asc
        limit 1`,
       [agentId, decisionId],
@@ -2831,6 +2867,13 @@ async function resolveRow(
     || kind === "venusSupply"
     || kind === "venusClaim"
     || kind === "venusClaimRepayLeg"
+    // MARKETPLACE-LENDING-AGENT R2.1. The sixth hand-maintained site. A
+    // `lending` row is one relay submission with a `callsId`, so it resolves
+    // exactly as `lp` and the Venus kinds do — and WITHOUT this branch a
+    // crashed lending arm, rescue or retire would fall through to the
+    // unrecognized-kind branch below and park as a PERMANENT UNKNOWN, because
+    // v1 ships no owner-signed resolver for this kind either.
+    || kind === "lending"
   ) {
     // An `lp` row is one saga step submitted through the same relay, so it
     // resolves identically: only its callsId — never a live session, never the

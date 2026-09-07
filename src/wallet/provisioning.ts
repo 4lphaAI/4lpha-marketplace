@@ -66,6 +66,29 @@ export async function convergeProvisioning(input: {
   readonly keyStore: Address;
   readonly nowSec: number;
   readonly tradeSettings?: Pick<TradeSettingsStore, "putInitialIfAbsentOrSameDigest">;
+  /**
+   * MARKETPLACE-LENDING-AGENT R3.3(3) — the lending materialization seam.
+   *
+   * `PendingGrant.initialLendingHire` carries the guarded account, the pinned
+   * markets, the USDT cap, the reserve split and the signed settings; at
+   * convergence they become a `lending_settings` row and a `lending_guards` row
+   * in status `provisioning-guard`. `lendingArm` then UPDATES that row to
+   * `arming` under CAS — "the guard row is created at arm" is dead.
+   *
+   * Absent collaborators with a present `initialLendingHire` is a
+   * `settings_conflict` activation error, exactly as the trade path treats a
+   * missing settings store: a hire whose durable intent cannot be materialized
+   * must NOT be armed, because the session spec was built from data the plane
+   * would then not hold.
+   */
+  readonly lendingSettings?: Pick<
+    import("../store/venusSettings.js").VenusSettingsStore,
+    "get" | "put"
+  >;
+  readonly lendingGuards?: Pick<
+    import("../store/lendingGuards.js").LendingGuardStore,
+    "putInitialIfAbsentOrSame"
+  >;
   readonly signal?: AbortSignal;
 }): Promise<ProvisioningConvergence> {
   const observed = await input.store.getAgent(input.ownerAddress, input.agentId);
@@ -119,6 +142,43 @@ export async function convergeProvisioning(input: {
       digest: pending.initialTradeSettings.digest,
     });
     if (initial.kind === "conflict") {
+      return { agent: observed, missing: [], revocationRequired: false, activationError: "settings_conflict" };
+    }
+  }
+
+  if (pending.initialLendingHire !== undefined) {
+    const hire = pending.initialLendingHire;
+    if (input.lendingSettings === undefined || input.lendingGuards === undefined) {
+      return { agent: observed, missing: [], revocationRequired: false, activationError: "settings_conflict" };
+    }
+    // ABSENT-OR-SAME, both rows. A converged agent may be re-converged by the
+    // GET and by the sweep concurrently, and neither may overwrite the other's
+    // work — nor accept a DIFFERENT settings object under the same hire.
+    const existingSettings = await input.lendingSettings.get(
+      observed.ownerAddress,
+      observed.id,
+    );
+    if (existingSettings === null) {
+      await input.lendingSettings.put({
+        agentId: observed.id,
+        ownerAddress: observed.ownerAddress,
+        params: hire.params,
+        digest: hire.digest,
+      });
+    } else if (existingSettings.digest.toLowerCase() !== hire.digest.toLowerCase()) {
+      return { agent: observed, missing: [], revocationRequired: false, activationError: "settings_conflict" };
+    }
+    const guard = await input.lendingGuards.putInitialIfAbsentOrSame({
+      agentId: observed.id,
+      ownerAddress: observed.ownerAddress,
+      guardedAccount: hire.guardedAccount,
+      reserveToken: getAddress(pending.sessionSpec.spendCaps
+        .find((cap) => cap.token !== undefined)?.token ?? hire.guardedAccount),
+      debtMarkets: hire.debtMarkets,
+      reserveCapWei: BigInt(hire.reserveCapWei),
+      reserveBps: hire.reserveBps,
+    });
+    if (guard.kind === "conflict") {
       return { agent: observed, missing: [], revocationRequired: false, activationError: "settings_conflict" };
     }
   }

@@ -33,6 +33,8 @@ import { validProvisioningCancellation, type AgentCaps, type AgentRecord } from 
 import { identityOwnerView } from "../identity/types.js";
 import type { WalletCall } from "../core/types.js";
 import { parseTradeSettings, type TradeSettings } from "../trade/settings.js";
+import { parseLendingSettingsParams, type LendingSettings } from "./lendingWire.js";
+import { LENDING_RESERVE_BPS_MAX, LENDING_RESERVE_BPS_MIN } from "../ops/policy.js";
 
 /** Parse outcome. The message is for the caller's 400, never for a log of input. */
 export type ParseResult<T> =
@@ -106,14 +108,122 @@ export type TradeHireParams = {
   readonly settings: TradeSettings;
 };
 
-export type HireParams = GridHireParams | TradeHireParams;
+/**
+ * MARKETPLACE-LENDING-AGENT R3.3(1) — the lending hire envelope.
+ *
+ * It carries the COMPLETE settings and `reserveBps` for the reason REVIEW2 H3
+ * gave: R3.1's USDT floor needs `rescueReserveCount`, and R3.2's native rule
+ * needs `supplyNativeWei` and therefore `reserveBps`. None of those exist on
+ * the grid envelope, so S1 could not have applied either gating condition. One
+ * signed hire carries every input the floors need, exactly as
+ * `parseTradeHireParams` already carries `settings`.
+ *
+ * `previewReceipt` is REQUIRED and is verified at S1 against
+ * `LENDING_PREVIEW_SECRET` (R3.8): it binds the guarded account, the finalized
+ * block the position was read at, guardability, the debts, AND every sizing
+ * input, so a receipt taken for budget X cannot be verified for budget 10X.
+ */
+export type LendingHireParams = {
+  readonly walletAddress: Address;
+  /** MUST equal the boot-derived USDT (`vUSDT.underlying()`), checked at S1. */
+  readonly token: Address;
+  readonly capDayWei: bigint;
+  readonly openNativeBudgetWei: bigint;
+  readonly ttlSec: number;
+  readonly sizingPreset: "lending-v1";
+  /** A — the guarded account. Never wallet B, never the owner's own address. */
+  readonly guardedAccount: Address;
+  /** The PINNED debt markets, non-empty, deduplicated, at most two in v1. */
+  readonly debtMarkets: readonly Address[];
+  /** The USDT rolling-day cap the session will grant. */
+  readonly reserveCapWei: bigint;
+  readonly reserveBps: number;
+  readonly settings: LendingSettings;
+  /** The exact settings bytes, so the digest binds what the owner signed. */
+  readonly settingsParams: unknown;
+  readonly previewReceipt: string;
+};
+
+export type HireParams = GridHireParams | TradeHireParams | LendingHireParams;
 
 const HIRE_PARAM_KEYS = ["walletAddress", "token", "capDayWei", "openNativeBudgetWei", "ttlSec", "sizingPreset"] as const;
+
+const LENDING_HIRE_PARAM_KEYS = [
+  "walletAddress", "token", "capDayWei", "openNativeBudgetWei", "ttlSec", "sizingPreset",
+  "guardedAccount", "debtMarkets", "reserveCapWei", "reserveBps", "settings", "previewReceipt",
+] as const;
+
+/** Strict lending-v1 S1 envelope; the grid and trade parsers stay byte-identical. */
+export function parseLendingHireParams(value: unknown): ParseResult<LendingHireParams> {
+  if (!isRecord(value)) return fail("Lending hire params must be a JSON object.");
+  const keys = Object.keys(value).sort();
+  const expected = [...LENDING_HIRE_PARAM_KEYS].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    return fail(`Lending hire params must contain exactly: ${LENDING_HIRE_PARAM_KEYS.join(", ")}.`);
+  }
+  const walletAddress = readAddress(value["walletAddress"], "walletAddress");
+  if (!walletAddress.ok) return walletAddress;
+  const token = readAddress(value["token"], "token");
+  if (!token.ok) return token;
+  const guardedAccount = readAddress(value["guardedAccount"], "guardedAccount");
+  if (!guardedAccount.ok) return guardedAccount;
+  if (guardedAccount.value.toLowerCase() === walletAddress.value.toLowerCase()) {
+    return fail('"guardedAccount" must differ from the agent wallet; a guard that repays its own reserve address guards nothing.');
+  }
+  if (typeof value["capDayWei"] !== "string") return fail('"capDayWei" must be a positive decimal bigint string.');
+  const capDayWei = readBigint(value["capDayWei"], "capDayWei");
+  if (!capDayWei.ok || capDayWei.value <= 0n) return fail('"capDayWei" must be a positive decimal bigint string.');
+  if (typeof value["openNativeBudgetWei"] !== "string") return fail('"openNativeBudgetWei" must be a positive decimal bigint string.');
+  const openNativeBudgetWei = readBigint(value["openNativeBudgetWei"], "openNativeBudgetWei");
+  if (!openNativeBudgetWei.ok || openNativeBudgetWei.value <= 0n) return fail('"openNativeBudgetWei" must be a positive decimal bigint string.');
+  if (typeof value["reserveCapWei"] !== "string") return fail('"reserveCapWei" must be a positive decimal bigint string.');
+  const reserveCapWei = readBigint(value["reserveCapWei"], "reserveCapWei");
+  if (!reserveCapWei.ok || reserveCapWei.value <= 0n) return fail('"reserveCapWei" must be a positive decimal bigint string.');
+  const ttlSec = value["ttlSec"];
+  if (!Number.isInteger(ttlSec) || (ttlSec as number) < 3_600 || (ttlSec as number) > 604_800) {
+    return fail('"ttlSec" must be an integer from 3600 through 604800.');
+  }
+  if (value["sizingPreset"] !== "lending-v1") return fail('"sizingPreset" must be "lending-v1".');
+  const reserveBps = value["reserveBps"];
+  if (!Number.isInteger(reserveBps)
+    || (reserveBps as number) < LENDING_RESERVE_BPS_MIN
+    || (reserveBps as number) > LENDING_RESERVE_BPS_MAX) {
+    return fail(`"reserveBps" must be an integer from ${LENDING_RESERVE_BPS_MIN} through ${LENDING_RESERVE_BPS_MAX}.`);
+  }
+  const rawMarkets = value["debtMarkets"];
+  if (!Array.isArray(rawMarkets) || rawMarkets.length === 0 || rawMarkets.length > 2) {
+    return fail('"debtMarkets" must be a non-empty array of at most 2 vToken addresses (v1 guards vUSDT and vBNB).');
+  }
+  const seen = new Set<string>();
+  const debtMarkets: Address[] = [];
+  for (const entry of rawMarkets) {
+    const market = readAddress(entry, "debtMarkets[]");
+    if (!market.ok) return market;
+    const key = market.value.toLowerCase();
+    if (seen.has(key)) return fail(`"debtMarkets" names ${market.value} twice.`);
+    seen.add(key);
+    debtMarkets.push(market.value);
+  }
+  const settings = parseLendingSettingsParams(value["settings"]);
+  if (!settings.ok) return fail(`"settings" is invalid: ${settings.message}`);
+  const receipt = value["previewReceipt"];
+  if (typeof receipt !== "string" || receipt.length === 0 || receipt.length > 1024) {
+    return fail('"previewReceipt" must be the plane-signed receipt string from GET /lending/guardable.');
+  }
+  return { ok: true, value: {
+    walletAddress: walletAddress.value, token: token.value, capDayWei: capDayWei.value,
+    openNativeBudgetWei: openNativeBudgetWei.value, ttlSec: ttlSec as number,
+    sizingPreset: "lending-v1", guardedAccount: guardedAccount.value, debtMarkets,
+    reserveCapWei: reserveCapWei.value, reserveBps: reserveBps as number,
+    settings: settings.value, settingsParams: value["settings"], previewReceipt: receipt,
+  } };
+}
 
 /** Strict S1 parser: exact keys, exact decimals, and the closed v1 preset. */
 export function parseHireParams(value: unknown): ParseResult<HireParams> {
   if (!isRecord(value)) return fail("Hire params must be a JSON object.");
   if (value["sizingPreset"] === "trade-v1") return parseTradeHireParams(value);
+  if (value["sizingPreset"] === "lending-v1") return parseLendingHireParams(value);
   const keys = Object.keys(value).sort();
   const expected = [...HIRE_PARAM_KEYS].sort();
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {

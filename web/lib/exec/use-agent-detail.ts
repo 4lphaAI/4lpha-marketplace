@@ -6,6 +6,7 @@ import { encodeReadHeader } from "./owner-action";
 import { forgetReadExpiry, readSessionStorage, rememberReadExpiry, storedReadExpiryMs, subscribeReadExpiry } from "./read-session-window";
 import { REVIEWED_MAJORS_56, WBNB_56 } from "./pairs";
 import { parseTradeViewEnvelope, type TradeView } from "../trade";
+import { parseLendingAgentView, type Invalid, type LendingAgentView } from "./lending-types";
 import {
   mapAgentDetail,
   type LiveTick,
@@ -45,6 +46,12 @@ export type UseAgentDetailResult = {
   readonly setChartInterval: (interval: ChartInterval) => void;
   readonly setChartUnit: (unit: ChartUnit) => void;
   readonly trade: TradeView | null;
+  /**
+   * The lending guard's own projection, loaded only for a `lending-v1` agent.
+   * `INVALID` when the plane answered a shape this page cannot map — which is a
+   * dash WITH a reason on every tile, never a blank page.
+   */
+  readonly lending: LendingAgentView | Invalid | null;
   readonly asOfMs: number | null;
   readonly message: string;
   /** Why the chart has no data, when it has none. Null while it is fine. */
@@ -56,6 +63,8 @@ export type UseAgentDetailResult = {
   readonly refresh: () => Promise<AgentDetailView | null>;
   /** Re-reads the trading projection immediately for a drain/remove workflow. */
   readonly refreshTrade: () => Promise<TradeView | null>;
+  /** Re-reads the lending guard immediately — L9's "`replayed` ⇒ re-read". */
+  readonly refreshLending: () => Promise<LendingAgentView | Invalid | null>;
 };
 
 export function pollStateForStatus(status: number): AgentDetailPollState {
@@ -87,43 +96,55 @@ type AuthWindow = { readonly expiryMs: number; readonly signedHeader?: string };
  * exposed as `signIn`: no effect calls it, so a render/timer can never open a
  * passkey ceremony. The bearer itself remains in an HttpOnly cookie.
  */
+/**
+ * A LENDING guard names no pool at all.
+ *
+ * Every selector below feeds a POOL-shaped read — the live tick, the OHLCV
+ * chart, the token metadata for a pair. A lending agent has none of that: it
+ * watches a third party's Venus account and holds a USDT reserve, so each
+ * selector answers "nothing" rather than falling through to the grid branch,
+ * where `notArmedView`'s empty grid block would make the page poll
+ * `/api/pool-state` for the empty string.
+ */
+const LENDING_PRESET = "lending-v1";
+
 function detailPool(view: AgentDetailView | null): string | null {
-  if (view === null) return null;
+  if (view === null || view.hireSizingName === LENDING_PRESET) return null;
   return view.hireSizingName === "lp-v1"
     ? view.lp?.pool?.poolAddress ?? null
     : view.grid.pool;
 }
 
 function detailBaseAddress(view: AgentDetailView | null): string | null {
-  if (view === null) return null;
+  if (view === null || view.hireSizingName === LENDING_PRESET) return null;
   return view.hireSizingName === "lp-v1"
     ? view.lp?.pool?.baseAddress ?? null
     : view.grid.baseAddress;
 }
 
 function detailQuoteAddress(view: AgentDetailView | null): string | null {
-  if (view === null) return null;
+  if (view === null || view.hireSizingName === LENDING_PRESET) return null;
   return view.hireSizingName === "lp-v1"
     ? view.lp?.pool?.quoteAddress ?? null
     : view.grid.quoteAddress;
 }
 
 function detailBaseSymbol(view: AgentDetailView | null): string | null {
-  if (view === null) return null;
+  if (view === null || view.hireSizingName === LENDING_PRESET) return null;
   return view.hireSizingName === "lp-v1"
     ? view.lp?.pool?.base ?? null
     : view.grid.base;
 }
 
 function detailQuoteSymbol(view: AgentDetailView | null): string | null {
-  if (view === null) return null;
+  if (view === null || view.hireSizingName === LENDING_PRESET) return null;
   return view.hireSizingName === "lp-v1"
     ? view.lp?.pool?.quote ?? null
     : view.grid.quote;
 }
 
 function detailTokens(view: AgentDetailView | null): readonly string[] {
-  if (view === null) return [];
+  if (view === null || view.hireSizingName === LENDING_PRESET) return [];
   if (view.hireSizingName === "lp-v1") {
     const pool = view.lp?.pool;
     return pool === null || pool === undefined ? [] : [pool.token0, pool.token1];
@@ -147,6 +168,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
   const [chartBanner, setChartBanner] = useState<string | null>(null);
   const chartAbortRef = useRef<AbortController | null>(null);
   const [trade, setTrade] = useState<TradeView | null>(null);
+  const [lending, setLending] = useState<LendingAgentView | Invalid | null>(null);
   const [asOfMs, setAsOfMs] = useState<number | null>(null);
   const [mapperError, setMapperError] = useState<string | null>(null);
   const viewRef = useRef<AgentDetailView | null>(null);
@@ -249,6 +271,26 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
         }
         setTrade(parseTradeViewEnvelope(await tradeResponse.json() as unknown));
       } else setTrade(null);
+      if (ownerData?.hireSizing?.name === "lending-v1") {
+        const lendingResponse = await fetch(`/api/agents/${encodeURIComponent(agentId)}/lending/view`, { headers: requestHeaders(window), cache: "no-store", signal: controller.signal });
+        if (!lendingResponse.ok) {
+          // A 404 here is a REAL state, not an outage: the guard row is written
+          // at convergence, so a session still provisioning has none yet. The
+          // page renders the hire-recovery path from the owner view instead.
+          if (lendingResponse.status === 404) setLending(null);
+          else {
+            const next = pollStateForStatus(lendingResponse.status);
+            setState(next);
+            if (next === "auth-expired") {
+              setAuth(null);
+              forgetReadExpiry(readSessionStorage());
+            }
+            return;
+          }
+        } else {
+          setLending(parseLendingAgentView(await lendingResponse.json() as unknown));
+        }
+      } else setLending(null);
     } catch (error) {
       if (!controller.signal.aborted) setState(error instanceof Error ? "execution-unavailable" : "invalid-response");
       return;
@@ -471,6 +513,21 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
     return next;
   }, [agentId, auth, requestHeaders, trade]);
 
+  const refreshLending = useCallback(async (): Promise<LendingAgentView | Invalid | null> => {
+    if (auth === null || !mayPoll(Date.now(), auth.expiryMs)) return lending;
+    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}/lending/view`, {
+      headers: requestHeaders(auth), cache: "no-store",
+    });
+    if (!response.ok) {
+      if (response.status !== 404) setState(pollStateForStatus(response.status));
+      return lending;
+    }
+    const next = parseLendingAgentView(await response.json() as unknown);
+    setLending(next);
+    setAsOfMs(Date.now());
+    return next;
+  }, [agentId, auth, lending, requestHeaders]);
+
   // Expiry metadata can only resume a cookie-backed read; the server still
   // verifies the cookie. Signing on Account or another tab resumes this page.
   useEffect(() => {
@@ -549,6 +606,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
     setChartInterval,
     setChartUnit,
     trade,
+    lending,
     asOfMs,
     message: mapperError === null ? stateMessage(state) : `${stateMessage(state)} (${mapperError})`,
     marketReason,
@@ -556,5 +614,6 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
     signIn,
     refresh,
     refreshTrade,
+    refreshLending,
   };
 }

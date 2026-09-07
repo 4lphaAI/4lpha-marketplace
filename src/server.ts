@@ -70,7 +70,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { createDemoRoutes, type DemoServerDeps } from "./demo/routes.js";
 import type { Context } from "hono";
-import { encodeAbiParameters, encodeFunctionData, formatEther, getAddress, getCreate2Address, keccak256, stringToBytes, zeroAddress } from "viem";
+import { encodeAbiParameters, encodeFunctionData, formatEther, getAddress, getCreate2Address, isAddress, keccak256, stringToBytes, zeroAddress } from "viem";
 import { publicKeyToAddress } from "viem/utils";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -188,8 +188,22 @@ import {
   parseTradeRequest,
   type TradeRequest,
   type HireParams,
+  type LendingHireParams,
   provisioningView,
 } from "./http/wire.js";
+import {
+  enforceLendingV1Profile,
+  lendingSettingsDigest,
+  lendingSettingsView,
+  parseGuardableQuery,
+  parseLendingArmParams,
+  parseLendingRetireParams,
+  parseLendingSettingsParams,
+  parseLendingSettingsRequest,
+  type LendingConfigView,
+  type LendingGuardableView,
+  type LendingQuoteView,
+} from "./http/lendingWire.js";
 import {
   flapVenue,
   pancakeV3Venue,
@@ -215,7 +229,36 @@ import {
   tradeSessionSpec,
   venusMeterReserve,
   walletNativeFloorWei,
+  LENDING_DUST_USDT_WEI,
+  LENDING_MAX_MARKETS,
+  RELAY_FEE_PER_EXIT_WEI,
+  checkLendingSizing,
+  lendingHireSizingPreview,
+  lendingSessionSpec,
+  type VenusRoutingCensus,
 } from "./ops/policy.js";
+import {
+  buildLendingArmBatch,
+  buildLendingRetireBatch,
+} from "./lending/batches.js";
+import {
+  lendingOwnerActionDecisionId,
+  submitLendingBatch,
+} from "./lending/execute.js";
+import { planLendingRetire, retireCleared } from "./lending/sizing.js";
+import {
+  createLendingPreviewCache,
+  createLendingPreviewLimiter,
+  issueLendingPreviewReceipt,
+  verifyLendingPreviewReceipt,
+} from "./lending/preview.js";
+import {
+  LendingAccountTooComplexError,
+  type LendingChainReaders,
+  type LendingVenue,
+} from "./lending/readers.js";
+import type { LendingGuardRecord, LendingGuardStore } from "./store/lendingGuards.js";
+import type { LendingHold } from "./lending/types.js";
 import { immutableTradeSettingChange, parseTradeSettings, tradeSettingsDigest } from "./trade/settings.js";
 import { checkTradeSizing, nativeDayCapWei } from "./trade/sizing.js";
 import {
@@ -765,6 +808,42 @@ export type VenusServerDeps = {
   readonly marketIndex: Readonly<Record<string, { readonly underlying: Address | null }>>;
 };
 
+/**
+ * Everything the lending routes need beyond the core deps. OPTIONAL on
+ * {@link ServerDeps}, exactly like {@link LpServerDeps} and
+ * {@link VenusServerDeps}: a deployment that does not wire it gets the same 404
+ * an unknown path gets. `LENDING_ENABLED` decides whether it is wired (§8.5).
+ */
+export type LendingServerDeps = {
+  readonly guards: LendingGuardStore;
+  readonly settingsStore: VenusSettingsStore;
+  readonly observations: VenusObservationStore;
+  readonly readers: LendingChainReaders;
+  readonly venue: LendingVenue;
+  /**
+   * The cadence the WORKER runs on. The view reports snapshot staleness as
+   * `2 x` this, so it must be the worker's own number and not a second default
+   * — the two disagreeing is what makes a "fresh" answer meaningless.
+   */
+  readonly intervalMs: number;
+  readonly maxObservationAgeMs: number;
+  /** `rails.maxSagaSlippageBps` — the ONE slippage rail every leg floors on. */
+  readonly maxSagaSlippageBps: number;
+  /**
+   * The preview-receipt key (R3.8). `null` is a supported, FAIL-CLOSED state:
+   * `/lending/guardable` returns no receipt and S1 refuses
+   * `preview-receipt-unavailable`.
+   */
+  readonly previewSecret: Uint8Array | null;
+  /**
+   * The boot-read Venus routing census (AUDIT A-M2). S1 passes it into
+   * `lendingSessionSpec`, which asserts it — that assertion was structurally
+   * unreachable on this path while nothing ever supplied one, and BUILD §4's
+   * ERC-20 overpay caveat cites the census as live.
+   */
+  readonly routing?: VenusRoutingCensus;
+};
+
 /** Owner-facing Phase 5 billing controls. Absent means exact 404. */
 export type BillingOwnerServerDeps = {
   readonly store: BillingStore;
@@ -812,6 +891,8 @@ export interface ServerDeps {
   readonly lp?: LpServerDeps;
   /** Venus routes (PHASE4). Absent ⇒ the Venus paths answer 404 (D11). */
   readonly venus?: VenusServerDeps;
+  /** Lending routes. Absent ⇒ every `/lending/*` path answers 404 (§8.5). */
+  readonly lending?: LendingServerDeps;
   /** Phase 5 owner billing surface. Absent/off/report means exact 404. */
   readonly billingOwner?: BillingOwnerServerDeps;
   /**
@@ -1646,17 +1727,22 @@ export function createServer(deps: ServerDeps): Hono {
     const WALLET_CONVERGENCE_BUDGET_MS = 12_000;
     const WALLET_CONVERGENCE_READS = 4;
 
-    function blockerKind(agent: AgentRecord): "Grid Agent" | "LP Agent" | "Trading Agent" | "Agent" {
+    function blockerKind(agent: AgentRecord): "Grid Agent" | "LP Agent" | "Trading Agent" | "Lending Agent" | "Agent" {
       const sizing = agent.pendingGrant?.sizing.sizingPreset ?? agent.sessionFacts?.hireSizing?.name;
       if (sizing === "grid-v1" || sizing === "grid-shift-v1") return "Grid Agent";
       if (sizing === "lp-v1") return "LP Agent";
       if (sizing === "trade-v1") return "Trading Agent";
+      // R2.16 / R3.13: the guard is one more agent under the existing
+      // one-live-passkey-agent-per-wallet rule, so it needs its own label on
+      // BOTH sides of the message — as the blocker and as the thing being
+      // deployed.
+      if (sizing === "lending-v1") return "Lending Agent";
       return "Agent";
     }
 
     function walletBlockerMessage(
       agent: AgentRecord,
-      deployingLabel: "Grid Agent" | "LP Agent" | "Trading Agent" | "Agent" = blockerKind(agent),
+      deployingLabel: "Grid Agent" | "LP Agent" | "Trading Agent" | "Lending Agent" | "Agent" = blockerKind(agent),
     ): string {
       const label = blockerKind(agent);
       if (agent.status === "revoked") {
@@ -1792,7 +1878,8 @@ export function createServer(deps: ServerDeps): Hono {
         return { kind: "error", code: "owner_auth_failed" };
       }
       const params = parseHireParams(parsed.value.params);
-      if (!params.ok || (params.value.sizingPreset !== "trade-v1" && params.value.sizingPreset !== "lp-v1")) {
+      if (!params.ok || (params.value.sizingPreset !== "trade-v1"
+        && params.value.sizingPreset !== "lp-v1" && params.value.sizingPreset !== "lending-v1")) {
         return { kind: "error", code: "owner_auth_failed" };
       }
       const agent = await deps.agentStore.getAgentById(id);
@@ -1812,6 +1899,19 @@ export function createServer(deps: ServerDeps): Hono {
               !== tradeSettingsDigest(params.value.settings).toLowerCase()))) {
           return { kind: "error", code: "conflict" };
         }
+      } else if (params.value.sizingPreset === "lending-v1") {
+        // The lending continuation binds the same three envelope figures the LP
+        // one does, PLUS the settings digest carried on `initialLendingHire` —
+        // the trade rule, for the same reason: the guard row materialized at
+        // convergence is built from those bytes, so a continuation presenting
+        // different settings must not be answered as a retry of this hire.
+        if (pending !== null && (pending.sizing.sizingPreset !== "lending-v1"
+          || pending.sizing.openNativeBudgetWei !== params.value.openNativeBudgetWei.toString(10)
+          || pending.sizing.capDayWei !== params.value.capDayWei.toString(10)
+          || pending.initialLendingHire?.digest.toLowerCase()
+            !== lendingSettingsDigest(params.value.settingsParams).toLowerCase())) {
+          return { kind: "error", code: "conflict" };
+        }
       } else if (pending !== null && (pending.sizing.sizingPreset !== "lp-v1"
         || pending.sizing.openNativeBudgetWei !== params.value.openNativeBudgetWei.toString(10)
         || pending.sizing.capDayWei !== params.value.capDayWei.toString(10))) {
@@ -1824,7 +1924,7 @@ export function createServer(deps: ServerDeps): Hono {
       let wallet: Address;
       let openNativeBudgetWei: bigint | undefined;
       let capDayWei: bigint | undefined;
-      let presetQuery: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1";
+      let presetQuery: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1";
       let executionModel: import("./trade/settings.js").TradeExecutionModel | undefined;
       let entryWei: bigint | undefined;
       let maxOpenPositions: number | undefined;
@@ -1836,6 +1936,7 @@ export function createServer(deps: ServerDeps): Hono {
           && rawPreset !== "grid-shift-v1"
           && rawPreset !== "lp-v1"
           && rawPreset !== "trade-v1"
+          && rawPreset !== "lending-v1"
         ) throw new Error("preset");
         presetQuery = rawPreset;
         if (presetQuery === "trade-v1") {
@@ -1867,6 +1968,13 @@ export function createServer(deps: ServerDeps): Hono {
             ? cachedPin(executionModel, wallet, c.req.raw.signal)
             : Promise.resolve(undefined),
         ]);
+        // MARKETPLACE-LENDING-AGENT R2.15: the lending deposit is
+        // `budget + registration + headroom + 3 x relayFee` — the
+        // `requiredTradeDepositWei` SHAPE, with no `reserves.totalWei`, because
+        // lending has no LP exit/protect lanes to reserve for. The FUNDING half
+        // is what the browser needs here; the sizing floors come from
+        // `/lending/guardable` in receipt mode, which is the only place they
+        // can be quoted.
         const sizing = presetQuery === "trade-v1"
           ? hireSizingPreview({
               capDayWei: capDayWei!, executionModel: executionModel!, entryWei: entryWei!,
@@ -1874,11 +1982,28 @@ export function createServer(deps: ServerDeps): Hono {
               feeBps: hire.feeBps, relayFeePerSubmitWei: hire.relayFeePerSubmitWei,
               sizingPreset: "trade-v1",
             })
-          : hireSizingPreview({ openNativeBudgetWei: openNativeBudgetWei!, feeBps: hire.feeBps,
-              relayFeePerSubmitWei: hire.relayFeePerSubmitWei, sizingPreset: presetQuery });
+          : presetQuery === "lending-v1"
+            ? {
+                name: "lending-v1" as const,
+                version: 1 as const,
+                openNativeBudgetWei: openNativeBudgetWei!.toString(10),
+                relayFeePerSubmitWei: RELAY_FEE_PER_EXIT_WEI.toString(10),
+                armSubmissionPad: 3,
+                note:
+                  "The USDT day-cap floor and the minimum native cap are quoted by "
+                  + "GET /lending/guardable in receipt mode; they need a live pool quote, "
+                  + "which this preview deliberately does not take.",
+              }
+            : hireSizingPreview({ openNativeBudgetWei: openNativeBudgetWei!, feeBps: hire.feeBps,
+                relayFeePerSubmitWei: hire.relayFeePerSubmitWei, sizingPreset: presetQuery });
         let responseCapDayWei: string;
         if (presetQuery === "trade-v1") {
           responseCapDayWei = capDayWei!.toString(10);
+        } else if (presetQuery === "lending-v1") {
+          // The lending cap is a SIGNED field derived from the receipt, not a
+          // figure this route can compute; answering a number here would look
+          // like a recommendation nobody sized.
+          responseCapDayWei = "0";
         } else {
           if (!("minimumCapDayWei" in sizing)) throw new Error("Grid hire preview shape mismatch.");
           responseCapDayWei = sizing.minimumCapDayWei;
@@ -2261,6 +2386,229 @@ export function createServer(deps: ServerDeps): Hono {
               prepared = { pending, sessionKey, params: tradeParams };
               return;
             }
+            if (params.value.sizingPreset === "lending-v1") {
+              const lendingParams: LendingHireParams = params.value;
+              const lending = deps.lending;
+              if (lending === undefined) {
+                throw new BadRequestError(
+                  "The lending guard is not enabled on this deployment.",
+                );
+              }
+              // R3.8, FAIL-CLOSED. No secret ⇒ no receipt can be verified ⇒ the
+              // hire refuses rather than trusting an unbound preview.
+              if (lending.previewSecret === null) {
+                throw new BadRequestError(
+                  "preview-receipt-unavailable: this deployment cannot verify a guardable preview, so it will not accept a hire sized against one.",
+                );
+              }
+              if (
+                lendingParams.token.toLowerCase()
+                !== lending.venue.usdt.toLowerCase()
+              ) {
+                throw new BadRequestError(
+                  `"token" must be the reserve asset ${lending.venue.usdt}, derived at boot from vUSDT.underlying().`,
+                );
+              }
+              for (const market of lendingParams.debtMarkets) {
+                const known =
+                  market.toLowerCase() === lending.venue.vUsdt.toLowerCase()
+                  || market.toLowerCase() === lending.venue.vBnb.toLowerCase();
+                if (!known) {
+                  throw new BadRequestError(
+                    `"debtMarkets" names ${market}, which is not a v1 guarded market (vUSDT or vBNB).`,
+                  );
+                }
+              }
+
+              // ═══ THE RECEIPT (R2.10, R3.3(b)) ═════════════════════════════
+              //
+              // It binds the ACCOUNT, the block its position was read at,
+              // guardability, the debts, AND every sizing input — so a receipt
+              // taken for one budget cannot be presented here for another
+              // against a floor S1 has no quote of its own to recompute.
+              const claims = verifyLendingPreviewReceipt(
+                lendingParams.previewReceipt, lending.previewSecret, observedAtSec,
+              );
+              if (claims === null) {
+                throw new BadRequestError(
+                  "The guardable preview receipt is missing, malformed or older than 30 seconds. Re-read the guarded account and sign again.",
+                );
+              }
+              if (
+                claims.account.toLowerCase()
+                !== lendingParams.guardedAccount.toLowerCase()
+              ) {
+                throw new BadRequestError(
+                  "The preview receipt was issued for a different guarded account.",
+                );
+              }
+              if (!claims.guardable) {
+                throw new BadRequestError(
+                  "The preview says this account cannot be guarded; the hire is refused before any nonce is consumed.",
+                );
+              }
+              const signedUsdtCeiling =
+                lendingParams.settings.maxPerAction.find(
+                  (cap) =>
+                    cap.token !== null
+                    && cap.token.toLowerCase() === lending.venue.usdt.toLowerCase(),
+                )?.maxWei ?? 0n;
+              if (
+                claims.budgetWei !== lendingParams.openNativeBudgetWei.toString(10)
+                || claims.reserveBps !== lendingParams.reserveBps
+                || claims.rescueReserveCount !== lendingParams.settings.rescueReserveCount
+                || claims.maxPerActionUsdtWei !== signedUsdtCeiling.toString(10)
+              ) {
+                throw new BadRequestError(
+                  "The signed hire does not match the sizing inputs the preview receipt was issued for. Re-read the preview with the values you intend to sign.",
+                );
+              }
+              const previewDebts = new Set(
+                claims.debts.map((debt) => debt.vToken.toLowerCase()),
+              );
+              for (const market of lendingParams.debtMarkets) {
+                if (!previewDebts.has(market.toLowerCase())) {
+                  throw new BadRequestError(
+                    `"debtMarkets" names ${market}, which carried no debt in the preview. A guard pinned to a market with nothing to repay grants authority it cannot use.`,
+                  );
+                }
+              }
+
+              // ═══ EXACTLY THREE BOUNDED READS (R2.10, corrected by L1) ═════
+              const [ownerVerdict, funding, facts] = await Promise.all([
+                verifyDeclaredWallet({ owner: verified.ownerAddress,
+                  wallet: lendingParams.walletAddress,
+                  reader: deps.keyStoreReader, signal: c.req.raw.signal }),
+                hire.evidence.readFunding(lendingParams.walletAddress,
+                  hire.grantGasHeadroomWei, observedAtSec, c.req.raw.signal),
+                lending.readers.readS1Facts(
+                  lendingParams.guardedAccount, lendingParams.debtMarkets,
+                ),
+              ]).catch((error: unknown) => {
+                if (error instanceof LendingAccountTooComplexError) {
+                  throw new BadRequestError(
+                    "The guarded account is in more markets than this guard can price.",
+                  );
+                }
+                throw new HireEvidenceError();
+              });
+              if (ownerVerdict === "unreadable") throw new HireEvidenceError();
+              if (ownerVerdict === "no-matching-key") throw new HireWalletOwnerError();
+              if (facts.liquidityErrorCode !== 0n) {
+                throw new BadRequestError(
+                  `protocol-error: the Comptroller returned code ${facts.liquidityErrorCode} for the guarded account; the hire is refused rather than armed against numbers the plane cannot trust.`,
+                );
+              }
+              for (const borrow of facts.borrows) {
+                if (borrow.borrowWei === 0n) {
+                  throw new BadRequestError(
+                    `debt-market-not-held: the guarded account carries no borrow in ${borrow.vToken}. Pin only markets it actually owes in.`,
+                  );
+                }
+              }
+              if (facts.borrows.every((borrow) => borrow.borrowWei === 0n)) {
+                throw new BadRequestError(
+                  "guarded-no-debt: the guarded account owes nothing in any pinned market.",
+                );
+              }
+
+              // The SIGNED settings, through the SAME check the preview ran —
+              // possible only because the receipt binds the two quoted figures
+              // the floor is derived from.
+              const sized = checkLendingSizing({
+                budgetWei: lendingParams.openNativeBudgetWei,
+                reserveBps: lendingParams.reserveBps,
+                capDayWei: lendingParams.capDayWei,
+                reserveCapWei: lendingParams.reserveCapWei,
+                mintUsdtWei: BigInt(claims.mintUsdtWei),
+                tierBuyBackUsdtWei: BigInt(claims.tierBuyBackUsdtWei),
+                rescueReserveCount: lendingParams.settings.rescueReserveCount,
+              });
+              if (!sized.ok) {
+                // AUDIT A-M3: remedy first, figure structured. The check's own
+                // prose is 500+ characters and `sanitizeMessage` caps a stored
+                // refusal at 280, so the hire used to lose both the number and
+                // the remedy to the truncation.
+                if (sized.kind === "malformed") throw new BadRequestError(sized.message);
+                throw new LpSizingShortfallError(
+                  "lending-sizing-short: raise the daily caps you are granting, or lower "
+                  + `the budget. Shortfall (wei): ${sized.shortfallWei}`,
+                  sized.shortfallWei,
+                );
+              }
+
+              const sessionKey = generatePrivateKey();
+              const sessionAccount = privateKeyToAccount(sessionKey);
+              const sessionPublicKey = sessionAccount.publicKey;
+              const sessionAddress = sessionAccount.address;
+              if (getAddress(publicKeyToAddress(sessionPublicKey)) !== getAddress(sessionAddress)) {
+                throw new HireEvidenceError();
+              }
+              const expiresAt = observedAtSec + lendingParams.ttlSec;
+              const guardsVBnb = lendingParams.debtMarkets.some(
+                (market) => market.toLowerCase() === lending.venue.vBnb.toLowerCase(),
+              );
+              const sessionSpec = lendingSessionSpec({
+                // A-M2: the boot-read census GATES the grant. Absent only in
+                // the offline compositions that inject their own readers.
+                ...(lending.routing === undefined ? {} : { routing: lending.routing }),
+                vUsdt: lending.venue.vUsdt,
+                usdt: lending.venue.usdt,
+                // vBNB is granted ONLY when it is a pinned debt market: an
+                // ungranted market is one fewer target a leaked key reaches.
+                ...(guardsVBnb ? { vBnb: lending.venue.vBnb } : {}),
+                routerV3: lending.venue.routerV3,
+                treasury: lending.venue.treasury,
+                walletAddress: lendingParams.walletAddress,
+                keyStoreAddress: config.keyStore,
+                nativeCaps: [{ limit: lendingParams.capDayWei, period: "day" }],
+                usdtDailyCapWei: lendingParams.reserveCapWei,
+                expiresAt,
+                nowSeconds: observedAtSec,
+              });
+              const permissions = validateSessionSpec(sessionSpec, {
+                nowSeconds: observedAtSec,
+                walletAddress: lendingParams.walletAddress,
+                keyStoreAddress: config.keyStore,
+              });
+              const pending: PendingGrant = {
+                version: 1,
+                recoveredOwner: verified.ownerAddress,
+                walletAddress: lendingParams.walletAddress,
+                sessionAddress,
+                sessionPublicKey,
+                accountKeyHash: accountKeyHashForAddress(sessionAddress),
+                keyStoreKeyId: keccak256(sessionPublicKey),
+                sessionSpec,
+                permissions,
+                grantDigest: grantDigest({ permissions, expiresAt,
+                  walletAddress: lendingParams.walletAddress, sessionAddress }),
+                expiresAt,
+                sizing: {
+                  openNativeBudgetWei: lendingParams.openNativeBudgetWei.toString(10),
+                  capDayWei: lendingParams.capDayWei.toString(10),
+                  sizingPreset: "lending-v1",
+                  sizingPresetVersion: 1,
+                },
+                funding,
+                createdAtSec: observedAtSec,
+                keyStoreVerdictAtS1: ownerVerdict,
+                provisionActionId,
+                // R3.3(2): the money-authority data rides HERE and is written
+                // INSIDE `createProvisioningAgent`'s CAS with the agent row and
+                // the sealed key — one statement, no torn write.
+                initialLendingHire: {
+                  guardedAccount: lendingParams.guardedAccount,
+                  debtMarkets: lendingParams.debtMarkets,
+                  reserveCapWei: lendingParams.reserveCapWei.toString(10),
+                  reserveBps: lendingParams.reserveBps,
+                  params: lendingParams.settingsParams,
+                  digest: lendingSettingsDigest(lendingParams.settingsParams),
+                },
+              };
+              prepared = { pending, sessionKey, params: lendingParams };
+              return;
+            }
             const [ownerVerdict, funding] = await Promise.all([
               verifyDeclaredWallet({ owner: verified.ownerAddress, wallet: params.value.walletAddress, reader: deps.keyStoreReader, signal: c.req.raw.signal }),
               hire.evidence.readFunding(params.value.walletAddress, hire.grantGasHeadroomWei, observedAtSec, c.req.raw.signal),
@@ -2337,7 +2685,9 @@ export function createServer(deps: ServerDeps): Hono {
         if (error instanceof TradeCapitalTooSmallError) {
           return fail(c, 400, "capital_too_small", `Total capital must be at least ${formatEther(error.minimumWei)} BNB.`);
         }
-        if (error instanceof BadRequestError) return fail(c, 400, "invalid_request", error.message);
+        // AUDIT A-M3: a sizing shortfall carries its figure as STRUCTURED
+        // meta, not only as prose the 280-character cap can eat.
+        if (error instanceof BadRequestError) return failBadRequest(c, error);
         if (error instanceof OwnerAuthError) return fail(c, 401, "owner_auth_failed");
         throw error;
       }
@@ -2348,6 +2698,12 @@ export function createServer(deps: ServerDeps): Hono {
         let httpRuntimeProfile: "unbound-v1" | "lp-v1";
         switch (prepared.params.sizingPreset) {
           case "trade-v1":
+          // The lending guard has NO HTTP runtime route at all: its money is
+          // moved by the worker holding the standing on-chain session, so
+          // `unbound-v1` — which grants only `agentRead` — is both correct and
+          // the narrowest thing available. The `venus-v1` profile stays what it
+          // is for the Phase 4 EOA path.
+          case "lending-v1":
             httpRuntimeProfile = "unbound-v1";
             break;
           case "grid-v1":
@@ -2364,7 +2720,15 @@ export function createServer(deps: ServerDeps): Hono {
             ownerAddress: prepared.pending.recoveredOwner,
             walletAddress: prepared.params.walletAddress,
             custodyModel: "passkey",
+            // MARKETPLACE-LENDING-AGENT R2.15 / L6: lending takes `capDayWei`
+            // (the trade rule), because the arm's own msg.value AND a full
+            // rescue both meter native BEYOND the budget. It is INERT here —
+            // no lending path reads `agent.caps` — and it must NEVER become a
+            // rescue gate: FINDINGS (ah), "a daily cap that can refuse the last
+            // repay before liquidation is a liquidation vector wearing a
+            // budget's name".
             caps: { dailyNativeWei: prepared.params.sizingPreset === "trade-v1"
+              || prepared.params.sizingPreset === "lending-v1"
               ? prepared.params.capDayWei : prepared.params.openNativeBudgetWei,
               ...(prepared.params.sizingPreset === "trade-v1"
                 ? { perTradeNativeWei: BigInt(prepared.params.settings.entryWei) }
@@ -2380,7 +2744,15 @@ export function createServer(deps: ServerDeps): Hono {
           // Match Trading's remedy, but never disclose another owner's agent.
           const blocker = error.agentId === null ? null
             : await deps.agentStore.getAgent(prepared.pending.recoveredOwner, error.agentId);
-          const deploying = prepared.params.sizingPreset === "lp-v1" ? "LP Agent" : "Grid Agent";
+          // R2.16 / R3.13: the THIRD label. One live passkey agent per wallet
+          // is inherited unchanged, so a user already running Grid, LP or
+          // Trading on wallet B cannot also hire the guard onto it — and the
+          // refusal must name what they were trying to deploy.
+          const deploying = prepared.params.sizingPreset === "lp-v1"
+            ? "LP Agent"
+            : prepared.params.sizingPreset === "lending-v1"
+              ? "Lending Agent"
+              : "Grid Agent";
           return fail(c, 409, "wallet_in_use", blocker === null
             ? `Remove the existing agent before deploying ${deploying}.`
             : walletBlockerMessage(blocker, deploying));
@@ -2420,13 +2792,19 @@ export function createServer(deps: ServerDeps): Hono {
       }
       const grantPreset = pending?.sizing.sizingPreset;
       if (continuation.agent.status !== "provisioning" || pending === null
-        || (grantPreset !== "trade-v1" && grantPreset !== "lp-v1")
+        || (grantPreset !== "trade-v1" && grantPreset !== "lp-v1" && grantPreset !== "lending-v1")
         || (grantPreset === "trade-v1" && pending.autoGrant !== true)
         || pending.cancelRequestedAtSec !== undefined) {
         return fail(c, 409, "conflict");
       }
       const attemptId = keccak256(stringToBytes(canonicalEncode({
-        purpose: grantPreset === "trade-v1" ? "tradeGrantAttempt/v1" : "lpGrantAttempt/v1",
+        // Namespaced per preset so a captured attempt id from one hire family
+        // can never be presented for another.
+        purpose: grantPreset === "trade-v1"
+          ? "tradeGrantAttempt/v1"
+          : grantPreset === "lending-v1"
+            ? "lendingGrantAttempt/v1"
+            : "lpGrantAttempt/v1",
         provisionActionId: pending.provisionActionId,
         ...(pending.lastGrantAttemptReset === undefined
           ? {}
@@ -2540,7 +2918,8 @@ export function createServer(deps: ServerDeps): Hono {
       if (agent === null) return fail(c, 404, "not_found");
       const pending = agent.pendingGrant;
       if (agent.status !== "provisioning" || pending === null
-        || (pending.sizing.sizingPreset !== "trade-v1" && pending.sizing.sizingPreset !== "lp-v1")) {
+        || (pending.sizing.sizingPreset !== "trade-v1" && pending.sizing.sizingPreset !== "lp-v1"
+          && pending.sizing.sizingPreset !== "lending-v1")) {
         return fail(c, 409, "conflict", "There is no grant attempt to reset.");
       }
       const reset = await deps.agentStore.resetGrantAttemptCas({
@@ -2718,6 +3097,15 @@ export function createServer(deps: ServerDeps): Hono {
             keyStore: config.keyStore,
             nowSec: nowSec(),
             ...(deps.tradeAgent === undefined ? {} : { tradeSettings: deps.tradeAgent.settingsStore }),
+            // MARKETPLACE-LENDING-AGENT R3.3(3): the lending materialization
+            // collaborators. Absent with a present `initialLendingHire` is a
+            // `settings_conflict` activation error, never a silent arm.
+            ...(deps.lending === undefined
+              ? {}
+              : {
+                  lendingSettings: deps.lending.settingsStore,
+                  lendingGuards: deps.lending.guards,
+                }),
             signal: evidenceSignal,
           });
           convergenceCache.set(cacheKey, { at: nowMs(), value: result });
@@ -3519,6 +3907,12 @@ export function createServer(deps: ServerDeps): Hono {
     registerVenusRoutes(deps.venus);
   }
 
+  /* ---- Lending routes: registered only when the deps are wired ---------- */
+
+  if (deps.lending !== undefined) {
+    registerLendingRoutes(deps.lending);
+  }
+
   if (deps.billingOwner !== undefined) {
     app.get("/agents/:id/billing", async (c) => {
       const id = c.req.param("id");
@@ -4005,17 +4399,7 @@ export function createServer(deps: ServerDeps): Hono {
           ? { resolution: error.evidence }
           : undefined,
       );
-      if (error instanceof BadRequestError) {
-        return fail(
-          c,
-          400,
-          "invalid_request",
-          error.message,
-          ...(error instanceof LpSizingShortfallError
-            ? [{ shortfallWei: error.shortfallWei }]
-            : []),
-        );
-      }
+      if (error instanceof BadRequestError) return failBadRequest(c, error);
       if (error instanceof ConflictError) {
         return fail(c, 409, "conflict", error.message);
       }
@@ -10445,6 +10829,1233 @@ export function createServer(deps: ServerDeps): Hono {
     });
   }
 
+  /**
+   * The lending guard surface (MARKETPLACE-LENDING-AGENT §3.2, §4, §6.1, §8.3,
+   * R3.9).
+   *
+   * SEVEN routes: three owner-signed mutations, one owner READ behind
+   * `authorizeAccountRead`, and three PERIMETER reads of public chain state.
+   *
+   * The perimeter reads are the deliberate widening this phase makes over Phase
+   * 4's "ZERO routes reachable with `x-exec-token` alone", and the reason is
+   * that the browser needs three things BEFORE any signature exists: A's
+   * position (so a mistyped address is caught by eye rather than by a refusal
+   * after funding — §0.5's whole safeguard), the venue addresses its passkey
+   * recovery batch must be built against, and a QuoterV2 quote so its `minOut`
+   * comes off THE SAME RAIL the plane uses. All three answer PUBLIC CHAIN DATA
+   * and carry no owner data at all; `/lending/guardable` is metered per R2.11
+   * because it is an RPC amplifier, and its receipt authorizes nothing.
+   *
+   * Registered only when the deps are wired, so a deployment with
+   * `LENDING_ENABLED` unset or `"false"` answers the same 404 an unknown path
+   * gets.
+   */
+  function registerLendingRoutes(lending: LendingServerDeps): void {
+    const previewLimiter = createLendingPreviewLimiter(nowMs);
+    const previewCache = createLendingPreviewCache<LendingGuardableView>(nowMs);
+
+    const venueAddresses = {
+      vUsdt: lending.venue.vUsdt,
+      usdt: lending.venue.usdt,
+      vBnb: lending.venue.vBnb,
+      routerV3: lending.venue.routerV3,
+      wbnb: lending.venue.wbnb,
+      swapFeeTier: lending.venue.swapFeeTier,
+    };
+
+    /** The pinned market set, so a refusal can name which one is unsupported. */
+    const supportedMarket = (vToken: Address): boolean =>
+      vToken.toLowerCase() === lending.venue.vUsdt.toLowerCase()
+      || vToken.toLowerCase() === lending.venue.vBnb.toLowerCase();
+
+    /* ---- GET /lending/config (R3.9 / L4) --------------------------------- */
+
+    app.get("/lending/config", (c) => {
+      const view: LendingConfigView = {
+        chainId: 56,
+        vUsdt: lending.venue.vUsdt,
+        usdt: lending.venue.usdt,
+        vBnb: lending.venue.vBnb,
+        routerV3: lending.venue.routerV3,
+        wbnb: lending.venue.wbnb,
+        quoterV2: lending.venue.quoterV2,
+        swapFeeTier: lending.venue.swapFeeTier,
+        maxSagaSlippageBps: lending.maxSagaSlippageBps,
+        dustUsdtWei: LENDING_DUST_USDT_WEI.toString(10),
+        maxMarkets: LENDING_MAX_MARKETS,
+        // The RESOLVED cadence, from the same composed deps the worker takes.
+        workerIntervalMs: lending.intervalMs,
+      };
+      return c.json({ data: view });
+    });
+
+    /* ---- GET /lending/quote (R3.9 / L4) ---------------------------------- */
+
+    app.get("/lending/quote", async (c) => {
+      const rawIn = c.req.query("tokenIn") ?? "";
+      const rawOut = c.req.query("tokenOut") ?? "";
+      const rawAmount = c.req.query("amountInWei") ?? "";
+      if (!isAddress(rawIn, { strict: false }) || !isAddress(rawOut, { strict: false })) {
+        return fail(c, 400, "invalid_request", "tokenIn and tokenOut must be addresses.");
+      }
+      if (!/^\d{1,78}$/u.test(rawAmount) || BigInt(rawAmount) <= 0n) {
+        return fail(c, 400, "invalid_request", "amountInWei must be a positive decimal uint256.");
+      }
+      // A CLOSED pair set. The browser's recovery batch swaps USDT -> WBNB and
+      // nothing else, and a general quoting proxy behind the perimeter token
+      // would be an RPC amplifier for arbitrary pools.
+      const tokenIn = getAddress(rawIn);
+      const tokenOut = getAddress(rawOut);
+      const pairOk =
+        (tokenIn.toLowerCase() === lending.venue.usdt.toLowerCase()
+          && tokenOut.toLowerCase() === lending.venue.wbnb.toLowerCase())
+        || (tokenIn.toLowerCase() === lending.venue.wbnb.toLowerCase()
+          && tokenOut.toLowerCase() === lending.venue.usdt.toLowerCase());
+      if (!pairOk) {
+        return fail(c, 400, "invalid_request",
+          "Only the pinned WBNB/USDT pair is quotable here.");
+      }
+      // AUDIT B-M4 — the per-"account" bucket is keyed on the CLIENT, not on
+      // `tokenIn`.
+      //
+      // `tokenIn` is one of exactly two constants here, so the per-account
+      // bucket was a PLATFORM-WIDE ten-per-minute allowance per direction: one
+      // browser refreshing a recovery screen could exhaust the quote route for
+      // every other user. The forwarded client key is the only per-caller
+      // identity this route has; when there is none the global bucket still
+      // applies, which is the same posture `/lending/guardable` takes.
+      const quoteClient = clientKey(c);
+      if (!previewLimiter.tryConsume(quoteClient ?? "anonymous", quoteClient)) {
+        return fail(c, 429, "rate_limited");
+      }
+      try {
+        const quotedOutWei = await lending.readers.quote({
+          tokenIn, tokenOut, amountInWei: BigInt(rawAmount),
+        });
+        if (quotedOutWei <= 0n) return fail(c, 503, "evidence_unreadable");
+        const view: LendingQuoteView = {
+          tokenIn, tokenOut, fee: lending.venue.swapFeeTier,
+          amountInWei: rawAmount,
+          quotedOutWei: quotedOutWei.toString(10),
+          minOutWei: sagaSwapMinOut(quotedOutWei, lending.maxSagaSlippageBps).toString(10),
+          maxSagaSlippageBps: lending.maxSagaSlippageBps,
+        };
+        return c.json({ data: view });
+      } catch {
+        return fail(c, 503, "evidence_unreadable");
+      }
+    });
+
+    /* ---- GET /lending/guardable (§3.2, R2.10, R2.11, R3.3(5)) ------------ */
+
+    app.get("/lending/guardable", async (c) => {
+      const parsed = parseGuardableQuery({
+        account: c.req.query("account"),
+        budgetWei: c.req.query("budgetWei"),
+        reserveBps: c.req.query("reserveBps"),
+        maxPerActionUsdtWei: c.req.query("maxPerActionUsdtWei"),
+        rescueReserveCount: c.req.query("rescueReserveCount"),
+      });
+      if (!parsed.ok) return fail(c, 400, "invalid_request", parsed.message);
+      const { account, sizing } = parsed.value;
+      if (!previewLimiter.tryConsume(account, clientKey(c))) {
+        return fail(c, 429, "rate_limited");
+      }
+
+      // AUDIT B-M3 — THE CACHE IS CONSULTED BEFORE THE FAN-OUT.
+      //
+      // It used to be looked up AFTER `readAccount`, whose block number was
+      // part of its key, so the lookup could only happen once the expensive
+      // read it was meant to avoid had already happened: two identical calls
+      // cost two fan-outs and the cache saved nothing but a rebuild of the
+      // view object. DISPLAY MODE only — a receipt is a signed claim about a
+      // block and is re-derived every time.
+      if (sizing === null) {
+        const recent = previewCache.getRecent(account);
+        if (recent !== undefined) return c.json({ data: recent });
+      }
+
+      let readingA;
+      try {
+        readingA = await lending.readers.readAccount(account, [
+          lending.venue.vUsdt,
+          lending.venue.vBnb,
+        ]);
+      } catch (error) {
+        if (error instanceof LendingAccountTooComplexError) {
+          return c.json({ data: {
+            account, blockNumber: "0",
+            bases: { borrowingPower: { hf: null, matched: false },
+              liquidation: { hf: null, matched: false } },
+            markets: [], debts: [], guardable: false,
+            refusal: "account-too-complex",
+            note:
+              "Your account is in more markets than this guard can price; the guard is "
+              + "paused until it can.",
+          } satisfies LendingGuardableView });
+        }
+        return fail(c, 503, "evidence_unreadable");
+      }
+
+      // The 30 s `(account, finalizedBlock)` cache. Keyed on the BLOCK too, so
+      // an answer can never be served across a block boundary.
+      const cached = sizing === null
+        ? previewCache.get(account, readingA.blockNumber)
+        : undefined;
+      if (cached !== undefined) return c.json({ data: cached });
+
+      const view = buildGuardableView({
+        readingA, account, lending, supportedMarket,
+      });
+      if (sizing === null) {
+        previewCache.set(account, readingA.blockNumber, view);
+        return c.json({ data: view });
+      }
+
+      // RECEIPT MODE. The floor needs a quote of what `supplyNativeWei` buys and
+      // of what the BNB tier could buy back, so it costs two quotes — which is
+      // why the display mode does not take them.
+      const reserveNativeWei =
+        (sizing.budgetWei * BigInt(sizing.reserveBps)) / 10_000n;
+      const supplyNativeWei = sizing.budgetWei - reserveNativeWei;
+      let mintUsdtWei = 0n;
+      let tierBuyBackUsdtWei = 0n;
+      try {
+        const [supplyQuote, tierQuote] = await Promise.all([
+          lending.readers.quote({
+            tokenIn: lending.venue.wbnb, tokenOut: lending.venue.usdt,
+            amountInWei: supplyNativeWei,
+          }),
+          reserveNativeWei > 0n
+            ? lending.readers.quote({
+                tokenIn: lending.venue.wbnb, tokenOut: lending.venue.usdt,
+                amountInWei: reserveNativeWei,
+              })
+            : Promise.resolve(0n),
+        ]);
+        mintUsdtWei =
+          supplyQuote > 0n ? sagaSwapMinOut(supplyQuote, lending.maxSagaSlippageBps) : 0n;
+        tierBuyBackUsdtWei =
+          tierQuote > 0n ? sagaSwapMinOut(tierQuote, lending.maxSagaSlippageBps) : 0n;
+      } catch {
+        return fail(c, 503, "evidence_unreadable");
+      }
+      const preview = lendingHireSizingPreview({
+        budgetWei: sizing.budgetWei,
+        reserveBps: sizing.reserveBps,
+        // The preview is a SIZING HINT: it reports the floor the hire must
+        // clear, so it prices the caps at the floor itself rather than at a cap
+        // the caller has not chosen yet.
+        capDayWei: 0n,
+        reserveCapWei: 0n,
+        mintUsdtWei,
+        tierBuyBackUsdtWei,
+        rescueReserveCount: sizing.rescueReserveCount,
+      });
+      const withSizing: LendingGuardableView = {
+        ...view,
+        sizing: {
+          reserveCapFloorWei: preview.reserveCapFloorWei,
+          minimumCapDayWei: preview.minimumCapDayWei,
+          mintUsdtWei: preview.mintUsdtWei,
+          reserveNativeWei: preview.reserveNativeWei,
+          supplyNativeWei: preview.supplyNativeWei,
+          ok: view.guardable,
+        },
+      };
+      if (lending.previewSecret === null) {
+        // FAIL-CLOSED (R3.8): no secret ⇒ no receipt ⇒ S1 refuses. The preview
+        // still answers, so the guarded-account stage keeps working and the
+        // operator sees the misconfiguration at the hire rather than never.
+        return c.json({ data: withSizing });
+      }
+      const issued = issueLendingPreviewReceipt({
+        key: lending.previewSecret,
+        nowSec: nowSec(),
+        claims: {
+          account,
+          blockNumber: readingA.blockNumber.toString(10),
+          guardable: view.guardable,
+          debts: view.debts
+            .filter((debt) => debt.supported)
+            .map((debt) => ({ vToken: debt.vToken, borrowWei: debt.borrowWei })),
+          budgetWei: sizing.budgetWei.toString(10),
+          reserveBps: sizing.reserveBps,
+          maxPerActionUsdtWei: sizing.maxPerActionUsdtWei.toString(10),
+          rescueReserveCount: sizing.rescueReserveCount,
+          mintUsdtWei: mintUsdtWei.toString(10),
+          tierBuyBackUsdtWei: tierBuyBackUsdtWei.toString(10),
+          reserveCapFloorWei: preview.reserveCapFloorWei,
+          minimumCapDayWei: preview.minimumCapDayWei,
+        },
+      });
+      return c.json({ data: {
+        ...withSizing,
+        previewReceipt: issued.token,
+        expiresAtSec: issued.expiresAt,
+      } satisfies LendingGuardableView });
+    });
+
+    /* ---- POST /agents/:id/lending/arm (§4.1, R2.1, R2.10, L12) ----------- */
+
+    app.post("/agents/:id/lending/arm", (c) =>
+      ownerMutation(c, c.req.param("id"), "lendingArm", "lendingArm",
+        async ({ agent, params }) => {
+          const parsed = parseLendingArmParams(params);
+          if (!parsed.ok) throw new BadRequestError(parsed.message);
+          const request = parsed.value;
+          if (agent.sessionFacts === null) {
+            throw new BadRequestError(
+              "Agent has no granted session; an arm that could not later be retired is refused.",
+            );
+          }
+          if (agent.sessionFacts.hireSizing?.name !== "lending-v1") {
+            throw new BadRequestError(
+              `This agent was hired as ${agent.sessionFacts.hireSizing?.name ?? "an older preset"}; lendingArm is for lending-v1 hires.`,
+            );
+          }
+          const guard = await lending.guards.get(agent.ownerAddress, agent.id);
+          if (guard === null) {
+            throw new BadRequestError(
+              "This agent has no lending guard row yet; the hire's convergence writes it. Reload and try again.",
+            );
+          }
+          // L11: a re-arm after `retired` is REFUSED so two budgets can never
+          // be summed across arms on one session. Renewal is retire + re-hire.
+          if (guard.status === "retired") {
+            throw new BadRequestError(
+              "This guard has been retired. Renewal is retire + re-hire: a second arm on the same session would grant a second budget against the same daily caps.",
+            );
+          }
+          if (guard.status !== "provisioning-guard" && guard.status !== "closed") {
+            throw new BadRequestError(
+              `This guard is ${guard.status}; a second arm is a second swap. Retire it, or wait for the worker to converge it.`,
+            );
+          }
+
+          const profile = enforceLendingV1Profile(request.settings, {
+            debtMarkets: guard.debtMarkets,
+            usdt: lending.venue.usdt,
+            vUsdt: lending.venue.vUsdt,
+            vBnb: lending.venue.vBnb,
+            grantedReserveCapWei: guard.reserveCapWei,
+            grantedCapDayWei: agent.caps?.dailyNativeWei ?? 0n,
+            hireBudgetWei: BigInt(agent.sessionFacts.hireSizing.openNativeBudgetWei),
+          }, request.budgetWei);
+          if (profile !== null) throw new BadRequestError(profile.message);
+
+          // AUDIT P19 / G-M1 — THE ARM MUST CARRY THE SETTINGS THE OWNER SIGNED.
+          //
+          // S1 signs the COMPLETE lending settings (digest on
+          // `PendingGrant.initialLendingHire`, materialized into
+          // `lending_settings` at convergence). The arm then took a `settings`
+          // object again and only ran the v1 profile over it, so a browser
+          // reload between the grant and the arm — which loses the form state
+          // and rebuilds it from defaults — armed DEFAULT thresholds against a
+          // funded budget, silently, under a valid owner signature.
+          //
+          // The arm is therefore a CONTINUATION, not a second admission: its
+          // settings must hash to what the owner already signed — either the
+          // hire's digest, or the digest an owner-signed `lendingSettings`
+          // update has since put in its place. Anything else is refused with
+          // the two paths back, and NOTHING is submitted.
+          //
+          // Pure, and BEFORE the fence: this reads only what is already
+          // persisted, so a refusal touches no durable state (B-M2's rule).
+          const armDigest = lendingSettingsDigest(request.settingsParams);
+          const storedSettings = await lending.settingsStore.get(
+            agent.ownerAddress, agent.id,
+          );
+          // THE CURRENT DIGEST IS THE AUTHORITY, NOT A UNION THAT GROWS
+          // (FIXREVIEW F2). The stored `lending_settings` row is materialized
+          // from `initialLendingHire` at convergence, so on the ordinary path
+          // the two ARE the same bytes. When they differ, the owner has signed
+          // a `lendingSettings` update since — now reachable BEFORE the first
+          // arm, which is the F2 fix — and the hire's superseded digest must
+          // stop being admissible, or that update could be silently undone by
+          // arming with the older signature.
+          //
+          // In practice the hire digest is already unreachable here:
+          // `armProvisioningAgent` clears `pendingGrant` when the session is
+          // granted, and this route requires `sessionFacts`. So this arm is
+          // belt-and-braces on a branch no live agent takes, and the ONE test
+          // that can see it is the `?? ` order itself. The fallback stays for
+          // the case where there is nothing else to compare against: no
+          // settings row at all.
+          const hireDigest = agent.pendingGrant?.initialLendingHire?.digest;
+          const acceptedDigests = [
+            storedSettings?.digest ?? hireDigest,
+          ].filter((value): value is Hex => value !== undefined)
+            .map((value) => value.toLowerCase());
+          if (!acceptedDigests.includes(armDigest.toLowerCase())) {
+            throw new BadRequestError(
+              "settings-digest-mismatch: sign lendingSettings first, or arm with the "
+              + "settings you signed at hire. These are not the settings this hire "
+              + "carries, and an arm never admits new ones.",
+            );
+          }
+          // The same rule for the two figures the hire was SIZED on. Equality,
+          // not a ceiling: a lower budget re-sizes the reserve split and the
+          // mint floor against arithmetic S1 never performed, so it is a
+          // post-v1 feature rather than a silently accepted variation.
+          const hireBudgetWei = BigInt(agent.sessionFacts.hireSizing.openNativeBudgetWei);
+          if (request.budgetWei !== hireBudgetWei) {
+            throw new BadRequestError(
+              `hire-budget-mismatch: arm with the budget this hire was sized and funded `
+              + `for (${hireBudgetWei} wei), or retire and re-hire at the size you want. `
+              + "Arming below the hire budget is not supported in v1.",
+            );
+          }
+          if (request.reserveBps !== guard.reserveBps) {
+            throw new BadRequestError(
+              `reserve-bps-mismatch: arm with the reserve split this hire was sized for `
+              + `(${guard.reserveBps} bps), or retire and re-hire at the split you want. `
+              + "Changing it at arm time is not supported in v1.",
+            );
+          }
+
+          // R2.10: A is re-read BEFORE the fence, and the cheap facts are
+          // re-verified inside it. `readAccount` is the fan-out; holding an
+          // advisory lock across it would serialize every other surface behind
+          // a third party's market count.
+          let readingA;
+          try {
+            readingA = await lending.readers.readAccount(
+              guard.guardedAccount, guard.debtMarkets,
+            );
+          } catch (error) {
+            if (error instanceof LendingAccountTooComplexError) {
+              throw new BadRequestError(
+                "The guarded account is in more markets than this guard can price; the arm is refused.",
+              );
+            }
+            throw new BadRequestError(
+              "The guarded account could not be read; the arm is refused rather than armed blind.",
+            );
+          }
+          const hasDebt = guard.debtMarkets.some((vToken) => {
+            const market = readingA.markets.find(
+              (entry) => entry.vToken.toLowerCase() === vToken.toLowerCase(),
+            );
+            return (market?.borrowCurrent ?? market?.borrowStored ?? 0n) > 0n;
+          });
+          if (!hasDebt) {
+            throw new BadRequestError(
+              "The guarded account carries no debt in any pinned market; there is nothing for this guard to do.",
+            );
+          }
+
+          const reserveNativeWei =
+            (request.budgetWei * BigInt(request.reserveBps)) / 10_000n;
+          const supplyNativeWei = request.budgetWei - reserveNativeWei;
+
+          // L12: `mintUsdtWei` is RE-DERIVED at arm time from the BOOT fee
+          // tier, and the response discloses the tier that was used — the
+          // operator can move it between the preview quote and the arm, so the
+          // number the owner was shown and the number that was used must never
+          // be silently different.
+          let mintUsdtWei: bigint;
+          let tierBuyBackUsdtWei: bigint;
+          try {
+            const [supplyQuote, tierQuote] = await Promise.all([
+              lending.readers.quote({
+                tokenIn: lending.venue.wbnb, tokenOut: lending.venue.usdt,
+                amountInWei: supplyNativeWei,
+              }),
+              reserveNativeWei > 0n
+                ? lending.readers.quote({
+                    tokenIn: lending.venue.wbnb, tokenOut: lending.venue.usdt,
+                    amountInWei: reserveNativeWei,
+                  })
+                : Promise.resolve(0n),
+            ]);
+            if (supplyQuote <= 0n) {
+              throw new BadRequestError(
+                "The WBNB/USDT pool returned no quote for the supply leg; the arm is refused rather than swapped without a floor.",
+              );
+            }
+            mintUsdtWei = sagaSwapMinOut(supplyQuote, lending.maxSagaSlippageBps);
+            tierBuyBackUsdtWei =
+              tierQuote > 0n ? sagaSwapMinOut(tierQuote, lending.maxSagaSlippageBps) : 0n;
+          } catch (error) {
+            if (error instanceof BadRequestError) throw error;
+            throw new BadRequestError(
+              "The arm's swap could not be quoted; refusing rather than arming against a stale price.",
+            );
+          }
+
+          // The LIVE on-chain caps, not the hire's request: an owner may have
+          // widened or narrowed them since.
+          // AUDIT B-L8: A TRANSPORT FAULT IS NOT A SIZING SHORTFALL.
+          //
+          // An unreadable meter used to become `liveCapDayWei = 0n`, which made
+          // `checkLendingSizing` refuse with "raise your daily cap" — a remedy
+          // for a problem the owner does not have, on a cap that may be
+          // perfectly adequate. The arm is an owner action with a retry, so it
+          // refuses as `transport` and says to try again.
+          let liveCapDayWei: bigint;
+          try {
+            const nativeMeter = await lending.readers.readTokenDayMeter({
+              walletAddress: agent.walletAddress,
+              publicKey: agent.sessionFacts.publicKey,
+              token: null,
+            });
+            if (nativeMeter.kind === "unreadable") {
+              throw new ConflictError(
+                "transport: the session's native day meter could not be read, and the arm "
+                + "sizes on it. Nothing was changed; try again shortly.",
+              );
+            }
+            liveCapDayWei = nativeMeter.kind === "day" ? nativeMeter.limitWei : 0n;
+          } catch (error) {
+            if (error instanceof ConflictError) throw error;
+            throw new ConflictError(
+              "transport: the session's native day meter could not be read, and the arm "
+              + "sizes on it. Nothing was changed; try again shortly.",
+            );
+          }
+          const sized = checkLendingSizing({
+            budgetWei: request.budgetWei,
+            reserveBps: request.reserveBps,
+            capDayWei: liveCapDayWei,
+            reserveCapWei: guard.reserveCapWei,
+            mintUsdtWei,
+            tierBuyBackUsdtWei,
+            rescueReserveCount: request.settings.rescueReserveCount,
+          });
+          if (!sized.ok) {
+            // AUDIT A-M3 — REMEDY FIRST, AND THE FIGURE IS STRUCTURED.
+            //
+            // `sanitizeMessage` caps a stored refusal at 280 characters, and
+            // this check's own prose is 500+: the owner was told the cap was
+            // too small and the sentence that said BY HOW MUCH, and what to do,
+            // fell past the cap. The shortfall now rides as `meta.shortfallWei`
+            // — the PHASE3.1-AUDIT A9 shape — and the text leads with the
+            // remedy. The full arithmetic still lives in `sized.message`, which
+            // the operator scripts print untruncated.
+            if (sized.kind === "malformed") {
+              throw new BadRequestError(`Lending arm refused: ${sized.message}`);
+            }
+            throw new LpSizingShortfallError(
+              "Lending arm refused: raise the session's daily caps with "
+              + "owner-add-spend-limit, or lower the budget. Shortfall (wei): "
+              + `${sized.shortfallWei}`,
+              sized.shortfallWei,
+            );
+          }
+
+          // L12: the wallet-floor re-check the S1 arithmetic cannot make. S1
+          // sized a BUDGET; the grant's own gas may have eaten the headroom
+          // since, and an arm that leaves B below the floor cannot pay for the
+          // first rescue's relay fee.
+          const reserve = await lending.readers.readReserve(agent.walletAddress);
+          // AUDIT A-L6: TWO fees, not one — the ARM's own submission draws a
+          // relay reimbursement out of this balance before the first rescue
+          // ever runs, and the check reserved only the rescue's.
+          const armFloorWei = walletNativeFloorWei() + 2n * RELAY_FEE_PER_EXIT_WEI;
+          if (reserve.nativeBalance - supplyNativeWei < armFloorWei) {
+            // Remedy first: the figures are useful, the fix is what the owner
+            // needs inside the 280-character cap.
+            throw new BadRequestError(
+              "wallet-floor-short: deposit more BNB, or lower the budget. The arm would spend "
+              + `${supplyNativeWei} of ${reserve.nativeBalance} wei, leaving less than the `
+              + `${armFloorWei} wei needed for the arm's OWN relay fee and the first rescue's.`,
+            );
+          }
+
+          // The digest is PURE; the WRITE happens inside the fence, below
+          // (AUDIT B-M2): a refused arm used to have already replaced the
+          // stored settings, so an admission the plane rejected still moved
+          // the digest the worker's hysteresis counter is bound to.
+          const digest = lendingSettingsDigest(request.settingsParams);
+
+          // THE DECISION ID IS KEYED ON THE ROW VERSION THE CAS CONSUMES
+          // (AUDIT B-H2), never on the PRE-fence read.
+          //
+          // Two owner-signed arms that both read `rowVersion: 1` outside the
+          // fence used to derive the SAME key `…:arm:1`, and the second one —
+          // admitted from `closed` after the first rolled back — reused the
+          // first's ROLLED_BACK journal row: the swap and the mint landed,
+          // `markInProgress` threw AFTER `executeViaSession`, and the arm door
+          // then closed the guard as "arm-rolled-back — NOTHING WAS SPENT",
+          // leaving a re-arm free to mint a SECOND budget on one session.
+          //
+          // `fresh.rowVersion` is unique per admission by construction: the CAS
+          // asserts it and increments it, so no two admissions of this row can
+          // ever observe the same value.
+          let decisionId = "";
+          let armJournalKey = "";
+          const admitted = await lending.guards.withLendingFence(
+            agent.ownerAddress, agent.id, async (fence) => {
+              const fresh = await fence.get();
+              if (fresh === null
+                || (fresh.status !== "provisioning-guard" && fresh.status !== "closed")) {
+                throw new ConflictError(
+                  "The guard changed status between the read and the fence; re-sign to arm.",
+                );
+              }
+              decisionId = lendingOwnerActionDecisionId(agent.id, "arm", fresh.rowVersion);
+              armJournalKey = `${agent.id}:${decisionId}`;
+              // FIXREVIEW F6 — THE ADMISSION CAS RUNS ON THE FENCE'S OWN
+              // TRANSACTION, and the settings write follows it rather than
+              // preceding it.
+              //
+              // B-M2 put the settings `put` inside the fence, after the idle
+              // gate, so a refused arm leaves the digest alone. P12's residual
+              // was the narrower case: the `put` ran BEFORE `armCas`, on the
+              // pool, so a CAS that LOST left the digest moved anyway. Running
+              // the CAS first closes that — nothing is written until the
+              // admission is real — and running it on `tx` means an aborting
+              // fence takes it back.
+              //
+              // The settings store is a DIFFERENT store over its own
+              // `SqlClient` and cannot join this transaction; that residue is
+              // named on `LendingGuardFence` and is benign, because the only
+              // bytes that can land here are ones the owner signed and P19
+              // already accepts.
+              const admittedInFence = await fence.armCas({
+                expectedRowVersion: fresh.rowVersion,
+                budgetWei: request.budgetWei,
+                reserveBps: request.reserveBps,
+                supplyNativeWei,
+                reserveNativeWei,
+                mintUsdtWei,
+                preArmVUsdtWei: reserve.vUsdtBalance,
+                preArmExchangeRate: reserve.exchangeRateStored,
+                armJournalKey,
+              });
+              if (admittedInFence.kind !== "ok") return admittedInFence;
+              await lending.settingsStore.put({
+                agentId: agent.id,
+                ownerAddress: agent.ownerAddress,
+                params: request.settingsParams,
+                digest,
+              });
+              return admittedInFence;
+            },
+          );
+          if (admitted.kind !== "ok") {
+            throw new ConflictError("The guard row moved during admission; re-sign to arm.");
+          }
+
+          // OUTSIDE the fence: the batch, and the `"lending"` money row it opens
+          // and settles INSIDE this `act` (R2.1). `ownerMutation` then commits
+          // the LOCAL-ONLY `lendingArm` row as it always does, so an UNKNOWN arm
+          // is an UNKNOWN `"lending"` row beside a COMMITTED `lendingArm` row.
+          const calls = buildLendingArmBatch({
+            venue: venueAddresses,
+            wallet: agent.walletAddress,
+            supplyNativeWei,
+            mintUsdtWei,
+            currentVUsdtAllowanceWei: reserve.usdtAllowanceToVUsdt,
+            deadline: BigInt(nowSec()) + 300n,
+          });
+          const outcome = await submitLendingBatch(
+            { agentStore: deps.agentStore, journal: deps.journal, provider: deps.providerRegistry.get(config.chainId) },
+            { agent, decisionId, calls, nativeSpendWei: supplyNativeWei },
+          );
+
+          // FIXREVIEW F8 — THE CHARGE FOLLOWS THE SUBMISSION, AS IT DOES IN THE
+          // WORKER.
+          //
+          // P6 moved the worker's `chargeAction` below its submit on the rule
+          // that a submission which never reached a relay must not consume a
+          // slot; the two owner routes still charged above it, so the same
+          // refusal was counted differently depending on which surface made it.
+          // The asymmetry was harmless ONLY because `usageSince` filters
+          // `kind === "rescue"` — a fact nobody widening that query would
+          // think to check. The rule is now the same on all three surfaces:
+          // charge a submission that REACHED a relay, and nothing else. A
+          // `relay-failed` rollback DID reach one and keeps its row.
+          //
+          // A throw from `submitLendingBatch` skips the charge for the same
+          // reason, and leaves no row to reconcile against.
+          if (!(outcome.status === "rolled-back" && outcome.code !== "relay-failed")) {
+            await lending.guards.chargeAction({
+              ownerAddress: agent.ownerAddress, agentId: agent.id,
+              actionId: armJournalKey, kind: "arm", chargedAtMs: nowMs(),
+            });
+          }
+
+          // R2.18: the arm's effect is a DELTA against the pre-submission read,
+          // never `balanceOf > 0` (which is true of a wallet that already held
+          // vUSDT) and never `balanceOf >= 0` (which is true of everything).
+          let effect: "changed" | "no-effect" | "unverified" = "unverified";
+          let idleUsdtWei: string | null = null;
+          // AUDIT C-M2: `armBlock` is RECORDED. It was hardcoded `null` in both
+          // writers, and `detectOwnerRecovery` refuses to fire on a null one —
+          // so §6.2's passkey-recovery observation was unreachable in
+          // production and the guard would sit `armed` over an empty reserve
+          // forever.
+          //
+          // FIXREVIEW F7 — AND THE RECORD SAYS WHICH BLOCK IT IS. The relay
+          // answers a txHash, not a block, so this route used to store the
+          // finalized block of a read taken AFTER the arm — normally BEHIND the
+          // block the arm landed in, under a field name that promised the
+          // stronger figure. It now reads the transaction back when it can and
+          // labels the fallback `post-arm-read`, so nothing downstream can
+          // compare the weaker figure to a chain height by accident. Only the
+          // null/non-null distinction is consumed today; the label is for the
+          // next reader.
+          let armBlock: bigint | null = null;
+          let armBlockSource: "receipt" | "post-arm-read" | undefined;
+          if (outcome.status === "completed") {
+            if (
+              outcome.txHash !== null
+              && lending.readers.readTransactionBlock !== undefined
+            ) {
+              const landed = await lending.readers.readTransactionBlock(outcome.txHash);
+              if (landed !== null) {
+                armBlock = landed;
+                armBlockSource = "receipt";
+              }
+            }
+            try {
+              const after = await lending.readers.readReserve(agent.walletAddress);
+              if (armBlock === null) {
+                armBlock = after.blockNumber;
+                armBlockSource = "post-arm-read";
+              }
+              const expected =
+                ((mintUsdtWei * 10n ** 18n) / (reserve.exchangeRateStored > 0n
+                  ? reserve.exchangeRateStored : 10n ** 18n)) * 9_990n / 10_000n;
+              effect =
+                after.vUsdtBalance - reserve.vUsdtBalance >= expected
+                  ? "changed" : "no-effect";
+              // RECORDED, not checked: the slippage surplus above `mintUsdtWei`
+              // stays idle in B and IS reserve.
+              idleUsdtWei = after.usdtBalance.toString(10);
+            } catch {
+              effect = "unverified";
+            }
+          }
+
+          const finished = await lending.guards.finishArm(
+            outcome.status === "completed"
+              ? {
+                  ownerAddress: agent.ownerAddress, agentId: agent.id,
+                  expectedRowVersion: admitted.record.rowVersion,
+                  outcome: "armed", armBlock,
+                  ...(armBlockSource === undefined ? {} : { armBlockSource }),
+                  armTxHash: outcome.txHash,
+                }
+              : outcome.status === "held"
+                ? {
+                    ownerAddress: agent.ownerAddress, agentId: agent.id,
+                    expectedRowVersion: admitted.record.rowVersion,
+                    outcome: "held", hold: "arm-unknown",
+                  }
+                : {
+                    ownerAddress: agent.ownerAddress, agentId: agent.id,
+                    expectedRowVersion: admitted.record.rowVersion,
+                    outcome: "closed", closeReason: "arm-rolled-back",
+                  },
+          );
+
+          return {
+            guard: finished.kind === "ok"
+              ? lendingGuardView(finished.record)
+              : lendingGuardView(admitted.record),
+            arm: {
+              status: outcome.status,
+              code: outcome.code,
+              reason: outcome.reason,
+              txHash: outcome.txHash,
+              effect,
+              idleUsdtWei,
+              mintUsdtWei: mintUsdtWei.toString(10),
+              supplyNativeWei: supplyNativeWei.toString(10),
+              reserveNativeWei: reserveNativeWei.toString(10),
+              // L12's disclosure: the tier the arm actually used.
+              swapFeeTier: lending.venue.swapFeeTier,
+            },
+            settingsDigest: digest,
+            settings: lendingSettingsView(request.settings),
+          };
+        }),
+    );
+
+    /* ---- POST /agents/:id/lending/settings (§4.2) ------------------------ */
+
+    app.post("/agents/:id/lending/settings", (c) =>
+      ownerMutation(c, c.req.param("id"), "lendingSettings", "lendingSettings",
+        async ({ agent, params }) => {
+          const parsed = parseLendingSettingsRequest(params);
+          if (!parsed.ok) throw new BadRequestError(parsed.message);
+          const guard = await lending.guards.get(agent.ownerAddress, agent.id);
+          if (guard === null) throw new NotFoundError();
+          // FIXREVIEW F2 — REACHABLE BEFORE THE FIRST ARM.
+          //
+          // The gate accepted `armed | held` only, so a guard that had never
+          // armed (`provisioning-guard`) could not have its settings replaced
+          // at all — and P19's own refusal tells the owner to "sign
+          // lendingSettings first", naming a route that answered 409. The union
+          // of admissible arm digests was therefore frozen at the hire's, and a
+          // hire granted on one device could not be armed from another at all.
+          //
+          // `closed` is accepted for the same reason on the re-arm path (a
+          // never-submitted arm closes the row; the settings must be changeable
+          // before the owner signs the next arm). `arming | retiring` are NOT:
+          // a submission is in flight against the digest the observation was
+          // taken under. `retired` is terminal.
+          //
+          // This route has NO money effect — it writes owner-signed bytes and
+          // their digest — so widening it admits no spend, and the arm's own
+          // P19 continuation check is what decides whether those bytes may fund
+          // anything.
+          if (
+            guard.status !== "armed"
+            && guard.status !== "held"
+            && guard.status !== "provisioning-guard"
+            && guard.status !== "closed"
+          ) {
+            throw new ConflictError(
+              `Settings can only be replaced while the guard is provisioning, armed, held or closed; it is ${guard.status}.`,
+            );
+          }
+          // §4.2 (SPEC.md:282, :694) — 409 WHILE ANY LENDING JOURNAL ROW IS
+          // LIVE, which is PENDING, IN_PROGRESS **or** UNKNOWN.
+          //
+          // AUDIT B-L10 / FIXREVIEW: this checked UNKNOWN only, which was a
+          // deviation from a NORMATIVE spec line carried as an erratum. The
+          // erratum is now gone, because the code does what the spec says. The
+          // reason the spec says it: a settings write mid-submission changes
+          // the digest the observation was taken under while a rescue is in
+          // flight against it, and a PENDING rescue is exactly as in-flight as
+          // an UNKNOWN one — it simply has not been given up on yet.
+          //
+          // It reads through the TWO queries the journal already exposes rather
+          // than adding a third: `listNonTerminal` is the PENDING/IN_PROGRESS
+          // set (all agents, filtered here — the non-terminal set is small by
+          // construction, since reconcile drains it every cycle), and
+          // `listUnknownForAgent` is the UNKNOWN set. A new per-agent PENDING
+          // query would be six hand-maintained sites across two backends plus
+          // the fake, for a route an owner signs by hand.
+          const [nonTerminal, unknown] = await Promise.all([
+            deps.journal.listNonTerminal(),
+            deps.journal.listUnknownForAgent(agent.id),
+          ]);
+          const live = [
+            ...nonTerminal.filter((row) => row.agentId === agent.id),
+            ...unknown,
+          ].filter((row) => row.kind === "lending");
+          if (live.length > 0) {
+            throw new ConflictError(
+              "A lending submission is unresolved; settings cannot be replaced until it settles.",
+            );
+          }
+          if (agent.sessionFacts === null) throw new ConflictError("No granted session.");
+          const profile = enforceLendingV1Profile(parsed.value.settings, {
+            debtMarkets: guard.debtMarkets,
+            usdt: lending.venue.usdt,
+            vUsdt: lending.venue.vUsdt,
+            vBnb: lending.venue.vBnb,
+            grantedReserveCapWei: guard.reserveCapWei,
+            grantedCapDayWei: agent.caps?.dailyNativeWei ?? 0n,
+            hireBudgetWei: BigInt(agent.sessionFacts.hireSizing?.openNativeBudgetWei ?? "0"),
+          });
+          if (profile !== null) throw new BadRequestError(profile.message);
+
+          const digest = lendingSettingsDigest(parsed.value.settingsParams);
+          await lending.settingsStore.put({
+            agentId: agent.id,
+            ownerAddress: agent.ownerAddress,
+            params: parsed.value.settingsParams,
+            digest,
+          });
+          return {
+            settingsDigest: digest,
+            settings: lendingSettingsView(parsed.value.settings),
+            note:
+              "The confirmation counter is invalidated by the digest change: the next "
+              + "breach needs two fresh observations one worker interval apart.",
+          };
+        }),
+    );
+
+    /* ---- POST /agents/:id/lending/retire (§6.1, R2.5, R3.1, R3.12) ------- */
+
+    app.post("/agents/:id/lending/retire", (c) =>
+      ownerMutation(c, c.req.param("id"), "lendingRetire", "lendingRetire",
+        async ({ agent, params }) => {
+          const parsed = parseLendingRetireParams(params);
+          if (!parsed.ok) throw new BadRequestError(parsed.message);
+          const guard = await lending.guards.get(agent.ownerAddress, agent.id);
+          if (guard === null) throw new NotFoundError();
+          // `retiring` IS accepted (AUDIT B-H1). A pool-short retire parks
+          // there and its own refusal says "retire again when the pool
+          // refills" — a remedy the gate used to refuse, which made `retiring`
+          // a dead end with no owner door: the PHASE3.11 / PHASE3.14 wedge in
+          // this enum.
+          if (
+            guard.status !== "armed"
+            && guard.status !== "held"
+            && guard.status !== "retiring"
+          ) {
+            throw new ConflictError(
+              `Retire needs an armed, held or retiring guard; it is ${guard.status}.`,
+            );
+          }
+          if (guard.hold === "retire-unknown") {
+            throw new ConflictError(
+              "A previous retire's outcome is UNKNOWN. Retire is blocked until it is understood; rescues continue on whatever the reserve still holds.",
+            );
+          }
+          if (agent.sessionFacts === null) {
+            throw new ConflictError(
+              "No granted session. Recover the reserve with your passkey instead — the agent's key cannot block it.",
+            );
+          }
+
+          const reserve = await lending.readers.readReserve(agent.walletAddress);
+
+          // R3.1: the retire is NOT a rescue, so an unreadable meter is
+          // FAIL-CLOSED here — this is the one place the omit-and-report rule
+          // does not apply, because submitting a retire into an exhausted cap
+          // surfaces as FINDINGS (h)'s silent PENDING rather than a refusal.
+          const meter = await lending.readers.readTokenDayMeter({
+            walletAddress: agent.walletAddress,
+            publicKey: agent.sessionFacts.publicKey,
+            token: lending.venue.usdt,
+          });
+          // AUDIT A-L5: `no-grant` and `other-period` fail closed HERE TOO.
+          // The retire is not a rescue, so R3.5's omit-and-report rule does not
+          // apply: a session with no rolling-DAY USDT row cannot be retired at
+          // all, and submitting into one surfaces as FINDINGS (h)'s silent
+          // PENDING rather than as a refusal the owner can act on.
+          if (meter.kind !== "day") {
+            throw new ConflictError(
+              meter.kind === "unreadable"
+                ? "transport: the USDT day meter could not be read, and a retire submitted into an exhausted cap surfaces as a silent PENDING rather than a refusal. Try again shortly."
+                : "usdt-cap-unreadable: this session holds no rolling-DAY USDT cap, so the retire's approve cannot be sized against one. Recover the reserve with your passkey instead — the agent's key cannot block it.",
+            );
+          }
+
+          const plan = planLendingRetire(reserve);
+          if (plan.empty) {
+            throw new BadRequestError(
+              "There is nothing to retire: wallet B holds no idle USDT and the pool can redeem nothing.",
+            );
+          }
+          if (plan.poolShort && parsed.value.acceptPartial !== true) {
+            // THE REMEDY LEADS. `sanitizeMessage` caps stored refusal prose at
+            // ~280 characters, and a remedy past the cap is a remedy nobody
+            // receives — the PHASE3.3-A7 lesson, re-learned by PHASE3.13 F12-b.
+            throw new BadRequestError(
+              "pool-cash-short: retire again when the pool refills, or re-sign with "
+              + "acceptPartial to take what it can pay now — the rest stays recoverable with "
+              + `your passkey. vUSDT can pay out ${plan.redeemAmountWei} of ${plan.suppliedUsdtWei} `
+              + `supplied; ${plan.remainderUsdtWei} would stay on Venus.`,
+            );
+          }
+          if (meter.kind === "day" && meter.remainingWei < plan.swapInWei) {
+            // Remedy first, figures after — the same cap this file's other
+            // refusals are written against.
+            throw new ConflictError(
+              "usdt-cap-exhausted: retire once the rolling day rolls forward, and pause the "
+              + "agent now so further rescues do not spend the rest of the cap. The retire "
+              + `approves ${plan.swapInWei} USDT; ${meter.remainingWei} is left today.`,
+            );
+          }
+
+          let minOutWei: bigint;
+          try {
+            const quoted = await lending.readers.quote({
+              tokenIn: lending.venue.usdt, tokenOut: lending.venue.wbnb,
+              amountInWei: plan.swapInWei,
+            });
+            if (quoted <= 0n) throw new Error("no quote");
+            minOutWei = sagaSwapMinOut(quoted, lending.maxSagaSlippageBps);
+          } catch {
+            throw new ConflictError(
+              "transport: the retire's swap could not be quoted; refusing rather than swapping without a floor.",
+            );
+          }
+
+          // What a submission that spends NOTHING must put back (B-H1). A
+          // retry that was ALREADY `retiring` has no earlier status to restore,
+          // so its rollback simply leaves it there — which is now a status the
+          // gate accepts and the worker watches.
+          // AUDIT B-M1 — THE RETIRE TAKES THE R3.7 CLAIM, under the same fence
+          // key the worker uses.
+          //
+          // Before this, ONLY the worker claimed: the fence serialized the two
+          // decisions but nothing stopped the worker from claiming and
+          // submitting a rescue in the seconds after a retire's fence closed,
+          // so both submissions could be in flight against one reserve — and
+          // the loser FAILED. The claim is the mutual exclusion that outlives
+          // the fence, because the cooldown stamp is durable.
+          //
+          // The floor is the OWNER'S OWN `minSecondsBetweenActions`, read from
+          // the settings the worker obeys, so the two agree by construction. A
+          // retire refused by it is a 409 the owner can retry, never a wedge:
+          // the guard is untouched, and §6.2's passkey recovery does not go
+          // through this route at all.
+          let retireFloorSec = 0;
+          const storedSettings =
+            await lending.settingsStore.get(agent.ownerAddress, agent.id);
+          if (storedSettings !== null) {
+            const parsedStored = parseLendingSettingsParams(storedSettings.params);
+            if (parsedStored.ok) {
+              retireFloorSec = parsedStored.value.minSecondsBetweenActions;
+            }
+          }
+          let restoreTo: { status: "armed" | "held"; hold: LendingHold | null } | null = null;
+          let claimedSeq: number | null = null;
+          let previousActionAtMs: number | null = null;
+          const began = await lending.guards.withLendingFence(
+            agent.ownerAddress, agent.id, async (fence) => {
+              const fresh = await fence.get();
+              if (
+                fresh === null
+                || (fresh.status !== "armed"
+                  && fresh.status !== "held"
+                  && fresh.status !== "retiring")
+              ) {
+                throw new ConflictError("The guard changed status; re-sign to retire.");
+              }
+              const claim = await fence.claim({
+                nowMs: nowMs(), minSecondsBetweenActions: retireFloorSec,
+              });
+              if (claim.kind !== "claimed") {
+                throw new ConflictError(
+                  claim.kind === "cooldown"
+                    ? `cooldown: a rescue ran ${claim.elapsedSec}s ago and the guard's own `
+                      + `${retireFloorSec}s floor keeps two submissions apart. Re-sign to `
+                      + "retire once it passes; your passkey can recover the reserve at any time."
+                    : "The guard row vanished between the read and the claim; re-sign to retire.",
+                );
+              }
+              claimedSeq = claim.actionSeq;
+              previousActionAtMs = fresh.lastActionAtMs;
+              restoreTo =
+                fresh.status === "retiring"
+                  ? null
+                  : { status: fresh.status, hold: fresh.hold };
+              // The claim WRITES (it moves the stamp and the sequence), so the
+              // row version the CAS must assert is the one AFTER it. Re-read
+              // inside the same fence rather than assuming `+1`: the CAS is the
+              // authority on what it consumed, and an assumed version is how a
+              // conditional write quietly becomes an unconditional one.
+              const claimed = await fence.get();
+              if (claimed === null) {
+                throw new ConflictError("The guard row vanished during admission.");
+              }
+              // FIXREVIEW F6: on the LOCK'S transaction, like the claim above
+              // it — an aborting fence must not leave a `retiring` row standing
+              // over a claim that rolled back.
+              return fence.beginRetire({ expectedRowVersion: claimed.rowVersion });
+            },
+          );
+          // The claim outlives the fence, so a `beginRetire` that lost its CAS
+          // must give it back or the next worker cycle is starved by a retire
+          // that never started (the AUDIT C-H1 rule, on this route).
+          const giveBackRetireClaim = async (): Promise<void> => {
+            if (claimedSeq === null) return;
+            await lending.guards.restoreClaim({
+              ownerAddress: agent.ownerAddress,
+              agentId: agent.id,
+              expectedActionSeq: claimedSeq,
+              previousLastActionAtMs: previousActionAtMs,
+            });
+          };
+          if (began.kind !== "ok") {
+            await giveBackRetireClaim();
+            throw new ConflictError("The guard row moved during admission; re-sign to retire.");
+          }
+
+          const decisionId = lendingOwnerActionDecisionId(
+            agent.id, "retire", began.record.rowVersion,
+          );
+          const calls = buildLendingRetireBatch({
+            venue: venueAddresses,
+            wallet: agent.walletAddress,
+            redeemAmountWei: plan.redeemAmountWei,
+            swapInWei: plan.swapInWei,
+            minOutWei,
+            deadline: BigInt(nowSec()) + 300n,
+          });
+          const outcome = await submitLendingBatch(
+            { agentStore: deps.agentStore, journal: deps.journal, provider: deps.providerRegistry.get(config.chainId) },
+            { agent, decisionId, calls, nativeSpendWei: 0n },
+          );
+          // FIXREVIEW F8: the charge follows the submission here too — the same
+          // rule the worker got from P6 and the arm got above. A retire refused
+          // before the relay draws no gas and writes no charged row.
+          //
+          // The `retire-unknown` door reads this row back
+          // (`lastActionId(owner, agent, "retire")`), and it still can: the
+          // branch that skips the charge is the one where nothing was
+          // submitted, so there is no ambiguous retire for it to be about.
+          if (!(outcome.status === "rolled-back" && outcome.code !== "relay-failed")) {
+            await lending.guards.chargeAction({
+              ownerAddress: agent.ownerAddress, agentId: agent.id,
+              actionId: `${agent.id}:${decisionId}`, kind: "retire", chargedAtMs: nowMs(),
+            });
+          }
+          let cleared = false;
+          let residueUsdtWei: string | null = null;
+          if (outcome.status === "completed") {
+            try {
+              const after = await lending.readers.readReserve(agent.walletAddress);
+              // R3.12: the residue is measured on the CURRENT rate when it is
+              // readable, so the stored-vs-current gap is not counted as
+              // leftover supply — and the bound is RELATIVE, so a large reserve
+              // retired perfectly still reaches `retired`.
+              const rate = after.exchangeRateCurrent ?? after.exchangeRateStored;
+              const suppliedAfter = (after.vUsdtBalance * rate) / 10n ** 18n;
+              residueUsdtWei = suppliedAfter.toString(10);
+              cleared = retireCleared(
+                suppliedAfter, plan.suppliedUsdtWei, LENDING_DUST_USDT_WEI,
+              );
+            } catch {
+              cleared = false;
+            }
+          }
+
+          // A ROLLED-BACK retire spent NOTHING (AUDIT B-H1): it was refused
+          // above the submit, or the relay answered FAILED on an atomic batch.
+          // Parking it at `retiring` said "a retire is in flight" about a
+          // submission that never happened, and that status had no exit.
+          const rolledBack = outcome.status === "rolled-back";
+          const restore: { status: "armed" | "held"; hold: LendingHold | null } | null =
+            restoreTo;
+          const finished = await lending.guards.finishRetire(
+            outcome.status === "held"
+              ? {
+                  ownerAddress: agent.ownerAddress, agentId: agent.id,
+                  expectedRowVersion: began.record.rowVersion,
+                  outcome: "held", hold: "retire-unknown",
+                }
+              : rolledBack && restore !== null
+                ? {
+                    ownerAddress: agent.ownerAddress, agentId: agent.id,
+                    expectedRowVersion: began.record.rowVersion,
+                    outcome: "rolled-back", restore,
+                  }
+                : cleared
+                  ? {
+                      ownerAddress: agent.ownerAddress, agentId: agent.id,
+                      expectedRowVersion: began.record.rowVersion, outcome: "retired",
+                    }
+                  : {
+                      ownerAddress: agent.ownerAddress, agentId: agent.id,
+                      expectedRowVersion: began.record.rowVersion, outcome: "partial",
+                    },
+          );
+
+          // A retire refused ABOVE the submit drew no relay gas: its cooldown
+          // goes back, so the next rescue is not starved by a retire that never
+          // happened (AUDIT C-H1's rule, this route's copy). It runs AFTER
+          // `finishRetire` because the restore bumps `row_version`, and that
+          // CAS asserts the version the fence handed it.
+          if (outcome.status === "rolled-back" && outcome.code !== "relay-failed") {
+            await giveBackRetireClaim();
+          }
+
+          return {
+            guard: finished.kind === "ok"
+              ? lendingGuardView(finished.record)
+              : lendingGuardView(began.record),
+            // HTTP 200 IS NOT "RETIRED". The outcome block is what says whether
+            // the reserve came back, and the web must parse it.
+            retire: {
+              status: outcome.status,
+              code: outcome.code,
+              reason: outcome.reason,
+              txHash: outcome.txHash,
+              cleared,
+              redeemAmountWei: plan.redeemAmountWei.toString(10),
+              swapInWei: plan.swapInWei.toString(10),
+              minOutWei: minOutWei.toString(10),
+              poolShort: plan.poolShort,
+              remainderUsdtWei: plan.remainderUsdtWei.toString(10),
+              residueUsdtWei,
+            },
+          };
+        }),
+    );
+
+    /* ---- GET /agents/:id/lending/view (§8.3, R2.18) ---------------------- */
+
+    app.get("/agents/:id/lending/view", async (c) => {
+      const id = c.req.param("id");
+      const auth = await authorizeAccountRead(c, id);
+      if (auth.kind !== "ok") return auth.response;
+      const agent = await deps.agentStore.getAgent(auth.owner.ownerAddress, id);
+      if (agent === null) return fail(c, 404, "not_found");
+      const guard = await lending.guards.get(agent.ownerAddress, agent.id);
+      if (guard === null) return fail(c, 404, "not_found");
+
+      // ZERO CHAIN READS. The worker writes `lending_snapshots` LAST in every
+      // cycle and this route serves it. A stale snapshot renders every account
+      // tile as a dash WITH ITS REASON — the view never guesses, and the BFF
+      // falls back to `/lending/guardable` for the account half, labelled "read
+      // now, not by the agent".
+      const [snapshot, settingsRow, rescues] = await Promise.all([
+        lending.guards.getSnapshot(agent.ownerAddress, agent.id),
+        lending.settingsStore.get(agent.ownerAddress, agent.id),
+        lending.guards.listRescues(agent.ownerAddress, agent.id, 50),
+      ]);
+      const staleAfterMs = 2 * lending.intervalMs;
+      const ageMs = snapshot === null ? null : nowMs() - snapshot.observedAtMs;
+      const stale = snapshot === null || (ageMs !== null && ageMs > staleAfterMs);
+      const parsedSettings =
+        settingsRow === null ? null : parseLendingSettingsParams(settingsRow.params);
+      const digestTrusted =
+        settingsRow !== null
+        && lendingSettingsDigest(settingsRow.params).toLowerCase()
+          === settingsRow.digest.toLowerCase();
+
+      return c.json({ data: {
+        guard: lendingGuardView(guard),
+        snapshot: {
+          presentAt: snapshot?.observedAtMs ?? null,
+          ageMs,
+          staleAfterMs,
+          stale,
+          reason: stale
+            ? snapshot === null
+              ? "The worker has not reported for this guard yet."
+              : `The worker has not reported since ${new Date(snapshot.observedAtMs).toISOString()}.`
+            : null,
+          workerIntervalMs: lending.intervalMs,
+          payload: stale ? null : snapshot?.snapshot ?? null,
+        },
+        rescues: rescues.map((rescue) => ({
+          rescueId: rescue.rescueId,
+          market: rescue.market,
+          amountWei: rescue.amountWei.toString(10),
+          hfBefore: rescue.hfBefore === null ? null : rescue.hfBefore.toString(10),
+          hfAfter: rescue.hfAfter === null ? null : rescue.hfAfter.toString(10),
+          achievedHf: rescue.achievedHf === null ? null : rescue.achievedHf.toString(10),
+          txHash: rescue.txHash,
+          effect: rescue.effect,
+          partial: rescue.partial,
+          conditions: rescue.conditions,
+          createdAtMs: rescue.createdAtMs,
+        })),
+        settings:
+          parsedSettings !== null && parsedSettings.ok && digestTrusted
+            ? lendingSettingsView(parsedSettings.value)
+            : null,
+        settingsDigest: digestTrusted ? settingsRow?.digest ?? null : null,
+        session: {
+          expiresAt: agent.sessionFacts?.expiry ?? null,
+          expiring:
+            agent.sessionFacts !== null
+            && agent.sessionFacts.expiry - nowSec() < VENUS_SESSION_EXPIRING_SECONDS,
+        },
+        recovery: {
+          // The sentence the detail page states next to the session countdown.
+          note:
+            "Your reserve is recoverable with your passkey at any time; the agent's key "
+            + "cannot block it.",
+        },
+      }, meta: { agentId: agent.id } });
+    });
+  }
+
   /** The operator-only global switch. Both routes share every check. */
   async function adminAction(c: Context, mode: "halt" | "resume"): Promise<Response> {
     const expected = config.operatorToken;
@@ -10514,6 +12125,28 @@ class TradeCapitalTooSmallError extends Error {
 class TradeNotExecutableError extends Error {}
 class TradeNotReadyError extends Error {}
 /** PHASE3.25 R8.1.3/R10.1 — exact sizing evidence survives message clipping. */
+/**
+ * THE ONE PLACE A 400 IS BUILT FROM A `BadRequestError`, and the ONE producer
+ * of `meta.shortfallWei` (PHASE3.25 R10.1, kept whole by AUDIT A-M3).
+ *
+ * The lending hire needed the same structured figure the owner routes already
+ * carried, and copying the six-line ternary would have made TWO metadata
+ * producers — which R10.1's own test forbids for the reason it exists: a
+ * metadata channel with two authors is a channel nobody can audit by reading
+ * one function.
+ */
+function failBadRequest(c: Context, error: BadRequestError): Response {
+  return fail(
+    c,
+    400,
+    "invalid_request",
+    error.message,
+    ...(error instanceof LpSizingShortfallError
+      ? [{ shortfallWei: error.shortfallWei }]
+      : []),
+  );
+}
+
 class LpSizingShortfallError extends BadRequestError {
   readonly shortfallWei: bigint;
 
@@ -10651,6 +12284,148 @@ function sourceKey(c: Context): string {
   const first = forwarded?.split(",")[0]?.trim();
   if (first !== undefined && first !== "") return first;
   return c.req.header("x-real-ip")?.trim() ?? "unknown";
+}
+
+/**
+ * The BFF-forwarded client address for the lending preview's per-client bucket
+ * (R2.11), or `null` when nothing forwarded one.
+ *
+ * `null` rather than `"unknown"`: a shared fallback key would let one caller
+ * behind a proxy that forwards nothing exhaust the bucket for every other such
+ * caller, and the GLOBAL bucket already bounds the aggregate.
+ */
+function clientKey(c: Context): string | null {
+  const key = sourceKey(c);
+  return key === "unknown" ? null : key;
+}
+
+/** The guard row as the arm/retire responses and the detail view report it. */
+function lendingGuardView(guard: LendingGuardRecord): Record<string, unknown> {
+  return {
+    status: guard.status,
+    hold: guard.hold,
+    guardedAccount: guard.guardedAccount,
+    debtMarkets: guard.debtMarkets,
+    reserveBps: guard.reserveBps,
+    budgetWei: guard.budgetWei.toString(10),
+    reserveCapWei: guard.reserveCapWei.toString(10),
+    armTxHash: guard.armTxHash,
+    armBlock: guard.armBlock === null ? null : guard.armBlock.toString(10),
+    armBlockSource: guard.armBlockSource,
+    closeReason: guard.closeReason,
+    actionSeq: guard.actionSeq,
+    lastActionAtMs: guard.lastActionAtMs,
+    updatedAtMs: guard.updatedAtMs,
+  };
+}
+
+/**
+ * Project A's finalized reading into the guardable view (§3.2 as amended).
+ *
+ * PRICES ARE THE PROTOCOL ORACLE'S, never the data plane's: this is the same
+ * reconstruction the trigger acts on, so a UI rendering it renders the number
+ * the guard would decide against. The one exception the body allowed —
+ * `reserveCapFloorWei` from a data-plane quote — is gone: R2.19 pins the pool
+ * and the floor is quoted through the plane's own QuoterV2.
+ */
+function buildGuardableView(input: {
+  readonly readingA: import("./venus/types.js").VenusAccountReading;
+  readonly account: Address;
+  readonly lending: LendingServerDeps;
+  readonly supportedMarket: (vToken: Address) => boolean;
+}): LendingGuardableView {
+  const { readingA } = input;
+  const view = venusBasisView(readingA);
+  const markets = readingA.markets.map((market) => ({
+    vToken: market.vToken,
+    symbol: market.vTokenSymbol,
+    underlying: market.underlying,
+    underlyingDecimals: market.underlyingDecimals,
+    supplyUnderlyingWei: (
+      (market.vTokenBalance * market.exchangeRateStored) / 10n ** 18n
+    ).toString(10),
+    borrowWei: (market.borrowCurrent ?? market.borrowStored).toString(10),
+    isCollateral: market.collateralMember,
+    collateralFactor: market.effectiveCf.toString(10),
+    liquidationThreshold: market.effectiveLt.toString(10),
+    priceMantissa: market.boundedDebtPrice.toString(10),
+  }));
+  const debts = readingA.markets
+    .filter((market) => (market.borrowCurrent ?? market.borrowStored) > 0n)
+    .map((market) => {
+      const borrow = market.borrowCurrent ?? market.borrowStored;
+      const supported = input.supportedMarket(market.vToken);
+      return {
+        vToken: market.vToken,
+        symbol: market.vTokenSymbol,
+        borrowWei: borrow.toString(10),
+        debtValueMantissa: ((borrow * market.boundedDebtPrice) / 10n ** 18n).toString(10),
+        supported,
+        ...(supported ? {} : { reason: "unsupported-in-v1" as const }),
+      };
+    });
+
+  // The refusal ORDER is the fail-closed order, and each name is the one the
+  // worker would report for the same state, so the hire screen and the running
+  // guard never disagree about why.
+  const zeroPriced = readingA.markets.find(
+    (market) =>
+      market.spotPrice === 0n
+      || market.boundedCollateralPrice === 0n
+      || market.boundedDebtPrice === 0n,
+  );
+  let refusal: LendingGuardableView["refusal"];
+  let refusalMarket: Address | undefined;
+  if (readingA.snapshotErrorMarket !== null) {
+    refusal = "snapshot-error";
+    refusalMarket = readingA.snapshotErrorMarket;
+  } else if (readingA.accountLiquidity[0] !== 0n || readingA.borrowingPower[0] !== 0n) {
+    refusal = "protocol-error";
+  } else if (!view.liquidationMatched || !view.borrowingPowerMatched) {
+    refusal = "protocol-mismatch";
+  } else if (readingA.userPoolId > readingA.lastPoolId) {
+    refusal = "emode-unverified";
+  } else if (zeroPriced !== undefined) {
+    refusal = "oracle-invalid";
+    refusalMarket = zeroPriced.vToken;
+  } else if (debts.length === 0) {
+    refusal = "no-debt";
+  } else if (!debts.some((debt) => debt.supported)) {
+    refusal = "no-supported-debt";
+  }
+
+  return {
+    account: input.account,
+    blockNumber: readingA.blockNumber.toString(10),
+    bases: {
+      borrowingPower: {
+        hf:
+          view.pair.borrowingPower.healthFactor === null
+            ? null
+            : view.pair.borrowingPower.healthFactor.toString(10),
+        matched: view.borrowingPowerMatched,
+      },
+      liquidation: {
+        hf:
+          view.pair.liquidationRisk.healthFactor === null
+            ? null
+            : view.pair.liquidationRisk.healthFactor.toString(10),
+        matched: view.liquidationMatched,
+      },
+    },
+    markets,
+    debts,
+    guardable: refusal === undefined,
+    ...(refusal === undefined ? {} : { refusal }),
+    ...(refusalMarket === undefined ? {} : { refusalMarket }),
+    ...(refusal === "oracle-invalid" || refusal === "protocol-mismatch"
+      ? {
+          note:
+            "Your account entered a market this guard cannot price; the guard is paused "
+            + "until it can.",
+        }
+      : {}),
+  };
 }
 
 type BodyResult =

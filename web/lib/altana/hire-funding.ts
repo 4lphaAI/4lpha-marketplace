@@ -89,6 +89,41 @@ export function requiredTradeDepositWei(input: {
   };
 }
 
+/**
+ * THE deposit a LENDING hire needs (MARKETPLACE-LENDING-AGENT R2.15).
+ *
+ * The `requiredTradeDepositWei` SHAPE — budget + registration + headroom + a
+ * submission pad — with NO `reserves.totalWei`: lending has no LP exit/protect
+ * lanes to reserve for, and its own gas reserve is the BNB tier inside the
+ * budget (`reserveBps`), not a figure added beside it.
+ *
+ * The wallet's readable balance IS credited, unlike the grid/LP formula. That
+ * is only sound because a lending hire is gated on
+ * {@link walletSharedWithLiveAgents} BEFORE any signature (R3.13) and the plane
+ * refuses a second live passkey agent on one wallet (R2.16) — so there is no
+ * neighbour whose gas pot this deposit could quietly consume. If that gate is
+ * ever removed, this must credit nothing.
+ */
+export function requiredLendingDepositWei(input: {
+  readonly budgetWei: string;
+  readonly relayFeePerSubmitWei: string;
+  readonly funding: HireFunding;
+}): { readonly totalWei: bigint; readonly creditedWei: bigint; readonly shortfallWei: bigint } {
+  const budget = wei(input.budgetWei, "budgetWei");
+  const relayFee = wei(input.relayFeePerSubmitWei, "relayFeePerSubmitWei");
+  const registration = wei(input.funding.registrationFeeWei, "registrationFeeWei")
+    * BigInt(input.funding.registrations);
+  const headroom = wei(input.funding.relayGasHeadroomWei, "relayGasHeadroomWei");
+  const totalWei = budget + registration + headroom + relayFee * ARM_GAS_SUBMISSION_PAD;
+  const creditedWei = input.funding.balanceWei === null
+    ? 0n : wei(input.funding.balanceWei, "balanceWei");
+  return {
+    totalWei,
+    creditedWei,
+    shortfallWei: totalWei > creditedWei ? totalWei - creditedWei : 0n,
+  };
+}
+
 /** Wei → BNB with four places, rounded UP, as the deposit field shows it. */
 export function depositAmountBnb(shortfallWei: bigint): string {
   const unit = 10n ** 14n;

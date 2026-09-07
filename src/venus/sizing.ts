@@ -115,6 +115,33 @@ export type VenusSizingMarket = VenusRiskMarketInput & {
    * guessed would be smaller than it needed to be for no reason.
    */
   readonly capRemainingWei: bigint | null;
+  /**
+   * MARKETPLACE-LENDING-AGENT R3.6 (closing REVIEW2 M2) — ADDITIVE, and
+   * absent for every Phase 4 caller.
+   *
+   * The lending guard repays a THIRD PARTY's debt out of a reserve that is
+   * mostly NOT sitting in the wallet as the underlying: it is supplied on
+   * Venus as vUSDT, or held as native BNB one swap away. So the quantity that
+   * funds a repay is a computed CAPACITY, not `walletBalance`.
+   *
+   * Revision 2 proposed writing that capacity INTO `walletBalance`. REVIEW2 M2
+   * refuted it: `boundBy` is DERIVED from the `terms` array by value match, so
+   * a capacity written into the wallet term would report as `wallet-balance`
+   * forever and the new bound member would be unreachable. Hence a real field.
+   *
+   * When it is present the funding term of the `min(...)` is
+   * `reserve-capacity` and `walletBalance` is REPORTED ONLY — because for this
+   * caller the wallet's idle balance is a component of the capacity, not a
+   * separate ceiling, and clamping on it would size every rescue to whatever
+   * happened not to be supplied. When it is absent NOTHING changes: Phase 4's
+   * terms, bounds and refusal text are byte-identical.
+   *
+   * The wallet-native floor is applied INSIDE this figure (the count-aware
+   * `tierBnb` of R2.8) and nowhere else, so the lending caller passes
+   * `context.walletNativeFloorWei = 0n` and the floor is subtracted exactly
+   * once on every path.
+   */
+  readonly reserveCapacityWei?: bigint;
   /** Whether the session grant actually names this market. */
   readonly inGrant: boolean;
   /** Whether the owner's settings name this market for the action in question. */
@@ -172,7 +199,10 @@ export type VenusRepayBound =
   | "borrow-balance"
   | "wallet-balance"
   | "max-per-action"
-  | "on-chain-cap";
+  | "on-chain-cap"
+  /** MARKETPLACE-LENDING-AGENT R3.6. Reachable only when the caller supplies
+   * {@link VenusSizingMarket.reserveCapacityWei}. */
+  | "reserve-capacity";
 
 export type VenusSupplyPlan = {
   readonly action: "venusSupply";
@@ -283,10 +313,17 @@ export function sizeVenusRepay(
     : market.walletBalance;
   const walletAvailable = walletTerm > 0n ? walletTerm : 0n;
 
+  // R3.6: the FUNDING term is `reserve-capacity` when the caller computed one,
+  // and `wallet-balance` otherwise. Exactly one of the two is ever in the
+  // `min(...)`, so `boundBy`'s value match can never report the wrong name.
+  const fundingTerm: { readonly bound: VenusRepayBound; readonly value: bigint } =
+    market.reserveCapacityWei === undefined
+      ? { bound: "wallet-balance", value: walletAvailable }
+      : { bound: "reserve-capacity", value: market.reserveCapacityWei };
   const terms: { readonly bound: VenusRepayBound; readonly value: bigint }[] = [
     { bound: "need", value: neededWei },
     { bound: "borrow-balance", value: market.borrowCurrent },
-    { bound: "wallet-balance", value: walletAvailable },
+    fundingTerm,
     { bound: "max-per-action", value: maxPerAction },
     ...(market.capRemainingWei === null
       ? []
@@ -298,8 +335,8 @@ export function sizeVenusRepay(
       refused: "insufficient-wallet-balance",
       detail:
         `Nothing can be repaid on ${market.vToken}: need ${neededWei}, ` +
-        `borrow ${market.borrowCurrent}, wallet available ${walletAvailable} ` +
-        `(after the ${context.walletNativeFloorWei} wei native floor), ` +
+        `borrow ${market.borrowCurrent}, ${fundingTerm.bound} ${fundingTerm.value} ` +
+        `(wallet ${walletAvailable} after the ${context.walletNativeFloorWei} wei native floor), ` +
         `maxPerAction ${maxPerAction}.`,
     };
   }

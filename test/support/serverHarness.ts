@@ -69,7 +69,7 @@ import {
   type SessionSpec,
   type WalletProvider,
 } from "../../src/core/types.js";
-import { createServer, type BillingOwnerServerDeps, type HireServerDeps, type LpServerDeps, type ServerConfig, type TradeAgentServerDeps, type VenusServerDeps } from "../../src/server.js";
+import { createServer, type BillingOwnerServerDeps, type HireServerDeps, type LendingServerDeps, type LpServerDeps, type ServerConfig, type TradeAgentServerDeps, type VenusServerDeps } from "../../src/server.js";
 import type { KeyStoreReader } from "../../src/account/keyStoreReader.js";
 import { MAX_CALLS_PER_EXECUTE } from "../../src/wallet/altana.js";
 import { parseExecuteRequest, parseTradeRequest } from "../../src/http/wire.js";
@@ -739,6 +739,8 @@ export type HarnessOptions = {
    * class: "enabled" and "reachable" must be the same word.
    */
   readonly venus?: VenusServerDeps;
+  /** Lending routes. Omitted means every `/lending/*` path answers 404. */
+  readonly lending?: LendingServerDeps;
   /** Phase 5 owner billing routes. Omitted means exact 404. */
   readonly billingOwner?: BillingOwnerServerDeps;
   readonly hire?: HireServerDeps;
@@ -892,6 +894,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
     dataPlane,
     ...(lp === undefined ? {} : { lp }),
     ...(options.venus === undefined ? {} : { venus: options.venus }),
+    ...(options.lending === undefined ? {} : { lending: options.lending }),
     ...(options.billingOwner === undefined ? {} : { billingOwner: options.billingOwner }),
     ...(options.hire === undefined ? {} : { hire: options.hire }),
     ...(options.tradeAgent === undefined ? {} : { tradeAgent: options.tradeAgent }),

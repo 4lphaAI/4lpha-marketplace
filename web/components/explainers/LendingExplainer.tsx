@@ -48,11 +48,14 @@ const yTop = 40,
 const HF_MAX = 2.2,
   HF_MIN = 0.9;
 const yOf = hf => yTop + (HF_MAX - hf) / (HF_MAX - HF_MIN) * (yBot - yTop);
-const TRIGGER = 1.15,
-  TARGET = 1.55,
+// MARKETPLACE-LENDING-AGENT §4.2 / R2.17: the animation and the deploy form
+// must agree, so these are the SHIPPED defaults (the operator's ruling of
+// 2026-09-06, closing OQ2), not the design export's 1.15 / 1.55.
+const TRIGGER = 1.2,
+  TARGET = 1.5,
   START = 1.9,
   LOW = 1.08,
-  RECOVERED = 1.62;
+  RECOVERED = 1.52;
 const N = 170;
 const LOSS = "var(--loss)",
   LP = "var(--cat-lp)";
@@ -212,7 +215,7 @@ function LendingExplainer({
       font: "var(--type-mono-xs)",
       fill: danger ? LOSS : "var(--text-subtle)"
     }
-  }, "TRIGGER 1.15"), /*#__PURE__*/React.createElement("line", {
+  }, "TRIGGER 1.20"), /*#__PURE__*/React.createElement("line", {
     x1: X0,
     y1: yOf(TARGET),
     x2: X1,
@@ -228,7 +231,7 @@ function LendingExplainer({
       font: "var(--type-mono-xs)",
       fill: LP
     }
-  }, "TARGET 1.55"), /*#__PURE__*/React.createElement("polyline", {
+  }, "TARGET 1.50"), /*#__PURE__*/React.createElement("polyline", {
     points: path,
     fill: "none",
     stroke: danger ? LOSS : "var(--brand)",
@@ -339,7 +342,7 @@ function LendingExplainer({
       font: "var(--type-mono-xs)",
       color: "var(--text-subtle)"
     }
-  }, /*#__PURE__*/React.createElement("span", null, "TRIGGER HF 1.15"), /*#__PURE__*/React.createElement("span", null, "TARGET HF 1.55"), /*#__PURE__*/React.createElement("span", null, "REPAYS FROM WALLET BALANCE ONLY")));
+  }, /*#__PURE__*/React.createElement("span", null, "TRIGGER HF 1.20"), /*#__PURE__*/React.createElement("span", null, "TARGET HF 1.50"), /*#__PURE__*/React.createElement("span", null, "REPAYS FROM THE AGENT RESERVE ONLY")));
 }
 
 export { LendingExplainer };

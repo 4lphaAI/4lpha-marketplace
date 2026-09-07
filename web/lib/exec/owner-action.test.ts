@@ -79,6 +79,27 @@ describe("paramsHash (golden vectors)", () => {
       "0xa14408fc5fed2935685f92563189d1e85e57c8121365c4209947a7ac9d5f1733",
     );
   });
+  // MARKETPLACE-LENDING-AGENT: computed by the PLANE's own
+  // `src/auth/canonical.ts` at build time, so a divergence in this browser port
+  // fails here rather than as a generic 401 from a live hire.
+  it("lendingArm / lendingSettings / lendingRetire", () => {
+    const lendingSettings = {
+      triggerHf: "1200000000000000000",
+      targetHf: "1500000000000000000",
+      maxPerAction: [{ token: "0x55d398326f99059fF775485246999027B3197955", maxWei: "240000000000000000000" }],
+      minSecondsBetweenActions: 300,
+      rescueReserveCount: 6,
+    };
+    expect(paramsHash("lendingArm", { settings: lendingSettings, budgetWei: "50000000000000000", reserveBps: 2000 })).toBe(
+      "0x19f65adaabaa769239febe9661e8b4c002bd6f83b95a4f68291e13a7f17edc26",
+    );
+    expect(paramsHash("lendingSettings", lendingSettings)).toBe(
+      "0x4f2e1c3462943819f2d2ef796a5259f9bc84598a889699d40411252e4983b8c8",
+    );
+    expect(paramsHash("lendingRetire", { acceptPartial: true })).toBe(
+      "0xba36ebdc16d99fc347e0d2541a16849525cf9210dd22305f877c1f7c1a4dc7b7",
+    );
+  });
   it("read over empty params", () => {
     expect(paramsHash("read", {})).toBe(
       "0xc66fca071fdcb969e9845c1a46fb3761f2bf2475b38046aba69be46c5a29591c",

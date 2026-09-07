@@ -128,31 +128,63 @@ type SettingsRow = {
 
 const SETTINGS_COLUMNS = "agent_id, owner_address, params, digest, updated_at";
 
-const VENUS_SETTINGS_DDL = `
-  create table if not exists venus_settings (
+/**
+ * The store is PARAMETERIZED BY NAMESPACE (MARKETPLACE-LENDING-AGENT R2.23
+ * item 4): `"venus"` gives `venus_settings` and the `venusSettings.*` tags
+ * this file has always used, and `"lending"` gives `lending_settings` and
+ * `lendingSettings.*`.
+ *
+ * A mechanical parameterization rather than a copy, because the two rows are
+ * the same row: an owner-scoped `(params, digest)` pair whose digest binds the
+ * bytes an observation was computed under. Two implementations would be two
+ * places to keep that invariant honest. Every default is `"venus"`, so the
+ * Phase 4 behaviour — table name, SQL text, tag, error strings — is
+ * byte-identical to what it was.
+ */
+export type SettingsNamespace = "venus" | "lending";
+
+function settingsTable(namespace: SettingsNamespace): string {
+  return `${namespace}_settings`;
+}
+
+function settingsTag(namespace: SettingsNamespace): string {
+  return `${namespace}Settings`;
+}
+
+function settingsLabel(namespace: SettingsNamespace): string {
+  return namespace === "venus" ? "Venus" : "Lending";
+}
+
+export class PostgresVenusSettingsStore implements VenusSettingsStore {
+  readonly #sql: SqlClient;
+  readonly #now: Clock;
+  readonly #table: string;
+  readonly #tag: string;
+  readonly #label: string;
+
+  private constructor(sql: SqlClient, now: Clock, namespace: SettingsNamespace) {
+    this.#sql = sql;
+    this.#now = now;
+    this.#table = settingsTable(namespace);
+    this.#tag = settingsTag(namespace);
+    this.#label = settingsLabel(namespace);
+  }
+
+  static async create(
+    sql: SqlClient,
+    now: Clock = Date.now,
+    namespace: SettingsNamespace = "venus",
+  ): Promise<PostgresVenusSettingsStore> {
+    await sql.query(`
+  create table if not exists ${settingsTable(namespace)} (
     agent_id text primary key,
     owner_address text not null,
     params jsonb not null,
     digest text not null,
     updated_at timestamptz not null default now()
   )
-`;
-
-export class PostgresVenusSettingsStore implements VenusSettingsStore {
-  readonly #sql: SqlClient;
-  readonly #now: Clock;
-
-  private constructor(sql: SqlClient, now: Clock) {
-    this.#sql = sql;
-    this.#now = now;
-  }
-
-  static async create(
-    sql: SqlClient,
-    now: Clock = Date.now,
-  ): Promise<PostgresVenusSettingsStore> {
-    await sql.query(VENUS_SETTINGS_DDL);
-    return new PostgresVenusSettingsStore(sql, now);
+`);
+    return new PostgresVenusSettingsStore(sql, now, namespace);
   }
 
   async get(
@@ -160,9 +192,9 @@ export class PostgresVenusSettingsStore implements VenusSettingsStore {
     agentId: string,
   ): Promise<VenusSettingsRecord | null> {
     const result = await this.#sql.query<SettingsRow>(
-      `/* venusSettings.get */
+      `/* ${this.#tag}.get */
        select ${SETTINGS_COLUMNS}
-       from venus_settings
+       from ${this.#table}
        where agent_id = $1 and owner_address = $2`,
       [agentId, ownerKey(ownerAddress)],
     );
@@ -174,12 +206,12 @@ export class PostgresVenusSettingsStore implements VenusSettingsStore {
     // The owner-match predicate rides on the UPDATE arm of the upsert, so a
     // cross-owner put updates nothing and the empty RETURNING throws.
     const result = await this.#sql.query<SettingsRow>(
-      `/* venusSettings.put */
-       insert into venus_settings (agent_id, owner_address, params, digest, updated_at)
+      `/* ${this.#tag}.put */
+       insert into ${this.#table} (agent_id, owner_address, params, digest, updated_at)
        values ($1, $2, $3::jsonb, $4, $5)
        on conflict (agent_id) do update
          set params = excluded.params, digest = excluded.digest, updated_at = excluded.updated_at
-         where venus_settings.owner_address = excluded.owner_address
+         where ${this.#table}.owner_address = excluded.owner_address
        returning ${SETTINGS_COLUMNS}`,
       [
         input.agentId,
@@ -192,7 +224,7 @@ export class PostgresVenusSettingsStore implements VenusSettingsStore {
     const row = result.rows[0];
     if (row === undefined) {
       throw new Error(
-        `Venus settings for agent "${input.agentId}" belong to another owner.`,
+        `${this.#label} settings for agent "${input.agentId}" belong to another owner.`,
       );
     }
     return rowToRecord(row);
@@ -200,9 +232,9 @@ export class PostgresVenusSettingsStore implements VenusSettingsStore {
 
   async listForWorker(): Promise<readonly VenusSettingsRecord[]> {
     const result = await this.#sql.query<SettingsRow>(
-      `/* venusSettings.listForWorker */
+      `/* ${this.#tag}.listForWorker */
        select ${SETTINGS_COLUMNS}
-       from venus_settings
+       from ${this.#table}
        order by agent_id asc`,
     );
     return result.rows.map(rowToRecord);
@@ -227,14 +259,16 @@ function rowToRecord(row: SettingsRow): VenusSettingsRecord {
 /* Factory                                                                    */
 /* -------------------------------------------------------------------------- */
 
-export async function createVenusSettingsStore(): Promise<VenusSettingsStore> {
+export async function createVenusSettingsStore(
+  namespace: SettingsNamespace = "venus",
+): Promise<VenusSettingsStore> {
   const connectionString = process.env["DATABASE_URL"]?.trim();
   if (connectionString !== undefined && connectionString !== "") {
     const sql = await createPgSqlClient(connectionString);
-    const store = await PostgresVenusSettingsStore.create(sql);
-    console.log("[venus-settings-store] backend=postgres");
+    const store = await PostgresVenusSettingsStore.create(sql, Date.now, namespace);
+    console.log(`[${namespace}-settings-store] backend=postgres`);
     return store;
   }
-  console.log("[venus-settings-store] backend=memory (DATABASE_URL not set)");
+  console.log(`[${namespace}-settings-store] backend=memory (DATABASE_URL not set)`);
   return new MemoryVenusSettingsStore();
 }

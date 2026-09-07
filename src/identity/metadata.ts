@@ -1,15 +1,17 @@
 import { fail, REGISTRY, validCategory, validId, validRef, type IdentityCategory, type MetadataVersion } from "./types.js";
 
-const LABELS = { grid: "Grid", trading: "Trading", lp: "LP" } as const;
+const LABELS = { grid: "Grid", trading: "Trading", lp: "LP", lending: "Health Guard" } as const;
 const DESCRIPTIONS = {
   grid: "A 4lpha grid trading deployment. Its ERC-8004 identity is owned and managed by the platform minter; trading funds retain their separate wallet custody.",
   trading: "A 4lpha trading deployment. Its ERC-8004 identity is owned and managed by the platform minter; trading funds retain their separate wallet custody.",
   lp: "A 4lpha liquidity provision deployment. Its ERC-8004 identity is owned and managed by the platform minter; trading funds retain their separate wallet custody.",
+  lending: "A 4lpha lending health guard. Its ERC-8004 identity is owned and managed by the platform minter; the rescue reserve retains its separate wallet custody.",
 } as const;
 const V2_DESCRIPTIONS = {
   grid: "Automated grid market making that buys low and sells high as market prices move using PancakeSwap V3 on BNB Chain.",
   trading: "Screens eligible markets, sizes entries, and automatically manages buys and exits using Four.Meme, Flap.sh, and PancakeSwap V3 on BNB Chain.",
   lp: "Routes liquidity to the best APR or fee opportunities with auto-rebalancing, compounding, and risk exits using PancakeSwap V3 on BNB Chain.",
+  lending: "Watches a Venus Core borrow position and repays its debt from a reserve when the health factor falls, on BNB Chain.",
 } as const;
 /**
  * The public marketplace origin, and the ONE place a host is written on-chain.

@@ -34,11 +34,22 @@ describe("ERC-8004 owner summary", () => {
     }
   });
 
+  // MARKETPLACE-LENDING-AGENT §8.4 / R2.23 item 9: `IdentityCategory` gained
+  // "lending", so the fixture that used to prove category "lending" was
+  // REJECTED is INVERTED here and declared. The rejection case it vacated is
+  // kept by an unrelated unknown category ("custody") in the malformed list, so
+  // the closed-union check is still exercised.
+  it("INVERTED for the lending phase: category \"lending\" is now ACCEPTED (was a rejection fixture)", () => {
+    const lending = { ...registered, category: "lending" };
+    expect(parseErc8004Identity(lending)).toEqual(lending);
+    expect(erc8004TokenUrl(parseErc8004Identity(lending)!)).toBe(`https://8004scan.io/agents/bsc/${maxId}`);
+  });
+
   it("strips malformed records to attention without retaining IDs, refs, URLs or raw errors", () => {
     const values: unknown[] = [false, [], "registered", {}, { agentId: "5" },
       { ...registered, version: 2 }, { ...registered, revision: 0 }, { ...registered, revision: Number.MAX_SAFE_INTEGER + 1 },
       { ...registered, publicRef: "customer-wallet" }, { ...registered, publicRef: ref.toUpperCase() },
-      { ...registered, category: "lending" }, { ...registered, errorCode: "rpc_unavailable" },
+      { ...registered, category: "custody" }, { ...registered, errorCode: "rpc_unavailable" },
       { ...registered, registrationTxHash: null }, { ...registered, uriUpdateTxHash: null },
       { ...registered, uriUpdateTxHash: "0x1234" }, { ...registered, registrationTxHash: hash.replace("0x", "0X") },
       { ...registered, status: "blocked", errorCode: "private error text" },

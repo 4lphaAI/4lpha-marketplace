@@ -14,7 +14,7 @@ export function HireRecoveryActions({ agentId, readHeaders, go, storageKey = "4l
   readonly go: (route: string) => void;
   readonly storageKey?: string;
   readonly onCancelled?: (agentId: string) => void;
-  readonly deployPath?: "/deploy/grid" | "/deploy/lp" | "/deploy/trading";
+  readonly deployPath?: "/deploy/grid" | "/deploy/lp" | "/deploy/lending" | "/deploy/trading";
 }) {
   const { signEnvelope, ownerAddress } = useOwnerActions();
   const storage = React.useMemo(() => accountHireStorage(typeof window === "undefined" ? undefined : window.localStorage, ownerAddress), [ownerAddress]);

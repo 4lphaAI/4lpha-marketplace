@@ -5,7 +5,7 @@ import { ownerAddressFromPasskey, PASSKEY_STORAGE_KEY } from "./passkey";
 const a = { x: `0x${"11".repeat(32)}`, y: `0x${"22".repeat(32)}`, credentialId: "YQ", rpId: "localhost", createdAt: 1 } as const;
 const ownerA = ownerAddressFromPasskey(a.x, a.y);
 const ownerB = "0x2222222222222222222222222222222222222222";
-const pointers = ["4lpha:trade-hire:v2", "4lpha:grid-hire:v1", "4lpha:lp-hire:v1"];
+const pointers = ["4lpha:trade-hire:v2", "4lpha:grid-hire:v1", "4lpha:lp-hire:v1", "4lpha:lending-hire:v1"];
 beforeEach(() => localStorage.clear());
 it("preserves all A recovery pointers and exposes none to B, including old callback writes", () => {
   localStorage.setItem(PASSKEY_STORAGE_KEY, JSON.stringify(a));

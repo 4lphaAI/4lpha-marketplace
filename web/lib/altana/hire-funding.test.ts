@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { depositAmountBnb, depositAmountWei, requiredDepositWei, requiredTradeDepositWei, walletSharedWithLiveAgents } from "./hire-funding";
+import { depositAmountBnb, depositAmountWei, requiredDepositWei, requiredLendingDepositWei, requiredTradeDepositWei, walletSharedWithLiveAgents } from "./hire-funding";
 
 /**
  * The live numbers from grid-agent-01-5's preview (2026-09-03): budget 0.0627,
@@ -118,5 +118,53 @@ describe("requiredTradeDepositWei", () => {
     const unreadable = { ...funding, balanceWei: null };
     const result = requiredTradeDepositWei({ capDayWei: "10000000000000000", funding: unreadable });
     expect(result.depositShortfallWei).toBe(result.depositTargetWei);
+  });
+});
+
+describe("requiredLendingDepositWei", () => {
+  /*
+   * MARKETPLACE-LENDING-AGENT R2.15: the `requiredTradeDepositWei` SHAPE with no
+   * `reserves.totalWei` — lending has no LP exit/protect lanes to reserve for,
+   * and its own gas reserve is the BNB tier INSIDE the budget (`reserveBps`).
+   *
+   * 0.0627 + 0.000693650169219776 + 0.0001128 + 3 × 0.0001 = 0.063806450169219776
+   */
+  const LENDING_TOTAL = 63_806_450_169_219_776n;
+
+  it("adds the reserve budget, the registration(s), the headroom and the arm gas pad — and NOT the LP reserve", () => {
+    const result = requiredLendingDepositWei({
+      budgetWei: sizing.openNativeBudgetWei,
+      relayFeePerSubmitWei: sizing.relayFeePerSubmitWei,
+      funding,
+    });
+    expect(result.totalWei).toBe(LENDING_TOTAL);
+    expect(result.totalWei).toBe(TOTAL - 7_800_000_000_000_000n);
+    expect(result.creditedWei).toBe(132_678_400_000_000n);
+    expect(result.shortfallWei).toBe(LENDING_TOTAL - 132_678_400_000_000n);
+  });
+
+  it("credits the readable balance — sound ONLY because R3.13 gates a shared wallet before signing", () => {
+    const shared = requiredLendingDepositWei({
+      budgetWei: sizing.openNativeBudgetWei,
+      relayFeePerSubmitWei: sizing.relayFeePerSubmitWei,
+      funding: { ...funding, balanceWei: LENDING_TOTAL.toString(10) },
+    });
+    expect(shared.shortfallWei).toBe(0n);
+    // Which is exactly why the gate must fire first.
+    expect(walletSharedWithLiveAgents({
+      agents: [{ id: "other", status: "armed", walletAddress: "0xB0B0000000000000000000000000000000000000" }],
+      walletAddress: "0xb0b0000000000000000000000000000000000000",
+      excludingId: "lending-agent-01",
+    })).toBe(true);
+  });
+
+  it("credits zero when the wallet balance is unreadable", () => {
+    const result = requiredLendingDepositWei({
+      budgetWei: sizing.openNativeBudgetWei,
+      relayFeePerSubmitWei: sizing.relayFeePerSubmitWei,
+      funding: { ...funding, balanceWei: null },
+    });
+    expect(result.creditedWei).toBe(0n);
+    expect(result.shortfallWei).toBe(result.totalWei);
   });
 });

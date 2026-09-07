@@ -77,8 +77,19 @@ export type SessionFacts = {
   readonly publicKey: Hex;
   readonly expiry: number;
   /** Immutable S1 sizing envelope retained after the pending grant is cleared. */
+  /**
+   * Immutable S1 sizing envelope retained after the pending grant is cleared.
+   *
+   * MARKETPLACE-LENDING-AGENT L3 (correcting R2.15): this stays FLAT. Once
+   * `guardedAccount` / `debtMarkets` / `reserveCapWei` moved onto the
+   * `lending_guards` row, lending's `hireSizing` carries the same three fields
+   * every other preset carries, so widening the `name` literal is the whole
+   * change — a discriminated union would add work and risk at eleven readers
+   * for no benefit. The reader list stays as the checklist of sites that
+   * switch on this name.
+   */
   readonly hireSizing?: {
-    readonly name: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1";
+    readonly name: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1";
     readonly version: 1;
     readonly openNativeBudgetWei: string;
   };
@@ -113,7 +124,7 @@ export type PendingGrant = {
   readonly sizing: {
     readonly openNativeBudgetWei: string;
     readonly capDayWei: string;
-    readonly sizingPreset: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1";
+    readonly sizingPreset: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1";
     readonly sizingPresetVersion: 1;
   };
   readonly funding: FundingRequirement;
@@ -124,6 +135,37 @@ export type PendingGrant = {
   readonly autoGrant?: true;
   readonly initialTradeSettings?: {
     readonly params: TradeSettings;
+    readonly digest: Hex;
+  };
+  /**
+   * MARKETPLACE-LENDING-AGENT R3.3(2), closing REVIEW2 H3(c).
+   *
+   * Everything the lending hire signed that is NOT part of the flat
+   * `hireSizing` envelope: the guarded account, the pinned debt markets, the
+   * USDT day cap, the reserve split and the complete settings with their
+   * digest.
+   *
+   * It rides HERE, and it is written INSIDE `createProvisioningAgent`'s CAS
+   * with the agent row and the sealed session key — ONE statement, no torn
+   * write. The alternative REVIEW2 rejected was a second insert into
+   * `lending_guards` at S1: `beforeNonceConsume` performs no store write
+   * anywhere in this tree, so a guard-row insert there would write durable
+   * state before the nonce, and placing it after `createProvisioningAgent`
+   * makes a crash between the two leave an agent whose session spec was built
+   * from a `guardedAccount` the plane no longer knows — grantable, and never
+   * armable.
+   *
+   * `guardedAccount` is IMMUTABLE for the strongest available reason:
+   * `PendingGrant` is write-once, and the guard row the convergence
+   * materializes from it refuses any later change to that column.
+   */
+  readonly initialLendingHire?: {
+    readonly guardedAccount: Address;
+    readonly debtMarkets: readonly Address[];
+    readonly reserveCapWei: string;
+    readonly reserveBps: number;
+    /** The owner-signed settings bytes, verbatim. Parsed on read, never on write. */
+    readonly params: unknown;
     readonly digest: Hex;
   };
   readonly grantAttempt?: {
@@ -893,7 +935,8 @@ export class MemoryAgentStore implements AgentStore {
     const pending = entry.record.pendingGrant;
     if (entry.record.status !== "provisioning" || pending === null
       || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
-      || (pending.sizing.sizingPreset !== "trade-v1" && pending.sizing.sizingPreset !== "lp-v1")
+      || (pending.sizing.sizingPreset !== "trade-v1" && pending.sizing.sizingPreset !== "lp-v1"
+        && pending.sizing.sizingPreset !== "lending-v1")
       || (pending.sizing.sizingPreset === "trade-v1" && pending.autoGrant !== true)
       || hasProvisioningCancellation(pending)) return { kind: "conflict" };
     if (pending.grantAttempt !== undefined) {
@@ -1571,7 +1614,8 @@ export class PostgresAgentStore implements AgentStore {
       const pending = current.pendingGrant;
       if (current.status !== "provisioning" || pending === null
         || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
-        || (pending.sizing.sizingPreset !== "trade-v1" && pending.sizing.sizingPreset !== "lp-v1")
+        || (pending.sizing.sizingPreset !== "trade-v1" && pending.sizing.sizingPreset !== "lp-v1"
+        && pending.sizing.sizingPreset !== "lending-v1")
         || (pending.sizing.sizingPreset === "trade-v1" && pending.autoGrant !== true)
         || hasProvisioningCancellation(pending)) return { kind: "conflict" } as const;
       if (pending.grantAttempt !== undefined) {

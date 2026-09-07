@@ -113,6 +113,7 @@ function baseDetail(view: AgentDetailView, overrides: Partial<UseAgentDetailResu
     setChartInterval: () => undefined,
     setChartUnit: () => undefined,
     trade: null,
+    lending: null,
     asOfMs: 2_000,
     message: "",
     marketReason: "market data unavailable",
@@ -120,6 +121,7 @@ function baseDetail(view: AgentDetailView, overrides: Partial<UseAgentDetailResu
     signIn: async () => undefined,
     refresh: async () => view,
     refreshTrade: async () => null,
+    refreshLending: async () => null,
     ...overrides,
   };
 }

@@ -1107,3 +1107,230 @@ export function resolveVenusRuntimeConfig(env: TradeEnv): VenusRuntimeConfig {
     rpcConcurrency: VENUS_RPC_CONCURRENCY,
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* The lending guard (MARKETPLACE-LENDING-AGENT §8.5, R2.19, R3.8)            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `LENDING_ENABLED`, the lending surface's master switch — the SAME tri-state
+ * shape as {@link resolveLpEnabled}, byte for byte, and for the same reason:
+ * OFF by default (deps absent ⇒ every `/lending/*` path answers the 404 an
+ * unknown path gets, the worker refuses to start), ON only for the exact string
+ * `"true"`, and a TYPO FAILS THE BOOT.
+ *
+ * TWO dependencies, both thrown HERE rather than at four composition sites, so
+ * the server boot, the wiring, the worker and the dev stack all get the same
+ * refusal without four copies of the conditional:
+ *
+ *   - **`LP_ENABLED`** (R2.19): the router, WBNB and the QuoterV2 the arm,
+ *     the rescues and the retire all swap through come from the LP venue. The
+ *     coupling is not new — `HIRE_ENABLED` already implies it transitively —
+ *     but stating it means a deployment cannot end up with a guard whose swap
+ *     legs have no venue to build against.
+ *   - **`HIRE_ENABLED`**: the guard has no other way to exist. Its only entry
+ *     is the `lending-v1` hire preset, which is part of the browser hire flow.
+ */
+export function resolveLendingEnabled(env: TradeEnv): boolean {
+  const raw = read(env, "LENDING_ENABLED");
+  const enabled =
+    raw === "" ? false : raw === "true" ? true : raw === "false" ? false : null;
+  if (enabled === null) {
+    throw new Error(`LENDING_ENABLED must be exactly "true" or "false"; got "${raw}".`);
+  }
+  if (!enabled) return false;
+  if (!resolveLpEnabled(env)) {
+    throw new Error(
+      'LENDING_ENABLED is "true" while LP_ENABLED is not: every lending swap leg — the arm, the pool-cash fallback, the BNB rescue and the retire — is built against the LP venue\'s router, WBNB and QuoterV2. Enabling it alone would produce a healthy-looking server whose money routes cannot build calldata.',
+    );
+  }
+  if (!resolveHireEnabled(env)) {
+    throw new Error(
+      'LENDING_ENABLED is "true" while HIRE_ENABLED is not: the guard\'s only entry is the lending-v1 hire preset, so nothing could ever be armed.',
+    );
+  }
+  return true;
+}
+
+/** Worker cadence floor. Below this the per-agent read budget cannot be met. */
+export const LENDING_WORKER_MIN_INTERVAL_MS = 15_000;
+export const LENDING_WORKER_DEFAULT_INTERVAL_MS = 30_000;
+
+/**
+ * `LENDING_WORKER_INTERVAL_MS`, with a BOOT-REFUSED floor of 15 000.
+ *
+ * REFUSED rather than clamped, exactly as {@link resolveVenusWorkerIntervalMs}
+ * is: an operator who asked for a 5-second cycle asked for something the
+ * per-agent read budget cannot serve (A's bounded market set plus B's reserve
+ * plus a quote), and silently running four times slower than requested is how a
+ * latency budget becomes fiction.
+ */
+export function resolveLendingWorkerIntervalMs(env: TradeEnv): number {
+  const raw = read(env, "LENDING_WORKER_INTERVAL_MS");
+  if (raw === "") return LENDING_WORKER_DEFAULT_INTERVAL_MS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      "LENDING_WORKER_INTERVAL_MS must be a positive integer number of milliseconds.",
+    );
+  }
+  if (parsed < LENDING_WORKER_MIN_INTERVAL_MS) {
+    throw new Error(
+      `LENDING_WORKER_INTERVAL_MS (${parsed}) is below the floor of ${LENDING_WORKER_MIN_INTERVAL_MS} ms. ` +
+        "A lending cycle reads A's bounded market set, B's reserve and at least one quote; a shorter " +
+        "interval cannot be served, and running slower than requested would make the guard's stated " +
+        "latency budget fiction.",
+    );
+  }
+  return parsed;
+}
+
+/**
+ * `LENDING_MAX_OBSERVATION_AGE_MS`, REFUSED below `2 x interval`.
+ *
+ * The floor is structural, not stylistic, and it is Phase 4's: below two
+ * intervals a previous observation can never satisfy BOTH "at least one
+ * interval old" and "within the bound" on a cycle that ran even slightly late,
+ * so the second confirmation would be unreachable and the guard would look
+ * armed while being unable to fire.
+ */
+export function resolveLendingMaxObservationAgeMs(
+  env: TradeEnv,
+  intervalMs: number,
+): number {
+  const raw = read(env, "LENDING_MAX_OBSERVATION_AGE_MS");
+  if (raw === "") return 3 * intervalMs;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      "LENDING_MAX_OBSERVATION_AGE_MS must be a positive integer number of milliseconds.",
+    );
+  }
+  if (parsed < 2 * intervalMs) {
+    throw new Error(
+      `LENDING_MAX_OBSERVATION_AGE_MS (${parsed}) is below 2 x the worker interval (${2 * intervalMs}); ` +
+        "below that bound a second confirmation is structurally unreachable.",
+    );
+  }
+  return parsed;
+}
+
+/** The V3 fee tiers a WBNB/USDT pool can exist at. */
+const LENDING_SWAP_FEE_TIERS: readonly number[] = [100, 500, 2_500, 10_000];
+
+/**
+ * `LENDING_SWAP_FEE_TIER` — the PINNED WBNB/USDT pool (R2.19, closing M13).
+ *
+ * Boot config rather than a signed field, and L12 states the consequence
+ * plainly: the owner signs an arm whose pool the operator can change between
+ * the preview quote and the arm. The arm therefore RE-DERIVES `mintUsdtWei`
+ * from the boot tier at arm time and DISCLOSES a tier change on its response,
+ * so the number the owner was shown and the number that was used are never
+ * silently different.
+ *
+ * Default 100. Verified 2026-09-06 at block 120338032: fee 100 ->
+ * `0x172fcd41e0913e95784454622d1c3724f546f849` (liquidity 3.234e24), fee 500 ->
+ * `0x36696169c63e42cd08ce11f5deebbcebae652050` (2.986e24), both `token0 = USDT`.
+ * Boot additionally proves the pool exists WITH NON-ZERO LIQUIDITY, because a
+ * pinned tier whose pool is empty makes every swap leg unfillable.
+ */
+export function resolveLendingSwapFeeTier(env: TradeEnv): 100 | 500 | 2500 | 10000 {
+  const raw = read(env, "LENDING_SWAP_FEE_TIER");
+  if (raw === "") return 100;
+  const parsed = Number(raw);
+  if (!LENDING_SWAP_FEE_TIERS.includes(parsed)) {
+    throw new Error(
+      `LENDING_SWAP_FEE_TIER must be one of ${LENDING_SWAP_FEE_TIERS.join(", ")}; got "${raw}".`,
+    );
+  }
+  return parsed as 100 | 500 | 2500 | 10000;
+}
+
+export type LendingVenueConfig = {
+  readonly vUsdt: Address;
+  readonly vBnb: Address;
+  readonly treasury: Address;
+  readonly swapFeeTier: 100 | 500 | 2500 | 10000;
+};
+
+function requireLendingAddress(env: TradeEnv, name: string): Address {
+  const raw = read(env, name);
+  if (raw === "") {
+    // Not "when LENDING_ENABLED is true": the read-only probes
+    // (`live-lending census|preview|guardable`) resolve this config with the
+    // guard OFF, on purpose, so an operator can check a deployment before
+    // enabling it. Naming the flag here sent them looking at the wrong line.
+    throw new Error(
+      `${name} is unset. The lending venue is pinned by address, not discovered: `
+      + "the boot validates it against the chain, and the read-only probes need it too.",
+    );
+  }
+  if (!isAddress(raw, { strict: false })) {
+    throw new Error(`${name} must be a 20-byte hex address; got "${raw}".`);
+  }
+  return getAddress(raw);
+}
+
+/**
+ * Resolve the lending venue. Only ever called when
+ * {@link resolveLendingEnabled} answered true.
+ *
+ * `LENDING_TREASURY_ADDRESS` falls back to `FEE_TREASURY_ADDRESS`, and vBNB is
+ * shared with the Venus guard's `VENUS_VBNB_ADDRESS` — one pinned address for
+ * the one native market, so the two surfaces cannot disagree about which
+ * contract vBNB is. USDT is NOT configured: it is derived at boot from
+ * `vUSDT.underlying()`, and `parseLendingHireParams`'s `token` is compared
+ * against the derived value.
+ */
+export function resolveLendingVenue(env: TradeEnv): LendingVenueConfig {
+  const treasuryRaw = read(env, "LENDING_TREASURY_ADDRESS");
+  return {
+    vUsdt: requireLendingAddress(env, "LENDING_VUSDT_ADDRESS"),
+    vBnb: requireLendingAddress(env, "VENUS_VBNB_ADDRESS"),
+    treasury:
+      treasuryRaw === ""
+        ? requireLendingAddress(env, "FEE_TREASURY_ADDRESS")
+        : requireLendingAddress(env, "LENDING_TREASURY_ADDRESS"),
+    swapFeeTier: resolveLendingSwapFeeTier(env),
+  };
+}
+
+/**
+ * The RPC fallback chain, most specific first.
+ *
+ * A lending deployment normally shares the Venus or LP endpoint; naming its own
+ * is for the case where the guard's read volume justifies a separate provider.
+ */
+export function resolveLendingRpcUrls(
+  env: TradeEnv,
+  publicRpcUrl: string,
+): readonly string[] {
+  const override = (
+    read(env, "LENDING_RPC_URL")
+    || read(env, "VENUS_RPC_URL")
+    || read(env, "LP_RPC_URL")
+  ).trim();
+  return [
+    ...new Set([...(override === "" ? [] : [override]), publicRpcUrl].filter((url) => url.length > 0)),
+  ];
+}
+
+/** Per-cycle agent concurrency for the lending worker. */
+export const LENDING_AGENT_CONCURRENCY = 4;
+
+export type LendingRuntimeConfig = {
+  readonly venue: LendingVenueConfig;
+  readonly intervalMs: number;
+  readonly maxObservationAgeMs: number;
+  readonly agentConcurrency: number;
+};
+
+export function resolveLendingRuntimeConfig(env: TradeEnv): LendingRuntimeConfig {
+  const intervalMs = resolveLendingWorkerIntervalMs(env);
+  return {
+    venue: resolveLendingVenue(env),
+    intervalMs,
+    maxObservationAgeMs: resolveLendingMaxObservationAgeMs(env, intervalMs),
+    agentConcurrency: LENDING_AGENT_CONCURRENCY,
+  };
+}

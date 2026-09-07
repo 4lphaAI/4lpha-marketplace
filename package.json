@@ -35,6 +35,8 @@
     "provision-venus": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/provision-venus-agent.ts",
     "provision-billing": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/provision-billing.ts",
     "venus-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/venus-worker.ts",
+    "lending-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/lending-worker.ts",
+    "live-lending": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-lending.ts",
     "billing-worker": "node --import tsx --env-file-if-exists=.env scripts/billing-worker.ts",
     "billing-status": "node --import tsx --env-file-if-exists=.env scripts/billing-status.ts",
     "billing-reconcile": "node --import tsx --env-file-if-exists=.env scripts/billing-reconcile.ts",

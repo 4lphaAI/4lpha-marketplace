@@ -13,7 +13,7 @@ export type Erc8004Identity = {
   readonly version: 1;
   readonly publicRef: string;
   readonly revision: number;
-  readonly category: "grid" | "trading" | "lp";
+  readonly category: "grid" | "trading" | "lp" | "lending";
   readonly status: "pending" | "registering" | "updating" | "registered" | "blocked";
   readonly agentId: string | null;
   readonly registrationTxHash: string | null;
@@ -41,7 +41,8 @@ export function parseErc8004Identity(value: unknown): Erc8004Identity | undefine
   if (Object.keys(raw).some((key) => !FIELDS.has(key))
     || raw["version"] !== 1 || typeof raw["publicRef"] !== "string" || !UUID.test(raw["publicRef"])
     || typeof raw["revision"] !== "number" || !Number.isSafeInteger(raw["revision"]) || raw["revision"] < 1
-    || (raw["category"] !== "grid" && raw["category"] !== "trading" && raw["category"] !== "lp")
+    || (raw["category"] !== "grid" && raw["category"] !== "trading" && raw["category"] !== "lp"
+      && raw["category"] !== "lending")
     || (raw["status"] !== "pending" && raw["status"] !== "registering" && raw["status"] !== "updating"
       && raw["status"] !== "registered" && raw["status"] !== "blocked")
     || (raw["agentId"] !== null && !uint256(raw["agentId"]))

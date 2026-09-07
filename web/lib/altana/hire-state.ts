@@ -23,7 +23,7 @@ export type HireSessionView = {
   readonly expiresAt?: number;
   readonly funding?: HireFunding;
   readonly sizing?: {
-    readonly sizingPreset: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1";
+    readonly sizingPreset: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1";
     readonly capDayWei: string;
     readonly openNativeBudgetWei: string;
     readonly sizingPresetVersion: 1;
@@ -35,7 +35,7 @@ export type HireSessionView = {
   readonly grantAttempt?: { readonly version: 1; readonly attemptId: `0x${string}`; readonly startedAtSec: number };
   readonly activationError?: "wallet_in_use" | "settings_conflict";
   /** Present once armed: the immutable hire profile the grid arm must stay inside. */
-  readonly hireSizing?: { readonly name: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1"; readonly version: 1; readonly openNativeBudgetWei: string } | null;
+  readonly hireSizing?: { readonly name: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1"; readonly version: 1; readonly openNativeBudgetWei: string } | null;
 };
 
 export type HireResumeStep = "s1" | "fund-and-grant" | "converge" | "poll" | "arm" | "terminal";

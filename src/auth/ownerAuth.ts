@@ -132,7 +132,22 @@ export type OwnerActionType =
   // domain. A new ACTION is a new value for the existing `action` string field,
   // not a new field.
   | "gridArm"
-  | "lpArm";
+  | "lpArm"
+  // MARKETPLACE-LENDING-AGENT §4, §6.1. THREE mutating owner actions and no
+  // others: the arm (which carries the complete settings, the native budget
+  // and the reserve split in one envelope), a settings replacement, and the
+  // retire that converts the reserve back to BNB in wallet B. The guardable
+  // preview and the detail view add NO member — the first is a perimeter read
+  // of public chain state and the second reuses `read` through
+  // `authorizeAccountRead`.
+  //
+  // Like every member above, each must appear in BOTH hand-maintained homes:
+  // this union AND the `OWNER_ACTIONS` runtime set below. A member in one and
+  // not the other is rejected before crypto with a generic failure, which an
+  // owner cannot tell apart from a forgery.
+  | "lendingArm"
+  | "lendingSettings"
+  | "lendingRetire";
 
 /**
  * The three LP members (PHASE3 Rev2 item 20): `lpOpen`, `lpSettings`, `lpExit`
@@ -211,6 +226,11 @@ const OWNER_ACTIONS: ReadonlySet<string> = new Set<OwnerActionType>([
   // which an owner cannot tell apart from a forgery.
   "gridArm",
   "lpArm",
+  // MARKETPLACE-LENDING-AGENT §4/§6.1 — the second home for the three lending
+  // owner actions.
+  "lendingArm",
+  "lendingSettings",
+  "lendingRetire",
 ]);
 
 /**

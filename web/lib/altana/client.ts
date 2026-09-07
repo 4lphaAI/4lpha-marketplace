@@ -489,6 +489,44 @@ export async function withdrawWbnbAsNative(input: {
   };
 }
 
+/**
+ * Bring the lending reserve home with the PASSKEY ALONE (§6.2, R2.5, R3.12).
+ *
+ * No session key, no plane, no server: after the seven-day expiry — or during
+ * any outage — this is the door that cannot be closed by anything the plane
+ * believes. The batch shape and its arithmetic live in `lending-recovery.ts` and
+ * are unit-tested against fixed inputs; this function only carries them to the
+ * SDK.
+ *
+ * The `withdrawWbnbAsNative` call shape is the precedent and NOTHING ELSE: its
+ * `WBNB.withdraw` leg is the FINDINGS (at) trap. The router unwraps inside the
+ * same multicall here.
+ *
+ * The result is returned VERBATIM — `execute` answers `status: "FAILED"` without
+ * throwing (CLAUDE.md, FINDINGS), so the caller must branch on `status` and must
+ * not read a resolved promise as success.
+ */
+export async function recoverLendingReserveWithPasskey(input: {
+  readonly record: StoredPasskey;
+  readonly calls: readonly { readonly to: Address; readonly value: bigint; readonly data: Hex }[];
+}): Promise<WithdrawResult> {
+  const walletAddress = input.record.walletAddress;
+  if (!walletAddress) throw new Error("This passkey has no agent wallet yet.");
+  if (input.calls.length === 0) throw new Error("There is nothing to recover.");
+  const signer = selectedSigner(input.record);
+  const result = await createAltanaClient().execute({
+    wallet: { address: walletAddress },
+    signer,
+    chainId: ALTANA_CHAIN_ID,
+    calls: input.calls.map((call) => ({ to: call.to, value: call.value, data: call.data })),
+  });
+  return {
+    status: result.status,
+    callsId: result.callsId,
+    ...(result.transactionHash ? { transactionHash: result.transactionHash } : {}),
+  };
+}
+
 function recordFrom(
   credential: PasskeyCredential,
   walletAddress: Address,
