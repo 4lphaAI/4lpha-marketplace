@@ -1323,7 +1323,20 @@ export const HIRE_SIZING_PRESETS = {
   },
 } as const;
 
-export type HireSizingPresetName = keyof typeof HIRE_SIZING_PRESETS | "trade-v1";
+/**
+ * The closed set of hire presets.
+ *
+ * `trade-v1` and `lending-v1` are members of the NAME and deliberately NOT of
+ * {@link HIRE_SIZING_PRESETS}: neither is an `LpNativeCapSizingInput` shape
+ * (no exits, no positions), so each carries its own preview type and its own
+ * sizing function — {@link TradeHireSizingPreview} / `checkTradeSizing`, and
+ * {@link LendingHireSizingPreview} / {@link checkLendingSizing}. Adding either
+ * to the record would give it four LP terms that mean nothing for it.
+ */
+export type HireSizingPresetName =
+  | keyof typeof HIRE_SIZING_PRESETS
+  | "trade-v1"
+  | "lending-v1";
 
 export type GridHireSizingPreview = {
   readonly name: HireSizingPresetName;
@@ -1436,6 +1449,14 @@ export function hireSizingPreview(input: {
       ok: sized.ok,
     };
   }
+  if (input.sizingPreset === "lending-v1") {
+    // The lending hire has its own preview (`lendingHireSizingPreview`) because
+    // its terms are a reserve split and a USDT cap, not exits and positions.
+    // Routing it through the LP record would silently produce grid figures.
+    throw new InvalidSessionSpecError(
+      "lending-v1 does not use hireSizingPreview; call lendingHireSizingPreview.",
+    );
+  }
   if (input.openNativeBudgetWei === undefined) throw new InvalidSessionSpecError("openNativeBudgetWei is required.");
   if (input.openNativeBudgetWei <= 0n) throw new InvalidSessionSpecError("openNativeBudgetWei must be positive.");
   const feeBps = input.feeBps ?? 0;
@@ -1499,6 +1520,16 @@ export function checkHireSizing(input: {
       ? { ok: true }
       : { ok: false, kind: "shortfall", shortfallWei: sized.shortfallWei,
           message: `Total capital must be at least ${sized.minimumCapWei} wei.` };
+  }
+  if (input.sizingPreset === "lending-v1") {
+    // Same reason as in `hireSizingPreview`: the lending check needs the
+    // reserve split, the USDT cap and the swap quote, none of which exist on
+    // this signature. `checkLendingSizing` is the one that runs at S1.
+    return {
+      ok: false,
+      kind: "malformed",
+      message: "lending-v1 is sized by checkLendingSizing, not by checkHireSizing.",
+    };
   }
   if (input.openNativeBudgetWei === undefined) {
     return { ok: false, kind: "malformed", message: "openNativeBudgetWei is required." };
@@ -2502,3 +2533,624 @@ export function checkVenusNativeCapSizing(
 }
 import { checkTradeSizing, maxGrantedTokens } from "../trade/sizing.js";
 import type { TradeExecutionModel } from "../trade/settings.js";
+
+/* -------------------------------------------------------------------------- */
+/* The LENDING guard template (MARKETPLACE-LENDING-AGENT R2.2, R2.5, §7)       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The selectors granted on vUSDT — THREE, and `redeem(uint256)` is deliberately
+ * absent (R2.5 / review OQ3).
+ *
+ * Both `redeem` forms pay `msg.sender` and neither is a custody widening over
+ * the other; the deciding argument is BATCH COMPOSABILITY. With `redeem(vBal)`
+ * the amount of USDT that will exist after the call is not known when the
+ * calldata is written, so every downstream leg in the same batch — the approve,
+ * the swap's `amountIn` — has to guess, which is precisely how Revision 1's
+ * retire came to strand ~80 % of the reserve. With `redeemUnderlying(x)` the
+ * plane chooses `x`, so the approve is exact and the swap input is exact, and
+ * the pool-cash bound of §5.4 applies uniformly to rescue and retire.
+ *
+ * Located in the deployed VBep20 implementation `0xCDfe...941e`:
+ * `mint(uint256)` 0xa0712d68, `redeemUnderlying(uint256)` 0x852a12e3,
+ * `repayBorrowBehalf(address,uint256)` 0x2608f818.
+ */
+export const LENDING_VUSDT_GRANTED_SELECTORS = [
+  "mint(uint256)",
+  "redeemUnderlying(uint256)",
+  "repayBorrowBehalf(address,uint256)",
+] as const;
+
+/**
+ * The ONE selector granted on vBNB, and ONLY when vBNB is a pinned debt market.
+ *
+ * `repayBorrowBehalf(address)` 0xe5974619, payable — the amount IS `msg.value`.
+ * `mint()` and every `redeem*` form stay refused for FINDINGS (at): vBNB pays
+ * out through a 2300-gas `.transfer()` that reverts against an EIP-7702
+ * wallet's delegation code, so a vBNB position minted by wallet B would be
+ * unredeemable. Repay sends value INTO the contract and is measured safe.
+ */
+export const LENDING_VBNB_GRANTED_SELECTORS = [
+  "repayBorrowBehalf(address)",
+] as const;
+
+/**
+ * THE CENSUS IS CLOSED. Every selector this template may ever emit, so a test
+ * can enumerate what a built spec granted and FAIL on any addition.
+ *
+ * The router and the treasury are TARGET-ONLY and therefore carry no selector;
+ * they are asserted separately.
+ */
+export const LENDING_GRANTED_SELECTORS: readonly string[] = [
+  ...LENDING_VUSDT_GRANTED_SELECTORS,
+  ...LENDING_VBNB_GRANTED_SELECTORS,
+  APPROVE_SELECTOR,
+];
+
+/**
+ * The set this template must never grant, by NAME, each absence carrying its
+ * reason (§7, amended by R2.5).
+ *
+ * `redeem(uint256)` leads the list because it is the one Revision 1 granted and
+ * Revision 2 dropped.
+ */
+export const LENDING_REFUSED_SELECTORS: readonly string[] = [
+  "redeem(uint256)",
+  "borrow(uint256)",
+  "enterMarkets(address[])",
+  "exitMarket(address)",
+  "mint()",
+  "repayBorrow()",
+  "repayBorrow(uint256)",
+  "mintBehalf(address,uint256)",
+  "claimVenus(address,address[])",
+  "claimInterest(address,address)",
+  "transfer(address,uint256)",
+  "transferFrom(address,address,uint256)",
+  "multicall(bytes[])",
+  "deposit()",
+  "withdraw(uint256)",
+];
+
+/**
+ * The role a market plays in a lending grant.
+ *
+ * `repay-behalf` is the debt side (the guard pays somebody else's borrow);
+ * `reserve` is the vUSDT side the reserve is supplied into and redeemed from.
+ * They are different selector sets on different contracts and a caller that
+ * conflates them gets the wrong answer from {@link grantsLendingMarket}.
+ */
+export type LendingMarketRole = "repay-behalf" | "reserve";
+
+export type LendingSessionSpecInput = {
+  /** vUSDT — the reserve market. Granted mint / redeemUnderlying / repayBehalf. */
+  readonly vUsdt: Address;
+  /** USDT, derived at boot from `vUSDT.underlying()`. Gets approve + cap. */
+  readonly usdt: Address;
+  /**
+   * vBNB, granted `repayBorrowBehalf(address)` ONLY when the owner pinned it as
+   * a debt market. Omit otherwise — an ungranted market is one fewer target a
+   * leaked key reaches.
+   */
+  readonly vBnb?: Address;
+  /** The dedicated Pancake V3 SwapRouter. TARGET-ONLY (OQ4). */
+  readonly routerV3: Address;
+  /** Fee treasury. Target-only, uncapped, fee-free v1 (the LP/Venus precedent). */
+  readonly treasury: Address;
+  /** Wallet B. REFUSED as a target, template-locally and via validate (R2.2). */
+  readonly walletAddress: Address;
+  /** The Altana KeyStore. REFUSED as a target, both ways (R2.2). */
+  readonly keyStoreAddress: Address;
+  /** NATIVE spend caps. MUST be non-empty; none may name a token. */
+  readonly nativeCaps: readonly SpendCap[];
+  /** `reserveCapWei` — the USDT rolling-day cap. REQUIRED, positive. */
+  readonly usdtDailyCapWei: bigint;
+  readonly usdtCapPeriod?: SpendPeriod;
+  readonly expiresAt: number;
+  readonly nowSeconds?: number;
+  /** The freshly-read routing census. Supplied by the grant path. */
+  readonly routing?: VenusRoutingCensus;
+};
+
+/**
+ * Build the canonical LENDING guard `SessionSpec`.
+ *
+ * === THE CUSTODY SENTENCE, IN ITS TRUE FORM (R2.2) ========================
+ *
+ * Wallet B's reserve is protected by three things and no fourth: the on-chain
+ * per-token and native caps, the call allowlist, and the 7-day expiry. **A
+ * leaked session key can move the reserve OUT of wallet B to an address of its
+ * choosing** — by approving any spender on USDT, or by naming any `recipient`
+ * on the granted router — bounded per rolling day by the USDT cap
+ * (`usdtDailyCapWei`) and the native cap, and over the session's life by seven
+ * times each. That is the same posture {@link venusSessionSpec} states and the
+ * same posture every LP and Grid session on this platform already carries.
+ * What the template DOES remove is the ability to borrow, to enter or exit
+ * markets, to touch the wallet's own admin surface or the KeyStore, and to mint
+ * an unredeemable native position (FINDINGS (at)). The hard stops remain the
+ * caps, the expiry, and an owner-signed revoke.
+ *
+ * === THE EXCEPTION TO `venusSessionSpec`'S OWN DOCSTRING (L8) =============
+ *
+ * `venusSessionSpec` states "Nothing is bare-selector; nothing is target-only
+ * on a contract that can move a token". THIS TEMPLATE BREAKS THE SECOND HALF
+ * DELIBERATELY: the Pancake V3 SwapRouter is granted TARGET-ONLY, and it is a
+ * contract that moves tokens under an allowance and pays an arbitrary
+ * `recipient`.
+ *
+ * The reason is OQ4's, and it is that the tighter-looking rule is a costume.
+ * Every proven builder wraps its swap in `multicall(bytes[])`
+ * (`src/ops/pancakeV3.ts`), and "a multicall grant IS a target-only grant in
+ * disguise (the delegatecall-to-self argument)" — this file at :443-455.
+ * Per-selector on this router would have to grant `multicall` and thereby
+ * everything behind it, so it would be identical authority with a tighter
+ * spelling. And no selector restriction on this router bounds where value goes
+ * in any case: `exactInputSingle` and `unwrapWETH9` both carry a caller-chosen
+ * `recipient`. The bounds are the caps and the expiry, nothing else — which is
+ * exactly what the custody paragraph above says.
+ */
+export function lendingSessionSpec(input: LendingSessionSpecInput): SessionSpec {
+  const nowSeconds = input.nowSeconds ?? Math.floor(Date.now() / 1000);
+  const ceiling = nowSeconds + MAX_VENUS_SESSION_SECONDS;
+  const expiresAt = Math.min(input.expiresAt, ceiling);
+
+  if (input.routing !== undefined) assertVenusRoutingUnchanged(input.routing);
+
+  if (input.nativeCaps.length === 0) {
+    throw new InvalidSessionSpecError(
+      "lendingSessionSpec requires at least one native spend cap; an empty list is uncapped.",
+    );
+  }
+  for (const [index, cap] of input.nativeCaps.entries()) {
+    if (cap.token !== undefined) {
+      throw new InvalidSessionSpecError(
+        `nativeCaps[${index}] names a token. The USDT cap comes from \`usdtDailyCapWei\`, which grants the matching approve rule too.`,
+      );
+    }
+  }
+  if (input.usdtDailyCapWei <= 0n) {
+    throw new InvalidSessionSpecError(
+      "lendingSessionSpec: usdtDailyCapWei has no positive value. The reserve's per-token cap is SIZED, never defaulted — it is the only bound on a leaked key's approve-spender drain (R2.2).",
+    );
+  }
+  if (input.usdtDailyCapWei >= DEFAULT_TOKEN_CAP_LIMIT) {
+    throw new InvalidSessionSpecError(
+      "lendingSessionSpec: usdtDailyCapWei was granted the effectively-unlimited trade-template cap (>= 2^160). That posture is FORBIDDEN here: this cap is the sole bound on an approve-spender drain of the owner's reserve.",
+    );
+  }
+
+  // Role collision, across every address in the grant PLUS the two structural
+  // refusals (R2.2). A treasury equal to USDT would be an uncapped target-only
+  // rule on an ERC-20; a router equal to vUSDT would merge the swap authority
+  // with the redeem authority; and a grant naming wallet B or the KeyStore is
+  // the escalation route `structuralTargetRefusal` exists for — refused HERE
+  // too, so the template's own refusal does not depend on the call site
+  // remembering to pass the options.
+  const roles: (readonly [string, Address])[] = [
+    ["vUsdt", input.vUsdt],
+    ["usdt", input.usdt],
+    ["routerV3", input.routerV3],
+    ["treasury", input.treasury],
+    ["walletAddress", input.walletAddress],
+    ["keyStoreAddress", input.keyStoreAddress],
+    ...(input.vBnb === undefined ? [] : [["vBnb", input.vBnb] as const]),
+  ];
+  for (let a = 0; a < roles.length; a += 1) {
+    for (let b = a + 1; b < roles.length; b += 1) {
+      const left = roles[a];
+      const right = roles[b];
+      if (
+        left !== undefined &&
+        right !== undefined &&
+        left[1].toLowerCase() === right[1].toLowerCase()
+      ) {
+        throw new InvalidSessionSpecError(
+          `lendingSessionSpec: ${left[0]} and ${right[0]} are the same address (${left[1]}). Each address plays a distinct role in the grant; a collision merges two authorities the template keeps apart.`,
+        );
+      }
+    }
+  }
+
+  const vBnb = input.vBnb;
+  const allowedCalls: CallRule[] = [
+    ...LENDING_VUSDT_GRANTED_SELECTORS.map((selector) => ({
+      to: input.vUsdt,
+      selector,
+    })),
+    ...(vBnb === undefined
+      ? []
+      : LENDING_VBNB_GRANTED_SELECTORS.map((selector) => ({ to: vBnb, selector }))),
+    // TARGET-BOUND approve. The SPENDER is an argument `CallRule` cannot
+    // constrain; it stays bounded by the builders naming vUSDT / the router
+    // from resolved config, never from a request field — and by the cap below,
+    // which is what actually bounds a leaked key.
+    { to: input.usdt, selector: APPROVE_SELECTOR },
+    // Target-only, for the reason in the docstring above.
+    { to: input.routerV3 },
+    // Fee-free v1, treasury granted anyway so a later fee is a config change
+    // rather than a re-grant.
+    { to: input.treasury },
+  ];
+
+  const spendCaps: SpendCap[] = [
+    ...input.nativeCaps,
+    {
+      token: input.usdt,
+      limit: input.usdtDailyCapWei,
+      period: input.usdtCapPeriod ?? DEFAULT_TOKEN_CAP_PERIOD,
+    },
+  ];
+
+  const spec: SessionSpec = { allowedCalls, spendCaps, expiresAt };
+  validateSessionSpec(spec, {
+    nowSeconds,
+    maxSessionSeconds: MAX_VENUS_SESSION_SECONDS,
+    walletAddress: input.walletAddress,
+    keyStoreAddress: input.keyStoreAddress,
+  });
+  return spec;
+}
+
+/**
+ * Whether a session grants everything one lending role on `vToken` needs.
+ *
+ * The settings and arm routes call this as an EARLY WARNING: a persisted
+ * `sessionFacts.spec` goes stale the moment the owner widens the session on
+ * chain, and `preflightExecute` at ACTION time is the guarantee — the chain is
+ * the authority NOW (Phase 2.4).
+ */
+export function grantsLendingMarket(
+  spec: SessionSpec,
+  vToken: Address,
+  role: LendingMarketRole,
+): boolean {
+  const target = vToken.toLowerCase();
+  const granted = new Set<string>();
+  for (const rule of spec.allowedCalls) {
+    if (rule.to === undefined || rule.to.toLowerCase() !== target) continue;
+    if (rule.selector === undefined) continue;
+    granted.add(rule.selector);
+  }
+  if (role === "reserve") {
+    return LENDING_VUSDT_GRANTED_SELECTORS.every((selector) => granted.has(selector));
+  }
+  // `repay-behalf` is satisfied by EITHER shape: the ERC-20 market's
+  // two-argument form, or vBNB's payable one-argument form.
+  return (
+    granted.has("repayBorrowBehalf(address,uint256)")
+    || granted.has("repayBorrowBehalf(address)")
+  );
+}
+
+/**
+ * The exposure PRODUCT the lending hire screen must print — `cap x periods`,
+ * never the per-period rate alone (FINDINGS (r), R2.3).
+ *
+ * A thin wrapper over {@link venusExposureProduct} rather than a second
+ * implementation: the arithmetic is identical and two copies would be two
+ * numbers to keep honest.
+ */
+export function lendingExposureProduct(input: {
+  readonly nativeDailyCapWei: bigint;
+  readonly usdt: Address;
+  readonly usdtDailyCapWei: bigint;
+  readonly sessionSeconds: number;
+}): ReturnType<typeof venusExposureProduct> {
+  return venusExposureProduct({
+    nativeDailyCapWei: input.nativeDailyCapWei,
+    tokens: [
+      { token: input.usdt, vToken: input.usdt, dailyCapWei: input.usdtDailyCapWei },
+    ],
+    sessionSeconds: input.sessionSeconds,
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Lending sizing constants and the S1 / arm check                            */
+/* -------------------------------------------------------------------------- */
+
+/** Reserve split `r` — the share of the budget kept as native BNB (§0.3). */
+export const LENDING_RESERVE_BPS_DEFAULT = 2_000;
+export const LENDING_RESERVE_BPS_MIN = 1_000;
+export const LENDING_RESERVE_BPS_MAX = 5_000;
+
+/**
+ * Dust floor for the retire's effect check, in USDT wei (18 decimals on BSC).
+ *
+ * 0.01 USDT. It is the FLOOR of a RELATIVE bound (R3.12): the residue after
+ * `redeemUnderlying` scales with the reserve while an absolute constant does
+ * not, so a five-figure reserve retired perfectly can leave more than this and
+ * would otherwise never reach `retired` — which would wedge Remove.
+ */
+export const LENDING_DUST_USDT_WEI = 10_000_000_000_000_000n;
+
+/**
+ * The most markets account A may be in before the guard refuses to price it
+ * (R2.10, R3.11).
+ *
+ * A is a THIRD PARTY who may enter markets at any time after the hire, and
+ * `readAccount` fans out ~8 reads per market with no cap of its own. 24 is
+ * comfortably above any real borrower's footprint and comfortably below the
+ * Core pool's 52. Crossing it after the hire is the standing condition
+ * `account-too-complex`, never a silent slow cycle.
+ */
+export const LENDING_MAX_MARKETS = 24;
+
+/**
+ * Per-token floor below which a debt is `guarded-no-debt` rather than a rescue
+ * target (L10).
+ *
+ * R2.6's 10-bps overpay clamp yields `r = 0` at `borrowCurrent == 1`, which
+ * `sizeVenusRepay` would surface as `insufficient-wallet-balance` — a wrong
+ * name for a dust debt. Below this floor there is nothing worth a relay fee.
+ */
+export const LENDING_MIN_REPAY_WEI: Readonly<{ usdt: bigint; native: bigint }> = {
+  usdt: 10_000_000_000_000_000n,
+  native: 10_000_000_000_000n,
+};
+
+/** `ceil(a / b)` for positive `b`. */
+function lendingCeilDiv(a: bigint, b: bigint): bigint {
+  if (b <= 0n) throw new Error("lendingCeilDiv: divisor must be positive.");
+  if (a <= 0n) return 0n;
+  return (a + b - 1n) / b;
+}
+
+export type LendingSizingInput = {
+  /** The native BNB the owner is committing at this hire / arm. */
+  readonly budgetWei: bigint;
+  /** The signed reserve split, in basis points. */
+  readonly reserveBps: number;
+  /** The rolling daily NATIVE cap being granted (or already granted) on chain. */
+  readonly capDayWei: bigint;
+  /** `reserveCapWei` — the rolling daily USDT cap. */
+  readonly reserveCapWei: bigint;
+  /**
+   * The USDT the arm's swap is expected to mint — `sagaSwapMinOut` of a live
+   * quote at the arm, the quoter's own answer at the preview.
+   */
+  readonly mintUsdtWei: bigint;
+  /**
+   * What the BNB tier could buy back in USDT: `sagaSwapMinOut(quote(wbnb->USDT,
+   * reserveNativeWei))`. `0n` when no quote is available, which makes the floor
+   * SMALLER and is therefore stated rather than defaulted.
+   */
+  readonly tierBuyBackUsdtWei: bigint;
+  /** `rescueReserveCount` from the settings being signed. */
+  readonly rescueReserveCount: number;
+};
+
+/**
+ * THE LENDING PROVISIONING SIZING CHECK — an EARLY WARNING, and it says so.
+ *
+ * === THE USDT FLOOR PRICES EVERY APPROVE (R3.1, closing REVIEW2 H1) =======
+ *
+ * The on-chain cap meters an `approve` AT ITS APPROVED AMOUNT (FINDINGS (h)),
+ * for whatever spender. This phase emits four kinds of USDT approve and only
+ * two of them are bounded by `maxPerAction`:
+ *
+ * ```
+ *   arm                  approve(USDT, vUSDT, mintUsdtWei)            unbounded by maxPerAction
+ *   USDT-debt rescue     approve(USDT, vUSDT, r)                      bounded
+ *   BNB-debt rescue      approve(USDT, router, swapIn)                UNBOUNDED - up to the whole reserve
+ *   retire               approve(USDT, router, idle + redeemed)       UNBOUNDED - the whole reserve by construction
+ * ```
+ *
+ * So the floor is written in terms of what the RESERVE can ever be, not in
+ * terms of a per-action ceiling that may not even exist (a vBNB-only guard
+ * names no USDT entry at all):
+ *
+ * ```
+ *   usdtReserveCeilingWei = mintUsdtWei + tierBuyBackUsdtWei
+ *   usdtCapFloorWei       = ceil(11 x mintUsdtWei / 10) + usdtReserveCeilingWei
+ * ```
+ *
+ * The first term is the arm's own approve with 10 % of quote drift; the second
+ * is one rolling day of approves to ANY spender, bounded by holdings. A retire
+ * on the ARM DAY then fits by construction when no rescue ran that day, because
+ * the arm consumes at most `1.1 x mint` and the remainder is at least the
+ * reserve ceiling. When a rescue DID run, the retire route reads the live USDT
+ * `capRemaining` and answers with figures instead of submitting into FINDINGS
+ * (h)'s silent PENDING.
+ *
+ * === THE NATIVE TERM IS UNCONDITIONAL (R3.2, closing REVIEW2 H2) ==========
+ *
+ * ```
+ *   capDayWei > supplyNativeWei + budgetWei + (rescueReserveCount + 2) x RELAY_FEE_PER_EXIT_WEI
+ * ```
+ *
+ * `budgetWei` covers BOTH the BNB-debt repay's `value: r` AND the USDT-only
+ * guard's pool-cash fallback swap, because `buildPancakeV3Buy` attaches
+ * `value: amountInWei`. Revision 2's `(vBNB in debtMarkets) ? budgetWei : 0n`
+ * branch budgeted ZERO for the very fallback decision 4 exists to fund, and is
+ * deleted.
+ *
+ * === WHAT A GREEN CHECK MEANS ============================================
+ *
+ * The same thing it means for {@link checkVenusNativeCapSizing}: it reserves
+ * per-SUBMISSION arithmetic on the still-unmeasured
+ * {@link RELAY_FEE_PER_EXIT_WEI}, and a rescue is NEVER refused for want of
+ * headroom. The submit-time guarantees are the count-aware wallet floor inside
+ * the rescue's own `min(...)` and the live `capRemaining` clamp.
+ */
+export function checkLendingSizing(input: LendingSizingInput): NativeCapSizing {
+  if (
+    !Number.isInteger(input.rescueReserveCount)
+    || input.rescueReserveCount < 1
+  ) {
+    return {
+      ok: false,
+      kind: "malformed",
+      message:
+        "rescueReserveCount must be an integer >= 1; the gas reserve cannot be sized on a malformed count.",
+    };
+  }
+  if (
+    !Number.isInteger(input.reserveBps)
+    || input.reserveBps < LENDING_RESERVE_BPS_MIN
+    || input.reserveBps > LENDING_RESERVE_BPS_MAX
+  ) {
+    return {
+      ok: false,
+      kind: "malformed",
+      message:
+        `reserveBps must be an integer in ${LENDING_RESERVE_BPS_MIN}..${LENDING_RESERVE_BPS_MAX} ` +
+        `(the owner-adjustable 10 %-50 % split); got ${input.reserveBps}.`,
+    };
+  }
+  if (input.budgetWei <= 0n) {
+    return { ok: false, kind: "malformed", message: "budgetWei must be positive." };
+  }
+  if (
+    input.capDayWei < 0n
+    || input.reserveCapWei < 0n
+    || input.mintUsdtWei < 0n
+    || input.tierBuyBackUsdtWei < 0n
+  ) {
+    return { ok: false, kind: "malformed", message: "Amounts must not be negative." };
+  }
+
+  const reserveNativeWei = (input.budgetWei * BigInt(input.reserveBps)) / 10_000n;
+  const supplyNativeWei = input.budgetWei - reserveNativeWei;
+
+  // The BNB tier must at least cover the wallet floor plus a day of relay
+  // reimbursements, or the guard is armed over a tier that cannot pay for its
+  // own submissions.
+  const tierFloorWei =
+    walletNativeFloorWei()
+    + BigInt(input.rescueReserveCount) * RELAY_FEE_PER_EXIT_WEI;
+  if (reserveNativeWei < tierFloorWei) {
+    return {
+      ok: false,
+      kind: "shortfall",
+      shortfallWei: tierFloorWei - reserveNativeWei,
+      message:
+        `The BNB tier is too small to pay for the rescues it is meant to fund. ` +
+        `reserve ${reserveNativeWei} wei (${input.reserveBps} bps of ${input.budgetWei}) ` +
+        `must be at least the wallet floor ${walletNativeFloorWei()} + ` +
+        `${input.rescueReserveCount} x ${RELAY_FEE_PER_EXIT_WEI} = ${tierFloorWei} wei. ` +
+        `Remedies: raise the budget, or raise the reserve %.`,
+    };
+  }
+
+  // R3.2 - unconditional on `debtMarkets`, and it covers a BOTH-MARKETS day
+  // (AUDIT A-M1).
+  //
+  // The term used to be `supply + budget + fees`, which prices ONE rescue. A
+  // guard pinned to both markets can have two in a day that BOTH attach
+  // native: a pool-short USDT rescue converts up to the whole BNB tier
+  // (`buildPancakeV3Buy` attaches `value: amountIn`), and a BNB rescue attaches
+  // `value: r`. `reserveNativeWei` IS that tier, so adding it is exactly the
+  // second leg — the measured gap was 0.933 vs 0.9008 BNB on the audit's own
+  // fixture. It never refused a rescue (nothing here does); it made the second
+  // one of the day a `native-cap-exhausted` partial, which is the wrong answer
+  // to give an owner who sized their hire on this check.
+  const dualMarketNativeWei = reserveNativeWei;
+  const nativeRequired =
+    supplyNativeWei
+    + input.budgetWei
+    + dualMarketNativeWei
+    + BigInt(input.rescueReserveCount + 2) * RELAY_FEE_PER_EXIT_WEI;
+  if (input.capDayWei <= nativeRequired) {
+    return {
+      ok: false,
+      kind: "shortfall",
+      shortfallWei: nativeRequired - input.capDayWei + 1n,
+      message:
+        `The on-chain daily native cap does not cover an arm plus a day of rescues. ` +
+        `cap ${input.capDayWei} wei must EXCEED the arm swap's msg.value ${supplyNativeWei} ` +
+        `+ one full rescue ${input.budgetWei} (a BNB repay's value, or a USDT guard's ` +
+        `pool-cash fallback swap) + the BNB tier ${dualMarketNativeWei} (a both-markets ` +
+        `day spends both) + gas reserve ` +
+        `${BigInt(input.rescueReserveCount + 2) * RELAY_FEE_PER_EXIT_WEI} ` +
+        `(= ${input.rescueReserveCount + 2} submissions x ${RELAY_FEE_PER_EXIT_WEI} wei) ` +
+        `= ${nativeRequired} wei; short by ${nativeRequired - input.capDayWei + 1n} wei. ` +
+        `THIS IS AN EARLY WARNING, NOT A GUARANTEE: RELAY_FEE_PER_EXIT_WEI is still a ` +
+        `padded estimate, and a rescue is NEVER refused for want of headroom.`,
+    };
+  }
+
+  // R3.1 - the two-term USDT floor.
+  const usdtReserveCeilingWei = input.mintUsdtWei + input.tierBuyBackUsdtWei;
+  const usdtCapFloorWei =
+    lendingCeilDiv(11n * input.mintUsdtWei, 10n) + usdtReserveCeilingWei;
+  if (input.reserveCapWei < usdtCapFloorWei) {
+    return {
+      ok: false,
+      kind: "shortfall",
+      shortfallWei: usdtCapFloorWei - input.reserveCapWei,
+      message:
+        `The USDT day cap does not cover the reserve it is meant to move. ` +
+        `reserveCapWei ${input.reserveCapWei} must be at least the arm's own approve ` +
+        `${lendingCeilDiv(11n * input.mintUsdtWei, 10n)} (mint ${input.mintUsdtWei} + 10 % ` +
+        `quote drift) + one rolling day of rescue/retire approves ${usdtReserveCeilingWei} ` +
+        `(everything the reserve can be: supplied ${input.mintUsdtWei} + what the BNB tier ` +
+        `can buy back ${input.tierBuyBackUsdtWei}) = ${usdtCapFloorWei} wei; short by ` +
+        `${usdtCapFloorWei - input.reserveCapWei} wei. Every USDT approve is metered at ` +
+        `its approved amount, whichever spender it names (FINDINGS (h)).`,
+    };
+  }
+
+  return { ok: true };
+}
+
+/** The figures {@link checkLendingSizing} derives, for the hire preview. */
+export type LendingHireSizingPreview = {
+  readonly name: "lending-v1";
+  readonly version: 1;
+  readonly openNativeBudgetWei: string;
+  readonly reserveBps: number;
+  readonly reserveNativeWei: string;
+  readonly supplyNativeWei: string;
+  readonly mintUsdtWei: string;
+  readonly usdtReserveCeilingWei: string;
+  readonly reserveCapFloorWei: string;
+  readonly rescueReserveCount: number;
+  readonly tierFloorWei: string;
+  readonly relayFeePerSubmitWei: string;
+  readonly minimumCapDayWei: string;
+  readonly ok: boolean;
+  /** Present when `ok` is false — the refusal the owner would have hit. */
+  readonly refusal?: string;
+};
+
+/** Server-owned arithmetic for the lending hire preview and receipt. */
+export function lendingHireSizingPreview(
+  input: LendingSizingInput,
+): LendingHireSizingPreview {
+  const reserveNativeWei = (input.budgetWei * BigInt(input.reserveBps)) / 10_000n;
+  const supplyNativeWei = input.budgetWei - reserveNativeWei;
+  const usdtReserveCeilingWei = input.mintUsdtWei + input.tierBuyBackUsdtWei;
+  const reserveCapFloorWei =
+    lendingCeilDiv(11n * input.mintUsdtWei, 10n) + usdtReserveCeilingWei;
+  const count = Math.max(1, Math.trunc(input.rescueReserveCount));
+  const tierFloorWei =
+    walletNativeFloorWei() + BigInt(count) * RELAY_FEE_PER_EXIT_WEI;
+  const minimumCapDayWei =
+    supplyNativeWei
+    + input.budgetWei
+    // AUDIT A-M1: the both-markets day's second native leg. The preview and
+    // the check derive the SAME figure or the preview stops being the hire's
+    // early warning — which is the whole reason this function exists.
+    + reserveNativeWei
+    + BigInt(count + 2) * RELAY_FEE_PER_EXIT_WEI
+    + 1n;
+  const sized = checkLendingSizing(input);
+  return {
+    name: "lending-v1",
+    version: 1,
+    openNativeBudgetWei: input.budgetWei.toString(10),
+    reserveBps: input.reserveBps,
+    reserveNativeWei: reserveNativeWei.toString(10),
+    supplyNativeWei: supplyNativeWei.toString(10),
+    mintUsdtWei: input.mintUsdtWei.toString(10),
+    usdtReserveCeilingWei: usdtReserveCeilingWei.toString(10),
+    reserveCapFloorWei: reserveCapFloorWei.toString(10),
+    rescueReserveCount: input.rescueReserveCount,
+    tierFloorWei: tierFloorWei.toString(10),
+    relayFeePerSubmitWei: RELAY_FEE_PER_EXIT_WEI.toString(10),
+    minimumCapDayWei: minimumCapDayWei.toString(10),
+    ok: sized.ok,
+    ...(sized.ok ? {} : { refusal: sized.message }),
+  };
+}

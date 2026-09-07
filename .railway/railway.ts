@@ -47,6 +47,13 @@ export default defineRailway(() => {
     FEE_BPS: "100",
     GRID_ENABLED: "true",
     LP_ENABLED: "true",
+    // DEMO MODE. Simulated grid/trading agents on live prices: no session, no
+    // key, no grant and no path to a transaction (`src/demo/**`, and the import
+    // ban its `types.ts` documents). The worker runs inline in the API process
+    // by default — one timer over shared reads — so no second service is
+    // needed; set `DEMO_WORKER_INLINE=false` here if one is ever added, so the
+    // two never drive the same rows at once.
+    DEMO_ENABLED: "true",
     HIRE_ENABLED: "true",
     TRADE_AGENT_ENABLED: "true",
     LP_MAX_PRICE_IMPACT_BPS: "100",
@@ -84,6 +91,31 @@ export default defineRailway(() => {
     TRADE_LLM_MODEL: "0gm-1.0-35b-a3b",
   };
 
+  // The lending venue, pinned by address rather than discovered. Both the API
+  // and the worker resolve the same config, so it lives in one place.
+  //
+  // VENUS_PRIME_ADDRESS is load-bearing even though the guard grants Prime
+  // NOTHING: the boot census compares Prime's EIP-1967 implementation against
+  // the recorded routing, and an unset value resolves Prime to the Comptroller,
+  // so the comparison cannot match and EVERY lending grant refuses. Verified on
+  // chain 2026-09-08: this proxy's implementation slot reads
+  // 0x18cb7198cbb6d6e94001458cf3cf47c106d83a1b, exactly what the census records
+  // (FINDINGS (bn) §1, which also carries the full PASS table at block
+  // 120 530 819).
+  //
+  // WARNING, blast radius: `buildLendingServerDeps` is awaited at the top level
+  // of `src/index-server.ts` with no try/catch and reads the chain — underlying,
+  // pool liquidity and the routing census. A failure there is a BOOT failure for
+  // execution-api, which serves grid, LP and trading too. Rollback is one step:
+  // set LENDING_ENABLED to "false" here (or in the dashboard) and redeploy.
+  const lendingVenue = {
+    LENDING_ENABLED: "true",
+    LENDING_VUSDT_ADDRESS: "0xfD5840Cd36d94D7229439859C0112a4185BC0255",
+    VENUS_VBNB_ADDRESS: "0xA07c5b74C9B40447a954e1466938b865b6BBea36",
+    VENUS_PRIME_ADDRESS: "0x059eaba8676b03e4e8f009efb7f587c28450f50f",
+    LENDING_SWAP_FEE_TIER: "100",
+  };
+
   const api = service("execution-api", {
     source,
     build: servicesImage,
@@ -101,6 +133,15 @@ export default defineRailway(() => {
       EXECUTION_OPERATOR_TOKEN: preserve(),
       OWNER_READ_SESSION_SECRET: preserve(),
       DATA_PLANE_TOKEN: preserve(),
+      // Lending. Without these three the `/lending/*` routes 404 byte-identically
+      // to an unknown path and the hire's preview receipt cannot be minted.
+      ...lendingVenue,
+      // 64 lowercase hex, its OWN secret — never derived from
+      // EXECUTION_MASTER_KEY, which has exactly one consumer. Generate once with
+      // `openssl rand -hex 32` in Git Bash and paste the VALUE (cmd.exe has
+      // stored the literal `$(openssl …)` string here before). Absent ⇒ S1 is
+      // fail-closed and mints no receipt.
+      LENDING_PREVIEW_SECRET: preserve(),
     },
   });
 
@@ -136,6 +177,53 @@ export default defineRailway(() => {
       ...fromApi,
       ...llm,
       TRADE_LLM_API_KEY: trade.env.TRADE_LLM_API_KEY,
+    },
+  });
+
+  // LENDING WORKER — PREPARED, DELIBERATELY NOT DECLARED YET.
+  //
+  // `scripts/lending-worker.ts` REFUSES to start when `LENDING_ENABLED` is not
+  // exactly "true" (it throws; `src/lending/wiring.ts:150-166` does the same for
+  // `DATABASE_URL` and chain 56). With `restartPolicyType: "ALWAYS"` a service
+  // declared before the flag is on would crash-loop forever, so this block goes
+  // live in the SAME change that turns the guard on — not before.
+  //
+  // Enabling lending touches TWO services, not one:
+  //   execution-api   + LENDING_ENABLED, LENDING_VUSDT_ADDRESS,
+  //                     LENDING_PREVIEW_SECRET  (without these the `/lending/*`
+  //                     routes 404 byte-identically to an unknown path, and the
+  //                     hire's preview receipt cannot be minted or verified)
+  //   lending-worker  the block below
+  //
+  // `LENDING_PREVIEW_SECRET` is a DEDICATED 64-hex secret (never derived from
+  // `EXECUTION_MASTER_KEY` — that key has exactly one consumer). Set it once in
+  // the dashboard on execution-api and reference it here, the way the other
+  // shared secrets are wired. `LENDING_VUSDT_ADDRESS` is checked at boot by
+  // reading `underlying()`; a wrong address fails the boot rather than a
+  // request. `LENDING_SWAP_FEE_TIER` defaults to 100 and is validated at boot
+  // against a live WBNB/USDT pool with non-zero liquidity.
+  //
+  // ACTIVE since 2026-09-08. Without this service nothing ever rescues: the
+  // API's flag only opens hire and arm, and the guard is the worker.
+  //
+  // EXACTLY ONE lending worker per database — the advisory lock and the claim
+  // CAS bound two racing workers to one submission per interval, but two
+  // daemons are not a supported configuration. If anyone runs
+  // `npm run lending-worker` against this Postgres, stop this service first.
+  const lending = service("lending-worker", {
+    source,
+    build: servicesImage,
+    deploy: {
+      startCommand: "node --import tsx scripts/lending-worker.ts",
+      restartPolicyType: "ALWAYS",
+    },
+    env: {
+      ...plane,
+      ...fromApi,
+      ...lendingVenue,
+      LENDING_PREVIEW_SECRET: api.env.LENDING_PREVIEW_SECRET,
+      // Optional; the defaults are the audited ones.
+      // LENDING_WORKER_INTERVAL_MS: "30000",   // floor 15000
     },
   });
 
