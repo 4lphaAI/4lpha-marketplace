@@ -959,8 +959,9 @@ function HealthScale({ nowHf, trigger, target }: {
         <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--warn)", background: "var(--surface-card)", padding: "3px 7px", border: "1px solid var(--line-3)", borderRadius: "var(--radius-sm)", whiteSpace: "nowrap" }}>TRIGGER {trigger.toFixed(2)}</span>
       </span>
     </div>
-    <div style={{ display: "flex", marginTop: 60 }}>
-      {zones.map((zone) => <span key={zone.k} style={{ width: `${at(zone.to) - at(zone.from)}%`, display: "grid", gap: 5, alignContent: "start", paddingLeft: 8, borderLeft: "1px solid var(--line-2)" }}>
+    {/* Only the bar scales with the thresholds; labels need readable width even for a 0.01 HF gap. */}
+    <div data-testid="lending-zone-legend" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 12, marginTop: 60 }}>
+      {zones.map((zone) => <span key={zone.k} style={{ minWidth: 0, display: "grid", gap: 5, alignContent: "start", paddingLeft: 8, borderLeft: "1px solid var(--line-2)" }}>
         <span style={{ font: "var(--weight-medium) var(--text-xs)/1.35 var(--font-mono)", color: zone.color, letterSpacing: "0.03em" }}>{zone.cap}</span>
         <span style={{ ...mono, letterSpacing: 0 }}>{zone.note}</span>
       </span>)}
