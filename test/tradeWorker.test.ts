@@ -399,6 +399,33 @@ describe("trade worker cycle", () => {
     assert.ok((run?.refusals ?? 0) >= 1);
   });
 
+  it("filters an excluded legacy-grant target before the entry LLM", async () => {
+    const usdt = getAddress("0x55d398326f99059fF775485246999027B3197955");
+    const base = dataPlane(5);
+    const validRows = await base.universe("meme");
+    const rows: UniverseRow[] = [{ address: usdt, symbol: "USDT", lane: "meme", source: "fixture" }, ...validRows];
+    const byAddress = new Map(rows.map((row) => [row.address.toLowerCase(), row]));
+    const reads: TradeDataPlaneReads = {
+      ...base,
+      async universe(lane) { return lane === "meme" ? rows : []; },
+      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => ({
+        address,
+        symbol: byAddress.get(address.toLowerCase())?.symbol,
+        priceUsd: 1, marketCapUsd: 1_000, volume24hUsd: 1, holders: 1, priceChange24hPct: 1,
+      })); },
+      async eligibilityBatch(addresses) { return addresses.map((address) => ({
+        address, eligible: true, reason: "allowlist", source: "allowlist" as const, venue: null,
+      })); },
+    };
+    const counter = { calls: 0 };
+    const h = await harness({ reads, llmCounter: counter });
+    await runTradeWorkerOnce(h.deps);
+    const [run] = await h.positions.listRuns(OWNER, "agent-a", 1);
+    assert.equal(counter.calls, 1);
+    assert.equal(h.calls[0]?.token, validRows[0]?.address);
+    assert.equal(run?.events?.some((event) => event.code === "non-entry-asset" && event.token === usdt), true);
+  });
+
   it("filters an unrouteable candidate before the entry LLM", async () => {
     const blocked = address(105);
     let prompt = "";

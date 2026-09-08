@@ -27,6 +27,26 @@ export const TRADE_READ_BUDGET = 24;
 export const TRADE_SHORTLIST_MAX = 12;
 export const TRADE_SCAN_TTL_SEC = 300;
 
+const NON_ENTRY_TOKEN_ADDRESSES: ReadonlySet<string> = new Set([
+  "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", // WBNB route anchor
+  "0x55d398326f99059ff775485246999027b3197955", // USDT
+  "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
+  "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", // BTCB
+]);
+
+const NON_ENTRY_TOKEN_SYMBOLS: ReadonlySet<string> = new Set([
+  "USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE", "USDS",
+  "USDP", "USDD", "FRAX", "LUSD", "CRVUSD", "USD1",
+]);
+
+/** Candidate-only exclusions; USDT remains usable as an internal route hop. */
+export function isEntryExcludedToken(address: string, symbol?: string): boolean {
+  if (NON_ENTRY_TOKEN_ADDRESSES.has(address.toLowerCase())
+    || EQUITY_WRAPPERS.has(address.toLowerCase())) return true;
+  if (typeof symbol !== "string") return false;
+  return NON_ENTRY_TOKEN_SYMBOLS.has(symbol.trim().toUpperCase());
+}
+
 export class PinUnreadableError extends Error {
   constructor() {
     super("The trading universe could not be read.");
@@ -161,7 +181,7 @@ export async function pinUniverse(
   }
 
   const laneReadCount = lanes.length;
-  const tokenReadLimit = PIN_MAX_READS - laneReadCount;
+  const tokenReadLimit = Math.min(PIN_MAX_READS - 4, PIN_MAX_READS - laneReadCount);
   // AUDIT M2: under the fixed read ceiling, deterministic custody relevance wins:
   // bStocks and allowlist first, then meme, then coins; one seed keeps every nonempty lane represented.
   const lanePriority: Readonly<Record<UniverseLane, number>> = { bstocks: 0, allowlist: 1, meme: 2, coins: 3 };
@@ -200,6 +220,7 @@ export async function pinUniverse(
   for (const [key, row] of universeByAddress) {
     const token = tokens.get(key);
     if (token === undefined || !inModelBand(model, row, token)) continue;
+    if (isEntryExcludedToken(row.address, token.symbol)) continue;
     candidates.push({
       address: row.address,
       symbol: token.symbol ?? row.symbol,
@@ -376,6 +397,10 @@ export async function selectEntryCandidates(
     const gate = eligibilityByAddress.get(key);
     if (token === undefined || gate === undefined) {
       return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads };
+    }
+    if (isEntryExcludedToken(candidate.address, token.symbol)) {
+      refusals.push({ address: candidate.address, reason: "non-entry-asset" });
+      continue;
     }
     if (!inModelBand(input.model, { ...candidate, source: "cycle" }, token) || !ownerBandAllows(token, input.settings)) {
       refusals.push({ address: candidate.address, reason: "market-cap" });

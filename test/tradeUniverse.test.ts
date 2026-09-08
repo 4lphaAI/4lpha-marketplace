@@ -17,6 +17,7 @@ import {
   PinUnreadableError,
   TRADE_READ_BUDGET,
   createTradeVerdictCache,
+  isEntryExcludedToken,
   isUsEquityOpen,
   marketHoursByAddress,
   pinUniverse,
@@ -55,6 +56,36 @@ function fakeReads(overrides: Partial<TradeDataPlaneReads> = {}): TradeDataPlane
 }
 
 describe("TRADING-AGENT R3 pin universe", () => {
+  it("excludes stablecoins, BTCB and exact Ondo wrappers before refilling the pin", async () => {
+    const excluded = [
+      { address: getAddress("0x55d398326f99059fF775485246999027B3197955"), symbol: "USDT" },
+      { address: getAddress("0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c"), symbol: "BTCB" },
+      { address: getAddress("0xa9eE28C80f960B889dFbd1902055218cBa016F75"), symbol: "NVDAon" },
+      { address: getAddress("0x9999999999999999999999999999999999999999"), symbol: " usdc " },
+    ];
+    const usable = Array.from({ length: MIN_PIN }, (_, index) => ({
+      address: getAddress(`0x${(5_000 + index).toString(16).padStart(40, "0")}`),
+      symbol: `VALID${index}`,
+    }));
+    const rows = [...excluded, ...usable].map(({ address, symbol }): UniverseRow => ({
+      address, symbol, lane: "meme", source: "fixture",
+    }));
+    const byAddress = new Map(rows.map((row) => [row.address.toLowerCase(), row]));
+    const pinned = await pinUniverse("degen", { dataPlane: fakeReads({
+      async universe(lane) { return lane === "meme" ? rows : []; },
+      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => ({
+        address,
+        symbol: byAddress.get(address.toLowerCase())?.symbol,
+        priceUsd: 1, marketCapUsd: 1_000, volume24hUsd: 1, holders: 1, priceChange24hPct: 1,
+      })); },
+    }) });
+    assert.equal(pinned.length, MIN_PIN);
+    assert.equal(pinned.some((row) => excluded.some((item) => item.address === row.address)), false);
+    assert.equal(isEntryExcludedToken(excluded[0]!.address, excluded[0]!.symbol), true);
+    assert.equal(isEntryExcludedToken(excluded[3]!.address, excluded[3]!.symbol), true);
+    assert.equal(isEntryExcludedToken(usable[0]!.address), false);
+  });
+
   it("admits bStocks when the allowlist lane is absent and ranks by volume", async () => {
     const pinned = await pinUniverse("blue-chip", { dataPlane: fakeReads() });
     assert.equal(pinned.length, 6);
@@ -116,6 +147,42 @@ describe("TRADING-AGENT R3 pin universe", () => {
     const pinned = await pinUniverse("sigma", { dataPlane });
     assert.equal(pinned.length, 25);
     assert.equal(reads, PIN_MAX_READS);
+  });
+
+  it("keeps the metadata pool at 600 addresses for one- and two-lane pins", async () => {
+    const rows = Array.from({ length: 700 }, (_, index): UniverseRow => ({
+      address: getAddress(`0x${(10_000 + index).toString(16).padStart(40, "0")}`),
+      symbol: `T${index}`, lane: "meme", source: "fixture",
+    }));
+    const measure = async (model: "degen" | "blue-chip"): Promise<{ reads: number; maxBatch: number }> => {
+      let reads = 0;
+      let maxBatch = 0;
+      const dataPlane = fakeReads({
+        async universe(lane) {
+          reads += 1;
+          if (model === "degen") return lane === "meme" ? rows : [];
+          return lane === "allowlist" ? rows.map((row) => ({ ...row, lane: "allowlist" as const })) : [];
+        },
+        async tokensBatch(addresses) {
+          reads += 1;
+          maxBatch = Math.max(maxBatch, addresses.length);
+          return addresses.map((address, index): TokenBatchRow => ({
+            address, symbol: `T${index}`, priceUsd: 1,
+            marketCapUsd: model === "blue-chip" ? 2_000_000_000 : 1_000,
+            volume24hUsd: index, holders: 1, priceChange24hPct: 0,
+          }));
+        },
+      });
+      const pinned = await pinUniverse(model, { dataPlane });
+      assert.equal(pinned.length, 25);
+      return { reads, maxBatch };
+    };
+    const degen = await measure("degen");
+    const blueChip = await measure("blue-chip");
+    assert.equal(degen.reads, 13);
+    assert.equal(blueChip.reads, 14);
+    assert.equal(degen.maxBatch, 50);
+    assert.equal(blueChip.maxBatch, 50);
   });
 
   it("keeps a diversified bStock share in a 761-address Sigma union", async () => {
