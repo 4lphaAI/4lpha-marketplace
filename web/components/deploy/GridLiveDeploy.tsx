@@ -26,6 +26,7 @@ import {
   type GridPresetId,
 } from "@/lib/grid/geometry";
 import { buildFixedGridSettings, buildShiftGridSettings } from "@/lib/grid/settings";
+import { WBNB_56 } from "@/lib/exec/pairs";
 import { PairIcons as SharedPairIcons } from "@/components/TokenIcon";
 import { DEMO_GRID_OMISSIONS } from "@/lib/demo/omissions";
 
@@ -213,7 +214,9 @@ export function LivePoolSection({ value, onChange }: {
             setCustomError(customErrorText(payload.error?.code ?? "pool_unavailable"));
             return;
           }
-          if (!payload.data.wbnbIsToken0 && payload.data.token1.toLowerCase() !== "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c") {
+          const hasWbnbLeg = payload.data.token0.toLowerCase() === WBNB_56
+            || payload.data.token1.toLowerCase() === WBNB_56;
+          if (!hasWbnbLeg) {
             setCustomError("Grid v1 needs a WBNB leg; that pool has none.");
             return;
           }
@@ -247,7 +250,7 @@ export function LivePoolSection({ value, onChange }: {
           value={q}
           onFocus={() => setOpen(true)}
           onChange={(event) => { setQ(event.target.value); setOpen(true); }}
-          placeholder="Search pair (e.g. WBNB-USDT) or paste pool contract"
+          placeholder="Search pair (e.g. WBNB-USDT) or paste pool/token contract"
           style={{
             width: "100%", padding: "12px 14px", borderRadius: "var(--radius-sm)",
             background: "var(--surface-sunken)",
@@ -258,7 +261,7 @@ export function LivePoolSection({ value, onChange }: {
         {open ? (
           <div style={{ background: "var(--surface-card)", border: "1px solid var(--line-1)", borderRadius: "var(--radius-sm)", padding: 8, display: "grid", gap: 2, maxHeight: 268, overflowY: "auto" }}>
             <span className="fl-eyebrow" style={{ padding: "4px 8px 6px" }}>
-              {isAddr ? "Pool contract" : "Live WBNB pools · PancakeSwap V3"}
+              {isAddr ? "Pool or token contract" : "Live WBNB pools · PancakeSwap V3"}
             </span>
             {isAddr ? (
               <>
