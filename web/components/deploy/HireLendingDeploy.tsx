@@ -41,6 +41,8 @@ import {
 } from "@/lib/lending/form";
 import { recoverLendingArmParams, type LendingArmValues } from "@/lib/lending/arm-recovery";
 import { lendingUsdtCapRefusal, sameLendingArmValues, saveLendingUsdtRepay } from "@/lib/lending/prearm-settings";
+import { suggestLendingRepay } from "@/lib/lending/repay-suggestion";
+import { lendingUsdtGrantCap } from "@/lib/lending/grant-cap";
 import { guardedAccountBlocker, guardedAccountReady, type GuardedAccountState } from "./GuardedAccountSection";
 
 const primaryBtn: React.CSSProperties = {
@@ -408,6 +410,7 @@ export type HireLendingDeployProps = {
   readonly reserveBps: number;
   /** The form's own refusal, surfaced BEFORE any passkey prompt. */
   readonly blockedReason?: string | null;
+  readonly onRepaySuggestion?: (amountUsd: string | null) => void;
   readonly go?: (route: string) => void;
 };
 
@@ -492,15 +495,27 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
   // price or not at all (`freshWbnbPriceMicros` returns null past 60 s).
   React.useEffect(() => {
     let alive = true;
+    let priceExpiry: ReturnType<typeof setTimeout> | undefined;
     const load = () => {
       void fetch(`/api/market-data/tokens/${WBNB_56}`, { cache: "no-store" })
         .then((response) => response.ok ? response.json() as Promise<unknown> : null)
-        .then((payload) => { if (alive) setWbnbMicros(payload === null ? null : freshWbnbPriceMicros(payload)); })
+        .then((payload) => {
+          if (!alive) return;
+          clearTimeout(priceExpiry);
+          const price = payload === null ? null : freshWbnbPriceMicros(payload);
+          setWbnbMicros(price);
+          if (price !== null) {
+            // freshWbnbPriceMicros validated this timestamp. Expire the scalar
+            // even if the next network read hangs beyond the freshness window.
+            const asOf = (payload as { meta: { asOf: number } }).meta.asOf;
+            priceExpiry = setTimeout(() => { if (alive) setWbnbMicros(null); }, Math.max(0, asOf + 60_001 - Date.now()));
+          }
+        })
         .catch(() => { if (alive) setWbnbMicros(null); });
     };
     load();
     const timer = setInterval(load, 30_000);
-    return () => { alive = false; clearInterval(timer); };
+    return () => { alive = false; clearInterval(timer); clearTimeout(priceExpiry); };
   }, []);
 
   const budgetWei = React.useMemo(() => {
@@ -510,6 +525,12 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
       return 0n;
     }
   }, [props.capitalBnb]);
+
+  const repaySuggestion = React.useMemo(() => suggestLendingRepay({
+    account: props.guarded?.account ?? "", view: props.guarded?.view ?? null,
+    loading: props.guarded?.loading ?? false, capitalWei: budgetWei, priceMicros: wbnbMicros,
+  }), [props.guarded?.account, props.guarded?.view, props.guarded?.loading, budgetWei, wbnbMicros]);
+  React.useEffect(() => { props.onRepaySuggestion?.(repaySuggestion); }, [props.onRepaySuggestion, repaySuggestion]);
 
   const debtMarkets = React.useMemo(
     () => pinnableDebtMarkets(props.guarded?.view ?? null),
@@ -838,6 +859,7 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
        */
       const RECEIPT_MAX_AGE_MS = 25_000;
       let receipt = await run.guarded(() => loadReceipt(form.usdtCeilingWei));
+      setSizing(receipt);
       let receiptAtMs = Date.now();
       const paramsFor = () => {
         const receiptSizing = receipt.sizing;
@@ -845,8 +867,10 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
         if (!receiptSizing.ok) {
           throw new Error(receiptSizing.refusal ?? "The plane refused this hire's sizing.");
         }
-        const capRefusal = lendingUsdtCapRefusal({ settings: form.settings, budgetWei: budgetWei.toString(10), reserveBps: props.reserveBps }, config.usdt, receiptSizing.reserveCapFloorWei, usdtDecimals);
-        if (capRefusal !== null) throw new Error(`Max repay per event exceeds the proposed session cap of ${formatAtomicAmount(receiptSizing.reserveCapFloorWei, usdtDecimals, usdtDecimals)} USDT. Lower it before hiring.`);
+        const grantCap = lendingUsdtGrantCap(receiptSizing.reserveCapFloorWei);
+        if (grantCap === null) throw new Error("The USDT grant cap could not be calculated. Nothing was signed.");
+        const capRefusal = lendingUsdtCapRefusal({ settings: form.settings, budgetWei: budgetWei.toString(10), reserveBps: props.reserveBps }, config.usdt, grantCap.toString(10), usdtDecimals);
+        if (capRefusal !== null) throw new Error(`Max repay per event exceeds the proposed session cap of ${formatAtomicAmount(grantCap, usdtDecimals, usdtDecimals)} USDT. Lower it before hiring.`);
         return {
           walletAddress: owner.walletAddress!,
           token: config.usdt,
@@ -856,7 +880,7 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
           sizingPreset: HIRE_PROFILE,
           guardedAccount: receipt.account,
           debtMarkets,
-          reserveCapWei: receiptSizing.reserveCapFloorWei,
+          reserveCapWei: grantCap.toString(10),
           reserveBps: props.reserveBps,
           settings: form.settings,
           previewReceipt: receipt.previewReceipt!,
@@ -869,12 +893,14 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
         if (Date.now() - receiptAtMs > RECEIPT_MAX_AGE_MS) {
           setWorking("The plane's sizing receipt expired while this hire waited — taking a fresh one…");
           receipt = await run.guarded(() => loadReceipt(form.usdtCeilingWei));
+          setSizing(receipt);
           receiptAtMs = Date.now();
           params = paramsFor();
         }
-        setWorking(attempt === 0
+        const signatureNote = attempt === 0
           ? "Confirm the one off-chain hire signature with your passkey…"
-          : `${taken[taken.length - 1] ?? base} is taken. Confirm the signature again to hire ${id}…`);
+          : `${taken[taken.length - 1] ?? base} is taken. Confirm the signature again to hire ${id}…`;
+        setWorking(`${signatureNote} USDT daily cap: ${formatAtomicAmount(params.reserveCapWei, usdtDecimals, usdtDecimals)} USDT, including 10% quote headroom.`);
         const envelope = await run.guarded(() => owner.signEnvelope("provisionAgent", id, params));
         provisionEnvelope.current = envelope;
         saveProvisionEnvelope(hireStorage, id, envelope);
@@ -1323,11 +1349,12 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
   /* ---- the derived, read-only figures the owner sees BEFORE signing ------- */
 
   const receiptSizing = sizing?.sizing ?? null;
+  const proposedGrantCap = receiptSizing === null ? null : lendingUsdtGrantCap(receiptSizing.reserveCapFloorWei);
   const dailyLimitWei = derivedDailyRepayLimitWei(props.rescueReserveCount, usdtCeilingWei);
-  const exposure = receiptSizing === null
+  const exposure = receiptSizing === null || proposedGrantCap === null
     ? null
     : lendingExposureLine({
-      reserveCapWei: BigInt(receiptSizing.reserveCapFloorWei),
+      reserveCapWei: proposedGrantCap,
       capDayWei: BigInt(receiptSizing.minimumCapDayWei),
       usdtDecimals,
     });
@@ -1336,6 +1363,8 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     <span><strong>Lending market</strong> · Venus</span>
     <span><strong>Repay from</strong> · {LENDING_REPAY_SOURCE_TEXT}</span>
     <span data-testid="lending-check-every"><strong>Check every</strong> · {lendingCheckEveryText(config?.workerIntervalMs)}</span>
+    <span data-testid="lending-grant-cap"><strong>Estimated USDT daily cap</strong> · {proposedGrantCap === null ? "— waiting for a quote" : `${formatAtomicAmount(proposedGrantCap, usdtDecimals, usdtDecimals)} USDT · includes 10% quote headroom`}</span>
+    {proposedGrantCap === null || receiptSizing === null ? null : <span data-testid="lending-grant-total"><strong>Seven-day cap total</strong> · {formatAtomicAmount(proposedGrantCap * 7n, usdtDecimals, usdtDecimals)} USDT + {formatEther(BigInt(receiptSizing.minimumCapDayWei) * 7n)} BNB</span>}
     <span>
       <strong>Daily repay limit (derived)</strong> ·{" "}
       {dailyLimitWei === null

@@ -3,6 +3,7 @@ import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+const suggestion = vi.hoisted(() => ({ report: null as ((value: string | null) => void) | null }));
 
 vi.mock("@/components/deploy/HireGridDeploy", () => ({ HireGridDeploy: () => null }));
 vi.mock("@/components/deploy/HireLpDeploy", () => ({ HireLpDeploy: () => null }));
@@ -13,7 +14,8 @@ vi.mock("@/components/deploy/HireLendingDeploy", () => ({
     readonly triggerHf: string; readonly targetHf: string; readonly maxRepayUsd: string;
     readonly rescueReserveCount: number; readonly cooldownSeconds: number; readonly reserveBps: number;
     readonly capitalBnb: string; readonly agentName: string;
-  }) => <button
+    readonly onRepaySuggestion?: (value: string | null) => void;
+  }) => { suggestion.report = props.onRepaySuggestion ?? null; return <button
     data-testid="lending-deploy-props"
     data-trigger={props.triggerHf}
     data-target={props.targetHf}
@@ -23,7 +25,7 @@ vi.mock("@/components/deploy/HireLendingDeploy", () => ({
     data-reserve-bps={String(props.reserveBps)}
     data-capital={props.capitalBnb}
     data-name={props.agentName}
-  >Deploy Lending Agent</button>,
+  >Deploy Lending Agent</button>; },
 }));
 // The guarded-account stage owns its own fetch; the screen only has to SWAP it
 // in for the section, which is what this file checks.
@@ -90,7 +92,7 @@ describe("lending deploy controls", () => {
     expect(rendered).toContain("data-reserve-bps=\"2000\"");
     expect(rendered).toContain("data-count=\"6\"");
     expect(rendered).toContain("data-cooldown=\"300\"");
-    expect(rendered).toContain("data-max-repay=\"240\"");
+    expect(rendered).toContain("data-max-repay=\"\"");
     expect(rendered).toContain("data-capital=\"0.05\"");
   });
 
@@ -214,6 +216,42 @@ describe("typed control values are never silently clamped", () => {
     // The blur is where the old clamp fired, so it is part of the test.
     await act(async () => { input.dispatchEvent(new Event("blur", { bubbles: true })); });
   }
+
+  it("uses suggestions until edited, preserves manual input through presets, and resets explicitly", async () => {
+    await act(async () => { root!.render(<DeployAgentScreen kind="health" go={() => undefined} />); });
+    expect(field("Max repay per event").value).toBe("");
+    await act(async () => { suggestion.report!("8.00"); });
+    expect(field("Max repay per event").value).toBe("8.00");
+    await act(async () => { suggestion.report!("6.25"); });
+    expect(props()["data-max-repay"]).toBe("6.25");
+    await type("Max repay per event", "5.35");
+    await act(async () => { suggestion.report!("3.00"); });
+    expect(props()["data-max-repay"]).toBe("5.35");
+    const preset = [...host.querySelectorAll("button")].find(button => button.textContent?.startsWith("Conservative"));
+    await act(async () => { preset!.click(); });
+    expect(props()["data-max-repay"]).toBe("5.35");
+    const reset = [...host.querySelectorAll("button")].find(button => button.textContent === "Reset parameters to defaults");
+    await act(async () => { reset!.click(); });
+    await act(async () => { suggestion.report!("4.00"); });
+    expect(props()["data-max-repay"]).toBe("4.00");
+  });
+
+  it("steps repayment by exactly one while preserving fractional amounts", async () => {
+    await act(async () => { root!.render(<DeployAgentScreen kind="health" go={() => undefined} />); });
+    await act(async () => { suggestion.report!("8.35"); });
+    const control = field("Max repay per event").closest(".fl-field")!;
+    await act(async () => { control.querySelector<HTMLButtonElement>('[aria-label="Increase"]')!.click(); });
+    expect(props()["data-max-repay"]).toBe("9.35");
+    await act(async () => { control.querySelector<HTMLButtonElement>('[aria-label="Decrease"]')!.click(); });
+    expect(props()["data-max-repay"]).toBe("8.35");
+    await act(async () => { suggestion.report!("3.00"); });
+    expect(props()["data-max-repay"]).toBe("8.35");
+    await type("Max repay per event", "0.35");
+    const decrease = control.querySelector<HTMLButtonElement>('[aria-label="Decrease"]')!;
+    expect(decrease.disabled).toBe(true);
+    await act(async () => { decrease.click(); });
+    expect(props()["data-max-repay"]).toBe("0.35");
+  });
 
   // The exact case in the audit: a cooldown of 100 must NEVER become a signed
   // 300. Below the floor is a refusal the owner can see, not a number the

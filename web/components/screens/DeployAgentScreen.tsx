@@ -93,11 +93,11 @@ const PRESETS = {
   // plane's own bounds (trigger 1.05..3.0, target >= trigger + 0.05).
   health: [
     { id: "conservative", label: "Conservative", note: "Acts early, restores a large buffer.",
-      set: { trigger: "1.35", target: "1.90", maxRepay: "400", reservePct: "30" } },
+      set: { trigger: "1.35", target: "1.90", reservePct: "30" } },
     { id: "balanced", label: "Balanced", note: "Standard buffer for BNB collateral.",
-      set: { trigger: "1.20", target: "1.50", maxRepay: "240", reservePct: "20" } },
+      set: { trigger: "1.20", target: "1.50", reservePct: "20" } },
     { id: "aggressive", label: "Aggressive", note: "Keeps capital deployed, thinner margin of safety.",
-      set: { trigger: "1.10", target: "1.35", maxRepay: "150", reservePct: "15" } },
+      set: { trigger: "1.10", target: "1.35", reservePct: "15" } },
   ],
 };
 
@@ -266,7 +266,7 @@ const CONFIG = {
         hint: "The rest is swapped to USDT and supplied to Venus, where it earns while it waits." },
     ] },
     { title: "Repair", fields: [
-      { k: "maxRepay", label: "Max repay per event", type: "num", v: "240", prefix: "$" },
+      { k: "maxRepay", label: "Max repay per event", type: "stepper", v: "", prefix: "$", step: 1, min: 0.000001, floor: 0.000001, preciseStep: true },
       { k: "rescueCount", label: "Rescues to reserve gas for", type: "stepper", v: "6", step: 1, min: 1, max: 24, floor: 1,
         hint: "The guard will still rescue beyond this — refusing a rescue is the trap it exists to avoid." },
       { k: "cooldown", label: "Cooldown between repays", type: "stepper", v: "300", step: 60, min: 300, max: 86400, floor: 300, suffix: "sec" },
@@ -477,7 +477,7 @@ function PoolPicker({ value, onChange }) {
 
 /** Zoom levels: bins PER SIDE the chart asks the plane for (route cap 1000). */
 
-function NumStepper({ value, onChange, step = 1, min, max, suffix, noLimitAtMin, disabled, noClamp }) {
+function NumStepper({ value, onChange, step = 1, min, max, prefix, suffix, noLimitAtMin, disabled, noClamp, preciseStep }) {
   const raw = value === "" || value == null ? null : parseFloat(String(value).replace(/,/g, ""));
   const round = (n) => Math.round(n / step) * step;
   const fmt = (n) => {
@@ -487,14 +487,15 @@ function NumStepper({ value, onChange, step = 1, min, max, suffix, noLimitAtMin,
   };
   const dec = () => {
     if (disabled || raw == null) return;
-    const next = round(raw - step);
+    const next = preciseStep ? Number((raw - step).toFixed(6)) : round(raw - step);
+    if (preciseStep && min != null && next < min) return;
     if (noLimitAtMin && next < (min != null ? min : step)) { onChange(""); return; }
     onChange(String(min != null && next < min ? min : next));
   };
   const inc = () => {
     if (disabled) return;
-    if (raw == null) { onChange(String(min != null ? min : step)); return; }
-    const next = round(raw + step);
+    if (raw == null) { onChange(String(preciseStep ? step : min != null ? min : step)); return; }
+    const next = preciseStep ? Number((raw + step).toFixed(6)) : round(raw + step);
     onChange(String(max != null && next > max ? max : next));
   };
   // `noClamp`: the caller shows the violation in red instead of silently
@@ -503,7 +504,8 @@ function NumStepper({ value, onChange, step = 1, min, max, suffix, noLimitAtMin,
   const below = !noClamp ? false : min != null && raw != null && raw < min;
   return (
     <div style={{ display: "flex", alignItems: "stretch", border: `1px solid ${below ? "var(--loss)" : "var(--line-1)"}`, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", opacity: disabled ? 0.45 : 1, pointerEvents: disabled ? "none" : "auto" }}>
-      <button type="button" onClick={dec} aria-label="Decrease" style={{ cursor: "pointer", width: 40, flex: "0 0 auto", display: "grid", placeItems: "center", background: "transparent", border: "none", borderRight: "1px solid var(--line-1)", color: "var(--text-subtle)", fontSize: 16, lineHeight: 1 }}>−</button>
+      <button type="button" onClick={dec} aria-label="Decrease" disabled={disabled || (preciseStep && (raw == null || raw - step < (min ?? 0)))} style={{ cursor: "pointer", width: 40, flex: "0 0 auto", display: "grid", placeItems: "center", background: "transparent", border: "none", borderRight: "1px solid var(--line-1)", color: "var(--text-subtle)", fontSize: 16, lineHeight: 1 }}>−</button>
+      {prefix ? <span style={{ alignSelf: "center", paddingLeft: 12, color: "var(--text-subtle)" }}>{prefix}</span> : null}
       <input value={value == null ? "" : value} placeholder={noLimitAtMin ? "No limit" : undefined} onChange={(e) => onChange(e.target.value)}
         onBlur={() => { if (raw != null && !noClamp) { const clamped = min != null && raw < min ? min : max != null && raw > max ? max : raw; onChange(String(clamped)); } }}
         style={{ flex: 1, minWidth: 0, textAlign: "right", padding: "11px 12px", background: "transparent", border: "none", outline: "none", font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", color: raw == null ? "var(--text-subtle)" : "var(--ink-1)" }} />
@@ -836,7 +838,7 @@ function Field({ f, value, onChange, values, set, preset }) {
     return (
       <div className="fl-field">
         <label className="fl-field__label">{f.label}</label>
-        <NumStepper value={value} onChange={onChange} step={f.step || 1} min={f.min} max={f.max} suffix={f.suffix} noClamp={f.floor != null} disabled={f.lockedByPreset && f.lockedByPreset.includes(preset)} />
+        <NumStepper value={value} onChange={onChange} step={f.step || 1} min={f.min} max={f.max} prefix={f.prefix} suffix={f.suffix} noClamp={f.floor != null} preciseStep={f.preciseStep} disabled={f.lockedByPreset && f.lockedByPreset.includes(preset)} />
         {below ? <span role="alert" style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--loss)" }}>Minimum {f.floor} {f.suffix ?? ""}</span>
           : f.hint ? <span className="fl-field__hint">{f.hint}</span> : null}
       </div>
@@ -1013,7 +1015,21 @@ function DeployAgentScreen({ kind, go }) {
   // machinery below; an untouched one snaps to the floor as pools and presets
   // change, so the field is always already valid.
   const capitalTouched = React.useRef(false);
-  const set = (k, v) => { if (k === "capital") capitalTouched.current = true; setValues((s) => ({ ...s, [k]: v })); };
+  const repayTouched = React.useRef(false);
+  const activeKind = React.useRef(id);
+  activeKind.current = id;
+  const [repaySuggestion, setRepaySuggestion] = React.useState(null);
+  const acceptRepaySuggestion = React.useCallback((amount) => {
+    if (activeKind.current !== "health") return;
+    setRepaySuggestion(amount);
+    setValues((current) => repayTouched.current || current.maxRepay === (amount ?? "")
+      ? current : { ...current, maxRepay: amount ?? "" });
+  }, []);
+  const set = (k, v) => {
+    if (k === "capital") capitalTouched.current = true;
+    if (k === "maxRepay") repayTouched.current = true;
+    setValues((s) => ({ ...s, [k]: v }));
+  };
   // Live-wired grid deploy (spec: MD here/MARKETPLACE-GRID-DEPLOY-SPEC.md):
   // a REAL pool object from /api/pools replaces the design export's static
   // POOLS list for the grid kind only.
@@ -1042,6 +1058,8 @@ function DeployAgentScreen({ kind, go }) {
   React.useEffect(() => {
     setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setMode("Live"); setShowAdv(false); setSim(null);
     capitalTouched.current = false;
+    repayTouched.current = false;
+    setRepaySuggestion(null);
   }, [id]);
 
   const capitalFloorText = id !== "grid"
@@ -1213,6 +1231,9 @@ function DeployAgentScreen({ kind, go }) {
   // Per-field overrides the CONFIG table cannot carry, because they depend on
   // live chain facts. Today: the grid's capital floor.
   const fieldOverrides = React.useMemo(() => {
+    if (id === "health") return { maxRepay: { hint: repaySuggestion === null
+      ? "Suggested from supported debt and Total capital once account data and BNB price are available. You can enter your own amount."
+      : `Suggested $${repaySuggestion} from supported debt and Total capital. You can edit this amount.` } };
     if (id === "trading") return {
       perTrade: { min: 0.002, floor: "0.002", max: undefined },
       capital: { min: 0.01, floor: "0.01", hint: null },
@@ -1222,7 +1243,7 @@ function DeployAgentScreen({ kind, go }) {
     // `floor` turns the stepper strict: the − button stops here and a smaller
     // typed number goes red instead of being silently rewritten.
     return { capital: { min: capitalFloorBnb, floor: capitalFloorText, hint: null } };
-  }, [id, capitalFloorText, capitalFloorBnb]);
+  }, [id, capitalFloorText, capitalFloorBnb, repaySuggestion]);
 
   const capitalBelowFloor = capitalFloorBnb !== null
     && Number(String(values.capital ?? "").replace(/,/gu, "")) < capitalFloorBnb;
@@ -1294,7 +1315,7 @@ function DeployAgentScreen({ kind, go }) {
         <div style={{ display: "grid", gap: 14, marginBottom: 26 }}>
           <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
             <span className="fl-eyebrow">Execution model</span>
-            <button onClick={() => { setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}
+            <button onClick={() => { repayTouched.current = false; setRepaySuggestion(null); setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}
               style={{ cursor: "pointer", background: "none", border: "none", padding: 0, font: "var(--weight-regular) var(--text-sm)/1 var(--font-sans)", color: "var(--text-subtle)", textDecoration: "underline", textUnderlineOffset: 3 }}>
               Reset parameters to defaults
             </button>
@@ -1460,6 +1481,7 @@ function DeployAgentScreen({ kind, go }) {
             triggerHf={String(values.trigger ?? "1.20")}
             targetHf={String(values.target ?? "1.50")}
             maxRepayUsd={String(values.maxRepay ?? "")}
+            onRepaySuggestion={acceptRepaySuggestion}
             /* W6: NO silent clamps. The typed value goes through as typed; an
                out-of-range one is REFUSED by `buildLendingForm` inside the hire
                component, which disables Deploy and names the legal range. */
@@ -1471,7 +1493,7 @@ function DeployAgentScreen({ kind, go }) {
         ) : (
         <div className="fl-deploy-actions" style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginTop: 26, paddingTop: 20, borderTop: "1px solid var(--line-1)" }}>
           <Button variant="primary" size="lg">Deploy {active.label}</Button>
-          <Button variant="ghost" onClick={() => { setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}>Reset to preset</Button>
+          <Button variant="ghost" onClick={() => { repayTouched.current = false; setRepaySuggestion(null); setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}>Reset to preset</Button>
           <span style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)", marginLeft: "auto" }}>
             {mode === "Demo" ? "Demo mode runs the same logic with no funds at risk." : "Live mode signs with a scoped session key. No withdrawals."}
           </span>

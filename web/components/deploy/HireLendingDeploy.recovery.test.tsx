@@ -426,7 +426,9 @@ describe("the PRE-SIGNATURE gates (R3.13, R2.20)", () => {
   it("shows the exposure line and the DERIVED daily limit before any signature", async () => {
     await mount();
     const derived = host.querySelector("[data-testid=\"lending-derived\"]")?.textContent ?? "";
-    expect(derived).toContain("Most this agent's key could move per day: 44 USDT + 0.09 BNB");
+    expect(derived).toContain("Most this agent's key could move per day: 48.4 USDT + 0.09 BNB");
+    expect(derived).toContain("48.4 USDT · includes 10% quote headroom");
+    expect(derived).toContain("338.8 USDT + 0.63 BNB");
     expect(derived).toContain("× 7 days");
     expect(derived).toContain("72 USDT");
     expect(derived).toContain("Reserve: USDT supplied on Venus + BNB tier");
@@ -455,7 +457,7 @@ describe("the S1 envelope", () => {
     // The caps and the receipt come from the FRESH receipt-mode read, never from
     // a figure the browser computed.
     expect(params["capDayWei"]).toBe("90000000000000000");
-    expect(params["reserveCapWei"]).toBe("44000000000000000000");
+    expect(params["reserveCapWei"]).toBe("48400000000000000000");
     expect(params["previewReceipt"]).toBe("v1.receipt.bytes");
     expect(params["settings"]).toEqual({
       triggerHf: "1200000000000000000",
@@ -474,6 +476,21 @@ describe("the S1 envelope", () => {
 });
 
 describe("lending arm browser boundary", () => {
+  it("suggests before form/ack readiness and expires it if later price reads hang", async () => {
+    const onRepaySuggestion = vi.fn<(amount: string | null) => void>();
+    const originalFetch = fetchMock.getMockImplementation()!;
+    let priceReads = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).startsWith("/api/market-data/tokens/") && ++priceReads > 1) return new Promise<Response>(() => undefined);
+      return originalFetch(input, init);
+    });
+    await mount({ maxRepayUsd: "", guarded: guarded({ confirmed: false }), onRepaySuggestion });
+    expect(onRepaySuggestion).toHaveBeenLastCalledWith("45.00");
+    expect(mocks.signEnvelope).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(61_000); });
+    expect(onRepaySuggestion).toHaveBeenLastCalledWith(null);
+  });
+
   it.each(["completed", "held"] as const)("ignores a %s arm response after switching owners", async status => {
     current = { ...provisioning(false), status: "armed", missing: [] };
     localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
@@ -573,8 +590,18 @@ describe("lending arm browser boundary", () => {
   it("does not create a new hire whose max repay exceeds the preview grant cap", async () => {
     await mount({ maxRepayUsd: "240" });
     await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
-    expect(host.textContent).toContain("proposed session cap of 44 USDT");
+    expect(host.textContent).toContain("proposed session cap of 48.4 USDT");
     expect(mocks.signEnvelope.mock.calls.map(([action]) => action)).not.toContain("provisionAgent");
+  });
+
+  it("admits a new repay ceiling within the padded grant and discloses that same cap", async () => {
+    await mount({ maxRepayUsd: "46" });
+    expect(host.querySelector("[data-testid='lending-grant-cap']")?.textContent).toContain("48.4 USDT");
+    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    const signed = mocks.signEnvelope.mock.calls.find(([action]) => action === "provisionAgent")?.[2] as Record<string, unknown>;
+    expect(signed["reserveCapWei"]).toBe("48400000000000000000");
+    expect(signed["capDayWei"]).toBe("90000000000000000");
+    expect(signed["openNativeBudgetWei"]).toBe("50000000000000000");
   });
 
   it("explains a blocked resumed arm and makes the button eligible only after acknowledgment", async () => {
