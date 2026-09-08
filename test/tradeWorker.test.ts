@@ -79,6 +79,34 @@ function quoteReader(quoteV2?: RouteQuoteReader["quoteV2"]): RouteQuoteReader {
   };
 }
 
+function routeReaderExcept(blocked: Address): RouteQuoteReader {
+  const blockedKey = blocked.toLowerCase();
+  const isBlocked = (token: string): boolean => token.toLowerCase() === blockedKey;
+  const pathToken = (path: Hex): string => `0x${path.slice(-40)}`;
+  return {
+    async quoteV2(path, amount) {
+      if (isBlocked(path.at(-1) ?? "")) throw new Error("no route");
+      return amount * 2n;
+    },
+    async quoteV3Single(_tokenIn, tokenOut, _fee, amount) {
+      if (isBlocked(tokenOut)) throw new Error("no route");
+      return amount * 2n;
+    },
+    async quoteV3Path(path, amount) {
+      if (isBlocked(pathToken(path))) throw new Error("no route");
+      return amount * 2n;
+    },
+  };
+}
+
+function unavailableRouteReader(): RouteQuoteReader {
+  return {
+    async quoteV2() { throw new Error("no route"); },
+    async quoteV3Single() { throw new Error("no route"); },
+    async quoteV3Path() { throw new Error("no route"); },
+  };
+}
+
 async function harness(input: {
   readonly ids?: readonly string[];
   readonly status?: "armed" | "paused";
@@ -88,6 +116,7 @@ async function harness(input: {
   readonly now?: number;
   readonly bstocks?: ReadonlySet<string>;
   readonly llmCounter?: { calls: number };
+  readonly llm?: TradeLlm;
   readonly providerCalls?: { calls: number };
   readonly routeReader?: RouteQuoteReader;
   readonly omitFirstCap?: boolean;
@@ -153,7 +182,7 @@ async function harness(input: {
         return input.tokenBalance?.() ?? balances.get(token.toLowerCase()) ?? 100n;
       },
     },
-    llmFor: () => llm(input.llmCounter), executor, executorDeps: {}, rpcUrls: [],
+    llmFor: () => input.llm ?? llm(input.llmCounter), executor, executorDeps: {}, rpcUrls: [],
     readiness: { ready: true, allowlistAvailable: true, bstocksAddresses: input.bstocks ?? new Set<string>() },
     routeReader: input.routeReader ?? quoteReader(),
     forbiddenAddresses: () => new Set<string>(),
@@ -368,6 +397,115 @@ describe("trade worker cycle", () => {
     assert.ok((report.outcomes[0]?.refusals ?? 0) >= 1);
     const [run] = await h.positions.listRuns(OWNER, "agent-a");
     assert.ok((run?.refusals ?? 0) >= 1);
+  });
+
+  it("filters an unrouteable candidate before the entry LLM", async () => {
+    const blocked = address(105);
+    let prompt = "";
+    const h = await harness({
+      routeReader: routeReaderExcept(blocked),
+      llm: {
+        async complete(messages) {
+          prompt = messages.map((message) => message.content).join("\n");
+          return { model: "fixture", content: JSON.stringify({ decisions: [{ index: 0, enter: true, confidence: 100, reason: "enter" }] }) };
+        },
+      },
+    });
+    await runTradeWorkerOnce(h.deps);
+    assert.doesNotMatch(prompt, new RegExp(blocked, "u"));
+    assert.match(prompt, new RegExp(address(104), "u"));
+    assert.equal(h.calls[0]?.token, address(104));
+  });
+
+  it("skips the LLM when every screened candidate has no route", async () => {
+    const counter = { calls: 0 };
+    const h = await harness({ llmCounter: counter, routeReader: unavailableRouteReader() });
+    const report = await runTradeWorkerOnce(h.deps);
+    assert.equal(report.outcomes[0]?.reason, "no-route");
+    assert.equal(report.outcomes[0]?.candidates, 0);
+    assert.equal(report.outcomes[0]?.refusals, 6);
+    assert.equal(counter.calls, 0);
+    assert.equal(h.calls.length, 0);
+    assert.equal((await h.intents.listUnsettled(OWNER, "agent-a")).length, 0);
+  });
+
+  it("refuses bonding-curve candidates before route probing or the LLM", async () => {
+    const base = dataPlane(1);
+    const reads: TradeDataPlaneReads = {
+      ...base,
+      async eligibilityBatch(addresses) {
+        return addresses.map((address) => ({ address, eligible: true, reason: "flap_portal", source: "flap" as const, venue: "flap-bonding" as const }));
+      },
+    };
+    const counter = { calls: 0 };
+    const h = await harness({ reads, llmCounter: counter, routeReader: quoteReader() });
+    const report = await runTradeWorkerOnce(h.deps);
+    assert.equal(report.outcomes[0]?.reason, "no-route");
+    assert.equal(counter.calls, 0);
+    assert.equal(h.calls.length, 0);
+  });
+
+  it("rechecks a route after the LLM and refuses if it disappeared", async () => {
+    let quoteCalls = 0;
+    const expiring: RouteQuoteReader = {
+      async quoteV2(_path, amount) {
+        quoteCalls += 1;
+        if (quoteCalls > 48) throw new Error("route disappeared");
+        return amount * 2n;
+      },
+      async quoteV3Single(_tokenIn, _tokenOut, _fee, amount) {
+        quoteCalls += 1;
+        if (quoteCalls > 48) throw new Error("route disappeared");
+        return amount * 2n;
+      },
+      async quoteV3Path(_path, amount) {
+        quoteCalls += 1;
+        if (quoteCalls > 48) throw new Error("route disappeared");
+        return amount * 2n;
+      },
+    };
+    const counter = { calls: 0 };
+    const h = await harness({ llmCounter: counter, routeReader: expiring });
+    const report = await runTradeWorkerOnce(h.deps);
+    const [run] = await h.positions.listRuns(OWNER, "agent-a", 1);
+    assert.equal(report.outcomes[0]?.reason, "no-route");
+    assert.equal(report.outcomes[0]?.candidates, 6);
+    assert.equal(report.outcomes[0]?.entries, 0);
+    assert.equal(report.outcomes[0]?.refusals, 1);
+    assert.equal(counter.calls, 1);
+    assert.equal(h.calls.length, 0);
+    assert.equal((await h.intents.listUnsettled(OWNER, "agent-a")).length, 0);
+    assert.equal(run?.events?.some((event) => event.stage === "route" && event.code === "NO_ROUTE"), true);
+  });
+
+  it("propagates an aborted route prefilter without counting a candidate refusal", async () => {
+    const counter = { calls: 0 };
+    const h = await harness({ llmCounter: counter });
+    const controller = new AbortController();
+    controller.abort();
+    await runTradeWorkerOnce(h.deps, { signal: controller.signal });
+    const [run] = await h.positions.listRuns(OWNER, "agent-a", 1);
+    assert.equal(counter.calls, 0);
+    assert.equal(h.calls.length, 0);
+    assert.equal(run?.refusals, 0);
+    assert.match(run?.reason ?? "", /^agent-error:.*abort/u);
+  });
+
+  it("propagates an abort that arrives with a late primary LLM response", async () => {
+    const controller = new AbortController();
+    const h = await harness({
+      llm: {
+        async complete() {
+          controller.abort();
+          return { model: "fixture", content: JSON.stringify({ decisions: [] }) };
+        },
+      },
+    });
+    await runTradeWorkerOnce(h.deps, { signal: controller.signal });
+    const [run] = await h.positions.listRuns(OWNER, "agent-a", 1);
+    assert.equal(h.calls.length, 0);
+    assert.equal(run?.refusals, 0);
+    assert.match(run?.reason ?? "", /^agent-error:.*abort/u);
   });
 
   it("uses at most 18 data-plane reads for a Sigma cycle", async () => {

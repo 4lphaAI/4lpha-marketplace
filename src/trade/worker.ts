@@ -33,6 +33,7 @@ import { parseTradeSettings, type TradeSettings } from "./settings.js";
 import {
   createTradeVerdictCache,
   selectEntryCandidates,
+  type EntryCandidate,
   type TradeVerdictCache,
 } from "./universe.js";
 import type { TradeDataPlaneReads } from "./dataPlaneReads.js";
@@ -552,27 +553,57 @@ async function runEntry(
   for (const refusal of selected.refusals) observe(counts, { stage: "screen", code: refusal.reason, token: refusal.address });
   counts.refusals += selected.refusals.length;
   if (selected.kind === "aborted") return selected.reason;
-  counts.candidates = selected.candidates.length;
-  observe(counts, { stage: "screen", code: "shortlisted", reason: `${selected.candidates.length} candidates passed screening` });
-  if (selected.candidates.length === 0) return "no-candidates";
+  const routeable: EntryCandidate[] = [];
+  for (const candidate of selected.candidates) {
+    signal?.throwIfAborted();
+    // The current worker has no bonding-curve quote path. A launchpad token
+    // must not reach the LLM merely because a future executor builder exists.
+    if (candidate.routeKind === "fourmeme" || candidate.routeKind === "flap") {
+      observe(counts, { stage: "route", code: "NO_ROUTE", token: candidate.address });
+      counts.refusals += 1;
+      continue;
+    }
+    try {
+      await quoteBestBuyRoute({
+        token: candidate.address,
+        amountInWei: buySize.amountWei,
+        rpcUrls: deps.rpcUrls,
+        ...(signal === undefined ? {} : { signal }),
+        ...(deps.routeReader === undefined ? {} : { reader: deps.routeReader }),
+      });
+      routeable.push(candidate);
+    } catch (error) {
+      if (signal?.aborted === true) throw error;
+      observe(counts, {
+        stage: "route",
+        code: error instanceof TradeRouteQuoteError ? error.code : "quote-unavailable",
+        token: candidate.address,
+      });
+      counts.refusals += 1;
+    }
+  }
+  counts.candidates = routeable.length;
+  signal?.throwIfAborted();
+  observe(counts, { stage: "screen", code: "shortlisted", reason: `${routeable.length} candidates passed screening and routeability` });
+  if (routeable.length === 0) return selected.candidates.length === 0 ? "no-candidates" : "no-route";
   let accepted: readonly number[];
   try {
     const features = await enrichFeatures(deps.dataPlane, settings.executionModel,
-      selected.candidates.map(item => item.address), deps.now?.() ?? Date.now(), signal);
+      routeable.map(item => item.address), deps.now?.() ?? Date.now(), signal);
     const featureNow = deps.now?.() ?? Date.now();
-    if (featureModel(settings.executionModel)) for (const candidate of selected.candidates) {
+    if (featureModel(settings.executionModel)) for (const candidate of routeable) {
       const evidence = features.get(candidate.address.toLowerCase());
       const momentum = assessMomentum(evidence ?? {}, featureNow);
       observe(counts, { stage: "entry-llm", code: !evidence ? "feature-missing" : momentum.status === "unavailable" ? "feature-partial" : "feature-ready",
         token: candidate.address, reason: `momentum:${momentum.status}; snapshot:${evidence?.["15m"]?.snapshotId ?? evidence?.["1h"]?.snapshotId ?? "none"}` });
     }
     const answer = await completeWithFallback(deps, settings, buildEntryPrompt({
-      featureBlocks: selected.candidates.map((item, index) => {
+      featureBlocks: routeable.map((item, index) => {
         const block = featurePrompt(features.get(item.address.toLowerCase()), featureNow);
         return block ? `${index}: ${block}` : "";
       }),
       model: settings.executionModel,
-      candidates: selected.candidates.map((candidate) => ({
+      candidates: routeable.map((candidate) => ({
         address: candidate.address, symbol: candidate.symbol,
         marketCapUsd: candidate.marketCapUsd, priceUsd: candidate.priceUsd,
         volume24hUsd: candidate.volume24hUsd, priceChange24hPct: candidate.priceChange24hPct,
@@ -582,19 +613,20 @@ async function runEntry(
       })),
       owner: settings,
     }), signal, (event) => observe(counts, { ...event, stage: "entry-llm" }));
-    const validated = validateEntryResponse(answer.content, selected.candidates.length);
+    const validated = validateEntryResponse(answer.content, routeable.length);
     if (!validated.ok) return "llm-invalid";
     accepted = enteredIndexes(settings.executionModel, validated);
     for (const decision of validated.decisions) observe(counts, {
       stage: "entry-llm", code: accepted.includes(decision.index) ? "selected" : decision.enter ? "below-confidence" : "hold",
-      token: selected.candidates[decision.index]!.address, model: answer.model,
+      token: routeable[decision.index]!.address, model: answer.model,
       confidence: decision.confidence, reason: decision.reason,
     });
   } catch {
+    signal?.throwIfAborted();
     return "llm-unavailable";
   }
   for (const index of accepted.slice(0, 3)) {
-    const candidate = selected.candidates[index];
+    const candidate = routeable[index];
     if (candidate === undefined) continue;
     // AUDIT H1: the pin filter is not authority; approve plus token cap must still hold at build time.
     if (!grantsTokenSell(facts.spec, candidate.address)) {
@@ -612,12 +644,14 @@ async function runEntry(
         ...(deps.routeReader === undefined ? {} : { reader: deps.routeReader }),
       });
     } catch (error) {
+      signal?.throwIfAborted();
       observe(counts, { stage: "route", code: error instanceof TradeRouteQuoteError ? error.code : "quote-unavailable", token: candidate.address });
       counts.refusals += 1;
       continue;
     }
     observe(counts, { stage: "route", code: quote.venue, token: candidate.address, reason: `Buy ${buySize.amountWei} wei; quote ${quote.amountOutWei} token units` });
     counts.entries += 1;
+    signal?.throwIfAborted();
     if (dryRun) return "dry-run";
     const request: TradeRequest = {
       decisionId: randomUUID(), venue: tradeVenue(quote.venue), side: "buy",
@@ -627,6 +661,7 @@ async function runEntry(
       route: quote.route,
     };
     const fenced = await deps.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async () => {
+      signal?.throwIfAborted();
       const identity = deps.executionIdentity(agent, request);
       const intent = await deps.intents.create({
         decisionId: request.decisionId,
@@ -717,13 +752,17 @@ async function completeWithFallback(
   try {
     observeCall?.({ code: "request", model: settings.primaryModel });
     const result = await deps.llmFor(settings.primaryModel).complete(prompt, signal);
+    signal?.throwIfAborted();
     observeCall?.({ code: "response", model: settings.primaryModel });
     return result;
   } catch (error) {
+    signal?.throwIfAborted();
     observeCall?.({ code: "request-failed", model: settings.primaryModel });
     if (settings.fallbackModel === settings.primaryModel) throw error;
+    signal?.throwIfAborted();
     observeCall?.({ code: "fallback-request", model: settings.fallbackModel });
     const result = await deps.llmFor(settings.fallbackModel).complete(prompt, signal);
+    signal?.throwIfAborted();
     observeCall?.({ code: "response", model: settings.fallbackModel });
     return result;
   }
