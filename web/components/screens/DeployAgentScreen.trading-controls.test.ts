@@ -9,10 +9,12 @@ const tradingConfigStart = deploySource.indexOf("  trading: [", configStart);
 const tradingConfig = deploySource.slice(tradingConfigStart, deploySource.indexOf("  lp: [", tradingConfigStart));
 
 describe("Trading control presentation", () => {
-  it("keeps the Blue Chip note short and removes the inert break-even row", () => {
-    expect(tradingPresets).toContain('note: "> $1B and bStocks. Established on-chain equities."');
-    expect(tradingPresets).not.toContain("Tokenized stocks trade on chain around the clock");
-    expect(tradingConfig).not.toContain("Move the stop to break-even");
+  it("matches the mockup's three-model catalogue and keeps wire break-even disabled", () => {
+    expect(tradingPresets).toContain('label: "Mid-Cap"');
+    expect(tradingPresets).toContain('label: "Degen"');
+    expect(tradingPresets).toContain('label: "Sigma"');
+    expect(tradingPresets).not.toContain('label: "Blue Chip"');
+    expect(tradingConfig).toContain("Move the stop to break-even");
     expect(deploySource).toContain("breakEvenAfterTp: false");
   });
 
@@ -23,11 +25,11 @@ describe("Trading control presentation", () => {
     expect(deploySource).not.toContain("shown in the preview");
   });
 
-  it("renders negative stop-loss presets while retaining positive canonical BPS", () => {
-    for (const value of ['stopLoss: "-25"', 'stopLoss: "-35"', 'stopLoss: "-50"']) {
+  it("renders the mockup's positive stop-loss values while retaining positive canonical BPS", () => {
+    for (const value of ['stopLoss: "25"', 'stopLoss: "35"', 'stopLoss: "50"']) {
       expect(tradingPresets).toContain(value);
     }
-    expect(tradingConfig).toContain("min: -100, max: -1");
+    expect(tradingConfig).toContain("min: 0, max: 100");
     expect(deploySource).toContain("stopLossBpsWhenEnabled(!!values.stopLossOn, Number(values.stopLoss))");
     expect(tradeDetailSource).toContain("stopLossPercentFromBps(draft.stopLossBps ?? 5_000)");
     expect(tradeDetailSource).toContain("bps(-settings.stopLossBps)");

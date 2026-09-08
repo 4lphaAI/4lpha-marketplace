@@ -28,7 +28,7 @@ import {
 
 /** R2.20(d). The whole safeguard against a mistyped address is the owner's eye. */
 export const LENDING_GIFT_COPY =
-  "Repayments are gifts. Nothing in this product can take them back, and 4lpha cannot verify that you control this address.";
+  "Repayments to this address are final: they cannot be undone.";
 
 /** R2.20(b). Deploy stays disabled until this is ticked. */
 export const LENDING_IRREVERSIBLE_TICK =

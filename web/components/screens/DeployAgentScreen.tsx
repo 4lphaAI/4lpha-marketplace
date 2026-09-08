@@ -39,18 +39,35 @@ const WORDS = [
 
 const KINDS = [
   { id: "grid", label: "Grid Agent", icon: "grid-trading", color: "var(--cat-grid)", tint: "var(--cat-grid-tint)",
+    venues: { demo: [{ label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" }], live: [{ label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" }] },
     blurb: "Automated grid market making that buys low and sells high as market price moves.",
     simLabel: "Backtest window", simNote: "Replays the ladder against historical pair data before any capital moves." },
   { id: "trading", label: "Trading Agent", icon: "yield", color: "var(--cat-yield)", tint: "var(--cat-yield-tint)",
+    venues: { demo: [
+      { label: "Four.meme", asset: "/design/protocols/fourmeme.png" },
+      { label: "Flap.sh", asset: "/design/protocols/flapsh.png" },
+      { label: "bStocks", asset: "/design/protocols/bstocks.png" },
+      { label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" },
+    ], live: [{ label: "BNB Chain", asset: "/design/protocols/bnb-chain.png" }] },
     blurb: "Screens eligible markets, sizes entries, and automatically manages buys & exits 24/7.",
     simLabel: "Backtest window", simNote: "Replays the model against historical pair data before any capital moves." },
   { id: "lp", label: "LP Agent", icon: "lp-rebalance", color: "var(--cat-lp)", tint: "var(--cat-lp-tint)",
+    venues: { demo: [{ label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" }], live: [{ label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" }] },
     blurb: "Routes liquidity to the best APR or fees with auto rebalance, compound & risk exits.",
     simLabel: "Backtest window", simNote: "Replays range, rebalance and fee behaviour over the selected pool history." },
   { id: "health", label: "Lending Agent", icon: "health-shield", color: "var(--cat-health)", tint: "var(--cat-health-tint)",
+    venues: { demo: [{ label: "Venus", asset: "/design/protocols/venus.png" }], live: [{ label: "Venus", asset: "/design/protocols/venus.png" }] },
     blurb: "Monitors lending positions loan health and automatically repays before liquidation.",
     simLabel: "Stress window", simNote: "Replays the collateral drawdown of the window against your triggers." },
 ];
+
+const GUIDE_LINKS = {
+  grid: "https://docs.4lpha.tech/#grid",
+  trading: "https://docs.4lpha.tech/#trading",
+  lp: "https://docs.4lpha.tech/#lp",
+  health: "https://docs.4lpha.tech/#lending",
+};
+const TUTORIAL_LINK = "https://www.youtube.com/watch?v=1uIeKGeg1no&list=PLOMsGmPsK-0Q";
 
 // Every id here answers on the 0G router; the names the mock-up carried are
 // other providers' and three of the old 0G product's answer HTTP 404.
@@ -72,14 +89,12 @@ const PRESETS = {
       set: { takeProfit: "25", stopLoss: "25" } },
   ],
   trading: [
-    { id: "bluechip", label: "Blue Chip", executionModel: "blue-chip", note: "> $1B and bStocks. Established on-chain equities.",
-      set: { confidence: "80", minMcap: "1,000,000,000", maxMcap: "", perTrade: "0.002", capital: "0.01", tp1: "40", stopLoss: "-25", holdTime: "1,440", maxPositions: "3" } },
     { id: "midcap", label: "Mid-Cap", executionModel: "mid-cap", note: "$10M – $1B. Balanced entry gate and sizing",
-      set: { confidence: "80", minMcap: "10,000,000", maxMcap: "1,000,000,000", perTrade: "0.002", capital: "0.01", tp1: "40", stopLoss: "-25", holdTime: "1,440", maxPositions: "3" } },
+      set: { confidence: "80", minMcap: "10,000,000", maxMcap: "1,000,000,000", perTrade: "0.02", capital: "0.02", tp1: "40", stopLoss: "25", holdTime: "1,440", maxPositions: "3" } },
     { id: "degen", label: "Degen", executionModel: "degen", note: "Runners under $1M selected from Four.meme and Flap.sh",
-      set: { confidence: "75", minMcap: "", maxMcap: "1,000,000", perTrade: "0.002", capital: "0.01", tp1: "60", stopLoss: "-35", holdTime: "480", maxPositions: "3" } },
+      set: { confidence: "75", minMcap: "", maxMcap: "1,000,000", perTrade: "0.01", capital: "0.02", tp1: "60", stopLoss: "35", holdTime: "480", maxPositions: "4" } },
     { id: "sigma", label: "Sigma", executionModel: "sigma", note: "Machine learning to spot daily runners by 4lpha",
-      set: { confidence: "72", minMcap: "", maxMcap: "", perTrade: "0.002", capital: "0.01", tp1: "100", stopLoss: "-50", holdTime: "120", maxPositions: "3" } },
+      set: { confidence: "72", minMcap: "", maxMcap: "", perTrade: "0.005", capital: "0.02", tp1: "100", stopLoss: "50", holdTime: "120", maxPositions: "5" } },
   ],
   lp: [
     { id: "wide", label: "Sigma", note: "Machine learning to route liquidity for the highest available Fee & APR.",
@@ -127,8 +142,8 @@ const CONFIG = {
   trading: [
     { title: "Agent", fields: [
       { k: "agentName", label: "Agent name", type: "text", v: "Trading Agent 01" },
-      { k: "perTrade", label: "BNB per entry", type: "stepper", v: "0.002", step: 0.002, min: 0.002, suffix: "BNB" },
-      { k: "capital", label: "Total capital", type: "stepper", v: "0.01", step: 0.01, min: 0.01, suffix: "BNB" },
+      { k: "perTrade", label: "BNB per entry", type: "stepper", v: "0.005", step: 0.002, min: 0.005, suffix: "BNB" },
+      { k: "capital", label: "Total capital", type: "stepper", v: "0.02", step: 0.01, min: 0.02, suffix: "BNB" },
       { k: "maxPositions", label: "Max open positions", type: "stepper", v: "3", step: 1, min: 1 },
     ] },
     { title: "Entry filter", fields: [
@@ -137,11 +152,12 @@ const CONFIG = {
       { k: "noReentry", label: "check", type: "check", v: true, text: "No re-entry" },
     ] },
     { title: "Exit (if you do not make a choice, the LLM model will decide)", fields: [
-      { k: "tp1On", type: "hidden", v: false },
+      { k: "tp1On", type: "hidden", v: true },
       { k: "tp1", label: "Take profit", type: "numToggle", on: "tp1On", v: "100", suffix: "%", step: 5, min: 0 },
-      { k: "stopLossOn", type: "hidden", v: false },
-      { k: "stopLoss", label: "Stop loss", type: "numToggle", on: "stopLossOn", v: "-50", suffix: "%", step: 5, min: -100, max: -1 },
+      { k: "stopLossOn", type: "hidden", v: true },
+      { k: "stopLoss", label: "Stop loss", type: "numToggle", on: "stopLossOn", v: "50", suffix: "%", step: 5, min: 0, max: 100 },
       { k: "holdTime", label: "Max holding time", type: "num", v: "480", suffix: "min", alignAsCheckbox: true, step: 60, noLimitAtMin: true },
+      { k: "moonbag", label: "check", type: "check", v: true, text: "Move the stop to break-even after the last take-profit target fills." },
     ] },
     { title: "Risk and execution", poweredBy: "0g", fields: [
       { k: "slippage", label: "Slippage tolerance", type: "stepper", v: "3", step: 0.5, min: 0.5, max: 5, suffix: "%", hint: "Between 0.5% and 5%." },
@@ -258,12 +274,8 @@ const CONFIG = {
     { title: "Triggers", fields: [
       { k: "trigger", label: "Act below health factor", type: "num", v: "1.20" },
       { k: "target", label: "Restore health factor to", type: "num", v: "1.50" },
-    ] },
-    { title: "Reserve", fields: [
-      // W6: `floor` turns OFF NumStepper's blur clamp, so a typed value out of
-      // range stays on screen in red and is refused — never quietly rewritten.
       { k: "reservePct", label: "Reserve kept as BNB", type: "stepper", v: "20", step: 5, min: 10, max: 50, floor: 10, suffix: "%",
-        hint: "The rest is swapped to USDT and supplied to Venus, where it earns while it waits." },
+        hint: "The rest is swapped to USDT and supplied to Venus." },
     ] },
     { title: "Repair", fields: [
       { k: "maxRepay", label: "Max repay per event", type: "stepper", v: "", prefix: "$", step: 1, min: 0.000001, floor: 0.000001, preciseStep: true },
@@ -1003,7 +1015,7 @@ function DeployAgentScreen({ kind, go }) {
   const active = KINDS.find((k) => k.id === kind) || KINDS[0];
   const id = active.id;
   const presets = PRESETS[id];
-  const [mode, setMode] = React.useState("Live");
+  const [mode, setMode] = React.useState("Demo");
   const [preset, setPreset] = React.useState(DEFAULT_PRESET[id]);
   const [values, setValues] = React.useState(() => defaults(id, DEFAULT_PRESET[id]));
   const [showAdv, setShowAdv] = React.useState(false);
@@ -1056,7 +1068,7 @@ function DeployAgentScreen({ kind, go }) {
   // depends only on the execution model and the pool's fee tier, both of which
   // this screen already holds, so it is known the instant the screen renders.
   React.useEffect(() => {
-    setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setMode("Live"); setShowAdv(false); setSim(null);
+    setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setMode("Demo"); setShowAdv(false); setSim(null);
     capitalTouched.current = false;
     repayTouched.current = false;
     setRepaySuggestion(null);
@@ -1091,7 +1103,7 @@ function DeployAgentScreen({ kind, go }) {
         agentName: settings.name, capital: saved.capitalBnb ?? current.capital, perTrade: weiToBnb(settings.entryWei), maxPositions: String(settings.maxOpenPositions),
         minMcap: settings.minMarketCapUsd === null ? "" : String(settings.minMarketCapUsd), maxMcap: settings.maxMarketCapUsd === null ? "" : String(settings.maxMarketCapUsd),
         noReentry: settings.noReentry, tp1On: settings.takeProfitBps !== null, tp1: settings.takeProfitBps === null ? "0" : String(settings.takeProfitBps / 100),
-        stopLossOn: settings.stopLossBps !== null, stopLoss: settings.stopLossBps === null ? "-50" : String(stopLossPercentFromBps(settings.stopLossBps)),
+        stopLossOn: settings.stopLossBps !== null, stopLoss: settings.stopLossBps === null ? "50" : String(Math.abs(stopLossPercentFromBps(settings.stopLossBps))),
         holdTime: settings.maxHoldSec === null ? "0" : String(settings.maxHoldSec / 60),
         slippage: String(settings.slippageBps / 100), gas: settings.gasPriority[0].toUpperCase() + settings.gasPriority.slice(1),
         instructions: settings.instructions ?? "", skillFile: settings.skillMarkdown === null ? null : { name: "Previous skill.md", text: settings.skillMarkdown },
@@ -1235,8 +1247,8 @@ function DeployAgentScreen({ kind, go }) {
       ? "Suggested from supported debt and Total capital once account data and BNB price are available. You can enter your own amount."
       : `Suggested $${repaySuggestion} from supported debt and Total capital. You can edit this amount.` } };
     if (id === "trading") return {
-      perTrade: { min: 0.002, floor: "0.002", max: undefined },
-      capital: { min: 0.01, floor: "0.01", hint: null },
+      perTrade: { min: 0.005, floor: "0.005", max: undefined },
+      capital: { min: 0.02, floor: "0.02", hint: null },
       maxPositions: { min: 1, max: 10 },
     };
     if (id !== "grid" || capitalFloorText === null || capitalFloorBnb === null) return null;
@@ -1266,15 +1278,15 @@ function DeployAgentScreen({ kind, go }) {
     if (!Number.isInteger(tradeSettings.maxOpenPositions) || tradeSettings.maxOpenPositions < 1
       || tradeSettings.maxOpenPositions > 10) return "Max open positions must be an integer from 1 through 10.";
     const stopLossPercent = Number(values.stopLoss);
-    if (values.stopLossOn && (!Number.isFinite(stopLossPercent) || stopLossPercent < -100 || stopLossPercent > -1)) {
-      return "Stop loss must be between -100% and -1%.";
+    if (values.stopLossOn && (!Number.isFinite(stopLossPercent) || stopLossPercent < 1 || stopLossPercent > 100)) {
+      return "Stop loss must be between 1% and 100%.";
     }
     if (totalWei < MIN_TRADE_CAPITAL_WEI) return "Total capital must be at least 0.01 BNB.";
     return null;
   })();
 
   return (
-    <div className="fl-shell fl-deploy-page" style={{ maxWidth: 1080 }}>
+    <div className={`fl-shell fl-deploy-page fl-deploy-polished${id === "grid" ? " fl-grid-deploy" : ""}`} style={{ maxWidth: 1080 }} data-testid={`deploy-${id}-screen`}>
       <Button variant="ghost" size="sm" icon={<span style={{ display: "grid", placeItems: "center", transform: "rotate(180deg)" }}><Icon name="arrow-right" size={13} /></span>} onClick={() => go("/")}>Back to marketplace</Button>
 
       <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 24, flexWrap: "wrap", margin: "20px 0 26px" }}>
@@ -1312,17 +1324,27 @@ function DeployAgentScreen({ kind, go }) {
       </div>
 
       <section className="fl-deploy-form" style={{ border: "1px solid var(--border-card)", borderTop: `2px solid ${active.color}`, borderRadius: "var(--radius-md)", background: "var(--surface-card)", padding: 24 }}>
+        {active.venues ? (
+          <div className="fl-deploy-providers" aria-label="Protocols">
+            {(mode === "Live" ? active.venues.live : active.venues.demo).map((venue) => (
+              <span className="fl-deploy-provider" key={venue.label} title={venue.label}>
+                <img src={venue.asset} alt="" />
+                <span>{venue.label}</span>
+              </span>
+            ))}
+          </div>
+        ) : null}
         <div style={{ display: "grid", gap: 14, marginBottom: 26 }}>
           <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
             <span className="fl-eyebrow">Execution model</span>
-            <button onClick={() => { repayTouched.current = false; setRepaySuggestion(null); setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}
-              style={{ cursor: "pointer", background: "none", border: "none", padding: 0, font: "var(--weight-regular) var(--text-sm)/1 var(--font-sans)", color: "var(--text-subtle)", textDecoration: "underline", textUnderlineOffset: 3 }}>
-              Reset parameters to defaults
-            </button>
+            <span className="fl-deploy-form-links">
+              <a href={GUIDE_LINKS[id]} target="_blank" rel="noreferrer">Guides</a>
+              <a href={TUTORIAL_LINK} target="_blank" rel="noreferrer">Tutorial Videos</a>
+              <button type="button" onClick={() => { repayTouched.current = false; setRepaySuggestion(null); setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}>
+                Reset parameters to defaults
+              </button>
+            </span>
           </div>
-          <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)", marginTop: -6, maxWidth: "70ch" }}>
-            Quant-tuned starting points. Picking one rewrites the controls below; you can still change any field afterwards.
-          </p>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 10 }}>
             {presets.map((p) => {
               const on = p.id === preset;

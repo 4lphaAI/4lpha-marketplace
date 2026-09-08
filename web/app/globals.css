@@ -948,6 +948,21 @@ button { font: inherit; color: inherit; }
   .fl-deploy-kind-card:hover::before,.fl-deploy-kind-card:focus-visible::before{animation:none}
 }
 
+/* Deploy settings refresh ------------------------------------------
+   The Claude Design update is scoped to the deploy forms only. The
+   Demo/Live controls and deploy handlers remain unchanged. */
+.fl-deploy-providers{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.fl-deploy-provider{display:inline-flex;align-items:center;gap:8px;width:max-content;min-height:30px;padding:0 10px 0 7px;border:1px solid var(--line-1);border-radius:var(--radius-pill);background:var(--surface-sunken);color:var(--text-muted);font:var(--weight-medium) var(--text-sm)/1 var(--font-sans)}
+.fl-deploy-provider img{width:20px;height:20px;display:block;border-radius:50%;object-fit:cover}
+.fl-deploy-form-links{display:inline-flex;align-items:center;gap:18px;flex-wrap:wrap}
+.fl-deploy-form-links button,.fl-deploy-form-links a{padding:0;border:0;background:transparent;color:var(--text-subtle);font:var(--weight-regular) var(--text-sm)/1 var(--font-sans);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.fl-deploy-form-links button:hover,.fl-deploy-form-links a:hover{color:var(--ink-1)}
+.fl-deploy-polished .fl-deploy-actions{margin-top:22px!important;padding-top:20px!important}
+@media (max-width:760px){
+  .fl-deploy-form-links{gap:12px}
+  .fl-deploy-polished .fl-deploy-form-links button{font-size:var(--text-xs)}
+}
+
 /* Dense list row --------------------------------------------------- */
 .fl-rows{border:var(--border-width) solid var(--border-card);border-radius:var(--radius-md);background:var(--surface-card);overflow:hidden}
 .fl-row{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) auto;align-items:center;gap:var(--space-6);padding:var(--row-pad-y) var(--row-pad-x);border-top:var(--border-width) solid var(--line-1);transition:background-color var(--dur-fast) var(--ease-out)}

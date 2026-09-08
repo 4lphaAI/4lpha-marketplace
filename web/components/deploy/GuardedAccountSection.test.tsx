@@ -90,7 +90,7 @@ describe("the guarded-account stage (R2.20)", () => {
   it("carries the gift copy and the irreversibility tick", async () => {
     await mount(emptyGuardedAccount());
     expect(host.textContent).toContain(
-      "Repayments are gifts. Nothing in this product can take them back, and 4lpha cannot verify that you control this address.",
+      "Repayments to this address are final: they cannot be undone.",
     );
     expect(host.textContent).toContain("I understand repayments to this address cannot be reversed");
   });

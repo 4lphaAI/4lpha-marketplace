@@ -46,7 +46,7 @@ const base = {
 describe("the copy the spec fixes verbatim", () => {
   it("carries R2.20's gift sentence, its tick, R3.13's copy, R2.17's hint and §6.2", () => {
     expect(LENDING_GIFT_COPY).toBe(
-      "Repayments are gifts. Nothing in this product can take them back, and 4lpha cannot verify that you control this address.",
+      "Repayments to this address are final: they cannot be undone.",
     );
     expect(LENDING_IRREVERSIBLE_TICK).toBe("I understand repayments to this address cannot be reversed");
     expect(LENDING_OWN_ACCOUNT_COPY).toBe(
