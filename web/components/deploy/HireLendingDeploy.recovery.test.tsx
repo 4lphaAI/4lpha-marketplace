@@ -502,6 +502,8 @@ describe("lending arm browser boundary", () => {
     await mount();
     await act(async () => { button("Place the reserve").click(); await vi.advanceTimersByTimeAsync(0); });
     expect(release).toBeDefined();
+    expect(host.querySelector("[data-testid='lending-deploy-running']")).not.toBeNull();
+    expect([...host.querySelectorAll("button")].some(button => /Save USDT|^Place the reserve$|without placing/u.test(button.textContent ?? ""))).toBe(false);
     mocks.owner.ownerAddress = "0x4444444444444444444444444444444444444444";
     await mount();
     await act(async () => {

@@ -1379,6 +1379,13 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
   </div>;
 
   if (step === "arm" && agentId !== null) {
+    // Deploy already continues through the arm. Recovery controls must not
+    // look like extra required steps while that same run is in progress.
+    if (running) return <div data-testid="lending-deploy-running" style={{ display: "grid", gap: 12 }}>
+      <p role="status" style={{ color: "var(--text-muted)", font: "var(--type-body-sm)", margin: 0 }}>Approve any wallet prompts to continue. This page will advance automatically.</p>
+      {Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
+      {message ? <p role="status" style={{ color: "var(--text-muted)", margin: 0 }}>{message}</p> : null}
+    </div>;
     const openAgent = (id: string): void => { if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`); };
     const retryArm = (): void => {
       hireStorage.removeItem(armOutcomeKey(agentId));
