@@ -54,6 +54,10 @@ import {
 import { PostgresVenusSettingsStore } from "../src/store/venusSettings.js";
 import { PostgresVenusObservationStore } from "../src/store/venusObservations.js";
 import { createPgSqlClient, type SqlClient } from "../src/store/sql.js";
+import { MemoryAgentStore } from "../src/store/agents.js";
+import { PostgresExecutionJournal } from "../src/store/journal.js";
+import { submitLendingBatch } from "../src/lending/execute.js";
+import type { WalletProvider } from "../src/core/types.js";
 
 const OWNER = getAddress("0x1111111111111111111111111111111111111111");
 const OTHER = getAddress("0x2222222222222222222222222222222222222222");
@@ -204,6 +208,51 @@ test("AUDIT P1 — every lending statement executes on a REAL PostgreSQL", {
     const observations = await PostgresVenusObservationStore.create(
       sql, () => clock, "lending",
     );
+
+    // A fake SQL client never serializes Date parameters. Exercise the actual
+    // submission seam against pg before claiming the Lending write path works.
+    const journal = await PostgresExecutionJournal.create(sql, () => clock);
+    const journalAgentId = `${AGENT}-journal-${Date.now()}`;
+    const agents = new MemoryAgentStore(null, () => clock);
+    await agents.createAgent({
+      id: journalAgentId, ownerAddress: OWNER, walletAddress: GUARDED, custodyModel: "passkey",
+      sessionFacts: {
+        spec: { allowedCalls: [], spendCaps: [], expiresAt: 9_999_999_999 },
+        permissions: { calls: [], spend: [] },
+        publicKey: `0x04${"ab".repeat(64)}` as Hex, expiry: 9_999_999_999,
+      },
+    });
+    // Public deterministic test fixture, used only with the fake provider below.
+    await agents.putAgentSessionKey(OWNER, journalAgentId, `0x${"7d".repeat(32)}` as Hex);
+    const agent = (await agents.getAgent(OWNER, journalAgentId))!;
+    let executions = 0;
+    const provider = {
+      restoreSession: () => ({ sessionId: "local-test-session" }),
+      preflightExecute: async () => undefined,
+      executeViaSession: async () => {
+        executions += 1;
+        return { status: "CONFIRMED", transactionHash: `0x${"ab".repeat(32)}`, callsId: `0x${"cd".repeat(32)}` };
+      },
+    } as unknown as WalletProvider;
+    const submission = { agent, decisionId: `lending:${journalAgentId}:arm:1`, calls: [], nativeSpendWei: 1n };
+    try {
+      const submitted = await submitLendingBatch({ agentStore: agents, journal, provider }, submission);
+      assert.equal(submitted.status, "completed");
+      assert.equal(executions, 1, "the valid timestamp allows exactly one fake submission");
+      const stored = await sql.query<{ state: string }>(
+        "select state from execution_journal where idempotency_key = $1", [submitted.journalKey],
+      );
+      assert.equal(stored.rows[0]?.state, "COMMITTED");
+      const duplicate = await submitLendingBatch({ agentStore: agents, journal, provider }, submission);
+      assert.equal(duplicate.status, "rolled-back");
+      assert.equal(duplicate.code, "refused-before-submit");
+      assert.equal(executions, 1, "the atomic created guard still refuses a duplicate");
+    } catch (error) {
+      assert.equal(executions, 0, "timestamp failure must precede every fake submission");
+      throw error;
+    } finally {
+      await sql.query("delete from execution_journal where agent_id = $1", [journalAgentId]);
+    }
 
     /* ---- putInitial / get / cross-tenant ------------------------------ */
     const created = await store.putInitialIfAbsentOrSame({

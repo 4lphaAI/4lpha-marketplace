@@ -190,7 +190,9 @@ export async function submitLendingBatch(
     },
     // Only `created` is read; the window is this row's own instant, so the sum
     // it takes is the cheapest one that answers nothing.
-    Number.MAX_SAFE_INTEGER,
+    // MAX_SAFE_INTEGER is outside Date's range and makes pg roll back this
+    // insert with an invalid timestamp. The unused sum needs a real instant.
+    Date.now(),
   );
   if (!created || begun.state !== "PENDING") {
     return {
