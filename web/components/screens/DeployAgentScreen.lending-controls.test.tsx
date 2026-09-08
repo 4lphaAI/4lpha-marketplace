@@ -5,18 +5,19 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const suggestion = vi.hoisted(() => ({ report: null as ((value: string | null) => void) | null }));
 
-vi.mock("@/components/deploy/HireGridDeploy", () => ({ HireGridDeploy: () => null }));
-vi.mock("@/components/deploy/HireLpDeploy", () => ({ HireLpDeploy: () => null }));
-vi.mock("@/components/deploy/HireTradeDeploy", () => ({ HireTradeDeploy: () => null }));
+vi.mock("@/components/deploy/HireGridDeploy", () => ({ HireGridDeploy: ({ mode }: { mode: string }) => <span data-mode={mode} /> }));
+vi.mock("@/components/deploy/HireLpDeploy", () => ({ HireLpDeploy: ({ mode }: { mode: string }) => <span data-mode={mode} /> }));
+vi.mock("@/components/deploy/HireTradeDeploy", () => ({ HireTradeDeploy: () => <span data-mode="Live" /> }));
 vi.mock("@/components/deploy/TradeModelSelect", () => ({ TradeModelSelect: () => null }));
 vi.mock("@/components/deploy/HireLendingDeploy", () => ({
   HireLendingDeploy: (props: {
     readonly triggerHf: string; readonly targetHf: string; readonly maxRepayUsd: string;
     readonly rescueReserveCount: number; readonly cooldownSeconds: number; readonly reserveBps: number;
-    readonly capitalBnb: string; readonly agentName: string;
+    readonly capitalBnb: string; readonly agentName: string; readonly mode: string;
     readonly onRepaySuggestion?: (value: string | null) => void;
   }) => { suggestion.report = props.onRepaySuggestion ?? null; return <button
     data-testid="lending-deploy-props"
+    data-mode={props.mode}
     data-trigger={props.triggerHf}
     data-target={props.targetHf}
     data-max-repay={props.maxRepayUsd}
@@ -43,6 +44,13 @@ function html(): string {
 }
 
 describe("lending deploy controls", () => {
+  for (const kind of ["grid", "trading", "lp", "health"]) {
+    it(`${kind} defaults to the actual Live hire flow`, () => {
+      const rendered = renderToStaticMarkup(<DeployAgentScreen kind={kind} go={() => undefined} />);
+      expect(rendered).toContain('data-mode="Live"');
+      expect(rendered).not.toContain('data-mode="Demo"');
+    });
+  }
   // MARKETPLACE-LENDING-AGENT §2.2: these have NO wire seam. "Do not render, do
   // not stub" — a control the owner can move that changes nothing is a lie
   // about what they control.
@@ -88,6 +96,7 @@ describe("lending deploy controls", () => {
   it("hands the hire component the operator's 1.20 / 1.50 defaults and a 2000 bps reserve", () => {
     const rendered = html();
     expect(rendered).toContain("data-trigger=\"1.20\"");
+    expect(rendered).toContain("data-mode=\"Live\"");
     expect(rendered).toContain("data-target=\"1.50\"");
     expect(rendered).toContain("data-reserve-bps=\"2000\"");
     expect(rendered).toContain("data-count=\"6\"");

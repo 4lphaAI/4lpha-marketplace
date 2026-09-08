@@ -1015,7 +1015,8 @@ function DeployAgentScreen({ kind, go }) {
   const active = KINDS.find((k) => k.id === kind) || KINDS[0];
   const id = active.id;
   const presets = PRESETS[id];
-  const [mode, setMode] = React.useState("Demo");
+  const [selectedMode, setMode] = React.useState("Live");
+  const mode = id === "lp" || id === "health" ? "Live" : selectedMode;
   const [preset, setPreset] = React.useState(DEFAULT_PRESET[id]);
   const [values, setValues] = React.useState(() => defaults(id, DEFAULT_PRESET[id]));
   const [showAdv, setShowAdv] = React.useState(false);
@@ -1068,7 +1069,7 @@ function DeployAgentScreen({ kind, go }) {
   // depends only on the execution model and the pool's fee tier, both of which
   // this screen already holds, so it is known the instant the screen renders.
   React.useEffect(() => {
-    setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setMode("Demo"); setShowAdv(false); setSim(null);
+    setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setMode("Live"); setShowAdv(false); setSim(null);
     capitalTouched.current = false;
     repayTouched.current = false;
     setRepaySuggestion(null);
@@ -1303,7 +1304,7 @@ function DeployAgentScreen({ kind, go }) {
             LP PnL needs fee accrual and impermanent loss, which is a simulator
             rather than a skipped submit. So its toggle is DISABLED with a
             reason rather than offering a Demo that cannot run (review finding
-            19). Lending has no deploy path at all yet. */}
+            19). Lending also uses only its live hire flow. */}
         {id === "lp" || id === "health" ? (
           <fieldset disabled title="Demo mode covers grid and trading agents; an LP demo needs fee and impermanent-loss modelling and is not built"
             style={{ border: 0, margin: 0, padding: 0, opacity: 0.65 }}>
