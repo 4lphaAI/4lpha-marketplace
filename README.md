@@ -4,12 +4,12 @@
 
 Deploy agents that manage PancakeSwap grids and liquidity, screen and trade markets, or protect Venus borrowing positions. This repository contains the marketplace frontend and execution plane. The **[separate market-data plane](https://github.com/4lphaAI/4lpha-market-data)** supplies market discovery, prices, pools and risk evidence; it is a core part of the system.
 
-| Agent | What it does |
-|---|---|
-| Grid | Places concentrated-liquidity buy/sell ranges and shifts them as the market moves. |
-| Trading | Screens an owner-authorized token universe, uses rules and 0G Compute LLM analysis, and executes entries and risk/time-based exits. |
-| LP | Opens PancakeSwap V3 liquidity, rebalances, compounds fees and applies configured protection exits. |
-| Lending | Supplies a rescue reserve to Venus and repays a monitored account's debt when health-factor conditions trigger. |
+| Agent | What it does | Demo video |
+|---|---|---|
+| Grid | Places concentrated-liquidity buy/sell ranges and shifts them as the market moves. | [Watch Grid demo](https://youtu.be/I5uyElPdtfo?si=LveDK1hVZYKhM_Yl) |
+| Trading | Screens an owner-authorized token universe, uses rules and 0G Compute LLM analysis, and executes entries and risk/time-based exits. | [Watch Trading demo](https://youtu.be/Y1jobkuKXH8) |
+| LP | Opens PancakeSwap V3 liquidity, rebalances, compounds fees and applies configured protection exits. | [Watch LP demo](https://youtu.be/1uIeKGeg1no?si=c3oBJ6ZVtWJp-3v5) |
+| Lending | Supplies a rescue reserve to Venus and repays a monitored account's debt when health-factor conditions trigger. | [Watch Lending demo](https://youtu.be/I7wxbKY0-ac?si=qIUkoD_waYymXi6W) |
 
 ## Five mainnet task results
 
