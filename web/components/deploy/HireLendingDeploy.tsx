@@ -40,6 +40,7 @@ import {
   type LendingSettingsParams,
 } from "@/lib/lending/form";
 import { recoverLendingArmParams, type LendingArmValues } from "@/lib/lending/arm-recovery";
+import { lendingUsdtCapRefusal, sameLendingArmValues, saveLendingUsdtRepay } from "@/lib/lending/prearm-settings";
 import { guardedAccountBlocker, guardedAccountReady, type GuardedAccountState } from "./GuardedAccountSection";
 
 const primaryBtn: React.CSSProperties = {
@@ -115,7 +116,9 @@ export type PersistedLendingArmParams = {
 };
 
 function saveArmParams(storage: Storage, agentId: string, params: PersistedLendingArmParams): void {
-  storage.setItem(armParamsKey(agentId), JSON.stringify(params));
+  const encoded = JSON.stringify(params);
+  storage.setItem(armParamsKey(agentId), encoded);
+  if (storage.getItem(armParamsKey(agentId)) !== encoded) throw new Error("Could not save the verified arm settings in this browser. Retry before placing the reserve.");
 }
 
 /** Non-throwing, and STRICT: a record this cannot map is no record at all. */
@@ -167,9 +170,8 @@ export function lendingArmRecoveryRefusal(reason: string): string {
 
 /** Shown ABOVE the confirm button, because these values are what gets signed. */
 export const LENDING_ARM_RECOVERED_COPY =
-  "This browser has no record of your hire, so these values were read back from the execution "
-  + "plane — they are the ones you signed when you hired this agent, and the ones the passkey "
-  + "prompt will sign now. Nothing has been signed yet.";
+  "These are the current signed settings and funded capital read from the execution plane. "
+  + "Review them before confirming the reserve placement. Nothing has been signed yet.";
 
 type DurableArmOutcome = { readonly status: "held" | "rolled-back"; readonly reason: string };
 
@@ -411,6 +413,9 @@ export type HireLendingDeployProps = {
 
 export function HireLendingDeploy(props: HireLendingDeployProps) {
   const owner = useOwnerActions();
+  const ownerIdentity = `${owner.ownerAddress ?? ""}:${owner.walletAddress ?? ""}`.toLowerCase();
+  const currentOwnerIdentity = React.useRef(ownerIdentity);
+  currentOwnerIdentity.current = ownerIdentity;
   const hireStorage = React.useMemo(
     () => accountHireStorage(typeof window === "undefined" ? undefined : window.localStorage, owner.ownerAddress),
     [owner.ownerAddress],
@@ -702,6 +707,31 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     return data;
   };
 
+  const checkArmOwner = (run: GridDeployRun): void => {
+    run.check();
+    if (currentOwnerIdentity.current !== ownerIdentity) {
+      run.stop();
+      throw new GridDeployStopped();
+    }
+  };
+
+  const readCurrentArm = async (id: string, run: GridDeployRun) => {
+    checkArmOwner(run);
+    const session = await run.guarded(() => readWithCredential(id, true));
+    checkArmOwner(run);
+    setView(session);
+    if (hireResumeStep(session) !== "arm" || cancellationRecorded(session)) {
+      throw new Error("This session is no longer ready to place a reserve. Refresh its agent page.");
+    }
+    const headers = await run.guarded(() => viewReadHeaders(id));
+    checkArmOwner(run);
+    const recovered = await run.guarded(() => recoverLendingArmParams({
+      agentId: id, hireBudgetWei: session.hireSizing?.openNativeBudgetWei, headers,
+    }));
+    checkArmOwner(run);
+    return recovered;
+  };
+
   const loadPreview = async (): Promise<LendingPreview> => {
     if (owner.passkey === null || owner.walletAddress === undefined) {
       throw new Error("Create or recover your passkey wallet first.");
@@ -815,6 +845,8 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
         if (!receiptSizing.ok) {
           throw new Error(receiptSizing.refusal ?? "The plane refused this hire's sizing.");
         }
+        const capRefusal = lendingUsdtCapRefusal({ settings: form.settings, budgetWei: budgetWei.toString(10), reserveBps: props.reserveBps }, config.usdt, receiptSizing.reserveCapFloorWei, usdtDecimals);
+        if (capRefusal !== null) throw new Error(`Max repay per event exceeds the proposed session cap of ${formatAtomicAmount(receiptSizing.reserveCapFloorWei, usdtDecimals, usdtDecimals)} USDT. Lower it before hiring.`);
         return {
           walletAddress: owner.walletAddress!,
           token: config.usdt,
@@ -1133,51 +1165,43 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
       // durable storage — never `form`/`props`, which after a reload are this
       // screen's defaults rather than the hire the owner funded.
       const persisted = loadArmParams(hireStorage, id);
-      let armParams: LendingArmValues | null = persisted === null ? null : {
+      const confirmed = confirmedArm.current;
+      const armParams: LendingArmValues | null = confirmed !== null && confirmed.agentId === id ? confirmed.values : persisted === null ? null : {
         settings: persisted.settings,
         budgetWei: persisted.budgetWei,
         reserveBps: persisted.reserveBps,
       };
-      if (armParams === null) {
-        // FIXREVIEW F2 — THE SECOND DEVICE. The W1 record is per browser and per
-        // account, so a hire granted elsewhere (or here, before `localStorage`
-        // was cleared) has none. The plane holds the same three values behind
-        // the owner read, so they are rebuilt from ITS record — never from this
-        // screen's defaults — SHOWN to the owner, and signed only after an
-        // explicit confirmation.
-        const confirmed = confirmedArm.current;
-        if (confirmed !== null && confirmed.agentId === id) {
-          armParams = confirmed.values;
-        } else {
-          mark("arm", "active", "This browser has no record of the hire — reading the values the plane stored…");
-          const headers = await run.guarded(() => viewReadHeaders(id!));
-          const recovery = await run.guarded(() => recoverLendingArmParams({
-            agentId: id!,
-            hireBudgetWei: current!.hireSizing?.openNativeBudgetWei ?? null,
-            headers,
-          }));
-          run.check();
-          if (recovery.kind === "past-arm") {
-            setArmPastArm(recovery.reason);
-            mark("arm", "skipped", recovery.reason);
-            return;
-          }
-          if (recovery.kind === "refused") throw new Error(lendingArmRecoveryRefusal(recovery.reason));
-          setArmRecovered({ agentId: id, values: recovery.values });
-          mark("arm", "active", "Check the values the plane recorded for this hire, then confirm to sign.");
-          return;
-        }
+      // The server's current signed settings supersede an old same-browser S1 cache too.
+      const recovery = await readCurrentArm(id, run);
+      if (recovery.kind === "past-arm") {
+        setArmPastArm(recovery.reason);
+        mark("arm", "skipped", recovery.reason);
+        return;
       }
-      // A `const` so the closure below sees the narrowed value, not the `let`.
-      const armValues: LendingArmValues = armParams;
+      if (recovery.kind === "refused") throw new Error(lendingArmRecoveryRefusal(recovery.reason));
+      const capRefusal = lendingUsdtCapRefusal(recovery.values, config.usdt, recovery.reserveCapWei, usdtDecimals);
+      if (capRefusal !== null) throw new Error(capRefusal);
+      if (armParams === null || !sameLendingArmValues(armParams, recovery.values)) {
+        confirmedArm.current = null;
+        setArmRecovered({ agentId: id, values: recovery.values });
+        mark("arm", "active", "Review the current signed settings, then confirm to place the reserve.");
+        return;
+      }
+      const armValues = recovery.values;
       const armed = await run.guarded(() => armLendingAgent({
         agentId: id!,
         settings: armValues.settings,
         budgetWei: BigInt(armValues.budgetWei),
         reserveBps: armValues.reserveBps,
-        signEnvelope: (action, targetId, params) => run.guarded(() => owner.signEnvelope(action, targetId, params)),
-        onNote: (note) => { if (!run.stopped && mounted.current) mark("arm", "active", note); },
+        signEnvelope: async (action, targetId, params) => {
+          checkArmOwner(run);
+          const signed = await run.guarded(() => owner.signEnvelope(action, targetId, params));
+          checkArmOwner(run);
+          return signed;
+        },
+        onNote: (note) => { if (!run.stopped && mounted.current && currentOwnerIdentity.current === ownerIdentity) mark("arm", "active", note); },
       }));
+      checkArmOwner(run);
       // L9: a replayed envelope carries NO outcome. Nothing here may infer one —
       // the navigation below lands on the agent page, which re-reads
       // `GET /lending/view` and renders whatever the plane actually recorded.
@@ -1189,7 +1213,7 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
       confirmedArm.current = null;
       if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
     } catch (error) {
-      if (!mounted.current || run.stopped) return;
+      if (!mounted.current || run.stopped || currentOwnerIdentity.current !== ownerIdentity) return;
       const text = error instanceof Error ? error.message : "The deploy could not be completed.";
       if (error instanceof LendingArmOutcomeError && id !== null) {
         const outcome = { status: error.status, reason: text } as const;
@@ -1211,10 +1235,42 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
       setMessage(text);
     } finally {
       if (activeRun.current === run) activeRun.current = null;
-      if (mounted.current) {
+      if (mounted.current && currentOwnerIdentity.current === ownerIdentity) {
         setRunning(false);
         if (!cancelling.current) setWorking(null);
       }
+    }
+  };
+
+  const saveMaxRepay = async (): Promise<void> => {
+    if (agentId === null || config === null || blocked !== null || working !== null || activeRun.current !== null || cancelling.current) return;
+    const run = new GridDeployRun();
+    activeRun.current = run;
+    autoContinued.current = true;
+    stopPolling();
+    setRunning(true);
+    setMessage("Reading the signed settings before saving your USDT max repay…");
+    try {
+      const saved = await saveLendingUsdtRepay({
+        agentId, amountUsd: props.maxRepayUsd, usdt: config.usdt, decimals: usdtDecimals,
+        readCurrent: () => readCurrentArm(agentId, run),
+        signEnvelope: (action, id, params) => run.guarded(() => owner.signEnvelope(action, id, params)),
+        check: () => checkArmOwner(run),
+      });
+      checkArmOwner(run);
+      saveArmParams(hireStorage, agentId, { ...saved.values, reserveCapWei: saved.reserveCapWei });
+      confirmedArm.current = null;
+      setArmRecovered(null);
+      hireStorage.removeItem(armOutcomeKey(agentId));
+      setArmOutcome(null);
+      setSteps(IDLE_STEPS);
+      const ceiling = saved.values.settings.maxPerAction.find(cap => cap.token?.toLowerCase() === config.usdt.toLowerCase());
+      setMessage(`Saved USDT max repay: ${formatAtomicAmount(ceiling!.maxWei, usdtDecimals, usdtDecimals)} USDT. Other signed settings are unchanged. You can now place the reserve.`);
+    } catch (error) {
+      if (mounted.current && !run.stopped && currentOwnerIdentity.current === ownerIdentity) setMessage(error instanceof Error ? error.message : "The settings could not be saved. No reserve was placed.");
+    } finally {
+      if (activeRun.current === run) activeRun.current = null;
+      if (mounted.current && currentOwnerIdentity.current === ownerIdentity) setRunning(false);
     }
   };
 
@@ -1322,6 +1378,10 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
               : <>Session <code>{agentId}</code> is live on chain. One step left: place the reserve with <code>lendingArm</code>. <strong>Until it is placed the guard holds nothing and can repay nothing.</strong></>}
       </p>
       {armOutcome !== null ? <p style={{ color: "var(--loss)", margin: 0 }}>{armOutcome.reason}</p> : null}
+      {armOutcome?.status === "held" || armPastArm !== null ? null : <div style={{ display: "grid", gap: 8 }}>
+        <span style={{ color: "var(--text-muted)", font: "var(--type-body-sm)" }}>Editing the form does not change the signed hire. Save the USDT max repay below first; all other signed settings, including any BNB ceiling, funded capital and reserve split, stay unchanged.</span>
+        <div><button type="button" style={secondaryBtn} disabled={running || blocked !== null || working !== null} title={blocked ?? working ?? undefined} onClick={() => void saveMaxRepay()}>Save USDT max repay: {props.maxRepayUsd}</button></div>
+      </div>}
       {recovered === null ? null : <div data-testid="lending-arm-recovered" style={{ display: "grid", gap: 8, padding: 14, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)", font: "var(--type-body-sm)", color: "var(--text-muted)" }}>
         <span>{LENDING_ARM_RECOVERED_COPY}</span>
         <span><strong>Total capital</strong> · {formatEther(BigInt(recovered.budgetWei))} BNB</span>
@@ -1339,14 +1399,15 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
           ? <button type="button" style={primaryBtn} onClick={() => openAgent(agentId)}>Continue from the agent page</button>
           : armPastArm !== null
             ? <button type="button" style={primaryBtn} onClick={() => openAgent(agentId)}>Open the agent page</button>
-            : <button type="button" style={busyBtn(running, primaryBtn)}
+            : <button type="button" style={{ ...busyBtn(running, primaryBtn), ...(blocked !== null ? { opacity: 0.5, cursor: "not-allowed" } : {}) }}
               onClick={recovered !== null ? confirmRecoveredArm : armOutcome?.status === "rolled-back" ? retryArm : () => void deployAll()}
-              disabled={running}>
+              disabled={running || blocked !== null} title={blocked ?? undefined}>
               {recovered !== null
                 ? "Confirm these values and place the reserve"
                 : armOutcome?.status === "rolled-back" ? "Retry placing the reserve" : "Place the reserve"}
             </button>}
       </div>
+      {blocked !== null && armOutcome?.status !== "held" && armPastArm === null ? <p role="status" style={{ color: "var(--warn)", margin: 0 }}>{blocked}</p> : null}
       {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
       {message && message !== armOutcome?.reason ? <p style={{ color: "var(--loss)" }}>{message}</p> : null}
       {armOutcome?.status === "held" || armPastArm !== null ? null : <div><button type="button" style={{ ...secondaryBtn, padding: "10px 16px", font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)" }} onClick={() => openAgent(agentId)}>Open the agent page without placing the reserve</button></div>}

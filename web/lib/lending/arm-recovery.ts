@@ -61,6 +61,7 @@ export type LendingArmRecovery =
     /** The digest this browser recomputed AND the plane already agreed with. */
     readonly digest: string;
     readonly guardStatus: LendingGuardStatus;
+    readonly reserveCapWei: string;
   }
   | {
     /** The guard is past the arm: there is nothing to place, only a page to open. */
@@ -174,5 +175,6 @@ export async function recoverLendingArmParams(input: {
     values: { settings, budgetWei: input.hireBudgetWei, reserveBps: view.guard.reserveBps },
     digest,
     guardStatus: view.guard.status,
+    reserveCapWei: view.guard.reserveCapWei,
   };
 }

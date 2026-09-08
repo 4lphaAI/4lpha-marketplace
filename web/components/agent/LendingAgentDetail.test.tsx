@@ -268,11 +268,15 @@ describe("the hero and the tiles", () => {
     expect(host.textContent).toContain("liquidation basis");
     expect(host.textContent).toContain("no protocol mismatch recorded by the agent");
     expect(testid("lending-target-marker")).toBe("TARGET 1.50");
+    expect(testid("lending-trigger-marker")).toBe("TRIGGER 1.20");
     const base = lendingView();
-    await mount(lendingView({ settings: { ...base.settings!, targetHf: "1900000000000000000" } }));
+    await mount(lendingView({ settings: { ...base.settings!, triggerHf: "1600000000000000000", targetHf: "1900000000000000000" } }));
     expect(testid("lending-target-marker")).toBe("TARGET 1.90");
+    expect(testid("lending-trigger-marker")).toBe("TRIGGER 1.60");
     const marker = host.querySelector<HTMLElement>("[data-testid='lending-target-marker']");
     expect(Number.parseFloat(marker!.style.left)).toBeCloseTo(64.2857, 3);
+    const triggerMarker = host.querySelector<HTMLElement>("[data-testid='lending-trigger-marker']");
+    expect(Number.parseFloat(triggerMarker!.style.left)).toBeCloseTo(42.8571, 3);
   });
 
   it("prices the reserve from the protocol oracle and names its composition", async () => {

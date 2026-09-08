@@ -44,6 +44,7 @@ import {
   LENDING_HIRE_STORAGE_KEY,
   LendingArmOutcomeError,
   armLendingAgent,
+  type PersistedLendingArmParams,
 } from "./HireLendingDeploy";
 
 const ID = "lending-agent-01";
@@ -115,6 +116,7 @@ const provisioning = (attempt = false): HireSessionView => ({
   sessionAddress: "0x5555555555555555555555555555555555555555",
   expiresAt: 9_999_999_999,
   permissions: { calls: [], spend: [] },
+  hireSizing: { name: "lending-v1", version: 1, openNativeBudgetWei: "50000000000000000" },
   ...(attempt ? { grantAttempt: { version: 1, attemptId: ATTEMPT_ID, startedAtSec: 100 } } : {}),
 });
 
@@ -139,13 +141,27 @@ const json = (data: unknown, status = 200) => new Response(JSON.stringify({ data
 const ARMABLE_HIRE = JSON.stringify({
   settings: {
     triggerHf: "1200000000000000000", targetHf: "1500000000000000000",
-    maxPerAction: [{ token: USDT, maxWei: "240000000000000000000" }],
+    maxPerAction: [{ token: USDT, maxWei: "12000000000000000000" }],
     minSecondsBetweenActions: 300, rescueReserveCount: 6,
   },
   budgetWei: "50000000000000000",
   reserveBps: 2000,
   reserveCapWei: "44000000000000000000",
 });
+
+function currentArmView(values: PersistedLendingArmParams = JSON.parse(ARMABLE_HIRE) as PersistedLendingArmParams) {
+  return {
+    guard: {
+      status: "provisioning-guard", hold: null, guardedAccount: ACCOUNT, debtMarkets: [V_USDT],
+      reserveBps: values.reserveBps, budgetWei: "0", reserveCapWei: values.reserveCapWei,
+      armTxHash: null, armBlock: null, closeReason: null, actionSeq: 0, lastActionAtMs: null, updatedAtMs: 1,
+    },
+    snapshot: { presentAt: null, ageMs: null, staleAfterMs: 60000, stale: true, reason: "not armed", workerIntervalMs: 30000, payload: null },
+    rescues: [], settings: { ...values.settings, notifyOnlyBelowHf: "notifyOnlyBelowHf" in values.settings ? values.settings.notifyOnlyBelowHf : null },
+    settingsDigest: paramsHash("lendingSettings", values.settings),
+    session: { expiresAt: 9999999999, expiring: false }, recovery: { note: "recoverable with your passkey" },
+  };
+}
 
 let host: HTMLDivElement;
 let root: Root | null;
@@ -171,7 +187,7 @@ function component(props: Partial<React.ComponentProps<typeof HireLendingDeploy>
     guarded={guarded()}
     triggerHf="1.20"
     targetHf="1.50"
-    maxRepayUsd="240"
+    maxRepayUsd="12"
     rescueReserveCount={6}
     cooldownSeconds={300}
     reserveBps={2000}
@@ -197,13 +213,14 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   localStorage.clear();
   vi.clearAllMocks();
+  mocks.owner.ownerAddress = "0x2222222222222222222222222222222222222222";
   current = provisioning(false);
   mayInvoke = false;
   provisionResponse = null;
   previewReads = 0;
   armStatus = "completed";
   agentList = [];
-  lendingViewBody = {};
+  lendingViewBody = currentArmView();
   lendingViewStatus = 200;
   lendingViewThrows = false;
   configPayload = CONFIG;
@@ -241,6 +258,11 @@ beforeEach(() => {
       return json({ ...provisioning(false), cancelRequested: true });
     }
     if (url.endsWith("/session")) return init?.method === "POST" ? provisionResponse ?? json(current) : json(current);
+    if (url.endsWith("/lending/settings") && init?.method === "POST") {
+      const saved = JSON.parse(String(init.body)) as { params: PersistedLendingArmParams["settings"] };
+      lendingViewBody = { ...(lendingViewBody as Record<string, unknown>), settings: { ...saved.params, notifyOnlyBelowHf: "notifyOnlyBelowHf" in saved.params ? saved.params.notifyOnlyBelowHf : null }, settingsDigest: paramsHash("lendingSettings", saved.params) };
+      return json({ settingsDigest: paramsHash("lendingSettings", saved.params) });
+    }
     if (url.endsWith("/lending/arm") && init?.method === "POST") {
       return json({
         arm: {
@@ -406,7 +428,7 @@ describe("the PRE-SIGNATURE gates (R3.13, R2.20)", () => {
     const derived = host.querySelector("[data-testid=\"lending-derived\"]")?.textContent ?? "";
     expect(derived).toContain("Most this agent's key could move per day: 44 USDT + 0.09 BNB");
     expect(derived).toContain("× 7 days");
-    expect(derived).toContain("1440 USDT");
+    expect(derived).toContain("72 USDT");
     expect(derived).toContain("Reserve: USDT supplied on Venus + BNB tier");
     expect(derived).toContain("A leaked session key can move the reserve OUT of wallet B");
     expect(mocks.signEnvelope).not.toHaveBeenCalled();
@@ -438,7 +460,7 @@ describe("the S1 envelope", () => {
     expect(params["settings"]).toEqual({
       triggerHf: "1200000000000000000",
       targetHf: "1500000000000000000",
-      maxPerAction: [{ token: USDT, maxWei: "240000000000000000000" }],
+      maxPerAction: [{ token: USDT, maxWei: "12000000000000000000" }],
       minSecondsBetweenActions: 300,
       rescueReserveCount: 6,
     });
@@ -452,6 +474,123 @@ describe("the S1 envelope", () => {
 });
 
 describe("lending arm browser boundary", () => {
+  it.each(["completed", "held"] as const)("ignores a %s arm response after switching owners", async status => {
+    current = { ...provisioning(false), status: "armed", missing: [] };
+    localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
+    localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, ARMABLE_HIRE);
+    const originalFetch = fetchMock.getMockImplementation()!;
+    let release: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementation(async (input, init) => String(input).endsWith("/lending/arm") && init?.method === "POST"
+      ? new Promise<Response>(resolve => { release = resolve; }) : originalFetch(input, init));
+    await mount();
+    await act(async () => { button("Place the reserve").click(); await vi.advanceTimersByTimeAsync(0); });
+    expect(release).toBeDefined();
+    mocks.owner.ownerAddress = "0x4444444444444444444444444444444444444444";
+    await mount();
+    await act(async () => {
+      release!(json({ arm: { status, reason: "old owner outcome", txHash: null, effect: "changed", idleUsdtWei: "0", mintUsdtWei: "1", supplyNativeWei: "1", reserveNativeWei: "1", swapFeeTier: 100 } }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mocks.go).not.toHaveBeenCalled();
+    expect(localStorage.getItem(LENDING_HIRE_STORAGE_KEY)).toBe(ID);
+    expect(localStorage.getItem(`${LENDING_ARM_OUTCOME_STORAGE_PREFIX}${ID}`)).toBeNull();
+    expect(host.textContent).not.toContain("old owner outcome");
+  });
+
+  it("does not post saved settings after the owner changes during the passkey prompt", async () => {
+    current = { ...provisioning(false), status: "armed", missing: [] };
+    localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
+    localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, ARMABLE_HIRE);
+    let release: ((value: unknown) => void) | undefined;
+    mocks.signEnvelope.mockImplementation(async (action: string, agentId: string, params: unknown) => action === "lendingSettings"
+      ? new Promise<unknown>(resolve => { release = resolve; }) : { signed: { action, agentId }, params, signature: "0x1234" });
+    await mount({ maxRepayUsd: "13" });
+    await act(async () => { button("Save USDT max repay: 13").click(); await vi.advanceTimersByTimeAsync(0); });
+    expect(release).toBeDefined();
+    mocks.owner.ownerAddress = "0x4444444444444444444444444444444444444444";
+    await mount({ maxRepayUsd: "13" });
+    await act(async () => { release!(envelope); await vi.advanceTimersByTimeAsync(0); });
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/lending/settings"))).toHaveLength(0);
+    expect(localStorage.getItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`)).toBe(ARMABLE_HIRE);
+  });
+
+  it("reports a cache write failure without claiming save success or arming", async () => {
+    current = { ...provisioning(false), status: "armed", missing: [] };
+    localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
+    localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, ARMABLE_HIRE);
+    await mount({ maxRepayUsd: "13" });
+    const setItem = localStorage.setItem.bind(localStorage);
+    const spy = vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === `${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`) throw new Error("Browser storage full");
+      setItem(key, value);
+    });
+    try {
+      await act(async () => { button("Save USDT max repay: 13").click(); await vi.advanceTimersByTimeAsync(0); });
+      expect(host.textContent).toContain("Browser storage full");
+      expect(host.textContent).not.toContain("Saved USDT max repay:");
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/lending/arm"))).toHaveLength(0);
+    } finally { spy.mockRestore(); }
+  });
+
+  it("saves 12 from an invalid 240 hire and only arms on the separate click", async () => {
+    current = { ...provisioning(false), status: "armed", missing: [] };
+    const old = JSON.parse(ARMABLE_HIRE) as PersistedLendingArmParams;
+    const invalid = { ...old, settings: { ...old.settings, maxPerAction: [{ token: USDT, maxWei: "240000000000000000000" }] }, reserveCapWei: "27576869756323761389" };
+    lendingViewBody = currentArmView(invalid);
+    localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
+    localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, JSON.stringify(invalid));
+    await mount({ maxRepayUsd: "12", capitalBnb: "0.5" });
+    await act(async () => { button("Save USDT max repay: 12").click(); await vi.advanceTimersByTimeAsync(0); });
+    expect(host.textContent).toContain("Saved USDT max repay: 12 USDT");
+    const saved = JSON.parse(localStorage.getItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`) ?? "null") as PersistedLendingArmParams;
+    expect(saved.settings.maxPerAction).toEqual([{ token: USDT, maxWei: "12000000000000000000" }]);
+    expect(saved.budgetWei).toBe(old.budgetWei);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/lending/arm"))).toHaveLength(0);
+    await act(async () => { button("Place the reserve").click(); await vi.advanceTimersByTimeAsync(0); });
+    const signedArm = mocks.signEnvelope.mock.calls.find(([action]) => action === "lendingArm")?.[2] as { settings: unknown; budgetWei: string };
+    expect(signedArm.settings).toEqual(saved.settings);
+    expect(signedArm.budgetWei).toBe(old.budgetWei);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/lending/arm"))).toHaveLength(1);
+  });
+
+  it("requires another confirmation if the signed settings change again", async () => {
+    current = { ...provisioning(false), status: "armed", missing: [] };
+    const old = JSON.parse(ARMABLE_HIRE) as PersistedLendingArmParams;
+    const newer = { ...old, settings: { ...old.settings, maxPerAction: [{ token: USDT, maxWei: "20000000000000000000" }] } };
+    localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
+    localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, ARMABLE_HIRE);
+    lendingViewBody = currentArmView(newer);
+    await mount();
+    await act(async () => { button("Place the reserve").click(); await vi.advanceTimersByTimeAsync(0); });
+    expect(host.querySelector("[data-testid='lending-arm-recovered']")?.textContent).toContain("20 USDT");
+    const latest = { ...newer, settings: { ...newer.settings, maxPerAction: [{ token: USDT, maxWei: "25000000000000000000" }] } };
+    lendingViewBody = currentArmView(latest);
+    await act(async () => { button("Confirm these values and place the reserve").click(); await vi.advanceTimersByTimeAsync(0); });
+    expect(host.querySelector("[data-testid='lending-arm-recovered']")?.textContent).toContain("25 USDT");
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/lending/arm"))).toHaveLength(0);
+  });
+
+  it("does not create a new hire whose max repay exceeds the preview grant cap", async () => {
+    await mount({ maxRepayUsd: "240" });
+    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    expect(host.textContent).toContain("proposed session cap of 44 USDT");
+    expect(mocks.signEnvelope.mock.calls.map(([action]) => action)).not.toContain("provisionAgent");
+  });
+
+  it("explains a blocked resumed arm and makes the button eligible only after acknowledgment", async () => {
+    current = { ...provisioning(false), status: "armed", missing: [] };
+    localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
+    localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, ARMABLE_HIRE);
+    await mount({ guarded: guarded({ confirmed: false }), maxRepayUsd: "12" });
+    expect(button("Place the reserve").disabled).toBe(true);
+    expect(host.textContent).toContain("I understand repayments to this address cannot be reversed");
+    await act(async () => { button("Place the reserve").click(); await vi.advanceTimersByTimeAsync(0); });
+    expect(mocks.signEnvelope).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/lending/arm"))).toHaveLength(0);
+    await mount({ guarded: guarded(), maxRepayUsd: "12" });
+    expect(button("Place the reserve").disabled).toBe(false);
+  });
+
   async function directArm(status: "completed" | "held" | "rolled-back" | "replayed") {
     const signed: Record<string, unknown>[] = [];
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => json(
@@ -557,7 +696,7 @@ describe("the arm signs the S1 values, across a reload", () => {
     },
     budgetWei: "500000000000000000",
     reserveBps: 3_000,
-    reserveCapWei: "44000000000000000000",
+    reserveCapWei: "440000000000000000000",
   };
 
   function armParams(): Record<string, unknown> {
@@ -567,7 +706,8 @@ describe("the arm signs the S1 values, across a reload", () => {
   }
 
   it("arms the PERSISTED hire after a reload, never this screen's defaults", async () => {
-    current = { ...provisioning(false), status: "armed", missing: [] };
+    current = { ...provisioning(false), status: "armed", missing: [], hireSizing: { name: "lending-v1", version: 1, openNativeBudgetWei: SIGNED.budgetWei } };
+    lendingViewBody = currentArmView(SIGNED);
     localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
     localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, JSON.stringify(SIGNED));
 
@@ -586,6 +726,7 @@ describe("the arm signs the S1 values, across a reload", () => {
   });
 
   it("REFUSES to arm with no persisted record rather than arming defaults", async () => {
+    lendingViewBody = {};
     current = { ...provisioning(false), status: "armed", missing: [] };
     localStorage.setItem(LENDING_HIRE_STORAGE_KEY, ID);
     await mount();
@@ -660,7 +801,7 @@ describe("the arm can be completed from a browser that never ran the hire", () =
         reserveBps: 3_000,
         // Zero until the arm writes it: the budget can only come from the hire.
         budgetWei: "0",
-        reserveCapWei: "44000000000000000000",
+        reserveCapWei: "440000000000000000000",
         armTxHash: null, armBlock: null, closeReason: null,
         actionSeq: 0, lastActionAtMs: null, updatedAtMs: 1_700_000_000_000,
       },
