@@ -1372,7 +1372,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   // realised figure waits for a completed round trip and dashes until then.
   const delta = metricValue(view?.grossPnl);
   const percent = metricValue(view?.grossPnlPercent);
-  const hodl = metricValue(detail.market?.hodl);
+  const hodl = metricValue(view?.hodl);
   // Read back from the SIGNED geometry: the preset name is never signed, so the
   // only honest label is the one this gap/width reproduces at this spacing.
   const model = view === null
@@ -1537,7 +1537,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
             the number alone. */}
         <MetricTile label="PnL since hire" value={delta} tone={metricTone(delta)} note={emptyNote(view?.grossPnl)} style={{ height: "100%" }} />
         <MetricTile label="PNL by percent" value={percent} tone={metricTone(percent)} note={emptyNote(view?.grossPnlPercent)} style={{ height: "100%" }} />
-        <MetricTile label="HODL benchmark" value={hodl} tone={metricTone(hodl)} note={emptyNote(detail.market?.hodl)} style={{ height: "100%" }} />
+        <MetricTile label="HODL benchmark" value={hodl} tone={metricTone(hodl)} style={{ height: "100%" }} />
       </div>
 
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>

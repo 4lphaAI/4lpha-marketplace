@@ -174,6 +174,8 @@ export type AgentDetailView = {
   readonly provisioning: boolean;
   readonly actionDisabledReason: string | null;
   readonly armMs: number | null;
+  readonly hodl?: DetailMetric;
+  readonly hodlArmTxHash?: string;
   readonly dailyNativeLimit: DetailMetric;
   readonly recordedCycleDelta: DetailMetric;
   /**
@@ -474,6 +476,45 @@ function signedUsdOrWbnb(deltaWei: bigint, quoteUsd: number | null): string {
   // Cents, computed on the integer wei so the rounding happens once.
   const cents = (magnitude * BigInt(Math.round(quoteUsd * 100)) + 10n ** 18n / 2n) / 10n ** 18n;
   return `${sign}$${cents / 100n}.${(cents % 100n).toString(10).padStart(2, "0")}`;
+}
+
+/** Independent of chart windows: base-token holding priced from the arm receipt. */
+export function onChainGridHodl(input: {
+  readonly benchmark: unknown; readonly capitalWei: string | null;
+  readonly pool: string | null; readonly token0: string; readonly token1: string;
+  readonly liveTick: LiveTick | null; readonly nowMs: number;
+}): { readonly metric: DetailMetric; readonly armedAtMs?: number; readonly txHash?: string } {
+  const missing = (reason: string) => ({ metric: { value: null, reason: `— ${reason}` } });
+  const evidence = row(input.benchmark);
+  if (evidence?.["status"] !== "ready") {
+    return missing(evidence?.["status"] === "pending" ? "reading on-chain arm" : "on-chain arm evidence unavailable");
+  }
+  const sqrtText = evidence["sqrtPriceX96"], capital = evidence["capitalWei"];
+  const armedAtMs = evidence["armedAtMs"], txHash = evidence["txHash"];
+  if (evidence["method"] !== "arm-transaction-post-swap-v1" || typeof evidence["pool"] !== "string" || evidence["pool"].toLowerCase() !== input.pool?.toLowerCase()
+    || typeof evidence["token0"] !== "string" || evidence["token0"].toLowerCase() !== input.token0.toLowerCase()
+    || typeof evidence["token1"] !== "string" || evidence["token1"].toLowerCase() !== input.token1.toLowerCase()
+    || typeof sqrtText !== "string" || !/^[1-9][0-9]{0,48}$/u.test(sqrtText)
+    || typeof capital !== "string" || !/^[1-9][0-9]{0,77}$/u.test(capital) || capital !== input.capitalWei || BigInt(capital) >= (1n << 256n)
+    || !safeInteger(armedAtMs) || armedAtMs < 0 || armedAtMs > input.nowMs || typeof txHash !== "string" || !HASH.test(txHash)
+    || typeof evidence["blockHash"] !== "string" || !HASH.test(evidence["blockHash"])
+    || typeof evidence["blockNumber"] !== "string" || !DECIMAL.test(evidence["blockNumber"])) return missing("invalid on-chain arm evidence");
+  const start = BigInt(sqrtText), c = BigInt(capital);
+  if (start < 4_295_128_739n || start >= 1461446703485210103287273052203988822378723970342n) return missing("invalid on-chain arm price");
+  const tick = input.liveTick;
+  if (!tick || tick.poolAddress?.toLowerCase() !== input.pool?.toLowerCase() || input.nowMs - tick.readAtMs < 0
+    || input.nowMs - tick.readAtMs > 60_000 || !Number.isSafeInteger(tick.tick) || tick.tick < -887272 || tick.tick >= 887272
+    || !DECIMAL.test(tick.blockNumber) || BigInt(tick.blockNumber) < BigInt(evidence["blockNumber"])) return missing("waiting for a fresh pool price");
+  const wbnb0 = input.token0.toLowerCase() === WBNB_56;
+  if (wbnb0 === (input.token1.toLowerCase() === WBNB_56)) return missing("invalid quote token");
+  const q = 1n << 192n, s2 = start * start, current = getSqrtRatioAtTick(tick.tick), n2 = current * current;
+  const base = wbnb0 ? c * s2 / q : c * q / s2;
+  if (base === 0n) return missing("capital is below one token unit");
+  const held = wbnb0 ? base * q / n2 : base * n2 / q;
+  const delta = held - c, magnitude = delta < 0n ? -delta : delta;
+  const hundredths = magnitude * 10_000n / c;
+  const percent = `${delta < 0n ? "-" : delta > 0n ? "+" : ""}${hundredths / 100n}.${(hundredths % 100n).toString().padStart(2, "0")}%`;
+  return { metric: { value: percent, reason: null }, armedAtMs, txHash };
 }
 
 function grossHoldingsWei(input: {
@@ -1261,6 +1302,9 @@ export function mapAgentDetail(
       : [];
   });
   const sessionPublicKey = typeof owner.session?.["publicKey"] === "string" ? owner.session["publicKey"] : null;
+  const hodl = onChainGridHodl({ benchmark: grid["benchmark"], capitalWei: armedBudgetWei,
+    pool: typeof grid["poolAddress"] === "string" ? grid["poolAddress"] : poolAddressFor(token0, token1, safeInteger(pool["fee"]) ? pool["fee"] : 0),
+    token0, token1, liveTick: liveTick ?? null, nowMs });
   return {
     id: owner.id,
     status: owner.status,
@@ -1271,7 +1315,9 @@ export function mapAgentDetail(
     sessionPublicKey,
     provisioning,
     actionDisabledReason: provisioning ? "This agent is still being hired. Finish the on-chain grant, or cancel the hire." : null,
-    armMs: liveCreatedAt.length === 0 ? null : Math.min(...liveCreatedAt),
+    armMs: hodl.armedAtMs ?? (liveCreatedAt.length === 0 ? null : Math.min(...liveCreatedAt)),
+    hodl: hodl.metric,
+    ...(hodl.txHash === undefined ? {} : { hodlArmTxHash: hodl.txHash }),
     dailyNativeLimit: dailyLimit(owner.session, nowMs, tokenSnapshot),
     recordedCycleDelta: { ...delta, note: cycleNote },
     grossPnl,

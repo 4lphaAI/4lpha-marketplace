@@ -101,6 +101,7 @@ import {
 } from "./account/keyStoreReader.js";
 import type { BalanceReader } from "./account/balanceReader.js";
 import type { LpTickLiquidityReading } from "./lp/readers.js";
+import { createGridBenchmarkCache, selectGridArmBenchmark, type GridArmBenchmarkInput, type GridArmBenchmark } from "./http/gridBenchmark.js";
 import {
   PASSKEY_DISABLED,
   createDispatchingVerifier,
@@ -593,6 +594,8 @@ export type LpPoolStateReading = {
  * (PHASE3: no RPC in the route layer; a fake serves the whole surface offline).
  */
 export type LpChainReaders = {
+  /** Optional, reporting-only receipt evidence; never used by execution. */
+  readonly gridArmBenchmark?: (input: GridArmBenchmarkInput) => Promise<GridArmBenchmark>;
   /** Factory `getPool`, or `null` when no pool exists for the triple. */
   getPool(token0: Address, token1: Address, fee: number): Promise<Address | null>;
   /** Pool state + rail evidence. THROWS when the TWAP cannot be read. */
@@ -4451,6 +4454,7 @@ export function createServer(deps: ServerDeps): Hono {
    * error body through `sanitizeMessage`.
    */
   function registerLpRoutes(lp: LpServerDeps): void {
+    const gridBenchmarkCache = createGridBenchmarkCache();
     /** Digest an agent that never signed `lpSettings` runs under. */
     const defaultSettingsDigest = paramsHash("lpSettings", defaultLpSettingsParams());
     // Tests and the dev stack deliberately use the explicit snapshot
@@ -9948,6 +9952,7 @@ export function createServer(deps: ServerDeps): Hono {
         sequence.steps.map((step) => step.journalIdempotencyKey),
       );
       const stepOutcomes = new Map<string, LpSequenceStepOutcome>();
+      const stepNativeSpends = new Map<string, bigint>();
       let nextStepKey = 0;
       const readStepOutcomes = async (): Promise<void> => {
         for (;;) {
@@ -9955,7 +9960,9 @@ export function createServer(deps: ServerDeps): Hono {
           nextStepKey += 1;
           if (key === undefined) return;
           try {
-            stepOutcomes.set(key, lpStepOutcome(await deps.journal.get(key)));
+            const journalRow = await deps.journal.get(key);
+            stepOutcomes.set(key, lpStepOutcome(journalRow));
+            if (journalRow?.state === "COMMITTED") stepNativeSpends.set(key, journalRow.nativeSpendWei);
           } catch {
             stepOutcomes.set(key, LP_STEP_OUTCOME_UNREADABLE);
           }
@@ -10201,7 +10208,7 @@ export function createServer(deps: ServerDeps): Hono {
           ...(effectiveSettings.grid === null
             ? {}
             : {
-                grid: gridOwnerView({
+                grid: { ...gridOwnerView({
                   grid: effectiveSettings.grid,
                   positions,
                   sequences,
@@ -10217,7 +10224,17 @@ export function createServer(deps: ServerDeps): Hono {
                   // omits the block rather than reporting a zero balance, which
                   // would be a claim.
                   ...(await ladderBufferView(agent, effectiveSettings.grid, positions)),
-                }),
+                }), benchmark: (() => {
+                  const grid = effectiveSettings.grid!;
+                  const selected = selectGridArmBenchmark({
+                    owner: agent.ownerAddress, agentId: agent.id, wallet: agent.walletAddress,
+                    pool: pancakeV3PoolAddress(grid.pool.token0, grid.pool.token1, grid.pool.fee),
+                    token0: grid.pool.token0, token1: grid.pool.token1, fee: grid.pool.fee, wbnb: lp.venue.wbnb,
+                    capitalWei: agent.sessionFacts?.hireSizing?.openNativeBudgetWei ?? null,
+                    positions, sequences, outcomes: stepOutcomes, nativeSpends: stepNativeSpends,
+                  });
+                  return "status" in selected ? selected : gridBenchmarkCache.getOrStart(selected, lp.readers.gridArmBenchmark);
+                })() },
               }),
           ...(lpOwnerBlock === undefined ? {} : { lp: lpOwnerBlock }),
           settingsDigest: stored?.digest ?? defaultSettingsDigest,

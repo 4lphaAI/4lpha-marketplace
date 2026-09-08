@@ -102,12 +102,24 @@ describe("Hired agent detail provenance", () => {
     // for the level rows.
     expect(html).toContain("+0.001200 WBNB");
     expect(html).toContain("+2.89%");
-    expect(html).toContain("0.78%");
+    expect(html).not.toContain("0.78%"); // Chart return is no longer the HODL baseline.
     expect(html).toContain("Position");
     expect(html).toContain("900719…0993 · GRID ORDER");
     expect(html).toContain("0.081 WBNB");
     expect(html).toContain("-0.004 WBNB");
     expect(html).toContain("https://bscscan.com/nft/0x46a15b0b27311cedf172ab29e4f4766fbe7f4364/9007199254740993");
+  });
+
+  it("renders only the on-chain HODL percentage, without amount, description or receipt link", () => {
+    const txHash = `0x${"ab".repeat(32)}`;
+    const html = render({ ...view, armMs: 1788717275000, hodlArmTxHash: txHash,
+      hodl: { value: "-4.78%", reason: null, note: "holding mubarak since on-chain arm" } });
+    expect(html).toContain("-4.78%");
+    expect(html).not.toContain("-$2.25");
+    expect(html).not.toContain("holding mubarak since on-chain arm");
+    expect(html).not.toContain(`https://bscscan.com/tx/${txHash}`);
+    expect(html).not.toContain("On-chain arm:");
+    expect(html).not.toContain("0.78%");
   });
 
   it("keeps ordinary lifecycle actions disabled and offers cancellation for an incomplete hire", () => {

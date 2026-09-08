@@ -1,4 +1,5 @@
 import { parseAtomicRotateReceipt, type AtomicRotateReceiptIdentity } from "./atomicRotateReceipt.js";
+import { parseGridArmBenchmark, type GridArmBenchmarkInput, type GridArmBenchmark } from "../http/gridBenchmark.js";
 /**
  * LP chain readers — the ONE place LP route/worker chain reads happen
  * (PHASE3-SPEC "Worker"; Revision 2 items 18–19, 32; PHASE3-REVIEW OQ3).
@@ -800,6 +801,19 @@ export function createLpChainReaders(
     return publicClient.getTransactionReceipt({ hash: txHash });
   }
 
+  async function gridArmBenchmark(input: GridArmBenchmarkInput): Promise<GridArmBenchmark> {
+    if (network.chainId !== 56) throw new Error("arm-chain-unavailable");
+    const { publicClient } = await connected();
+    const pool = await getPool(input.token0, input.token1, input.fee);
+    if (pool === null || pool.toLowerCase() !== input.pool.toLowerCase()) throw new Error("arm-pool-mismatch");
+    const receipt = await receiptOf(input.txHash);
+    const [block, finalized] = await Promise.all([
+      publicClient.getBlock({ blockNumber: receipt.blockNumber }),
+      publicClient.getBlock({ blockTag: "finalized" }),
+    ]);
+    return parseGridArmBenchmark(input, nfpm, receipt, block, finalized.number);
+  }
+
   async function collectAmounts(txHash: Hex): Promise<{
     amount0Wei: bigint;
     amount1Wei: bigint;
@@ -1323,6 +1337,7 @@ export function createLpChainReaders(
   return {
     getPool,
     poolState,
+    gridArmBenchmark,
     tickLiquidity,
     positions,
     positionFees,

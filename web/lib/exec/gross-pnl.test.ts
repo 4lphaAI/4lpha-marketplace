@@ -71,6 +71,31 @@ function lp(gridOverrides: Record<string, unknown> = {}, positions = [position("
 }
 
 describe("gross PnL", () => {
+  it("counts collectible fees in the exit value once, then counts collected fees in the wallet once", () => {
+    const budget = "20000000000000000";
+    const beforeCollect = lp({ buffer: { quoteWei: "10000000000000000", baseWei: "0" } }, [
+      position("p1", "7316794", "11000000000000000"),
+    ]);
+    const afterCollect = lp({ buffer: { quoteWei: "11000000000000000", baseWei: "0" } }, [
+      position("p1", "7316794", "10000000000000000"),
+    ]);
+    // Moving 0.001 WBNB of earned fees from the NFT into the wallet leaves
+    // total profit unchanged. Fee-history telemetry is not additional money.
+    const before = mapAgentDetail(owner(budget), beforeCollect, NOW);
+    const after = mapAgentDetail(owner(budget), afterCollect, NOW);
+    expect(before.grossPnl.value).toBe("+0.001 WBNB");
+    expect(after.grossPnl).toEqual(before.grossPnl);
+    expect(after.grossPnlPercent.value).toBe("+5.00%");
+  });
+
+  it("excludes the separate native gas reserve from the capital profit calculation", () => {
+    const view = mapAgentDetail(owner(), lp({ buffer: {
+      quoteWei: "20000000000000000", baseWei: "0",
+      nativeWei: "900000000000000000", nextShiftGasWei: "1000000000000000",
+    } }), NOW);
+    expect(view.grossPnl).toEqual(mapAgentDetail(owner(), lp(), NOW).grossPnl);
+  });
+
   it("adds the rungs to the wallet's idle WBNB and compares against the armed budget", () => {
     const view = mapAgentDetail(owner(), lp(), NOW);
     // 0.006193 + 0.006219 rungs + 0.020000 idle = 0.032412 vs 0.0415 armed.

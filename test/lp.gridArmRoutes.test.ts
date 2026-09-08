@@ -151,7 +151,7 @@ function lpSessionSpec(expiresAt: number, nativeCapWei = 10n ** 18n): SessionSpe
 function lpSessionFacts(
   expiresAt: number,
   nativeCapWei = 10n ** 18n,
-  hireSizingName?: "lp-v1",
+  hireSizingName?: "lp-v1" | "grid-v1",
 ): SessionFacts {
   return {
     spec: lpSessionSpec(expiresAt, nativeCapWei),
@@ -206,7 +206,8 @@ async function fixture(
     readonly settingsGrid?: LpGridSettings | null;
     readonly nativeSessionCapWei?: bigint;
     readonly canceledDraft?: boolean;
-    readonly hireSizingName?: "lp-v1";
+    readonly hireSizingName?: "lp-v1" | "grid-v1";
+    readonly benchmarkReader?: LpServerDeps["readers"]["gridArmBenchmark"];
   } = {},
 ): Promise<Fixture> {
   const lpStore = new MemoryLpSequenceStore();
@@ -237,6 +238,7 @@ async function fixture(
   });
 
   const readers = {
+    ...(options.benchmarkReader === undefined ? {} : { gridArmBenchmark: options.benchmarkReader }),
     getPool: async (): Promise<Address> => POOL,
     poolState: async (): Promise<LpPoolStateReading> => state(),
     positions: async (tokenId: bigint): Promise<LpPositionSnapshot | "burned"> => {
@@ -420,6 +422,30 @@ async function viewCall(f: Fixture): Promise<Record<string, unknown>> {
   });
   return (response.body["data"] ?? {}) as Record<string, unknown>;
 }
+
+describe("on-chain HODL owner projection", () => {
+  it("starts only after owner auth, uses journal capital, then serves cached evidence", async () => {
+    let reads = 0;
+    const f = await fixture({ gridEnabled: true, hireSizingName: "grid-v1", benchmarkReader: async input => {
+      reads++;
+      assert.equal(input.capitalWei, BUDGET.toString());
+      return { status: "ready", method: "arm-transaction-post-swap-v1", txHash: input.txHash,
+        blockNumber: "100", blockHash: `0x${"11".repeat(32)}`, armedAtMs: NOW_SEC * 1000,
+        pool: input.pool, token0: input.token0, token1: input.token1, sqrtPriceX96: (1n << 96n).toString(), capitalWei: input.capitalWei };
+    } });
+    assert.equal((await armCall(f, armParams())).status, 200);
+    const forbidden = await call(f.harness, `/agents/${AGENT_ID}/lp`);
+    assert.notEqual(forbidden.status, 200);
+    assert.equal(reads, 0);
+    const first = await viewCall(f);
+    assert.equal(((first["grid"] as Record<string, unknown>)["benchmark"] as { status: string }).status, "pending");
+    await new Promise(resolve => setImmediate(resolve));
+    const second = await viewCall(f);
+    assert.equal(((second["grid"] as Record<string, unknown>)["benchmark"] as { status: string }).status, "ready");
+    assert.equal(reads, 1);
+    assert.equal(f.harness.provider.executeCalls.length, 1, "reporting never executes another batch");
+  });
+});
 
 function reason(body: Record<string, unknown>): string {
   const error = body["error"] as { message?: string } | undefined;
