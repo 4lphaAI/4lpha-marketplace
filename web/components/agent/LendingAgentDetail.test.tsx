@@ -261,11 +261,18 @@ async function openTab(name: "Overview" | "Run log" | "Permissions") {
 }
 
 describe("the hero and the tiles", () => {
-  it("shows the liquidation-basis health factor and the protocol match credit", async () => {
+  it("keeps health in the tile and panel, with a target marker from the signed settings", async () => {
     await mount(lendingView());
-    expect(testid("lending-health")).toContain("1.18");
-    expect(testid("lending-health")).toContain("liquidation basis");
-    expect(testid("lending-health")).toContain("no protocol mismatch recorded by the agent");
+    expect(host.querySelector("[data-testid='lending-health']")).toBeNull();
+    expect(testid("lending-health-panel")).toContain("1.18");
+    expect(host.textContent).toContain("liquidation basis");
+    expect(host.textContent).toContain("no protocol mismatch recorded by the agent");
+    expect(testid("lending-target-marker")).toBe("TARGET 1.50");
+    const base = lendingView();
+    await mount(lendingView({ settings: { ...base.settings!, targetHf: "1900000000000000000" } }));
+    expect(testid("lending-target-marker")).toBe("TARGET 1.90");
+    const marker = host.querySelector<HTMLElement>("[data-testid='lending-target-marker']");
+    expect(Number.parseFloat(marker!.style.left)).toBeCloseTo(64.2857, 3);
   });
 
   it("prices the reserve from the protocol oracle and names its composition", async () => {
@@ -276,8 +283,11 @@ describe("the hero and the tiles", () => {
     expect(host.textContent).toContain("31.0%");
   });
 
-  it("shows the session countdown beside the no-lock-in sentence", async () => {
+  it("keeps the session countdown in Overview and the recovery explanation in Permissions", async () => {
     await mount(lendingView());
+    expect(testid("lending-reserve-panel")).toContain("SESSION");
+    expect(testid("lending-reserve-panel")).not.toContain("Your reserve is recoverable");
+    await openTab("Permissions");
     expect(host.textContent).toContain("Your reserve is recoverable with your passkey at any time; the agent's key cannot block it.");
   });
 });
@@ -293,7 +303,7 @@ describe("dash with reason", () => {
         workerIntervalMs: 30_000, payload: null,
       },
     }));
-    expect(testid("lending-health")).toContain("The worker has not reported since");
+    expect(testid("lending-health-panel")).toContain("The worker has not reported since");
     expect(testid("lending-stale")).toContain("has not reported recently");
     expect(host.textContent).not.toContain("$31.00");
     expect(host.textContent).not.toContain("31.0%");
@@ -314,8 +324,7 @@ describe("dash with reason", () => {
         markets: [market], debts: [], guardable: true,
       },
     }));
-    expect(testid("lending-health")).toContain("1.05");
-    expect(testid("lending-health")).toContain("read now, not by the agent");
+    expect(testid("lending-health-panel")).toContain("1.05");
     expect(testid("lending-stale")).toContain("read now, not by the agent");
     // The guard half has NO live source and stays dashed.
     expect(host.textContent).not.toContain("$31.00");
@@ -324,7 +333,7 @@ describe("dash with reason", () => {
   it("keeps the page alive — and honest — when the plane's view cannot be mapped", async () => {
     await mount(INVALID);
     expect(host.textContent).toContain("could not map");
-    expect(testid("lending-health")).toContain("—");
+    expect(testid("lending-health-panel")).toContain("—");
     expect(host.textContent).not.toContain("$");
   });
 
@@ -709,12 +718,13 @@ describe("effect and partial are two facts, not one tone", () => {
 /* -------------------------------------------------------------------------- */
 
 describe("the two bases and their match flags", () => {
-  it("renders the liquidation basis with the agent's match credit and says the snapshot has no borrowing-power basis", async () => {
+  it("keeps the normal match credit on hover and explains the missing borrowing-power basis", async () => {
     await mount(lendingView());
     const panel = testid("lending-health-panel");
     expect(panel).toContain("Liquidation basis");
     expect(panel).toContain("Borrowing-power basis");
-    expect(panel).toContain("no protocol mismatch recorded by the agent");
+    expect(panel).not.toContain("no protocol mismatch recorded by the agent");
+    expect(host.querySelector("[data-testid='lending-health-panel'] [title='no protocol mismatch recorded by the agent']")).not.toBeNull();
     expect(panel).toContain("carries only the liquidation basis");
   });
 
@@ -736,7 +746,8 @@ describe("the two bases and their match flags", () => {
     const panel = testid("lending-health-panel");
     expect(panel).toContain("1.62");
     expect(panel).toContain("1.30");
-    expect(panel).toContain("matches Venus's own account-liquidity call");
+    expect(panel).not.toContain("matches Venus's own account-liquidity call");
+    expect(host.querySelector('[data-testid="lending-health-panel"] [title="matches Venus\'s own account-liquidity call"]')).not.toBeNull();
     expect(panel).toContain("does NOT match Venus's own account-liquidity call");
     // +62.0% above the liquidation line, exact from the mantissa.
     expect(panel).toContain("+62.0%");
@@ -791,7 +802,8 @@ describe("the stale snapshot in the panels", () => {
       },
     }));
     expect(testid("lending-health-panel")).toContain("block 990");
-    expect(testid("lending-health-panel")).toContain("read now, not by the agent");
+    expect(testid("lending-health-panel")).not.toContain("read now, not by the agent");
+    expect(testid("lending-stale")).toContain("read now, not by the agent");
     expect(testid("lending-position")).toContain("READ NOW, NOT BY THE AGENT");
   });
 });
@@ -944,13 +956,15 @@ describe("guard.hold", () => {
 /* -------------------------------------------------------------------------- */
 
 describe("the USDT cap's label", () => {
-  it("calls it a daily USDT SPEND cap and says every approve charges it", async () => {
+  it("keeps the spend cap in Overview and its metering explanation in Permissions", async () => {
     await mount(lendingView());
     const panel = testid("lending-reserve-panel");
     expect(panel).toContain("Daily USDT spend cap");
     expect(panel).toContain("44 USDT");
-    expect(panel).toContain("charged by every USDT approve the session makes");
-    expect(panel).toContain("not reported by this view");
+    expect(panel).not.toContain("charged by every USDT approve the session makes");
+    await openTab("Permissions");
+    expect(host.textContent).toContain("charged by every USDT approve the session makes");
+    expect(host.textContent).toContain("not reported by this view");
     // The old name claimed it bounded repays. It does not.
     expect(host.textContent).not.toContain("Daily repay limit");
   });

@@ -705,21 +705,6 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
             <StatusBadge pill status={view?.status === "armed" ? "live" : "paused"} label={guard?.status ?? view?.status ?? "state unavailable"} />
           </div>
 
-          {/* THE HERO: the health factor the guard decides on, and nothing else. */}
-          <div data-testid="lending-health" style={{ display: "flex", alignItems: "baseline", gap: 12, marginTop: 10, flexWrap: "wrap" }}>
-            <span style={{ font: "var(--weight-medium) var(--text-3xl)/1 var(--font-mono)", color: cat.color }}>
-              {health?.value ?? "—"}
-            </span>
-            <span style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>
-              {health?.value === null || health === null
-                ? `— ${health?.reason ?? "no source"}`
-                : `health factor · liquidation basis${health.live ? ` · ${LENDING_LIVE_ACCOUNT_LABEL}` : ""}`}
-            </span>
-            <span style={{ font: "var(--type-mono-xs)", color: health?.matched === false ? "var(--loss)" : "var(--text-subtle)" }}>
-              {health === null ? "" : health.matchedNote}
-            </span>
-          </div>
-
           {props.message ? <p role="status">{props.message}</p> : null}
           {notice !== null ? <p role="status" style={{ color: "var(--ink-1)", maxWidth: "70ch" }}>{notice}</p> : null}
           {configReason !== null ? <p role="alert" style={{ color: "var(--warn)" }}>— {configReason}</p> : null}
@@ -892,8 +877,7 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
         settings={settings}
         guard={guard}
         workerIntervalMs={mapped?.snapshot.workerIntervalMs ?? config?.workerIntervalMs ?? null}
-        usdtDecimals={usdtDecimals}
-        config={config} />
+        usdtDecimals={usdtDecimals} />
     </div> : null}
 
     {tab === "Run log" ? <div style={{ display: "grid", gap: 16 }}>
@@ -934,15 +918,13 @@ function BasisCell({ name, cell }: { readonly name: string; readonly cell: Lendi
       <Dash reason={cell?.reason ?? "the guard view is not readable"} />
     </span>;
   }
-  return <span style={{ display: "grid", gap: 7, alignContent: "start", padding: "14px 16px" }}>
+  return <span title={cell.matchedNote} style={{ display: "grid", gap: 7, alignContent: "start", padding: "14px 16px" }}>
     <span style={label}>{name}</span>
     <span style={val}>{cell.hf}</span>
-    {/* Fix 2: the match flag rides WITH the number. The guard pauses when the
-        reconstruction and the Comptroller disagree, so an unmatched basis is
-        the most important thing in this cell. */}
-    <span style={{ ...mono, color: cell.matched === false ? "var(--loss)" : "var(--text-subtle)" }}>
-      {cell.matchedNote}{cell.live ? ` · ${LENDING_LIVE_ACCOUNT_LABEL}` : ""}
-    </span>
+    {/* A mismatch stays visible; the normal match detail is available on hover. */}
+    {cell.matched === true ? null : <span style={{ ...mono, color: cell.matched === false ? "var(--loss)" : "var(--text-subtle)" }}>
+      {cell.matchedNote}
+    </span>}
   </span>;
 }
 
@@ -968,8 +950,12 @@ function HealthScale({ nowHf, trigger, target }: {
       <div style={{ display: "flex", height: 14, borderRadius: 3, overflow: "hidden" }}>
         {zones.map((zone) => <i key={zone.k} style={{ width: `${at(zone.to) - at(zone.from)}%`, background: zone.color, opacity: zone.op }} />)}
       </div>
+      <span data-testid="lending-target-marker" style={{ position: "absolute", left: `${at(target)}%`, top: 0, transform: "translateX(-50%)", display: "grid", gap: 4, justifyItems: "center" }}>
+        <i style={{ height: 22, borderLeft: "2px dashed var(--profit)" }} />
+        <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--profit)", background: "var(--surface-card)", padding: "3px 7px", border: "1px solid var(--line-3)", borderRadius: "var(--radius-sm)", whiteSpace: "nowrap" }}>TARGET {target.toFixed(2)}</span>
+      </span>
     </div>
-    <div style={{ display: "flex", marginTop: 2 }}>
+    <div style={{ display: "flex", marginTop: 38 }}>
       {zones.map((zone) => <span key={zone.k} style={{ width: `${at(zone.to) - at(zone.from)}%`, display: "grid", gap: 5, alignContent: "start", paddingLeft: 8, borderLeft: "1px solid var(--line-2)" }}>
         <span style={{ font: "var(--weight-medium) var(--text-xs)/1.35 var(--font-mono)", color: zone.color, letterSpacing: "0.03em" }}>{zone.cap}</span>
         <span style={{ ...mono, letterSpacing: 0 }}>{zone.note}</span>
@@ -1020,14 +1006,12 @@ function HealthPanel({ health, bases, triggerHf, targetHf, readAt, readReason, n
       </span>
       <span style={{ display: "grid", gap: 7, alignContent: "start", padding: "14px 16px" }}>
         <span style={label}>Read at</span>
-        {/* Fix 3: a stale snapshot dashes with the plane's own reason, and the
-            BFF's live fallback renders LABELLED rather than passed off as the
-            agent's own work. */}
+        {/* Live-read provenance is shown in the banner and position header. */}
         {readAt === null || readAt.block === null
           ? <Dash reason={readReason ?? "no read is recorded"} />
           : <>
-            <span style={val}>block {readAt.block}</span>
-            <span style={mono}>{readAt.live ? LENDING_LIVE_ACCOUNT_LABEL : readAt.at === null ? "no time recorded" : relativeTime(readAt.at, now).text}</span>
+            <span title={readAt.live ? LENDING_LIVE_ACCOUNT_LABEL : undefined} style={val}>block {readAt.block}</span>
+            {readAt.live ? null : <span style={mono}>{readAt.at === null ? "no time recorded" : relativeTime(readAt.at, now).text}</span>}
           </>}
       </span>
     </div>
@@ -1093,9 +1077,8 @@ function ReservePanel({ capacity, coverage, legs, legsReason, capWei, usdtDecima
         <span style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 3, paddingTop: 11, borderTop: "1px solid var(--line-1)" }}>
           <span style={bodyText}>{LENDING_USDT_CAP_LABEL}</span>
           <span style={val}>{capWei === null ? "—" : `${formatAtomicAmount(capWei, usdtDecimals, 2)} USDT`}</span>
-          <span style={{ ...mono, gridColumn: "1 / -1" }}>{capWei === null ? "the guard row is not readable" : LENDING_USDT_CAP_NOTE}</span>
+          {capWei === null ? <span style={{ ...mono, gridColumn: "1 / -1" }}>the guard row is not readable</span> : null}
         </span>
-        <span style={{ ...mono, letterSpacing: 0 }}>{session.note}</span>
       </div>
     </div>
   </Panel>;
@@ -1182,29 +1165,25 @@ function PositionPanel({ markets, reason, live, guardedAccount, debtMarkets, con
 /* Guard rules                                                                */
 /* -------------------------------------------------------------------------- */
 
-function RulesStrip({ settings, guard, workerIntervalMs, usdtDecimals, config }: {
+function RulesStrip({ settings, guard, workerIntervalMs, usdtDecimals }: {
   readonly settings: LendingAgentView["settings"];
   readonly guard: LendingAgentView["guard"] | null;
   readonly workerIntervalMs: number | null;
   readonly usdtDecimals: number;
-  readonly config: LendingConfigView | null;
 }) {
   const caps = settings === null ? [] : settings.maxPerAction.map((cap) => cap.token === null
     ? `${formatAtomicAmount(cap.maxWei, 18, 6)} BNB`
     : `${formatAtomicAmount(cap.maxWei, usdtDecimals, 2)} USDT`);
   const rules: readonly (readonly [string, string | null, string])[] = [
-    ["Act below HF", settings === null ? null : formatHf(settings.triggerHf), "the settings are not readable"],
-    ["Restore HF to", settings === null ? null : formatHf(settings.targetHf), "the settings are not readable"],
     ["Max per repay", caps.length === 0 ? null : caps.join(" · "), "the settings are not readable"],
     ["Cooldown", settings === null ? null : `${settings.minSecondsBetweenActions} s`, "the settings are not readable"],
     ["Gas reserved for", settings === null ? null : `${settings.rescueReserveCount} repays`, "the settings are not readable"],
     ["Checks every", workerIntervalMs === null ? null : `${Math.round(workerIntervalMs / 1_000)} s`, "this deployment does not publish the worker cadence"],
     ["Reserve split", guard === null ? null : `${guard.reserveBps / 100}% BNB`, "the guard row is not readable"],
-    ["Venue", config === null ? null : "Venus Core · chain 56", "the lending venue could not be read"],
   ];
-  return <Panel title="Guard rules" testId="lending-rules" right={<span style={mono}>SIGNED AT HIRE · SIZING ONLY, A REPAY IS NEVER REFUSED FOR COUNT</span>}>
+  return <Panel title="Guard rules" testId="lending-rules">
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(170px,1fr))" }}>
-      {rules.map(([name, value, reason]) => <span key={name} style={{ display: "grid", gap: 7, padding: "14px 16px", borderRight: "1px solid var(--line-1)" }}>
+      {rules.map(([name, value, reason]) => <span key={name} title={name === "Gas reserved for" ? LENDING_RESCUE_COUNT_HINT : undefined} style={{ display: "grid", gap: 7, padding: "14px 16px", borderRight: "1px solid var(--line-1)" }}>
         <span style={label}>{name}</span>
         {value === null ? <Dash reason={reason} /> : <span style={val}>{value}</span>}
       </span>)}
