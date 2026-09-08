@@ -48,7 +48,12 @@ const KINDS = [
       { label: "Flap.sh", asset: "/design/protocols/flapsh.png" },
       { label: "bStocks", asset: "/design/protocols/bstocks.png" },
       { label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" },
-    ], live: [{ label: "BNB Chain", asset: "/design/protocols/bnb-chain.png" }] },
+    ], live: [
+      { label: "Four.meme", asset: "/design/protocols/fourmeme.png" },
+      { label: "Flap.sh", asset: "/design/protocols/flapsh.png" },
+      { label: "bStocks", asset: "/design/protocols/bstocks.png" },
+      { label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" },
+    ] },
     blurb: "Screens eligible markets, sizes entries, and automatically manages buys & exits 24/7.",
     simLabel: "Backtest window", simNote: "Replays the model against historical pair data before any capital moves." },
   { id: "lp", label: "LP Agent", icon: "lp-rebalance", color: "var(--cat-lp)", tint: "var(--cat-lp-tint)",
@@ -89,6 +94,8 @@ const PRESETS = {
       set: { takeProfit: "25", stopLoss: "25" } },
   ],
   trading: [
+    { id: "bluechip", label: "Blue Chip", executionModel: "blue-chip", note: "> $1B and bStocks. Established on-chain equities.",
+      set: { confidence: "80", minMcap: "1,000,000,000", maxMcap: "", perTrade: "0.002", capital: "0.01", tp1: "40", stopLoss: "25", holdTime: "1,440", maxPositions: "3" } },
     { id: "midcap", label: "Mid-Cap", executionModel: "mid-cap", note: "$10M – $1B. Balanced entry gate and sizing",
       set: { confidence: "80", minMcap: "10,000,000", maxMcap: "1,000,000,000", perTrade: "0.02", capital: "0.02", tp1: "40", stopLoss: "25", holdTime: "1,440", maxPositions: "3" } },
     { id: "degen", label: "Degen", executionModel: "degen", note: "Runners under $1M selected from Four.meme and Flap.sh",

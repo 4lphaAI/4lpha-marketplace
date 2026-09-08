@@ -9,11 +9,11 @@ const tradingConfigStart = deploySource.indexOf("  trading: [", configStart);
 const tradingConfig = deploySource.slice(tradingConfigStart, deploySource.indexOf("  lp: [", tradingConfigStart));
 
 describe("Trading control presentation", () => {
-  it("matches the mockup's three-model catalogue and keeps wire break-even disabled", () => {
+  it("keeps all four trading models and wire break-even disabled", () => {
     expect(tradingPresets).toContain('label: "Mid-Cap"');
     expect(tradingPresets).toContain('label: "Degen"');
     expect(tradingPresets).toContain('label: "Sigma"');
-    expect(tradingPresets).not.toContain('label: "Blue Chip"');
+    expect(tradingPresets).toContain('label: "Blue Chip", executionModel: "blue-chip"');
     expect(tradingConfig).toContain("Move the stop to break-even");
     expect(deploySource).toContain("breakEvenAfterTp: false");
   });
