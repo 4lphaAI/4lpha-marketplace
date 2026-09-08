@@ -264,6 +264,7 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
   const [tab, setTab] = React.useState<Tab>("Overview");
   const [now, setNow] = React.useState(Date.now());
   const [busy, setBusy] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [editing, setEditing] = React.useState(false);
   const [leaveRemainder, setLeaveRemainder] = React.useState(false);
@@ -379,7 +380,7 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
     note: LENDING_NO_LOCK_IN_COPY,
   };
 
-  const conditions = payload?.conditions ?? [];
+  const conditions = (payload?.conditions ?? []).filter((entry) => entry.condition !== "hf-above-trigger");
   const rescues = mapped?.rescues ?? [];
   const settings = mapped?.settings ?? null;
 
@@ -776,6 +777,10 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
 
     <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
       <SegmentedToggle options={["Overview", "Run log", "Permissions"]} value={tab} onChange={(next: Tab) => setTab(next)} />
+      <Button variant="ghost" disabled={refreshing} onClick={() => {
+        setRefreshing(true);
+        void detail.refreshLending().catch(() => setNotice("Could not refresh data. Please try again.")).finally(() => setRefreshing(false));
+      }}>{refreshing ? "Refreshing…" : "Refresh"}</Button>
     </div>
 
     {tab === "Overview" ? <div style={{ display: "grid", gap: 16 }}>
