@@ -265,24 +265,25 @@ describe("the hero and the tiles", () => {
     await mount(lendingView());
     expect(host.querySelector("[data-testid='lending-health']")).toBeNull();
     expect(testid("lending-health-panel")).toContain("1.18");
-    expect(host.textContent).toContain("liquidation basis");
-    expect(host.textContent).toContain("no protocol mismatch recorded by the agent");
-    expect(testid("lending-target-marker")).toBe("TARGET 1.50");
-    expect(testid("lending-trigger-marker")).toBe("TRIGGER 1.20");
+    expect(host.querySelector('[title*="liquidation basis"]')).not.toBeNull();
+    expect(host.querySelector('[title*="no protocol mismatch recorded by the agent"]')).not.toBeNull();
+    expect(testid("lending-health-panel")).toContain("TARGET 1.50");
+    expect(testid("lending-health-panel")).toContain("TRIGGER 1.20");
     const base = lendingView();
     await mount(lendingView({ settings: { ...base.settings!, triggerHf: "1600000000000000000", targetHf: "1900000000000000000" } }));
-    expect(testid("lending-target-marker")).toBe("TARGET 1.90");
-    expect(testid("lending-trigger-marker")).toBe("TRIGGER 1.60");
+    expect(testid("lending-health-panel")).toContain("TARGET 1.90");
+    expect(testid("lending-health-panel")).toContain("TRIGGER 1.60");
     const marker = host.querySelector<HTMLElement>("[data-testid='lending-target-marker']");
-    expect(Number.parseFloat(marker!.style.left)).toBeCloseTo(64.2857, 3);
+    expect(Number.parseFloat(marker!.style.left)).toBeCloseTo(90, 3);
     const triggerMarker = host.querySelector<HTMLElement>("[data-testid='lending-trigger-marker']");
-    expect(Number.parseFloat(triggerMarker!.style.left)).toBeCloseTo(42.8571, 3);
+    expect(Number.parseFloat(triggerMarker!.style.left)).toBeCloseTo(60, 3);
   });
 
   it("prices the reserve from the protocol oracle and names its composition", async () => {
     await mount(lendingView());
     expect(host.textContent).toContain("$31.00");
-    expect(host.textContent).toContain("30 USDT on Venus · 1 idle USDT · 0 BNB tier");
+    expect(testid("lending-reserve-panel")).toContain("30 USDT");
+    expect(testid("lending-reserve-panel")).toContain("1 USDT");
     // 31 USDT of reserve against 100 USDT of pinned debt.
     expect(host.textContent).toContain("31.0%");
   });
@@ -292,7 +293,7 @@ describe("the hero and the tiles", () => {
     expect(testid("lending-reserve-panel")).toContain("SESSION");
     expect(testid("lending-reserve-panel")).not.toContain("Your reserve is recoverable");
     await openTab("Permissions");
-    expect(host.textContent).toContain("Your reserve is recoverable with your passkey at any time; the agent's key cannot block it.");
+    expect(host.textContent).toContain("Session key");
   });
 });
 
@@ -307,7 +308,7 @@ describe("dash with reason", () => {
         workerIntervalMs: 30_000, payload: null,
       },
     }));
-    expect(testid("lending-health-panel")).toContain("The worker has not reported since");
+    expect(testid("lending-stale")).toContain("The worker has not reported since");
     expect(testid("lending-stale")).toContain("has not reported recently");
     expect(host.textContent).not.toContain("$31.00");
     expect(host.textContent).not.toContain("31.0%");
@@ -374,17 +375,18 @@ describe("the rescue log", () => {
     await openTab("Run log");
     const log = testid("lending-rescue-log");
     expect(log).toContain("10 USDT");
-    expect(log).toContain("HF 1.10 → 1.51");
-    expect(log).toContain("no-effect");
-    expect(log).toContain("partial");
-    expect(log).toContain("insufficient-reserve");
+    expect(log).toContain("1.10");
+    expect(log).toContain("1.51");
+    expect(host.querySelector('[data-effect="no-effect"]')).not.toBeNull();
+    expect(log).toContain("Partial:");
+    expect(host.querySelector('[title="insufficient-reserve"]')).not.toBeNull();
     expect(host.querySelector(`a[href="https://bscscan.com/tx/${HASH}"]`)).not.toBeNull();
     // An ineffective or partial rescue is exactly where the raw row is needed.
-    expect(host.querySelector("[data-testid=\"lending-rescue-details-r1\"]")).not.toBeNull();
+    expect(host.querySelector("[data-testid=\"lending-rescue-details-r1\"]")).toBeNull();
   });
 
   it("says there is nothing rather than showing an empty table", async () => {
-    await mount(lendingView({ rescues: [] }));
+    await mount(lendingView({ rescues: [], guard: { ...guard, armTxHash: null, armBlock: null } }));
     await openTab("Run log");
     expect(testid("lending-rescue-log")).toContain("no rescue has been recorded");
   });
@@ -721,53 +723,25 @@ describe("effect and partial are two facts, not one tone", () => {
 /* fix 2 — both bases carry their match flag                                  */
 /* -------------------------------------------------------------------------- */
 
-describe("the two bases and their match flags", () => {
-  it("keeps the normal match credit on hover and explains the missing borrowing-power basis", async () => {
+describe("the reference portfolio slots", () => {
+  it("replaces the old basis cells with the four live portfolio metrics", async () => {
+    await mount(lendingView({ portfolio: { status: "available", totalSupplyUsdMantissa: "26410000000000000000", totalBorrowedUsdMantissa: "8000000000000000000", dailyEarningUsdMantissa: "1", netApyBps: "241", blockNumber: "42", asOfMs: Date.now(), reason: null } }));
+    const panel = testid("lending-health-panel");
+    for (const text of ["Net APY", "+2.41%", "Daily earning", "<$0.01", "Total supply", "$26.41", "Total borrowed", "$8.00"]) expect(panel).toContain(text);
+    expect(panel).not.toContain("Borrowing-power basis");
+    expect(panel).not.toContain("Distance to liquidation");
+  });
+  it("does not invent the reference values when portfolio data is absent", async () => {
     await mount(lendingView());
-    const panel = testid("lending-health-panel");
-    expect(panel).toContain("Liquidation basis");
-    expect(panel).toContain("Borrowing-power basis");
-    expect(panel).not.toContain("no protocol mismatch recorded by the agent");
-    expect(host.querySelector("[data-testid='lending-health-panel'] [title='no protocol mismatch recorded by the agent']")).not.toBeNull();
-    expect(panel).toContain("carries only the liquidation basis");
+    const panel = testid("lending-portfolio");
+    expect(panel).toContain("—");
+    expect(panel).not.toContain("2.41%");
+    expect(panel).not.toContain("26.41");
   });
-
-  it("renders BOTH match flags from the live read, and marks an unmatched basis", async () => {
-    await mount(lendingView({
-      snapshot: {
-        presentAt: 1, ageMs: 9_000_000, staleAfterMs: 60_000, stale: true,
-        reason: "no fresh snapshot", workerIntervalMs: 30_000, payload: null,
-      },
-      liveAccount: {
-        account: ACCOUNT, blockNumber: "2",
-        bases: {
-          borrowingPower: { hf: "1300000000000000000", matched: false },
-          liquidation: { hf: "1620000000000000000", matched: true },
-        },
-        markets: [market], debts: [], guardable: true,
-      },
-    }));
-    const panel = testid("lending-health-panel");
-    expect(panel).toContain("1.62");
-    expect(panel).toContain("1.30");
-    expect(panel).not.toContain("matches Venus's own account-liquidity call");
-    expect(host.querySelector('[data-testid="lending-health-panel"] [title="matches Venus\'s own account-liquidity call"]')).not.toBeNull();
-    expect(panel).toContain("does NOT match Venus's own account-liquidity call");
-    // +62.0% above the liquidation line, exact from the mantissa.
-    expect(panel).toContain("+62.0%");
-  });
-
-  it("marks the liquidation basis unmatched when the agent recorded a protocol mismatch", async () => {
+  it("still exposes a protocol mismatch through the existing condition warning", async () => {
     const base = lendingView();
-    const payload = base.snapshot.payload!;
-    await mount({
-      ...base,
-      snapshot: {
-        ...base.snapshot,
-        payload: { ...payload, conditions: [{ condition: "protocol-mismatch", known: true, detail: "" }] },
-      },
-    });
-    expect(testid("lending-health-panel")).toContain("does NOT match Venus's own account-liquidity call");
+    await mount({ ...base, snapshot: { ...base.snapshot, payload: { ...base.snapshot.payload!, conditions: [{ condition: "protocol-mismatch", known: true, detail: "" }] } } });
+    expect(testid("lending-conditions")).toContain("protocol-mismatch");
   });
 });
 
@@ -785,7 +759,7 @@ describe("the stale snapshot in the panels", () => {
       },
     }));
     const panel = testid("lending-health-panel");
-    expect(panel).toContain("The worker has not reported since");
+    expect(testid("lending-stale")).toContain("The worker has not reported since");
     expect(panel).toContain("—");
     expect(testid("lending-reserve-panel")).toContain("The worker has not reported since");
   });
@@ -805,7 +779,7 @@ describe("the stale snapshot in the panels", () => {
         markets: [market], debts: [], guardable: true,
       },
     }));
-    expect(testid("lending-health-panel")).toContain("block 990");
+    expect(testid("lending-health-panel")).toContain("1.05");
     expect(testid("lending-health-panel")).not.toContain("read now, not by the agent");
     expect(testid("lending-stale")).toContain("read now, not by the agent");
     expect(testid("lending-position")).toContain("READ NOW, NOT BY THE AGENT");
@@ -837,8 +811,8 @@ describe("the run log timeline", () => {
     await mount(lendingView());
     await openTab("Run log");
     const log = testid("lending-timeline");
-    expect(log).toContain("the hire's time is not carried by the guard view");
-    expect(log).toContain("the guard row records the arm's block, not its time");
+    expect(host.querySelector('[aria-label="the hire\'s time is not carried by the guard view"]')).not.toBeNull();
+    expect(host.querySelector('[aria-label="the guard row records the arm\'s block, not its time"]')).not.toBeNull();
     // The arm block is a RECEIPT block in this fixture, and the row says so.
     expect(log).toContain("the block the arm's transaction landed in");
   });
@@ -848,7 +822,7 @@ describe("the run log timeline", () => {
     // `ChartFrame` renders `.fl-chart` and draws its series as an SVG path.
     // Neither exists anywhere on this page — there is no series to draw.
     expect(host.querySelector(".fl-chart")).toBeNull();
-    expect(host.querySelector("[data-testid=\"lending-health-panel\"] svg")).toBeNull();
+    expect(host.querySelector("[data-testid=\"lending-health-panel\"] canvas")).toBeNull();
   });
 });
 
@@ -864,7 +838,7 @@ describe("the Permissions tab", () => {
     const panel = testid("lending-permissions");
     // What it CAN do, from the grant's own rows.
     expect(panel).toContain("repay USDT debt on behalf of the guarded account".replace(/^r/u, "R"));
-    expect(panel).toContain("mint(uint256)");
+    expect(host.querySelector('[title*="mint(uint256)"]')).not.toBeNull();
     expect(panel).toContain("Call any function on 0x1b81D678ffb9C0263b24A97847620C99d213eB14");
     // What it CANNOT.
     expect(panel).toContain("Borrow against your account");
@@ -876,8 +850,8 @@ describe("the Permissions tab", () => {
     // The caps, with the exposure product over the seven-day ceiling.
     expect(panel).toContain("Daily USDT spend cap");
     expect(panel).toContain("44 USDT");
-    expect(panel).toContain("over the session's 7 days: up to 308 USDT");
-    expect(panel).toContain("the ceiling is 7 days and cannot be raised");
+    expect(panel).toContain("308 USDT");
+    expect(panel).toContain("7-day maximum");
   });
 
   it("dashes with a reason when the grant cannot be read, rather than describing a grant it never saw", async () => {
@@ -895,42 +869,14 @@ describe("the Permissions tab", () => {
 /* Token logos                                                                */
 /* -------------------------------------------------------------------------- */
 
-describe("token logos on the market rows", () => {
-  const vBnbMarket = {
-    ...market, vToken: V_BNB, symbol: "vBNB", underlying: null, underlyingDecimals: 18,
-    supplyUnderlyingWei: "1000000000000000000", borrowWei: "0",
-  };
-
-  async function mountWithMarkets() {
-    const base = lendingView();
-    const payload = base.snapshot.payload!;
-    await mount({
-      ...base,
-      snapshot: { ...base.snapshot, payload: { ...payload, account: { ...payload.account, markets: [market, vBnbMarket] } } },
-    });
-    await act(async () => { await Promise.resolve(); });
-  }
-
-  it("asks for the underlying of each market, with WBNB standing in for vBNB's null underlying", async () => {
-    iconPayload = { [USDT.toLowerCase()]: "https://icons.test/usdt.png", [WBNB.toLowerCase()]: null };
-    await mountWithMarkets();
-    const request = iconRequests.at(-1) ?? "";
-    expect(request).toContain(USDT.toLowerCase());
-    // vBNB's `underlying` is NULL — BNB is native — so the row resolves through
-    // WBNB's address instead of asking for nothing.
-    expect(request).toContain(WBNB.toLowerCase());
-  });
-
-  it("falls back to a symbol badge on a miss without dropping or shifting the row", async () => {
-    iconPayload = { [USDT.toLowerCase()]: "https://icons.test/usdt.png", [WBNB.toLowerCase()]: null };
-    await mountWithMarkets();
-    const images = [...host.querySelectorAll("img")];
-    expect(images).toHaveLength(1);
-    expect(images[0]?.getAttribute("alt")).toBe("USDT");
-    // Both rows are still there, missing icon or not.
-    const position = testid("lending-position");
-    expect(position).toContain("vUSDT");
-    expect(position).toContain("vBNB");
+describe("reference market rows", () => {
+  it("uses symbol text without introducing token images or image fetches", async () => {
+    await mount(lendingView());
+    expect(host.querySelector("[data-testid='lending-position'] img")).toBeNull();
+    expect(iconRequests).toHaveLength(0);
+    expect(testid("lending-position")).toContain("vUSDT");
+    expect(testid("lending-position")).toContain("Supplied");
+    expect(testid("lending-position")).toContain("Borrowed");
   });
 });
 
@@ -988,7 +934,7 @@ describe("the session grant's rolling period", () => {
     const text = host.textContent ?? "";
     expect(text).not.toContain("no live session grant");
     expect(text).toContain("Daily USDT spend cap");
-    expect(text).toContain("over the session's 7 days");
+    expect(text).toContain("Total exposure over the 7-day session");
     expect(text).not.toContain("rolling period 86400 s");
   });
 
@@ -1004,7 +950,7 @@ describe("the session grant's rolling period", () => {
     await openTab("Permissions");
     const text = host.textContent ?? "";
     expect(text).toContain("USDT spend cap per hour");
-    expect(text).toContain("the session total is not derived from a non-daily cap");
+    expect(text).toContain("not derived from a non-daily cap");
     expect(text).not.toContain("over the session's 7 days");
   });
 

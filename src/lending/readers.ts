@@ -34,6 +34,7 @@
  * derives the key hash the way `onChainNativeDailyCapWei` does, because "a read
  * that needs no key must not ask for one" (`src/core/types.ts`).
  */
+import { readLendingPortfolioBalances, type LendingPortfolioBalances } from "./portfolioBalances.js";
 import {
   createPublicClient,
   getAddress,
@@ -204,6 +205,8 @@ export type LendingVenue = {
 };
 
 export interface LendingChainReaders {
+  /** Owner-display only; never used by the lending worker or money sizing. */
+  readPortfolioBalances?(accounts: readonly Address[], signal?: AbortSignal): Promise<LendingPortfolioBalances>;
   /**
    * Wallet B's reserve at ONE pinned finalized block.
    *
@@ -383,6 +386,10 @@ export function createLendingChainReaders(
   }
 
   return {
+    async readPortfolioBalances(accounts, signal) {
+      const { publicClient } = await connected();
+      return readLendingPortfolioBalances(publicClient, comptroller, accounts, signal);
+    },
     async readReserve(wallet: Address): Promise<LendingReserveReading> {
       const { publicClient } = await connected();
       const finalized = await publicClient.getBlock({ blockTag: "finalized" });

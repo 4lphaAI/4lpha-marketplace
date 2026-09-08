@@ -24,11 +24,11 @@
  * per-cycle check history and no collateral-at-hire figure is stored anywhere.
  */
 import * as React from "react";
-import { Button, Category, Checkbox, Icon, Input, MetricTile, PermissionItem, SegmentedToggle, StatusBadge } from "@/design-system";
+import { ActivityRow, Button, Category, Checkbox, Icon, Input, MetricTile, PermissionItem, SegmentedToggle, StatusBadge } from "@/design-system";
+import { portfolioApy, portfolioUsd, type LendingPortfolio } from "@/lib/exec/lending-portfolio";
 import { usePublicClient } from "wagmi";
 import type { Address } from "viem";
 import { HireRecoveryActions } from "@/components/deploy/HireRecoveryActions";
-import { TokenIcon } from "@/components/TokenIcon";
 import { freshWbnbPriceMicros, relativeTime, type AgentDetailView, type DetailMetric } from "@/lib/exec/agent-detail";
 import { WBNB_56 } from "@/lib/exec/pairs";
 import type { UseAgentDetailResult } from "@/lib/exec/use-agent-detail";
@@ -57,7 +57,6 @@ import {
 import {
   LENDING_PARTIAL_COPY,
   lendingAccountSource,
-  lendingBases,
   lendingConditionCopy,
   lendingConditionTone,
   lendingCoverageMetric,
@@ -71,7 +70,6 @@ import {
   lendingTimeline,
   shortAddress,
   unavailable,
-  type LendingBasisCell,
   type LendingTimelineEvent,
 } from "@/lib/lending/detail";
 import {
@@ -100,10 +98,10 @@ const E18 = 10n ** 18n;
 /* The mock-up's shell, ported                                                */
 /* -------------------------------------------------------------------------- */
 
-const mono: React.CSSProperties = { font: "var(--weight-regular) var(--text-xs)/1.35 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" };
+const mono: React.CSSProperties = { font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" };
 const label: React.CSSProperties = { font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.06em", textTransform: "uppercase" };
-const val: React.CSSProperties = { font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-mono)", color: "var(--ink-1)" };
-const bodyText: React.CSSProperties = { font: "var(--weight-regular) var(--text-sm)/1.3 var(--font-sans)", color: "var(--text-muted)" };
+const val: React.CSSProperties = { font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", color: "var(--ink-1)" };
+const bodyText: React.CSSProperties = { font: "var(--weight-regular) var(--text-sm)/1.2 var(--font-sans)", color: "var(--text-muted)" };
 
 /** Nothing is invented: every unsourced cell renders a dash and says why. */
 function Dash({ reason, align = "start" }: { readonly reason: string; readonly align?: "start" | "end" }) {
@@ -135,13 +133,13 @@ function Panel({ title, right, children, fill, testId }: {
   </section>;
 }
 
-function tile(labelText: string, metric: DetailMetric, showNote = false) {
+function tile(labelText: string, metric: DetailMetric, tone?: string) {
   return <MetricTile
     key={labelText}
     label={labelText}
     title={metric.value === null ? metric.reason?.replace(/^—\s*/u, "") ?? "source unavailable" : metric.note}
     value={metric.value ?? "—"}
-    note={metric.value === null ? metric.reason ?? undefined : showNote ? metric.note : undefined} />;
+    tone={tone} />;
 }
 
 function txLink(hash: string | null | undefined) {
@@ -267,14 +265,12 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
   const [now, setNow] = React.useState(Date.now());
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<string | null>(null);
-  const [expanded, setExpanded] = React.useState<string | null>(null);
   const [editing, setEditing] = React.useState(false);
   const [leaveRemainder, setLeaveRemainder] = React.useState(false);
   const [poolShort, setPoolShort] = React.useState(false);
   const [config, setConfig] = React.useState<LendingConfigView | null>(null);
   const [configReason, setConfigReason] = React.useState<string | null>(null);
   const [wbnbMicros, setWbnbMicros] = React.useState<bigint | null>(null);
-  const [icons, setIcons] = React.useState<Record<string, string | null>>({});
   const [grant, setGrant] = React.useState<SessionGrantView | null>(null);
   const [grantReason, setGrantReason] = React.useState<string | null>(null);
 
@@ -353,7 +349,6 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
   const usdtDecimals = usdtDecimalsFrom(mapped?.liveAccount ?? null, config?.vUsdt ?? null);
 
   const health = mapped === null ? null : lendingHealth(mapped);
-  const bases = mapped === null ? null : lendingBases(mapped);
   const account = mapped === null ? null : lendingAccountSource(mapped);
   const reserveMetric = payload === null
     ? unavailable(mapped === null
@@ -387,35 +382,6 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
   const conditions = payload?.conditions ?? [];
   const rescues = mapped?.rescues ?? [];
   const settings = mapped?.settings ?? null;
-
-  /* ---- token icons for the market rows ----------------------------------- */
-
-  // vBNB's `underlying` is NULL — BNB is native and has no ERC-20 row — so its
-  // icon is resolved with WBNB's address. A miss is a symbol badge; it never
-  // shifts the layout and never blocks a row.
-  const iconAddresses = React.useMemo(() => {
-    const markets = account?.markets ?? [];
-    const wbnb = config?.wbnb ?? null;
-    const seen: string[] = [];
-    for (const market of markets) {
-      const address = (market.underlying ?? wbnb)?.toLowerCase() ?? null;
-      if (address !== null && !seen.includes(address)) seen.push(address);
-    }
-    return seen.slice(0, 8);
-  }, [account?.markets, config?.wbnb]);
-  const iconKey = iconAddresses.join(",");
-
-  React.useEffect(() => {
-    if (iconKey.length === 0) return;
-    const controller = new AbortController();
-    void fetch(`/api/token-icons?addresses=${iconKey}`, { signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ data?: Record<string, string | null> }> : null)
-      .then((payloadBody) => {
-        if (!controller.signal.aborted && payloadBody !== null) setIcons(payloadBody.data ?? {});
-      })
-      .catch(() => undefined);
-    return () => controller.abort();
-  }, [iconKey]);
 
   /* ---- the session grant, read only when the tab asks for it ------------- */
 
@@ -692,14 +658,14 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
   const timeline = mapped === null ? [] : lendingTimeline({ view: mapped, config, usdtDecimals });
 
   return <div className="fl-shell fl-hired-agent-page">
-    <Button variant="ghost" size="sm" onClick={() => props.go("/account")}>My agents</Button>
+    <Button variant="ghost" size="sm" icon={<Icon name="chevron-right" size={14} style={{ transform: "rotate(180deg)" }} />} onClick={() => props.go("/account")}>My agents</Button>
 
-    <div className="fl-hired-hero" style={{ display: "flex", justifyContent: "space-between", gap: 24, flexWrap: "wrap", margin: "16px 0 24px" }}>
+    <div className="fl-hired-hero" style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 24, flexWrap: "wrap", margin: "16px 0 24px" }}>
       <div style={{ display: "flex", gap: 16 }}>
-        <span className="fl-card__glyph" style={{ width: 44, height: 44, color: cat.color, background: cat.tint }}>
+        <span className="fl-card__glyph" style={{ width: 44, height: 44, color: cat.color, borderColor: cat.color, background: cat.tint }}>
           <Icon name={cat.icon} size={22} />
         </span>
-        <div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <h1 style={{ font: "var(--type-page-title)" }}>{view?.id ?? props.agentId}</h1>
             <StatusBadge pill status={view?.status === "armed" ? "live" : "paused"} label={guard?.status ?? view?.status ?? "state unavailable"} />
@@ -709,7 +675,10 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
           {notice !== null ? <p role="status" style={{ color: "var(--ink-1)", maxWidth: "70ch" }}>{notice}</p> : null}
           {configReason !== null ? <p role="alert" style={{ color: "var(--warn)" }}>— {configReason}</p> : null}
           {props.removeCallsId ? <p>Relay call {shortAddress(props.removeCallsId)} {txLink(props.removeTransactionHash)}</p> : null}
-          {props.identityStatus}
+          <div className="fl-lending-identity" style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)" }}>
+            {props.identityStatus}
+            <style>{`.fl-lending-identity > [role="status"] { font: inherit !important; } .fl-lending-identity a { text-decoration: none !important; }`}</style>
+          </div>
         </div>
       </div>
 
@@ -727,16 +696,16 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
         {props.showEdit === true ? (
           <Button variant="secondary" disabled={props.actionsDisabled || settings === null} title={settings === null ? "Settings are not readable for this guard yet." : undefined} onClick={() => setEditing((value) => !value)}>Edit</Button>
         ) : null}
-        <Button variant="secondary" disabled={props.actionsDisabled || !["armed", "paused"].includes(view?.status ?? "")} onClick={props.onTogglePause}>
+        <Button variant="secondary" icon={<Icon name="pause" size={15} />} disabled={props.actionsDisabled || !["armed", "paused"].includes(view?.status ?? "")} onClick={props.onTogglePause}>
           {view?.status === "paused" ? "Resume" : "Pause"}
         </Button>
-        <Button variant="secondary" disabled={busy || props.actionsDisabled || guard === null || !["armed", "held"].includes(guard.status)}
+        <Button variant="secondary" icon={<Icon name="wallet" size={15} />} disabled={busy || props.actionsDisabled || guard === null || !["armed", "held"].includes(guard.status)}
           title={guard === null ? undefined : !["armed", "held"].includes(guard.status) ? `Retire needs an armed or held guard; it is ${guard.status}.` : undefined}
           onClick={() => { if (window.confirm("Retire the reserve? Everything the Venus pool can pay is redeemed and swapped back to BNB in the agent wallet.")) void retire(false); }}>
           Retire reserve
         </Button>
         {recoveryOffered ? <Button variant="secondary" disabled={busy} onClick={() => { if (window.confirm("Recover the reserve with your passkey? This needs no session and no server.")) void recover(); }}>Recover with passkey</Button> : null}
-        <Button variant="danger" disabled={props.removeDisabled || !removeGate.allowed} title={removeGate.reason ?? props.removeTitle} onClick={props.onRemove}>
+        <Button variant="danger" icon={<Icon name="revoke" size={15} />} disabled={props.removeDisabled || !removeGate.allowed} title={removeGate.reason ?? props.removeTitle} onClick={props.onRemove}>
           {props.removeLabel}
         </Button>
       </div>
@@ -771,14 +740,14 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
       </div>
     </div> : null}
 
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(175px,1fr))", gap: 12, marginBottom: 20 }}>
-      {tile("Reserve budget", budgetMetric, true)}
-      {tile("Debt repaid to date", repaidMetric, true)}
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(175px,1fr))", gap: 16, marginBottom: 20 }}>
+      {tile("Reserve budget", budgetMetric)}
+      {tile("Debt repaid to date", repaidMetric)}
       {tile("Health factor", health === null
         ? unavailable("the guard view is not readable")
-        : { value: health.value, reason: health.reason, note: `liquidation basis · ${health.matchedNote}` }, true)}
-      {tile("Repay capacity", reserveMetric, true)}
-      {tile("Repays made", rescuesMetric, true)}
+        : { value: health.value, reason: health.reason, note: `liquidation basis · ${health.matchedNote}` }, "profit")}
+      {tile("Repay capacity", reserveMetric)}
+      {tile("Repays made", rescuesMetric)}
     </div>
 
     {editing && form !== null ? <div style={{ marginBottom: 20 }}><Panel>
@@ -807,7 +776,6 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
 
     <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
       <SegmentedToggle options={["Overview", "Run log", "Permissions"]} value={tab} onChange={(next: Tab) => setTab(next)} />
-      <Button size="sm" variant="ghost" onClick={() => void detail.refreshLending()}>Refresh</Button>
     </div>
 
     {tab === "Overview" ? <div style={{ display: "grid", gap: 16 }}>
@@ -834,18 +802,9 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
       <div className="fl-lending-split" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.9fr) minmax(300px,1fr)", gap: 16, alignItems: "stretch" }}>
         <HealthPanel
           health={health}
-          bases={bases}
           triggerHf={hfNumber(settings?.triggerHf)}
           targetHf={hfNumber(settings?.targetHf)}
-          readAt={account === null || account.reason !== null
-            ? null
-            : {
-              block: account.live ? mapped?.liveAccount?.blockNumber ?? null : payload?.account.blockNumber ?? null,
-              live: account.live,
-              at: mapped?.snapshot.presentAt ?? null,
-            }}
-          readReason={account?.reason ?? (mapped === null ? "the guard view is not readable" : null)}
-          now={now} />
+          portfolio={mapped?.portfolio ?? null} />
         <ReservePanel
           capacity={reserveMetric}
           coverage={coverageMetric}
@@ -870,7 +829,6 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
         guardedAccount={guard?.guardedAccount ?? null}
         debtMarkets={guard?.debtMarkets ?? []}
         config={config}
-        icons={icons}
         usdtDecimals={usdtDecimals} />
 
       <RulesStrip
@@ -881,20 +839,27 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
     </div> : null}
 
     {tab === "Run log" ? <div style={{ display: "grid", gap: 16 }}>
-      <Panel title="What this guard has done" right={<span style={mono}>DURABLE ROWS ONLY · NO CHECK HISTORY IS STORED</span>}>
-        <div data-testid="lending-timeline" style={{ padding: 16, display: "grid", gap: 14, maxHeight: 520, overflowY: "auto" }}>
+      <Panel>
+        <div data-testid="lending-timeline" style={{ padding: "8px 20px 16px" }}>
           {timeline.length === 0
             ? <span style={{ color: "var(--text-subtle)" }}>— the guard view is not readable</span>
             : timeline.map((event) => <TimelineRow key={event.key} event={event} now={now} />)}
         </div>
       </Panel>
 
-      <Panel title="Repay history" right={<span style={mono}>{`${rescues.length} RECORDED · EFFECT RE-READ ON CHAIN`}</span>}>
-        <div data-testid="lending-rescue-log" style={{ padding: 16, maxHeight: 520, overflowY: "auto", display: "grid", gap: 12 }}>
-          {rescues.length === 0
-            ? <span style={{ color: "var(--text-subtle)" }}>— {mapped === null ? "the guard view is not readable" : "no rescue has been recorded for this guard"}</span>
-            : rescues.map((rescue) => <RescueRow key={rescue.rescueId} rescue={rescue} now={now} usdtDecimals={usdtDecimals} config={config}
-              expanded={expanded === rescue.rescueId} onToggle={() => setExpanded(expanded === rescue.rescueId ? null : rescue.rescueId)} />)}
+      <Panel title="Repay history" right={<span style={mono}>{`${rescues.length} REPAYS · EFFECT RE-READ ON-CHAIN`}</span>}>
+        <div data-testid="lending-rescue-log">
+          <div className="fl-row__head" style={{ gridTemplateColumns: RESCUE_COLS }}><span>Time</span><span>Action</span><span>Health factor</span><span>Result</span><span style={{ justifySelf: "end" }}>Proof</span></div>
+          {rescues.length === 0 && guard?.armTxHash == null
+            ? <div style={{ padding: 16, color: "var(--text-subtle)" }}>— {mapped === null ? "the guard view is not readable" : "no rescue has been recorded for this guard"}</div>
+            : rescues.map(rescue => <RescueRow key={rescue.rescueId} rescue={rescue} now={now} usdtDecimals={usdtDecimals} config={config} />)}
+          {guard?.armTxHash == null ? null : <div className="fl-row" style={{ gridTemplateColumns: RESCUE_COLS, cursor: "default", alignItems: "center" }}>
+            <span style={mono} title="The arm records a block, not a timestamp.">—</span>
+            <span style={{ display: "grid", gap: 4 }}><span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>Reserve armed</span><span style={mono}>{formatAtomicAmount(guard.budgetWei, 18, 4)} BNB reserve budget</span></span>
+            <span style={{ display: "grid", gap: 4 }}><span style={{ ...val, color: "var(--text-subtle)" }}>—</span><span style={mono}>no repay in this row</span></span>
+            <span style={bodyText}>{timeline.find(event => event.key === "arm")?.detail}</span>
+            <a href={`https://bscscan.com/tx/${guard.armTxHash}`} target="_blank" rel="noreferrer" style={{ ...mono, justifySelf: "end", display: "flex", gap: 5, alignItems: "center" }}>{shortAddress(guard.armTxHash)}<Icon name="external" size={11} /></a>
+          </div>}
         </div>
       </Panel>
     </div> : null}
@@ -903,7 +868,10 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
       grant={grant}
       reason={grantReason}
       usdtDecimals={usdtDecimals}
-      now={now} /> : null}
+      now={now}
+      walletAddress={view?.walletAddress ?? null}
+      removeDisabled={props.removeDisabled || !removeGate.allowed}
+      onRemove={props.onRemove} /> : null}
   </div>;
 }
 
@@ -911,114 +879,76 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
 /* Health                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function BasisCell({ name, cell }: { readonly name: string; readonly cell: LendingBasisCell | null }) {
-  if (cell === null || cell.hf === null) {
-    return <span style={{ display: "grid", gap: 7, alignContent: "start", padding: "14px 16px" }}>
-      <span style={label}>{name}</span>
-      <Dash reason={cell?.reason ?? "the guard view is not readable"} />
-    </span>;
-  }
-  return <span title={cell.matchedNote} style={{ display: "grid", gap: 7, alignContent: "start", padding: "14px 16px" }}>
-    <span style={label}>{name}</span>
-    <span style={val}>{cell.hf}</span>
-    {/* A mismatch stays visible; the normal match detail is available on hover. */}
-    {cell.matched === true ? null : <span style={{ ...mono, color: cell.matched === false ? "var(--loss)" : "var(--text-subtle)" }}>
-      {cell.matchedNote}
-    </span>}
-  </span>;
-}
-
 function HealthScale({ nowHf, trigger, target }: {
   readonly nowHf: number | null;
   readonly trigger: number;
   readonly target: number;
 }) {
-  const lo = 1.0;
-  const hi = Math.max(2.0, target + 0.5, (nowHf ?? 0) + 0.2);
-  const at = (value: number) => ((Math.min(Math.max(value, lo), hi) - lo) / (hi - lo)) * 100;
+  const lo = 1.0, hi = 2.0;
+  const at = (value: number) => ((Math.min(hi, Math.max(lo, value)) - lo) / (hi - lo)) * 100;
+  const riskEnd = Math.min(1.20, target);
   const zones = [
-    { from: lo, to: trigger, color: "var(--loss)", op: 0.5, k: "risk", cap: `DANGER ${lo.toFixed(2)} – ${trigger.toFixed(2)}`, note: "liquidatable at 1.00" },
-    { from: trigger, to: target, color: "var(--warn)", op: 0.5, k: "act", cap: `AGENT REPAYS ${trigger.toFixed(2)} – ${target.toFixed(2)}`, note: "back to target, then stops" },
-    { from: target, to: hi, color: "var(--profit)", op: 0.42, k: "safe", cap: `SAFE ${target.toFixed(2)} AND UP`, note: "watching only" },
+    { from: lo, to: riskEnd, color: "var(--loss)", op: 0.5, k: "risk" },
+    { from: riskEnd, to: target, color: "var(--warn)", op: 0.5, k: "act" },
+    { from: target, to: hi, color: "var(--profit)", op: 0.42, k: "safe" },
   ];
-  return <div style={{ padding: "22px 20px 16px" }}>
-    <div style={{ position: "relative" }}>
-      {nowHf === null ? null : <span style={{ position: "absolute", left: `${at(nowHf)}%`, bottom: 6, transform: "translateX(-50%)", display: "grid", gap: 4, justifyItems: "center" }}>
-        <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", color: "var(--ink-1)", background: "var(--surface-card)", padding: "3px 7px", border: "1px solid var(--line-3)", borderRadius: "var(--radius-sm)", whiteSpace: "nowrap" }}>YOU {nowHf.toFixed(2)}</span>
-        <i style={{ width: 2, height: 18, background: "var(--ink-1)" }} />
-      </span>}
-      <div style={{ display: "flex", height: 14, borderRadius: 3, overflow: "hidden" }}>
-        {zones.map((zone) => <i key={zone.k} style={{ width: `${at(zone.to) - at(zone.from)}%`, background: zone.color, opacity: zone.op }} />)}
-      </div>
-      <span data-testid="lending-target-marker" style={{ position: "absolute", left: `${at(target)}%`, top: 0, transform: "translateX(-50%)", display: "grid", gap: 4, justifyItems: "center" }}>
-        <i style={{ height: 22, borderLeft: "2px dashed var(--profit)" }} />
-        <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--profit)", background: "var(--surface-card)", padding: "3px 7px", border: "1px solid var(--line-3)", borderRadius: "var(--radius-sm)", whiteSpace: "nowrap" }}>TARGET {target.toFixed(2)}</span>
-      </span>
-      <span data-testid="lending-trigger-marker" style={{ position: "absolute", left: `${at(trigger)}%`, top: 0, transform: "translateX(-50%)", display: "grid", gap: 4, justifyItems: "center" }}>
-        <i style={{ height: 44, borderLeft: "2px dashed var(--warn)" }} />
-        <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--warn)", background: "var(--surface-card)", padding: "3px 7px", border: "1px solid var(--line-3)", borderRadius: "var(--radius-sm)", whiteSpace: "nowrap" }}>TRIGGER {trigger.toFixed(2)}</span>
-      </span>
+  const ticks = [
+    { k: "trigger", v: trigger, color: "var(--warn)", cap: `TRIGGER ${trigger.toFixed(2)}` },
+    { k: "target", v: target, color: "var(--profit)", cap: `TARGET ${target.toFixed(2)}` },
+    ...(nowHf === null ? [] : [{ k: "you", v: nowHf, color: "var(--ink-1)", cap: `YOU ${nowHf.toFixed(2)}` }]),
+  ];
+  return <div style={{ padding: "18px 20px 16px" }}>
+    <div style={{ position: "relative", height: 16 }}>
+      {[{ v: 1.0, t: "<1", j: "flex-start" }, { v: 1.2, t: "1.2", j: "center" }, { v: 1.5, t: "1.5", j: "center" }, { v: 2.0, t: ">2", j: "flex-end" }].map(mark => (
+        <span key={mark.t} style={{ position: "absolute", left: `${at(mark.v)}%`, top: 0, transform: mark.j === "flex-start" ? "none" : mark.j === "flex-end" ? "translateX(-100%)" : "translateX(-50%)", ...mono }}>{mark.t}</span>
+      ))}
     </div>
-    {/* Only the bar scales with the thresholds; labels need readable width even for a 0.01 HF gap. */}
-    <div data-testid="lending-zone-legend" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))", gap: 12, marginTop: 60 }}>
-      {zones.map((zone) => <span key={zone.k} style={{ minWidth: 0, display: "grid", gap: 5, alignContent: "start", paddingLeft: 8, borderLeft: "1px solid var(--line-2)" }}>
-        <span style={{ font: "var(--weight-medium) var(--text-xs)/1.35 var(--font-mono)", color: zone.color, letterSpacing: "0.03em" }}>{zone.cap}</span>
-        <span style={{ ...mono, letterSpacing: 0 }}>{zone.note}</span>
+    <div style={{ position: "relative", display: "flex", height: 14, borderRadius: 3, overflow: "hidden" }}>
+      {zones.map(zone => <i key={zone.k} style={{ width: `${Math.max(0, at(zone.to) - at(zone.from))}%`, background: zone.color, opacity: zone.op }} />)}
+      {ticks.map(tick => <i data-testid={`lending-${tick.k}-marker`} key={tick.k} style={{ position: "absolute", left: `${at(tick.v)}%`, top: 0, bottom: 0, width: 2, marginLeft: -1, background: tick.color }} />)}
+    </div>
+    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 22px", marginTop: 10 }}>
+      {ticks.map(tick => <span key={tick.k} style={{ display: "flex", alignItems: "center", gap: 7 }}>
+        <i style={{ width: 2, height: 12, background: tick.color }} />
+        <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: tick.color, letterSpacing: "0.03em" }}>{tick.cap}</span>
       </span>)}
     </div>
     <p style={{ font: "var(--weight-regular) var(--text-md)/1.6 var(--font-sans)", color: "var(--text-muted)", margin: "16px 0 0", textWrap: "pretty" }}>
       Health factor is your collateral, discounted by each asset&apos;s liquidation threshold, divided by what you owe.
-      At <b style={{ color: "var(--ink-1)" }}>1.00</b> Venus can liquidate you. This guard repays your debt when the factor sits
-      below <b style={{ color: "var(--ink-1)" }}>{trigger.toFixed(2)}</b> for two finalized reads one worker interval apart, and stops
-      once it is back at <b style={{ color: "var(--ink-1)" }}>{target.toFixed(2)}</b>. An account already liquidatable races bots and usually loses.
+      At <b style={{ color: "var(--ink-1)" }}>1.00</b> Venus can liquidate you. This guard repays your debt when the factor sits below <b style={{ color: "var(--ink-1)" }}>{trigger.toFixed(2)}</b> for two finalized reads one worker interval apart, and stops once it is back at <b style={{ color: "var(--ink-1)" }}>{target.toFixed(2)}</b>. An account already liquidatable races bots and usually loses.
     </p>
   </div>;
 }
 
-function HealthPanel({ health, bases, triggerHf, targetHf, readAt, readReason, now }: {
-  readonly health: { readonly value: string | null; readonly reason: string | null; readonly matched: boolean | null; readonly live: boolean } | null;
-  readonly bases: { readonly liquidation: LendingBasisCell; readonly borrowingPower: LendingBasisCell } | null;
+function HealthPanel({ health, triggerHf, targetHf, portfolio }: {
+  readonly health: { readonly value: string | null; readonly reason: string | null } | null;
   readonly triggerHf: number | null;
   readonly targetHf: number | null;
-  readonly readAt: { readonly block: string | null; readonly live: boolean; readonly at: number | null } | null;
-  readonly readReason: string | null;
-  readonly now: number;
+  readonly portfolio: LendingPortfolio | null;
 }) {
   const nowHf = health?.value === null || health === null ? null : Number(health.value);
-  const distance = distanceToLiquidation(bases?.liquidation.raw ?? null);
+  const ready = portfolio?.status === "available" ? portfolio : null;
+  const facts = [
+    ["Net APY", portfolioApy(ready?.netApyBps), "Supply interest minus borrow cost, across your account and the agent reserve."],
+    ["Daily earning", portfolioUsd(ready?.dailyEarningUsdMantissa, true), "Net interest per day at today's rate. Under a cent shows as <$0.01."],
+    ["Total supply", portfolioUsd(ready?.totalSupplyUsdMantissa), "All supply on Venus: your collateral plus the agent reserve."],
+    ["Total borrowed", portfolioUsd(ready?.totalBorrowedUsdMantissa), "All debt on Venus, pinned markets and not."],
+  ];
   return <Panel fill title="Health factor" testId="lending-health-panel" right={<>
-    <span style={{ font: "var(--weight-medium) var(--text-3xl)/1 var(--font-mono)", color: health?.value === null || health === null ? "var(--text-subtle)" : "var(--profit)" }}>
-      {health?.value ?? "—"}
-    </span>
-    {health?.value === null || health === null ? null
-      : <StatusBadge pill status={triggerHf !== null && nowHf !== null && nowHf < triggerHf ? "warning" : "live"}
-        label={triggerHf === null ? "no signed trigger to compare" : nowHf !== null && nowHf < triggerHf ? "Below your trigger" : "Above your trigger"} />}
+    <span style={{ font: "var(--weight-medium) var(--text-3xl)/1 var(--font-mono)", color: health?.value == null ? "var(--text-subtle)" : "var(--profit)" }}>{health?.value ?? "—"}</span>
+    {nowHf === null ? null : <StatusBadge pill status={triggerHf !== null && nowHf < triggerHf ? "warning" : "live"}
+      label={triggerHf === null ? "no signed trigger to compare" : nowHf < triggerHf ? "Below your trigger" : "Above your trigger"} />}
   </>}>
-    {/* NO CHART. The observation table keeps one row per agent and overwrites
-        it, so there is no health-factor time series to draw — the mock's
-        `ChartFrame` is deliberately absent rather than filled with a shape. */}
     {triggerHf === null || targetHf === null
-      ? <div style={{ padding: "22px 20px 16px" }}>
-        <Dash reason="the signed trigger and target are not readable, so the scale they define cannot be drawn" />
-      </div>
+      ? <div style={{ padding: "18px 20px 16px" }}><Dash reason={health?.reason ?? "The signed thresholds are unavailable."} /></div>
       : <HealthScale nowHf={nowHf} trigger={triggerHf} target={targetHf} />}
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(190px,1fr))", borderTop: "1px solid var(--line-1)", background: "var(--surface-sunken)", marginTop: "auto" }}>
-      <BasisCell name="Liquidation basis" cell={bases?.liquidation ?? null} />
-      <BasisCell name="Borrowing-power basis" cell={bases?.borrowingPower ?? null} />
-      <span style={{ display: "grid", gap: 7, alignContent: "start", padding: "14px 16px" }}>
-        <span style={label}>Distance to liquidation</span>
-        {distance === null ? <Dash reason="no health factor to measure from" /> : <span style={val}>{distance}</span>}
-      </span>
-      <span style={{ display: "grid", gap: 7, alignContent: "start", padding: "14px 16px" }}>
-        <span style={label}>Read at</span>
-        {/* Live-read provenance is shown in the banner and position header. */}
-        {readAt === null || readAt.block === null
-          ? <Dash reason={readReason ?? "no read is recorded"} />
-          : <>
-            <span title={readAt.live ? LENDING_LIVE_ACCOUNT_LABEL : undefined} style={val}>block {readAt.block}</span>
-            {readAt.live ? null : <span style={mono}>{readAt.at === null ? "no time recorded" : relativeTime(readAt.at, now).text}</span>}
-          </>}
-      </span>
+    <div data-testid="lending-portfolio" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(170px,1fr))", borderTop: "1px solid var(--line-1)", background: "var(--surface-sunken)", marginTop: "auto" }}>
+      {facts.map(([name, value, help], index) => <span key={name} style={{ display: "grid", gap: 9, alignContent: "start", justifyItems: "center", textAlign: "center", padding: 16, borderRight: index < facts.length - 1 ? "1px solid var(--line-1)" : "none" }}>
+        <span style={{ ...label, display: "flex", alignItems: "center", gap: 6 }}>{name}
+          <span title={value === "—" ? `${help} ${portfolio?.reason ?? "Current portfolio data is unavailable."}` : help} style={{ display: "inline-flex", color: "var(--text-subtle)", cursor: "help" }}><Icon name="info" size={13} /></span>
+        </span>
+        <span style={{ font: "var(--weight-medium) var(--text-xl)/1.1 var(--font-mono)", color: value === "—" ? "var(--text-subtle)" : name === "Net APY" ? value.startsWith("-") ? "var(--loss)" : "var(--profit)" : "var(--ink-1)" }}>{value}</span>
+      </span>)}
     </div>
   </Panel>;
 }
@@ -1043,21 +973,20 @@ function ReservePanel({ capacity, coverage, legs, legsReason, capWei, usdtDecima
     ["Idle in the agent wallet", `${legs.idle} USDT`, "swap surplus, still reserve"],
     ["BNB tier", `${legs.bnb} BNB`, "relay gas, and BNB repays"],
   ];
-  return <Panel fill title="Rescue reserve" testId="lending-reserve-panel" right={<>
-    <span style={mono}>{walletAddress === null ? "AGENT WALLET" : `${shortAddress(walletAddress)} · YOURS`}</span>
-    <span style={mono}>SESSION {session.value ?? "—"}</span>
-  </>}>
+  return <Panel fill title="Rescue reserve" testId="lending-reserve-panel" right={<span style={mono}>
+    {walletAddress === null ? "AGENT WALLET" : `${shortAddress(walletAddress.toLowerCase())} · YOURS`}&nbsp;&nbsp; SESSION {session.value ?? "—"}
+  </span>}>
     <div style={{ padding: 16, display: "grid", gap: 14, alignContent: "start", height: "100%" }}>
       <div style={{ display: "grid", gap: 6 }}>
-        <span style={label}>Repay capacity</span>
+        <span style={label}><strong>Reserve value</strong></span>
         {capacity.value === null
           ? <Dash reason={capacity.reason ?? "no source"} />
           : <>
             <span style={{ font: "var(--weight-medium) var(--text-3xl)/1 var(--font-mono)", color: "var(--ink-1)" }}>{capacity.value}</span>
-            <span style={{ ...mono, letterSpacing: 0 }}>{capacity.note}</span>
+            <span style={{ ...mono, letterSpacing: 0 }} />
           </>}
       </div>
-      <div style={{ display: "grid", gap: 6 }}>
+      <div style={{ display: "grid", gap: 8 }}>
         <span style={label}>Coverage of the pinned debt</span>
         {coverage.value === null
           ? <Dash reason={coverage.reason ?? "no source"} />
@@ -1093,7 +1022,7 @@ function ReservePanel({ capacity, coverage, legs, legsReason, capWei, usdtDecima
 /* The guarded account's position                                             */
 /* -------------------------------------------------------------------------- */
 
-const POSITION_COLS = "minmax(150px,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.6fr) minmax(0,0.7fr) 150px";
+const POSITION_COLS = "minmax(140px,1fr) minmax(0,1fr) minmax(0,1fr) minmax(0,0.7fr) minmax(0,0.8fr) 140px";
 
 function percentFromMantissa(mantissa: string): string {
   try {
@@ -1104,14 +1033,13 @@ function percentFromMantissa(mantissa: string): string {
   }
 }
 
-function PositionPanel({ markets, reason, live, guardedAccount, debtMarkets, config, icons, usdtDecimals }: {
+function PositionPanel({ markets, reason, live, guardedAccount, debtMarkets, config, usdtDecimals }: {
   readonly markets: readonly LendingMarketView[];
   readonly reason: string | null;
   readonly live: boolean;
   readonly guardedAccount: string | null;
   readonly debtMarkets: readonly string[];
   readonly config: LendingConfigView | null;
-  readonly icons: Record<string, string | null>;
   readonly usdtDecimals: number;
 }) {
   const pinned = new Set(debtMarkets.map((entry) => entry.toLowerCase()));
@@ -1119,33 +1047,25 @@ function PositionPanel({ markets, reason, live, guardedAccount, debtMarkets, con
   return <Panel title="Guarded account position" testId="lending-position" right={<>
     <span style={mono}>{guardedAccount === null ? "account unavailable" : shortAddress(guardedAccount)}</span>
     {guardedAccount === null ? null : <a href={`https://bscscan.com/address/${guardedAccount}`} target="_blank" rel="noreferrer"
-      className="fl-btn fl-btn--ghost fl-btn--sm" style={{ gap: 5, textDecoration: "none" }}>BscScan <Icon name="external" size={12} /></a>}
+      className="fl-btn fl-btn--ghost fl-btn--sm" style={{ gap: "var(--space-3)", textDecoration: "none" }}>BscScan<Icon name="external" size={13} /></a>}
     {live ? <span style={mono}>{LENDING_LIVE_ACCOUNT_LABEL.toUpperCase()}</span> : null}
   </>}>
     {markets.length === 0
       ? <div style={{ padding: 16 }}><Dash reason={reason ?? "this account is in no Venus market"} /></div>
       : <>
         <div className="fl-row__head" style={{ gridTemplateColumns: POSITION_COLS }}>
-          <span>Market</span><span>You supplied</span><span>You owe</span><span>Collateral</span><span>Liq. threshold</span>
+          <span>Market</span><span>Supplied</span><span>Borrowed</span><span>Collateral</span><span>Liq. threshold</span>
           <span style={{ justifySelf: "end" }}>Guard can repay</span>
         </div>
         {markets.map((market) => {
-          // vBNB carries `underlying: null` — BNB is native — so its badge is
-          // resolved with WBNB's address instead. A missing icon degrades to a
-          // symbol badge and never shifts the row.
-          const iconAddress = (market.underlying ?? config?.wbnb ?? null)?.toLowerCase() ?? null;
-          const src = iconAddress === null ? null : icons[iconAddress] ?? null;
           const symbol = market.symbol.replace(/^v/u, "");
           const decimals = market.underlyingDecimals;
           const isPinned = pinned.has(market.vToken.toLowerCase());
           const supported = repayable === null ? null : repayable.has(market.vToken.toLowerCase());
           return <div key={market.vToken} className="fl-row" style={{ gridTemplateColumns: POSITION_COLS, cursor: "default", alignItems: "center" }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
-              <TokenIcon src={src} symbol={symbol} size={24} />
               <span style={{ display: "grid", gap: 4, minWidth: 0 }}>
                 <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>{symbol}</span>
                 <span style={mono}>{market.symbol}</span>
-              </span>
             </span>
             <span style={val}>{formatAtomicAmount(market.supplyUnderlyingWei, decimals, decimals === 18 ? 4 : 2)}</span>
             <span style={val}>{formatAtomicAmount(market.borrowWei, decimals, decimals === 18 ? 4 : 2)}</span>
@@ -1187,10 +1107,10 @@ function RulesStrip({ settings, guard, workerIntervalMs, usdtDecimals }: {
     ["Reserve split", guard === null ? null : `${guard.reserveBps / 100}% BNB`, "the guard row is not readable"],
   ];
   return <Panel title="Guard rules" testId="lending-rules">
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(170px,1fr))" }}>
-      {rules.map(([name, value, reason]) => <span key={name} title={name === "Gas reserved for" ? LENDING_RESCUE_COUNT_HINT : undefined} style={{ display: "grid", gap: 7, padding: "14px 16px", borderRight: "1px solid var(--line-1)" }}>
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))" }}>
+      {rules.map(([name, value, reason], index) => <span key={name} title={name === "Gas reserved for" ? LENDING_RESCUE_COUNT_HINT : undefined} style={{ display: "grid", gap: 7, padding: "14px 16px", borderRight: index < rules.length - 1 ? "1px solid var(--line-1)" : "none" }}>
         <span style={label}>{name}</span>
-        {value === null ? <Dash reason={reason} /> : <span style={val}>{value}</span>}
+        {value === null ? <Dash reason={reason} /> : <span style={{ font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-mono)", color: "var(--ink-1)" }}>{value}</span>}
       </span>)}
     </div>
   </Panel>;
@@ -1201,77 +1121,37 @@ function RulesStrip({ settings, guard, workerIntervalMs, usdtDecimals }: {
 /* -------------------------------------------------------------------------- */
 
 function TimelineRow({ event, now }: { readonly event: LendingTimelineEvent; readonly now: number }) {
-  const color = event.tone === "profit" ? "var(--profit)" : event.tone === "warn" ? "var(--warn)" : event.tone === "loss" ? "var(--loss)" : "var(--text-subtle)";
-  return <div style={{ display: "grid", gridTemplateColumns: "auto 1fr auto", gap: 12, alignItems: "start" }}>
-    <i style={{ width: 8, height: 8, borderRadius: 999, background: color, marginTop: 6 }} />
-    <span style={{ display: "grid", gap: 4, minWidth: 0 }}>
-      <span style={{ font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-sans)", color: "var(--ink-1)" }}>{event.title}</span>
-      <span style={{ ...bodyText, overflowWrap: "anywhere" }}>{event.detail}</span>
-    </span>
-    <span style={{ display: "grid", gap: 4, justifyItems: "end" }}>
-      {event.atMs === null
-        ? <Dash reason={event.timeReason ?? "no time recorded"} align="end" />
-        : <span style={mono}>{relativeTime(event.atMs, now).text}</span>}
-      {txLink(event.txHash)}
-    </span>
-  </div>;
+  return <ActivityRow timeline title={event.title} detail={event.detail} tone={event.tone}
+    time={event.atMs === null ? "—" : relativeTime(event.atMs, now).text}
+    txHash={event.txHash === null ? undefined : shortAddress(event.txHash)}
+    href={event.txHash === null ? undefined : `https://bscscan.com/tx/${event.txHash}`}
+    aria-label={event.timeReason ?? undefined} />;
 }
 
-function RescueRow({ rescue, now, usdtDecimals, config, expanded, onToggle }: {
+const RESCUE_COLS = "88px minmax(0,1.5fr) minmax(0,0.9fr) minmax(0,1.6fr) 110px";
+function RescueRow({ rescue, now, usdtDecimals, config }: {
   readonly rescue: LendingRescueView;
   readonly now: number;
   readonly usdtDecimals: number;
   readonly config: LendingConfigView | null;
-  readonly expanded: boolean;
-  readonly onToggle: () => void;
 }) {
   const native = config !== null && rescue.market.toLowerCase() === config.vBnb.toLowerCase();
-  const amount = native
-    ? `${formatAtomicAmount(rescue.amountWei, 18, 6)} BNB`
-    : `${formatAtomicAmount(rescue.amountWei, usdtDecimals, 2)} USDT`;
-  // An ambiguous or ineffective rescue is where an owner needs the raw row, so
-  // Details is offered for exactly those.
-  const debuggable = rescue.effect !== "changed" || rescue.partial
-    || rescue.conditions.some((entry) => entry === "arm-unknown" || entry === "unknown-held" || entry === "borrow-moved");
-  return <div data-testid={`lending-rescue-${rescue.rescueId}`} style={{ padding: "12px 0", borderBottom: "1px solid var(--line-1)", display: "grid", gap: 6 }}>
-    <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-      <strong>{amount}</strong>
-      <span style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>{shortAddress(rescue.market)}</span>
-      <span style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>
-        HF {formatHf(rescue.hfBefore)} → {formatHf(rescue.hfAfter)}
-        {rescue.achievedHf === null ? "" : ` (target ${formatHf(rescue.achievedHf)})`}
-      </span>
-      <small>· {relativeTime(rescue.createdAtMs, now).text}</small>
-      {/* FIX 1: `effect` and `partial` are DIFFERENT FACTS. The dot is coloured
-          from `effect` alone — changed / no-effect / unverified — and `partial`
-          is its own chip, because a repay can be both changed and partial. */}
-      <span data-testid={`lending-rescue-effect-${rescue.rescueId}`} style={{ display: "flex", alignItems: "center", gap: 6, font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>
+  const amount = config === null ? `${rescue.amountWei} wei` : native
+    ? `${formatAtomicAmount(rescue.amountWei, 18, 6)} BNB` : `${formatAtomicAmount(rescue.amountWei, usdtDecimals, 2)} USDT`;
+  const stamp = new Date(rescue.createdAtMs);
+  const time = stamp.toDateString() === new Date(now).toDateString()
+    ? stamp.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : stamp.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  return <div data-testid={`lending-rescue-${rescue.rescueId}`} className="fl-row" style={{ gridTemplateColumns: RESCUE_COLS, cursor: "default", alignItems: "center" }}>
+    <span style={mono}>{time}</span>
+    <span style={{ display: "grid", gap: 4 }}><span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>Repaid {amount}</span><span style={mono}>{config === null ? shortAddress(rescue.market) : native ? "vBNB" : "vUSDT"} · repayBorrowBehalf</span></span>
+    <span style={{ display: "flex", alignItems: "center", gap: 8, ...val }}>{formatHf(rescue.hfBefore)}<Icon name="arrow-right" size={13} style={{ color: "var(--text-subtle)" }} />{formatHf(rescue.hfAfter)}</span>
+    <span style={{ display: "flex", alignItems: "center", gap: 8, font: "var(--weight-regular) var(--text-sm)/1.35 var(--font-sans)", color: "var(--text-muted)" }} title={rescue.conditions.join(" · ")}>
+      <span data-testid={`lending-rescue-effect-${rescue.rescueId}`} data-effect={rescue.effect} style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <i style={{ width: 7, height: 7, borderRadius: 999, flex: "0 0 auto", background: lendingEffectColor(rescue.effect) }} />
-        {rescue.effect}
+        <span>{lendingEffectCopy(rescue.effect)}{rescue.partial ? <span data-testid={`lending-rescue-partial-${rescue.rescueId}`}> {LENDING_PARTIAL_COPY}</span> : null}</span>
       </span>
-      {rescue.partial ? <span data-testid={`lending-rescue-partial-${rescue.rescueId}`} style={{ font: "var(--type-mono-xs)", color: "var(--warn)", border: "1px solid var(--warn)", borderRadius: 999, padding: "1px 7px" }}>partial</span> : null}
-      {txLink(rescue.txHash)}
-      {debuggable ? <Button size="sm" variant="ghost" data-testid={`lending-rescue-details-${rescue.rescueId}`} onClick={onToggle}>{expanded ? "Hide details" : "Details"}</Button> : null}
-    </div>
-    {/* The two facts SAID, not left to a colour: what the effect means, and
-        separately what partial means. */}
-    <span style={bodyText}>{lendingEffectCopy(rescue.effect)}</span>
-    {rescue.partial ? <span style={{ ...bodyText, color: "var(--warn)" }}>{LENDING_PARTIAL_COPY}</span> : null}
-    {rescue.conditions.length > 0
-      ? <span style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>{rescue.conditions.join(" · ")}</span>
-      : null}
-    {expanded ? <pre style={{ margin: "8px 0 0", padding: 10, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", font: "var(--weight-regular) var(--text-xs)/1.5 var(--font-mono)", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-      {[
-        `rescue    ${rescue.rescueId}`,
-        `market    ${rescue.market}`,
-        `amount    ${rescue.amountWei} wei`,
-        `effect    ${rescue.effect}${rescue.partial ? "  partial" : ""}`,
-        `hf        ${rescue.hfBefore ?? "—"} -> ${rescue.hfAfter ?? "—"}  achieved ${rescue.achievedHf ?? "—"}`,
-        `tx        ${rescue.txHash ?? "none — no confirmed transaction is recorded for this row"}`,
-        `at        ${new Date(rescue.createdAtMs).toISOString()}`,
-        rescue.conditions.length === 0 ? "conditions none" : `conditions ${rescue.conditions.join(", ")}`,
-      ].join("\n")}
-    </pre> : null}
+    </span>
+    {rescue.txHash === null ? <span style={{ ...mono, justifySelf: "end" }}>—</span> : <a href={`https://bscscan.com/tx/${rescue.txHash}`} target="_blank" rel="noreferrer" style={{ ...mono, justifySelf: "end", display: "flex", gap: 5, alignItems: "center" }}>{shortAddress(rescue.txHash)}<Icon name="external" size={11} /></a>}
   </div>;
 }
 
@@ -1279,77 +1159,34 @@ function RescueRow({ rescue, now, usdtDecimals, config, expanded, onToggle }: {
 /* Permissions — the REAL grant, and the honest sentence                      */
 /* -------------------------------------------------------------------------- */
 
-function PermissionsTab({ grant, reason, usdtDecimals, now }: {
+function PermissionsTab({ grant, reason, usdtDecimals, now, walletAddress, removeDisabled, onRemove }: {
   readonly grant: SessionGrantView | null;
   readonly reason: string | null;
   readonly usdtDecimals: number;
   readonly now: number;
+  readonly walletAddress: string | null;
+  readonly removeDisabled: boolean;
+  readonly onRemove: () => void;
 }) {
-  if (grant === null) {
-    return <Panel title="What this agent may do" testId="lending-permissions">
-      <div style={{ padding: 16 }}><Dash reason={reason ?? "reading the session grant…"} /></div>
-    </Panel>;
-  }
-  const allows = lendingGrantAllows(grant);
+  const allows = grant === null ? [] : lendingGrantAllows(grant);
   const denies = lendingGrantDenies();
-  return <div data-testid="lending-permissions" style={{ display: "grid", gap: 16 }}>
-    <Panel title="What this agent may do" right={<span style={mono}>READ FROM THE ON-CHAIN SESSION GRANT</span>}>
-      <div style={{ display: "grid", gap: 10, padding: 16 }}>
-        {allows.map((line, index) => <PermissionItem key={`allow-${index}`} kind="allow" note={line.note}>{line.text}</PermissionItem>)}
-        {denies.map((line, index) => <PermissionItem key={`deny-${index}`} kind="deny" note={line.note}>{line.text}</PermissionItem>)}
+  const caps = grant?.spendCaps.map(cap => lendingCapExposure(cap, usdtDecimals)) ?? [];
+  return <section data-testid="lending-permissions" style={{ border: "1px solid var(--border-card)", borderRadius: "var(--radius-md)", background: "var(--surface-card)", padding: 20, maxWidth: 620 }}>
+    {grant === null ? <Dash reason={reason ?? "reading the session grant…"} /> : <>
+      <div data-testid="lending-permission-caps"><PermissionItem>
+        {caps.length === 0 ? "This grant carries no spend cap." : caps.map((cap, index) => <React.Fragment key={index}>{index === 0 ? "" : "; "}{cap.label}: <b>{cap.perDay}</b></React.Fragment>)}. {LENDING_USDT_CAP_NOTE}
+      </PermissionItem></div>
+      <PermissionItem>{allows.map((line, index) => <span key={index} title={line.note}>{index === 0 ? "" : ". "}{line.text}</span>)}</PermissionItem>
+      <PermissionItem kind="deny">{denies.slice(0, 2).map(line => line.text).join(". ")}</PermissionItem>
+      <PermissionItem kind="deny">{denies.slice(2).map(line => line.text).join(". ")}</PermissionItem>
+      <div data-testid="lending-leaked-key"><PermissionItem kind="info">{LENDING_LEAKED_KEY_SENTENCE} Total exposure over the 7-day session: <b>{caps.map(cap => cap.overSession ?? "not derived from a non-daily cap").join(" + ")}</b>.</PermissionItem></div>
+      <div data-testid="lending-permission-session"><PermissionItem kind="info" note={grant.expiresAt === null ? "Expiry unavailable" : `Expires ${new Date(grant.expiresAt * 1_000).toLocaleDateString("en-GB")} · ${countdown(grant.expiresAt, now)} · 7-day maximum`}>
+        <span title={grant.publicKey ?? "Session key unavailable"}>Session key {grant.publicKey === null ? "—" : shortAddress(grant.publicKey)}</span>
+      </PermissionItem></div>
+      <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+        <Button variant="danger" icon={<Icon name="key" size={15} />} disabled={removeDisabled} onClick={onRemove}>Remove session key</Button>
+        {walletAddress === null ? null : <a href={`https://bscscan.com/address/${walletAddress}`} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}><Button variant="secondary" iconRight={<Icon name="external" size={14} />}>View on BscScan</Button></a>}
       </div>
-    </Panel>
-
-    <Panel title="Caps — what actually bounds a leaked key" testId="lending-permission-caps">
-      <div style={{ display: "grid", gap: 12, padding: 16 }}>
-        {/* THE HONEST SENTENCE. A `CallRule` cannot constrain an argument, so
-            the call list does NOT stop a leaked key from naming a recipient —
-            the caps do. Never print "cannot send funds to any wallet but
-            yours"; it is false on this contract. */}
-        <p data-testid="lending-leaked-key" style={{ ...bodyText, color: "var(--ink-1)", maxWidth: "80ch", margin: 0 }}>
-          {LENDING_LEAKED_KEY_SENTENCE}
-        </p>
-        {grant.spendCaps.length === 0
-          ? <Dash reason="this grant carries no spend cap, which the lending template refuses to build" />
-          : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 12 }}>
-            {grant.spendCaps.map((cap, index) => {
-              const exposure = lendingCapExposure(cap, usdtDecimals);
-              return <span key={`${cap.token ?? "native"}-${index}`} style={{ display: "grid", gap: 6, padding: "12px 14px", borderRadius: "var(--radius-sm)", border: "1px solid var(--line-1)", background: "var(--surface-sunken)" }}>
-                <span style={label}>{exposure.label}</span>
-                <span style={val}>{exposure.perDay}</span>
-                {/* The x7 is only true for a DAILY cap; anything else says so
-                    rather than multiplying a window it did not measure. And
-                    `period` is the plane's own word — "day", "hour", … — not a
-                    number of seconds. It used to render as "… s". */}
-                <span style={mono}>{exposure.overSession === null
-                  ? `rolling ${exposure.period} — the session total is not derived from a non-daily cap`
-                  : `over the session's ${LENDING_MAX_SESSION_DAYS} days: up to ${exposure.overSession}`}</span>
-              </span>;
-            })}
-          </div>}
-        <span style={{ ...mono, letterSpacing: 0 }}>{LENDING_USDT_CAP_NOTE}</span>
-      </div>
-    </Panel>
-
-    <Panel title="The session key" testId="lending-permission-session">
-      <div style={{ display: "grid", gap: 10, padding: 16 }}>
-        <span style={{ display: "grid", gap: 4 }}>
-          <span style={label}>Expires</span>
-          {grant.expiresAt === null
-            ? <Dash reason="the grant carries no expiry" />
-            : <>
-              <span style={val}>{countdown(grant.expiresAt, now)}</span>
-              <span style={mono}>{new Date(grant.expiresAt * 1_000).toISOString()} · the ceiling is {LENDING_MAX_SESSION_DAYS} days and cannot be raised</span>
-            </>}
-        </span>
-        <span style={{ display: "grid", gap: 4 }}>
-          <span style={label}>Key</span>
-          {grant.publicKey === null
-            ? <Dash reason="the grant carries no public key" />
-            : <span style={{ ...mono, overflowWrap: "anywhere" }}>{grant.publicKey}</span>}
-        </span>
-        <span style={bodyText}>{LENDING_NO_LOCK_IN_COPY}</span>
-      </div>
-    </Panel>
-  </div>;
+    </>}
+  </section>;
 }

@@ -88,6 +88,19 @@ describe("the three lending mutations forward the SIGNED BYTES, unchanged", () =
 });
 
 describe("GET /api/agents/:id/lending/view", () => {
+  it("adds portfolio facts from the same authorized agent owner-view", async () => {
+    const portfolio = { status: "unavailable", reason: "rates unavailable" };
+    exec.accountRead.mockImplementation(async (path: string) => ({
+      status: 200, body: path.endsWith("/owner-view") ? JSON.stringify({ data: { lendingPortfolio: portfolio } }) : viewBody(false),
+    }));
+    const response = await lendingView(new NextRequest("https://app.test/x", { headers: { cookie: "4lpha_account_read=opaque" } }), context);
+    const body = await response.json() as { data: { portfolio: unknown; guard: unknown } };
+    expect(body.data.portfolio).toEqual(portfolio);
+    expect(body.data.guard).toEqual(guard);
+    expect(exec.accountRead).toHaveBeenCalledWith("/agents/lending-agent-01/owner-view", "opaque");
+    expect(exec.ownerRead).not.toHaveBeenCalled();
+    expect(exec.ownerMutation).not.toHaveBeenCalled();
+  });
   it("forwards EXACTLY ONE credential — the cookie, or the signed header, never both", async () => {
     exec.accountRead.mockResolvedValue({ status: 200, body: viewBody(false) });
     exec.ownerRead.mockResolvedValue({ status: 200, body: viewBody(false) });
@@ -108,7 +121,10 @@ describe("GET /api/agents/:id/lending/view", () => {
       headers: { cookie: "4lpha_account_read=opaque", "x-owner-action": "signed" },
     });
     expect((await lendingView(both, context)).status).toBe(200);
-    expect(exec.ownerRead).toHaveBeenCalledTimes(1);
+    expect(exec.ownerRead).toHaveBeenCalledTimes(2);
+    expect(exec.ownerRead.mock.calls.map(([path]) => path)).toEqual([
+      "/agents/lending-agent-01/lending/view", "/agents/lending-agent-01/owner-view",
+    ]);
     expect(exec.accountRead).not.toHaveBeenCalled();
   });
 

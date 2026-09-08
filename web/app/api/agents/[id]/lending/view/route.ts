@@ -70,22 +70,33 @@ export async function GET(
   const snapshot = data["snapshot"] as { stale?: unknown } | undefined;
   const guard = data["guard"] as { guardedAccount?: unknown } | undefined;
   const account = typeof guard?.guardedAccount === "string" ? guard.guardedAccount : "";
-  if (snapshot?.stale !== true || !ADDRESS.test(account)) {
-    return new NextResponse(upstream.body, { status: 200, headers });
-  }
-
-  const fallback = await readGuardable({ account });
-  const enriched = fallback.kind === "ok"
-    ? { ...data, liveAccount: fallback.view }
-    : {
-        ...data,
+  // The independent owner-display projection must never replace the worker's
+  // snapshot or block the existing view when its rates/balances are unavailable.
+  const portfolioRead = async (): Promise<unknown> => {
+    try {
+      const path = `/agents/${encodeURIComponent(id)}/owner-view`;
+      const response = credential.kind === "bearer"
+        ? await execAccountRead(path, credential.value) : await execOwnerRead(path, credential.value);
+      if (response.status !== 200) return undefined;
+      return (JSON.parse(response.body) as { data?: { lendingPortfolio?: unknown } })?.data?.lendingPortfolio;
+    } catch { return undefined; }
+  };
+  const [portfolio, fallback] = await Promise.all([
+    portfolioRead(),
+    snapshot?.stale === true && ADDRESS.test(account) ? readGuardable({ account }) : Promise.resolve(null),
+  ]);
+  const enriched = {
+    ...data,
+    ...(portfolio === undefined ? {} : { portfolio }),
+    ...(fallback === null ? {} : fallback.kind === "ok" ? { liveAccount: fallback.view } : {
         liveAccountReason: fallback.kind === "rate-limited"
           ? "the live read is rate-limited"
           : fallback.kind === "disabled"
             ? "the lending guard is not enabled on this deployment"
             : fallback.kind === "invalid-request"
               ? "the live read was refused"
-              : fallback.reason,
-      };
+            : fallback.reason,
+      }),
+  };
   return NextResponse.json({ ...body, data: enriched }, { status: 200, headers });
 }

@@ -1,4 +1,5 @@
 import { feeCoverage, sumFeeRows, type LpFeeEvent, type FeeCandidate } from "./store/lpFeeEvents.js";
+import { createLendingPortfolioProjection, unavailableLendingPortfolio } from "./http/lendingPortfolio.js";
 import { isFeeCollectionStep, sequenceAffectsPosition } from "./lp/feeRecorder.js";
 /**
  * The HTTP exposure layer over the 1b-core authorization engine.
@@ -1446,6 +1447,12 @@ export function createServer(deps: ServerDeps): Hono {
   });
 
   const app = new Hono();
+  const lendingPortfolio = deps.lending?.readers.readPortfolioBalances === undefined ? undefined
+    : createLendingPortfolioProjection({
+      dataPlane: deps.dataPlane,
+      readBalances: (accounts, signal) => deps.lending!.readers.readPortfolioBalances!(accounts, signal),
+      now: nowMs,
+    });
 
   async function authorizeHttpRuntime(
     c: Context,
@@ -1711,11 +1718,26 @@ export function createServer(deps: ServerDeps): Hono {
     // the dashboard tab should not leave a chain read running, and the parameter
     // was dead until this call passed one.
     const nativeMeter = await readOwnerNativeMeter(agent, c.req.raw.signal);
+    // Add display-only portfolio facts here, not to the worker's decision
+    // snapshot or lending/view's deliberately zero-chain-read route.
+    let portfolio;
+    if (agent.sessionFacts?.hireSizing?.name === "lending-v1" && deps.lending !== undefined) {
+      try {
+        const guard = await deps.lending.guards.get(agent.ownerAddress, agent.id);
+        if (guard !== null) {
+          portfolio = lendingPortfolio === undefined
+            ? unavailableLendingPortfolio("Portfolio reader is unavailable.")
+            : await lendingPortfolio([guard.guardedAccount, agent.walletAddress], c.req.raw.signal);
+        }
+      } catch { portfolio = unavailableLendingPortfolio("Current Venus portfolio data is unavailable."); }
+    }
     return c.json({
-      data:
-        nativeMeter === undefined
+      data: {
+        ...(nativeMeter === undefined
           ? agentOwnerView(agent)
-          : agentOwnerView(agent, nativeMeter),
+          : agentOwnerView(agent, nativeMeter)),
+        ...(portfolio === undefined ? {} : { lendingPortfolio: portfolio }),
+      },
     });
   });
 

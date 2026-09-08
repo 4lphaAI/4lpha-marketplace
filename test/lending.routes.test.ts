@@ -748,6 +748,18 @@ describe("GET /agents/:id/lending/view", () => {
     assert.equal(response.status, 200, "the view serves the worker's snapshot, never the chain");
   });
 
+  it("isolates a portfolio guard-store failure from the ordinary owner view", async () => {
+    const { harness, lending } = await readable();
+    lending.guards.get = async () => { throw new Error("display store unavailable"); };
+    const response = await call(harness, `/agents/${AGENT}/owner-view`, {
+      headers: { "x-owner-action": toReadHeader(await signOwnerAction("read", {}, { agentId: AGENT })) },
+    });
+    assert.equal(response.status, 200);
+    const data = response.body["data"] as Record<string, unknown>;
+    assert.equal(data["id"], AGENT);
+    assert.equal((data["lendingPortfolio"] as Record<string, unknown>)["status"], "unavailable");
+  });
+
   it("reports a MISSING snapshot as stale WITH ITS REASON — never a guess", async () => {
     const { harness } = await readable();
     const response = await call(harness, `/agents/${AGENT}/lending/view`, {

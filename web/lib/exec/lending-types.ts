@@ -28,6 +28,7 @@
 /* -------------------------------------------------------------------------- */
 
 /** The single failure value every parser returns. Never thrown. */
+import { parseLendingPortfolio } from "./lending-portfolio";
 export const INVALID = "invalid" as const;
 export type Invalid = typeof INVALID;
 
@@ -793,6 +794,7 @@ export type LendingSnapshotEnvelope = {
 };
 
 export type LendingAgentView = {
+  readonly portfolio?: import("./lending-portfolio").LendingPortfolio | null;
   readonly guard: LendingGuardView;
   readonly snapshot: LendingSnapshotEnvelope;
   readonly rescues: readonly LendingRescueView[];
@@ -871,6 +873,7 @@ export function parseLendingAgentView(value: unknown): LendingAgentView | Invali
   return {
     guard,
     snapshot: { presentAt, ageMs, staleAfterMs, stale, reason, workerIntervalMs, payload },
+    ...(data["portfolio"] === undefined ? {} : { portfolio: parseLendingPortfolio(data["portfolio"]) }),
     rescues,
     settings,
     settingsDigest,
