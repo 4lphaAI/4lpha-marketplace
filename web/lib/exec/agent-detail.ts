@@ -24,6 +24,7 @@ const HASH = /^0x[0-9a-f]{64}$/iu;
 const STATUSES = new Set(["provisioning", "armed", "paused", "revoked", "retired"]);
 
 export type DetailMetric = {
+  readonly tokenBreakdown?: string;
   readonly rawWei?: string;
   readonly value: string | null;
   readonly reason: string | null;

@@ -8,6 +8,8 @@ import type { UseAgentDetailResult } from "@/lib/exec/use-agent-detail";
 import { InfoHint, LpAgentDetail, LpRangeEvents, usdMetric } from "./LpAgentDetail";
 import { DUST_EXPLAINER } from "@/lib/lp/dust";
 import type { LiquidityGeometry } from "@/components/lp/LiquidityChart";
+import type { LpAccountingRead } from "@/lib/lp/accounting";
+import type { OnChainPosition } from "@/lib/altana/position-reader";
 
 function metric(value: string | null, reason: string | null, extra: Partial<DetailMetric> = {}): DetailMetric {
   return { value, reason, ...extra };
@@ -126,7 +128,7 @@ function baseDetail(view: AgentDetailView, overrides: Partial<UseAgentDetailResu
   };
 }
 
-function render(view: AgentDetailView, detailOverrides: Partial<UseAgentDetailResult> = {}): string {
+function render(view: AgentDetailView, detailOverrides: Partial<UseAgentDetailResult> = {}, propsOverrides: Partial<React.ComponentProps<typeof LpAgentDetail>> = {}): string {
   return renderToStaticMarkup(
     <LpAgentDetail
       agentId={view.id}
@@ -147,6 +149,7 @@ function render(view: AgentDetailView, detailOverrides: Partial<UseAgentDetailRe
       onRemove={() => undefined}
       onResolve={() => undefined}
       onAbandon={() => undefined}
+      {...propsOverrides}
     />,
   );
 }
@@ -224,6 +227,30 @@ function rangeView(wbnbIsToken0: boolean): AgentDetailView {
 }
 
 describe("LpAgentDetail", () => {
+  it("colors both PNL amount and matching percentage, and shows fee quantities under the same total", () => {
+    const e=10n**18n;
+    const base=rangeView(false);
+    const position: OnChainPosition={kind:"position",tokenId:7n,liquidity:100n,blockNumber:100n,readAtMs:Date.now(),
+      token0:base.lp!.pool!.token0 as `0x${string}`,token1:base.lp!.pool!.token1 as `0x${string}`,fee:100,
+      tickLower:-10,tickUpper:10,amountsAvailable:true,sqrtPriceX96:1n<<96n,
+      amounts:{amount0:5n*e,amount1:4n*e},owed:{amount0:0n,amount1:0n},minimums:{amount0:0n,amount1:0n}};
+    const accounting: LpAccountingRead={kind:"read",wallet:base.walletAddress,pool:base.lp!.pool!.poolAddress!,position,
+      collectible0:e,collectible1:0n,dust0:2n*e,dust1:0n};
+    for(const [capital,dollars,percent,tone] of [[10n,"+$6.00","+20.00%","profit"],[15n,"-$9.00","-20.00%","loss"]] as const){
+      const view={...base,lp:{...base.lp!,wbnbUsd:3,budgetWei:(capital*e).toString(),feeMetric:{value:"$0.19",reason:null,tokenBreakdown:"2 USDT / <0.001 WBNB"}},
+        grossPnlPercent:{value:"-99.99%",reason:null}};
+      const host=document.createElement("div");host.innerHTML=render(view,{}, {accounting,discovered:[position]});
+      const tiles=[...host.querySelectorAll(".fl-metric")];
+      const pnl=tiles.find(t=>t.querySelector(".fl-metric__label")?.textContent==="PnL since hire")!;
+      expect(pnl.querySelector(".fl-metric__value")?.textContent).toBe(dollars);
+      expect(pnl.querySelector(".fl-metric__foot")?.textContent).toBe(percent);
+      expect(pnl.querySelectorAll(`.fl-num--${tone}`)).toHaveLength(2);
+      expect(pnl.textContent).not.toContain("-99.99%");
+      const fees=tiles.find(t=>t.querySelector(".fl-metric__label")?.textContent==="Fees earned")!;
+      expect(fees.querySelector(".fl-metric__value")?.textContent).toBe("$0.19");
+      expect(fees.querySelector(".fl-metric__foot")?.textContent).toBe("2 USDT / <0.001 WBNB");
+    }
+  });
   it("renders the five amended mock-up tiles with reasons and no retired panels", () => {
     const html = render(baseView());
     for (const text of ["Delegated", "Execution model", "PnL since hire", "Fees earned", "Dust", "Fee APR", "Farm APR", "session limit unavailable", "not armed yet", "no open positions"]) expect(html).toContain(text);

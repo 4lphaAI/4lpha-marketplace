@@ -14,6 +14,7 @@ import { usePublicClient } from "wagmi";
 import { NFPM_56 } from "@/lib/exec/pairs";
 import { listWalletPositionIds, readOnChainPosition, readWalletLegBalances, type OnChainPosition, type OnChainPositionRead } from "@/lib/altana/position-reader";
 import type { DustRead } from "@/lib/lp/dust";
+import { readLpAccounting, selectLpAccountingPosition, type LpAccountingRead } from "@/lib/lp/accounting";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
 import type { TradeSettings } from "@/lib/trade";
 import { TradeAgentDetail } from "@/components/trade/TradeAgentDetail";
@@ -744,6 +745,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   const [chainReadIdentity, setChainReadIdentity] = useState("");
   const [chainReads, setChainReads] = useState<ReadonlyMap<string, OnChainPositionRead>>(new Map());
   const [dust, setDust] = useState<DustRead | undefined>(undefined);
+  const [lpAccounting, setLpAccounting] = useState<LpAccountingRead | undefined>(undefined);
   const chainGeneration = useRef(0);
   const pendingClose = useRef<{ identity: string; tokenId: string; callsId: `0x${string}` } | null>(null);
   const publicClient = usePublicClient();
@@ -914,6 +916,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       if (isCurrent()) {
         setChainReadIdentity(identity); setChainReads(new Map(reads.map(r => [r.tokenId.toString(), r]))); setOnChain(new Map());
         setDust({ kind: "unavailable", reason: "cannot read the agent wallet: client, owner or pool unavailable" });
+        setLpAccounting({kind:"unavailable",reason:"accounting client, owner or pool unavailable"});
       }
       return reads;
     }
@@ -944,8 +947,21 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       const positions = extra.filter((r): r is OnChainPosition => r.kind === "position" && samePool(r));
       setDiscovered(positions.filter(r => r.liquidity > 0n));
       setEmptyRungs([...next.values(), ...positions].filter(r => r.liquidity === 0n));
+      if (target.hireSizingName === "lp-v1") {
+        const selected = selectLpAccountingPosition([...next.values(),...positions].filter(samePool));
+        if (selected === null) setLpAccounting({kind:"unavailable",reason:"no single live LP position"});
+        else void readLpAccounting(publicClient, NFPM_56 as `0x${string}`, target.walletAddress as `0x${string}`, selected).then(result => {
+          if (!isCurrent()) return;
+          setLpAccounting(result);
+          if (result.kind === "read") setDust({kind:"read",token0Wei:result.dust0,token1Wei:result.dust1,
+            blockNumber:result.position.blockNumber,readAtMs:result.position.readAtMs});
+        }).catch(() => { if (isCurrent()) setLpAccounting({kind:"unavailable",reason:"LP accounting unavailable"}); });
+      }
       return [...reads, ...positions];
-    } catch { return reads; }
+    } catch {
+      if (isCurrent() && target.hireSizingName === "lp-v1") setLpAccounting({kind:"unavailable",reason:"LP inventory unavailable"});
+      return reads;
+    }
   }, [publicClient, chainIdentity, owner.ownerAddress]);
 
   useEffect(() => {
@@ -1430,6 +1446,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
 
   if (lpAgent) {
     return <LpAgentDetail
+      accounting={chainReadIdentity === chainIdentity ? lpAccounting : undefined}
       identityStatus={identityStatus}
       agentId={agentId}
       go={go}

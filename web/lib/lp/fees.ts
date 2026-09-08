@@ -1,5 +1,6 @@
 import { getSqrtRatioAtTick, formatAtomic } from "@/lib/exec/pairs";
 import type { DetailMetric } from "@/lib/exec/agent-detail";
+import { formatTokenAmount } from "./dust";
 
 export type FeeEvidence = {
   events: readonly Record<string, unknown>[];
@@ -47,6 +48,8 @@ export function feeMetric(input: { evidence: FeeEvidence; tokenId: string | null
   if (input.quoteMicros === null || input.tick === null || input.decimals0 === null || input.decimals1 === null) {
     return { value: null, reason: "fresh matching price unavailable", note: `${a} ${input.symbol0} wei + ${b} ${input.symbol1} wei · ${note}` };
   }
+  const token0 = `${formatTokenAmount(a,input.decimals0)} ${input.symbol0}`, token1 = `${formatTokenAmount(b,input.decimals1)} ${input.symbol1}`;
   return { value: feeUsd(a,b,input.tick,input.quoteIsToken0,input.quoteIsToken0 ? input.decimals0 : input.decimals1,input.quoteMicros), reason: null,
+    tokenBreakdown: input.quoteIsToken0 ? `${token0} / ${token1}` : `${token1} / ${token0}`,
     note: `${formatAtomic(a.toString(),input.decimals0,6) ?? a.toString()} ${input.symbol0} + ${formatAtomic(b.toString(),input.decimals1,6) ?? b.toString()} ${input.symbol1} · ${note}` };
 }

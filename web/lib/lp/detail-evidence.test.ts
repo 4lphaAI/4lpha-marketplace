@@ -22,6 +22,15 @@ describe("LP detail money and freshness",()=>{
   });
   const position={tokenId:"7",rowVersion:1,feeSum:{realised0Wei:"10",realised1Wei:"20",throughBlock:"100",recordedCount:1,gapCount:0},feeCoverage:{status:"complete",reason:"managed",missing:0,gaps:0},observation:{fees:{collectible0Wei:"1",collectible1Wei:"2",tokenId:"7",positionRowVersion:1,blockNumber:"100",asOfMs:now}}};
   const metric=(p=position,imported=false)=>feeMetric({evidence:parseFeeEvidence(p),tokenId:"7",rowVersion:1,imported,tick:0,quoteIsToken0:false,quoteMicros:1000000n,decimals0:18,decimals1:18,symbol0:"A",symbol1:"B"});
+  it("fee token subtitle uses the same recorded plus collectible totals in quote/base order",()=>{
+    const p={...position,feeSum:{...position.feeSum,realised0Wei:"1000000000000000000",realised1Wei:"0"},
+      observation:{fees:{...position.observation.fees,collectible0Wei:"1000000000000000000",collectible1Wei:"1"}}};
+    const input={evidence:parseFeeEvidence(p),tokenId:"7",rowVersion:1,imported:false,tick:0,quoteIsToken0:true,
+      quoteMicros:1000000n,decimals0:18,decimals1:18,symbol0:"USDT",symbol1:"WBNB"};
+    expect(feeMetric(input)).toMatchObject({value:"$2.00",tokenBreakdown:"2 USDT / <0.001 WBNB"});
+    expect(feeMetric({...input,quoteIsToken0:false}).tokenBreakdown).toBe("<0.001 WBNB / 2 USDT");
+    expect(feeMetric({...input,evidence:{...input.evidence,coverage:{status:"incomplete",reason:"gap",missing:1,gaps:0}}}).tokenBreakdown).toBeUndefined();
+  });
   it("combined fees require complete same-B, same-NFT, same-version evidence",()=>{
     expect(metric().value).toBe("$0.00");
     expect(metric({...position,feeCoverage:{...position.feeCoverage,status:"incomplete"}}).value).toBeNull();

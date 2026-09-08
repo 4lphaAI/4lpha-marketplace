@@ -15,7 +15,8 @@ import { isTerminalSequence } from "@/lib/exec/remove-agent";
 import { formatPrice, priceFromTick } from "@/lib/lp/range";
 import { farmAprMetric, unavailableApr, type RangeApr } from "@/lib/lp/pool-range";
 import { DUST_EXPLAINER, dustMetric, type DustRead } from "@/lib/lp/dust";
-import { liveFeesMetric, liveInRange, livePnlMetric, liveReadFor, liveValueMetric, type LivePricing } from "@/lib/lp/live";
+import { liveInRange, liveReadFor, liveValueMetric, type LivePricing } from "@/lib/lp/live";
+import { lpAccountingPnl, lpAccountingFees, matchingLpAccounting, type LpAccountingRead } from "@/lib/lp/accounting";
 export const LP_EDIT_TITLE = "Settings editing is not available for LP agents yet — the plane does not return owner instructions to the browser, and a partial save would erase them.";
 type Props = {
   readonly identityStatus?: React.ReactNode;
@@ -37,6 +38,7 @@ type Props = {
   onWithdraw: (positionId: string) => void;
   chainReads: ReadonlyMap<string, OnChainPositionRead>;
   dust?: DustRead;
+  accounting?: LpAccountingRead;
   discovered?: readonly OnChainPosition[];
   onTogglePause: () => void;
   onRemove: () => void;
@@ -299,9 +301,6 @@ export function LpAgentDetail(props: Props) {
     decimals0: pool?.decimals0 ?? null, decimals1: pool?.decimals1 ?? null,
     symbol0: pool?.symbol0 ?? "token0", symbol1: pool?.symbol1 ?? "token1"
   });
-  const pnlBase = usdMetric(lp?.recordedPnl ?? unavailable("valuation unavailable"));
-  const pnlPercent = view?.grossPnlPercent.value ?? null;
-  const pnl: DetailMetric = pnlBase.value === null ? pnlBase : { ...pnlBase, note: pnlPercent ?? undefined };
   const pricing: LivePricing = {
     quoteIsToken0: pool?.quoteIsToken0 ?? false,
     decimals0: pool?.decimals0 ?? null, decimals1: pool?.decimals1 ?? null,
@@ -313,8 +312,12 @@ export function LpAgentDetail(props: Props) {
   // The newest open row is the one the tiles speak for.
   const openRow = (view?.positions ?? []).find(row => row.state !== "closed");
   const tileRead = liveReadFor({ tokenId: openRow?.tokenId ?? null, chainReads: props.chainReads, discovered });
-  const livePnl = livePnlMetric(tileRead, pricing, lp?.budgetWei ?? null, wbnbUsdMicros);
-  const liveFees = liveFeesMetric(tileRead, pricing);
+  const accounting = matchingLpAccounting({read:props.accounting,wallet:view?.walletAddress ?? null,
+    pool:pool?.poolAddress ?? null,tokenId:tileRead?.position.tokenId ?? null,nowMs:now});
+  const pnl = lpAccountingPnl(accounting, lp?.budgetWei ?? null, wbnbUsdMicros);
+  const pnlTone = pnl.rawWei === undefined || BigInt(pnl.rawWei) === 0n ? "flat" : BigInt(pnl.rawWei) < 0n ? "loss" : "profit";
+  const liveFees = lpAccountingFees(accounting,{...pricing,wbnbMicros:wbnbUsdMicros});
+  const earnedFees = lp?.feeMetric?.value !== null && lp?.feeMetric !== undefined ? lp.feeMetric : liveFees;
   const limit = view?.dailyNativeLimit ?? unavailable("session limit unavailable");
   const delegated = limit.value === null ? "—" : unit === "USD" ? limit.usd ?? "—" : limit.bnb ?? limit.value;
   const positions = view?.positions ?? [], rows = positions.filter(p => tab === "Closed Positions" ? p.state === "closed" : p.state !== "closed");
@@ -406,9 +409,13 @@ export function LpAgentDetail(props: Props) {
 
       {tile("Execution model", lp?.model ? { value: sigma ? "Sigma" : "Custom", reason: null, note: lp.settings?.brain ? "LLM model: " + (TRADE_LLM_MODELS.find(model => model.id === lp.settings?.brain?.primaryModel)?.label ?? lp.settings.brain.primaryModel).replace(/^Auto:\s*/u, "") : undefined } : unavailable(lp?.reason ?? "execution model unavailable"), true, lp?.model ? <ZeroGCredit /> : undefined)}
 
-      {tile("PnL since hire", livePnl.value === null ? pnl : { ...livePnl, note: pnlPercent ?? undefined }, true)}
+      <MetricTile label="PnL since hire" value={pnl.value ?? "—"} tone={pnlTone}
+        delta={pnl.value === null ? undefined : pnl.note} deltaTone={pnlTone}
+        title={pnl.value === null ? pnl.reason ?? undefined : undefined} />
 
-      {tile("Fees earned", lp?.feeMetric?.value !== null && lp?.feeMetric !== undefined ? lp.feeMetric : liveFees)}
+      <MetricTile label="Fees earned" value={earnedFees.value ?? "—"}
+        note={earnedFees.value === null ? undefined : earnedFees.tokenBreakdown}
+        title={earnedFees.note ?? earnedFees.reason ?? undefined} />
 
       {sigma ? tile("Open positions", { value: view ? `${positions.filter(p => p.state !== "closed").length} / 1` : null, reason: view ? null : "positions unavailable" }) : <MetricTile
         key="Dust"
@@ -494,7 +501,7 @@ export function LpAgentDetail(props: Props) {
             const inside = liveInRange(read, lp?.currentTick ?? null)
               ?? (live && lp?.liveRange && lp.currentTick !== null ? lp.currentTick >= lp.liveRange.tickLower && lp.currentTick < lp.liveRange.tickUpper : null);
             const rowValue = liveValueMetric(read, pricing);
-            const rowFees = liveFeesMetric(read, pricing);
+            const rowFees = read?.position.tokenId === accounting?.position.tokenId ? liveFees : unavailable("full collectible fees unavailable");
             const shownTokenId = read?.discovered === true ? read.position.tokenId.toString(10) : p.tokenId;
             const chartRange = read !== undefined && read.position.liquidity > 0n
               ? { tickLower: read.position.tickLower, tickUpper: read.position.tickUpper, fromChain: true }
