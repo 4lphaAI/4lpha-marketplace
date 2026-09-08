@@ -43,24 +43,53 @@ Every linked execution receipt was checked for success on BNB Chain (chain ID 56
 
 ## Architecture
 
-**Execution flow** — read left to right:
+The marketplace has **two separate planes**: the [market-data plane](https://github.com/4lphaAI/4lpha-market-data) provides read-only market evidence; this repository runs the UI and execution plane. The diagrams separate data dependencies from transaction execution. Arrows in the first diagram show **information supplied**, not transaction authority.
+
+### Market data and AI
 
 ```mermaid
 flowchart LR
-    U["User<br/>Passkey wallet"] --> W["Marketplace<br/>Next.js + BFF"]
-    W --> E["Execution plane<br/>API + agent workers"]
-    E --> A["Altana<br/>Scoped sessions"]
-    A --> B["BNB Chain<br/>PancakeSwap · Venus"]
+    D["Market-data plane<br/>4lpha-market-data"]
+    G["0G Compute<br/>LLM inference"]
+    D -->|HTTP| W["Web server / BFF"]
+    D -->|HTTP| A["Execution API"]
+    D -->|HTTP| T["Trading worker"]
+    G --> T
+    G -->|optional LP brain| L["LP / Grid worker"]
 ```
 
-| Component | Responsibility |
-|---|---|
-| **[Market-data plane](https://github.com/4lphaAI/4lpha-market-data)** | Separate repository supplying discovery, prices, pools and risk evidence to the UI and agents through `DATA_PLANE_URL`. Execution providers also read chain state and receipts. |
-| **Marketplace · `web/`** | Independent frontend build and deployment. The server BFF calls the private execution API over HTTP; service credentials never reach the browser. |
-| **Execution API + workers** | Hono/TypeScript API and LP/Grid, Trading and Lending workers. PostgreSQL holds tenant-scoped agents, encrypted session keys, strategy state and the idempotent execution journal. Ambiguous submissions are held for reconciliation. |
-| **Identity worker** | An isolated platform minter registers each agent in ERC-8004. Identity grants no authority over customer funds. |
+Market discovery, token/pool data and risk evidence use `DATA_PLANE_URL`. This is distinct from execution-time chain reads: LP/Grid and Lending workers read pool/position or Venus account state through their chain readers; the browser also reads wallet/NFT state for display and owner recovery. Lending's health-factor decisions do not require an LLM.
 
-**Custody and control:** the browser creates a new passkey-controlled Altana wallet that the user funds. The owner grants a session with call permissions, spend caps and expiry; the server holds no owner private key. Pause/halt stops server execution; the owner signs on-chain revocation and recovery directly. A compromised session key remains a risk within its granted permissions, including approval/recipient limitations. Autonomous HTTP trade/raw requests also require runtime assertions; raw execution defaults off. Lending uses the reserve wallet to repay the monitored account on its behalf.
+### Execution and custody
+
+```mermaid
+flowchart TB
+    W["Public marketplace<br/>Browser + server BFF"] -->|HTTP| A
+    subgraph P["Private execution services"]
+        A["Execution API<br/>Owner actions and agent state"]
+        R["Autonomous workers<br/>LP / Grid · Trading · Lending"]
+        DB[("PostgreSQL<br/>Agents · journal · strategy state")]
+        X["Execution controls<br/>Policy · caps · pause · idempotency"]
+        A <--> DB
+        R <--> DB
+        A --> X
+        R --> X
+    end
+    X --> S["Altana provider / relay<br/>Scoped session execution"]
+    S --> C["BNB Chain<br/>User wallet · PancakeSwap · Venus"]
+```
+
+API and workers are separate processes sharing stores and execution libraries; workers do **not** route their autonomous actions through the BFF. The controls box represents shared code, not another deployed service. Session permissions, spend caps and expiry are enforced on-chain; the journal holds ambiguous outcomes instead of blindly resubmitting them.
+
+| Boundary | Implementation |
+|---|---|
+| **Frontend / backend** | `web/` has its own dependencies, build and deployment and never imports backend `src/`. Only its server BFF holds execution-service credentials. The production API and PostgreSQL are private Railway services. |
+| **Owner custody** | A new passkey-controlled Altana wallet is funded by the user. The owner signs grants and owner actions; the server stores encrypted session keys, not the owner's private key. Owner-signed on-chain revoke/recovery bypasses the normal agent execution path. |
+| **Runtime authority** | Pause/halt is server-side refusal. On-chain revocation is the hard stop. A compromised session key remains a risk within its granted permissions; selector permissions do not universally constrain approval/recipient arguments. Autonomous HTTP trade/raw routes additionally require request-bound runtime assertions; raw execution defaults off. |
+| **ERC-8004 identity** | PostgreSQL enrollment → isolated identity worker → BNB Chain registry. A dedicated platform minter registers agents; it has no customer session authority. This identity path is separate from DeFi execution. |
+| **Lending** | The monitored borrow stays on account A; reserve wallet B supplies funds on Venus and repays on A's behalf. Repayment is a transfer from the reserve, not investment income. |
+
+Source: [deployment services](./.railway/railway.ts), [API composition](./src/index-server.ts), [LP/Grid worker](./scripts/lp-worker.ts), [Trading worker](./scripts/trade-worker.ts), [Lending wiring](./src/lending/wiring.ts), and [market-data client](./src/clients/dataPlane.ts).
 
 ## Development
 
