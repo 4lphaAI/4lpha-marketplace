@@ -1239,6 +1239,29 @@ describe("FIXREVIEW F7 — the door prefers the arm's OWN block and labels it", 
 describe("FIXREVIEW F3 — the `retire-unknown` door", () => {
   const RETIRE_KEY = `${AGENT}:lending:${AGENT}:retire:9`;
 
+  for (const sample of [
+    { name: "interest dust", supplied: 1n, idle: 0n, rate: E18, stored: E18, retired: true },
+    { name: "exact dust boundary", supplied: E18 / 100n, idle: 0n, rate: E18, stored: E18, retired: false },
+    { name: "idle included", supplied: 1n, idle: E18 / 100n, rate: E18, stored: E18, retired: false },
+    { name: "missing current rate", supplied: 1n, idle: 0n, rate: null, stored: E18, retired: false },
+    { name: "zero current rate", supplied: 1n, idle: 0n, rate: 0n, stored: E18, retired: false },
+    { name: "conservative stored rate", supplied: E18 / 100n, idle: 0n, rate: 1n, stored: E18, retired: false },
+  ]) {
+    it(`UNKNOWN recovery residue: ${sample.name}`, async () => {
+      const h = await harness({ guardStatus: "held", hold: "retire-unknown", reserve: {
+        vUsdtBalance: sample.supplied, usdtBalance: sample.idle,
+        exchangeRateCurrent: sample.rate, exchangeRateStored: sample.stored,
+      } });
+      await chargeRetire(h);
+      await seedRetireRow(h);
+      await h.journal.markUnknown(RETIRE_KEY, "ambiguous");
+      await runLendingWorkerOnce(h.deps);
+      assert.equal((await h.guards.get(OWNER, AGENT))?.status, sample.retired ? "retired" : "held");
+      assert.equal((await h.journal.get(RETIRE_KEY))?.state, "UNKNOWN");
+      assert.equal(h.submissions.length, 0);
+    });
+  }
+
   type Rig = Awaited<ReturnType<typeof harness>>;
 
   async function chargeRetire(h: Rig): Promise<void> {

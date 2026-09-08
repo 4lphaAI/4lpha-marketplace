@@ -240,6 +240,9 @@ describe("the Remove gate (§6.1 / R3.12)", () => {
 
 describe("the passkey recovery door (§6.2)", () => {
   const nowSec = 1_700_000_000;
+  it("opens for an unresolved retire even with a live session", () => {
+    expect(lendingRecoveryOffered({ guard: { ...guard, status: "held", hold: "retire-unknown" }, sessionExpiresAt: nowSec + 10000, agentStatus: "armed", planeUnreachable: false, nowSec })).toBe(true);
+  });
   it("opens on an expired session, on a revoked agent and on an unreachable plane", () => {
     expect(lendingRecoveryOffered({ guard, sessionExpiresAt: nowSec - 1, agentStatus: "armed", planeUnreachable: false, nowSec })).toBe(true);
     expect(lendingRecoveryOffered({ guard, sessionExpiresAt: nowSec + 10_000, agentStatus: "revoked", planeUnreachable: false, nowSec })).toBe(true);

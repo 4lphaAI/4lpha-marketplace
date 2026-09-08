@@ -701,8 +701,8 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
         <Button variant="secondary" icon={<Icon name="pause" size={15} />} disabled={props.actionsDisabled || !["armed", "paused"].includes(view?.status ?? "")} onClick={props.onTogglePause}>
           {view?.status === "paused" ? "Resume" : "Pause"}
         </Button>
-        <Button variant="secondary" icon={<Icon name="wallet" size={15} />} disabled={busy || props.actionsDisabled || guard === null || !["armed", "held"].includes(guard.status)}
-          title={guard === null ? undefined : !["armed", "held"].includes(guard.status) ? `Retire needs an armed or held guard; it is ${guard.status}.` : undefined}
+        <Button variant="secondary" icon={<Icon name="wallet" size={15} />} disabled={busy || props.actionsDisabled || guard === null || guard.hold === "retire-unknown" || !["armed", "held"].includes(guard.status)}
+          title={guard?.hold === "retire-unknown" ? "The previous retire is unresolved. Use Recover with passkey to recover the remaining reserve." : guard === null ? undefined : !["armed", "held"].includes(guard.status) ? `Retire needs an armed or held guard; it is ${guard.status}.` : undefined}
           onClick={() => { if (window.confirm("Retire the reserve? Everything the Venus pool can pay is redeemed and swapped back to BNB in the agent wallet.")) void retire(false); }}>
           Retire reserve
         </Button>

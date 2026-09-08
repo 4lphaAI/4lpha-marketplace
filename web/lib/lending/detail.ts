@@ -342,6 +342,7 @@ export function lendingRecoveryOffered(input: {
   readonly nowSec: number;
 }): boolean {
   if (input.guard.status === "retired" || input.guard.status === "closed") return false;
+  if (input.guard.status === "held" && input.guard.hold === "retire-unknown") return true;
   if (input.planeUnreachable) return true;
   if (input.agentStatus === "revoked" || input.agentStatus === "retired") return true;
   return input.sessionExpiresAt !== null && input.sessionExpiresAt <= input.nowSec;

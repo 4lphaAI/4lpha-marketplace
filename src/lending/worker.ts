@@ -1131,8 +1131,16 @@ async function resolveRetireUnknown(
   guard: LendingGuardRecord,
   reserve: LendingReserveReading,
 ): Promise<LendingWorkerAgentOutcome | null> {
+  // Owner recovery uses redeemUnderlying and can leave interest dust. This
+  // proves only that the reserve is economically empty, never tx inclusion.
+  const currentRate = reserve.exchangeRateCurrent;
+  const conservativeRate = currentRate !== null && currentRate > reserve.exchangeRateStored
+    ? currentRate : reserve.exchangeRateStored;
+  const belowDust = currentRate !== null && currentRate > 0n
+    && reserve.vUsdtBalance >= 0n && reserve.usdtBalance >= 0n
+    && (reserve.vUsdtBalance * conservativeRate) / E18 + reserve.usdtBalance < LENDING_DUST_USDT_WEI;
   const emptied =
-    reserve.vUsdtBalance === 0n && reserve.usdtBalance < LENDING_DUST_USDT_WEI;
+    (reserve.vUsdtBalance === 0n && reserve.usdtBalance < LENDING_DUST_USDT_WEI) || belowDust;
   const retireKey = await deps.guards.lastActionId(
     guard.ownerAddress, guard.agentId, "retire",
   );
@@ -1156,8 +1164,8 @@ async function resolveRetireUnknown(
       : disposition === "retired"
         ? state === "COMMITTED"
           ? "The retire's journal row COMMITTED and the reserve is empty; the guard is retired."
-          : "The retire's outcome is still UNKNOWN, but wallet B holds no vUSDT and no idle "
-            + "USDT above dust, so the retire evidently landed; the guard is retired."
+          : "The retire's outcome is still UNKNOWN, but the remaining supplied and idle "
+            + "USDT reserve is below dust; the guard is retired. The journal remains unresolved."
         : "The retire's journal row COMMITTED and part of the reserve is still supplied; the "
           + "guard is retiring. Retire again to take what the pool can pay now.";
 
