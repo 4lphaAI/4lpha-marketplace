@@ -24,6 +24,7 @@
  * per-cycle check history and no collateral-at-hire figure is stored anywhere.
  */
 import * as React from "react";
+import { TokenIcon } from "@/components/TokenIcon";
 import { ActivityRow, Button, Category, Checkbox, Icon, Input, MetricTile, PermissionItem, SegmentedToggle, StatusBadge } from "@/design-system";
 import { portfolioApy, portfolioUsd, type LendingPortfolio } from "@/lib/exec/lending-portfolio";
 import { usePublicClient } from "wagmi";
@@ -380,7 +381,7 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
     note: LENDING_NO_LOCK_IN_COPY,
   };
 
-  const conditions = (payload?.conditions ?? []).filter((entry) => entry.condition !== "hf-above-trigger");
+  const conditions = (payload?.conditions ?? []).filter((entry) => entry.condition !== "hf-above-trigger" && entry.condition !== "awaiting-confirmation");
   const rescues = mapped?.rescues ?? [];
   const settings = mapped?.settings ?? null;
 
@@ -1007,7 +1008,7 @@ function ReservePanel({ capacity, coverage, legs, legsReason, capWei, usdtDecima
         {legs === null
           ? <Dash reason={legsReason ?? "the reserve legs are not readable"} />
           : rows.map(([name, value, note]) => <span key={name} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 3 }}>
-            <span style={bodyText}>{name}</span><span style={val}>{value}</span>
+            <span style={bodyText}>{name}{name === "Supplied on Venus" ? <img src="/design/protocols/venus.png" alt="Venus" width={14} height={14} style={{ marginLeft: 6, verticalAlign: "middle", objectFit: "contain" }} /> : null}</span><span style={val}>{value}</span>
             <span style={{ ...mono, gridColumn: "1 / -1" }}>{note}</span>
           </span>)}
         {/* FIX 7: `reserveCapWei` is charged by EVERY USDT approve the session
@@ -1048,6 +1049,19 @@ function PositionPanel({ markets, reason, live, guardedAccount, debtMarkets, con
   readonly usdtDecimals: number;
 }) {
   const pinned = new Set(debtMarkets.map((entry) => entry.toLowerCase()));
+  const [icons, setIcons] = React.useState<Record<string, string | null>>({});
+  const iconKey = [...new Set(markets.map((market) => (market.underlying ?? WBNB_56).toLowerCase()))].sort().join(",");
+  React.useEffect(() => {
+    setIcons({});
+    if (!iconKey) return;
+    const controller = new AbortController();
+    void fetch(`/api/token-icons?addresses=${iconKey}`, { signal: controller.signal })
+      .then((response) => response.json())
+      .then((payload: { data?: Record<string, string | null> }) => {
+        if (!controller.signal.aborted) setIcons(payload.data ?? {});
+      }).catch(() => undefined);
+    return () => controller.abort();
+  }, [iconKey]);
   const repayable = config === null ? null : new Set([config.vUsdt.toLowerCase(), config.vBnb.toLowerCase()]);
   return <Panel title="Guarded account position" testId="lending-position" right={<>
     <span style={mono}>{guardedAccount === null ? "account unavailable" : shortAddress(guardedAccount)}</span>
@@ -1068,9 +1082,12 @@ function PositionPanel({ markets, reason, live, guardedAccount, debtMarkets, con
           const isPinned = pinned.has(market.vToken.toLowerCase());
           const supported = repayable === null ? null : repayable.has(market.vToken.toLowerCase());
           return <div key={market.vToken} className="fl-row" style={{ gridTemplateColumns: POSITION_COLS, cursor: "default", alignItems: "center" }}>
-              <span style={{ display: "grid", gap: 4, minWidth: 0 }}>
+              <span style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                <TokenIcon src={icons[(market.underlying ?? WBNB_56).toLowerCase()] ?? null} symbol={symbol} size={24} />
+                <span style={{ display: "grid", gap: 4 }}>
                 <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>{symbol}</span>
                 <span style={mono}>{market.symbol}</span>
+                </span>
             </span>
             <span style={val}>{formatAtomicAmount(market.supplyUnderlyingWei, decimals, decimals === 18 ? 4 : 2)}</span>
             <span style={val}>{formatAtomicAmount(market.borrowWei, decimals, decimals === 18 ? 4 : 2)}</span>

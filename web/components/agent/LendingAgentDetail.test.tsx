@@ -870,10 +870,11 @@ describe("the Permissions tab", () => {
 /* -------------------------------------------------------------------------- */
 
 describe("reference market rows", () => {
-  it("uses symbol text without introducing token images or image fetches", async () => {
+  it("resolves token logos and keeps symbol text when a logo is unavailable", async () => {
     await mount(lendingView());
     expect(host.querySelector("[data-testid='lending-position'] img")).toBeNull();
-    expect(iconRequests).toHaveLength(0);
+    expect(iconRequests).toHaveLength(1);
+    expect(host.querySelector("img[alt='Venus']")?.getAttribute("height")).toBe("14");
     expect(testid("lending-position")).toContain("vUSDT");
     expect(testid("lending-position")).toContain("Supplied");
     expect(testid("lending-position")).toContain("Borrowed");
