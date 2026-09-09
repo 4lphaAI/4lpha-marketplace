@@ -1,8 +1,44 @@
 # 4LPHA — BNB Chain Agent Marketplace
 
-[Live app](https://4lpha.tech) · [Docs](https://docs.4lpha.tech) · **[Market data repository](https://github.com/4lphaAI/4lpha-market-data)**
+A non-custodial marketplace for autonomous trading, grid, liquidity and lending agents built on **BNB Smart Chain (BSC)** using EVM smart contracts and scoped wallet sessions.
 
-Deploy agents that manage PancakeSwap grids and liquidity, screen and trade markets, or protect Venus borrowing positions. This repository contains the marketplace frontend and execution plane. The **[separate market-data plane](https://github.com/4lphaAI/4lpha-market-data)** supplies market discovery, prices, pools and risk evidence; it is a core part of the system.
+[Live app](https://4lpha.tech) · [Docs](https://docs.4lpha.tech) · **[Market-data repository](https://github.com/4lphaAI/4lpha-market-data)**
+
+This repository contains the marketplace frontend and execution plane. The **[separate market-data plane](https://github.com/4lphaAI/4lpha-market-data)** is a core part of the system: it supplies market discovery, prices, pool data and risk evidence through `DATA_PLANE_URL`.
+
+## Technology Stack
+
+- **Blockchain:** BNB Smart Chain; EVM contracts and EIP-7702 wallet infrastructure.
+- **Smart contracts:** Altana wallet/session contracts, PancakeSwap and Venus integrations, and ERC-8004 identity. The repository's [BillingCollector](./contracts/BillingCollector.sol) uses **Solidity 0.8.30**; production billing is disabled.
+- **Frontend:** Next.js 16 + React 19 + TypeScript, wagmi, viem and RainbowKit.
+- **Backend:** Node.js 22+, TypeScript, Hono and PostgreSQL.
+- **Wallets and AI:** Altana SDK 0.7.0, passkeys/WebAuthn, and 0G Compute for Trading analysis and the optional LP brain.
+- **Development and deployment:** npm, tsx, solc 0.8.30, node:test, Vitest, Docker and Railway.
+
+## Supported Networks
+
+| Network | Chain ID | Scope |
+|---|---:|---|
+| **BNB Smart Chain Mainnet** | **56** | Live marketplace, Grid, Trading, LP, Lending and ERC-8004 registrations. |
+| **BNB Smart Chain Testnet** | **97** | Wallet/session development and spike tooling; not full marketplace/DeFi feature parity. |
+
+The code uses EVM-compatible tooling, but Ethereum mainnet and other EVM networks are **not currently supported marketplace deployments**. Adding a network requires its own protocol addresses, configuration and validation.
+
+## Contract Addresses
+
+Key **integrated protocol contracts on BSC mainnet (56)**, not contracts deployed by 4LPHA:
+
+| Contract | Address |
+|---|---|
+| ERC-8004 Identity Registry | [`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`](https://bscscan.com/address/0x8004A169FB4a3325136EB29fA0ceB6D2e539a432) |
+| PancakeSwap V3 Position Manager | [`0x46A15B0b27311cedF172AB29E4f4766fbE7F4364`](https://bscscan.com/address/0x46A15B0b27311cedF172AB29E4f4766fbE7F4364) |
+| PancakeSwap V3 Swap Router | [`0x1b81D678ffb9C0263b24A97847620C99d213eB14`](https://bscscan.com/address/0x1b81D678ffb9C0263b24A97847620C99d213eB14) |
+| Venus vUSDT | [`0xfD5840Cd36d94D7229439859C0112a4185BC0255`](https://bscscan.com/address/0xfD5840Cd36d94D7229439859C0112a4185BC0255) |
+| Venus vBNB | [`0xA07c5b74C9B40447a954e1466938b865b6BBea36`](https://bscscan.com/address/0xA07c5b74C9B40447a954e1466938b865b6BBea36) |
+
+User wallet addresses and ERC-8004 agent IDs are instance-specific; see the transaction proofs below. No active production BillingCollector address is claimed while billing remains disabled.
+
+## Agents and Demo Videos
 
 | Agent | What it does | Demo video |
 |---|---|---|
