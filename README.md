@@ -11,19 +11,21 @@ Deploy agents that manage PancakeSwap grids and liquidity, screen and trade mark
 | LP | Opens PancakeSwap V3 liquidity, rebalances, compounds fees and applies configured protection exits. | [Watch LP demo](https://youtu.be/1uIeKGeg1no?si=c3oBJ6ZVtWJp-3v5) |
 | Lending | Supplies a rescue reserve to Venus and repays a monitored account's debt when health-factor conditions trigger. | [Watch Lending demo](https://youtu.be/I7wxbKY0-ac?si=qIUkoD_waYymXi6W) |
 
-## Five mainnet task results
+## 5 mainnet task results
 
 **Evidence refreshed 9 September 2026.** Open Grid/LP snapshots are from **10:40:43 UTC**; completed tasks retain their original measurement windows. These are selected real production tasks, not simulated marketplace-card statistics or a 30-day backtest. The five selected tasks cover the active mubarak Grid, the best-returning completed mubarak LP, the stronger of the two active USDT/WBNB LPs, the best-returning closed Trading position among 11 closed trades rechecked on September 9, and a Lending agent with receipt-confirmed repayments. Different windows are shown explicitly; this is a curated showcase, not an aggregate return or a claim that every agent beats HODL.
 
 | Task / ERC-8004 identity | Measurement window (UTC) | Agent result | Passive comparison, same window | Difference |
 |---|---|---|---|---|
-| **Grid · mubarak/WBNB** — `grid-agent-01-2` · [#337848](https://8004scan.io/agents/bsc/337848) | Sep 6 17:54:35 → Sep 9 10:40:43; still open | **−3.11%**; 0.062700 → **0.060748385 BNB-equivalent** | Hold mubarak: **−7.05%** | **+3.94 percentage points** |
-| **LP · mubarak/WBNB** — `lp-agent-01` · [#337272](https://8004scan.io/agents/bsc/337272) | Sep 6 15:58:50 → 17:19:47; closed | **−0.83%**; 0.030000 → **0.029752 BNB-equivalent** | Hold mubarak: **−1.18%** | **+0.35 percentage points** |
-| **LP · USDT/WBNB** — `4lpha-lp-agent-01-2` · [#340032](https://8004scan.io/agents/bsc/340032) | Sep 8 03:14:57 → Sep 9 10:40:43; still open | **+1.80%**; 0.020000 → **0.020360171 BNB-equivalent** | Hold USDT, valued in BNB: **−1.61%** | **+3.41 percentage points** |
-| **Trading · LIon** — one position of `trading-agent-01-new` · [#341245](https://8004scan.io/agents/bsc/341245) | Sep 8 15:13:55 → 15:46:23; closed by take-profit rule | **+108.38%**; 0.001800 → **0.003750829 BNB** | Hold LIon: **+106.87%** | **+1.51 percentage points before gas/relay** |
+| **Grid · mubarak/WBNB** — `grid-agent-01-2` · [#337848](https://8004scan.io/agents/bsc/337848) | Sep 6 17:54:35 → Sep 9 10:40:43; still open | **−3.11%**; 0.062700 → **0.060748385 BNB-equivalent** | Hold mubarak: **−7.05%** | **+3.94%** |
+| **LP · mubarak/WBNB** — `lp-agent-01` · [#337272](https://8004scan.io/agents/bsc/337272) | Sep 6 15:58:50 → 17:19:47; closed | **−0.83%**; 0.030000 → **0.029752 BNB-equivalent** | Hold mubarak: **−1.18%** | **+0.35%** |
+| **LP · USDT/WBNB** — `4lpha-lp-agent-01-2` · [#340032](https://8004scan.io/agents/bsc/340032) | Sep 8 03:14:57 → Sep 9 10:40:43; still open | **+1.80%**; 0.020000 → **0.020360171 BNB-equivalent** | Hold USDT, valued in BNB: **−1.61%** | **+3.41%** |
+| **Trading · LIon** — one position of `trading-agent-01-new` · [#341245](https://8004scan.io/agents/bsc/341245) | Sep 8 15:13:55 → 15:46:23; closed by take-profit rule | **+108.38%**; 0.001800 → **0.003750829 BNB** | Hold LIon: **+106.87%** | **+1.51% before gas/relay** |
 | **Lending · Venus USDT debt** — `lending-agent-01-3` · [#340548](https://8004scan.io/agents/bsc/340548) | Sep 8 04:53:58 arm → 08:37:22 second repayment | **1.619104 USDT repaid** across two transactions from a 0.020 BNB rescue budget | A passive reserve makes **no automatic repayments**; absent these actions, debt would be about **1.619104 USDT higher**, holding other actions fixed and excluding incremental interest | Debt reduction, **not investment profit** or proof that liquidation was imminent |
 
-Since the September 8 snapshot, the featured USDT/WBNB LP improved from **+1.13% to +1.80%**. Grid’s return fell from **−2.32% to −3.11%**, while token-HODL fell from **−5.16% to −7.05%**: its gross relative advantage widened from **+2.83 to +3.94 percentage points**. LIon remains the best recorded closed trade; no additional lending repayment was recorded.
+Since the September 8 snapshot, the featured USDT/WBNB LP improved from **+1.13% to +1.80%**. Grid’s return fell from **−2.32% to −3.11%**, while token-HODL fell from **−5.16% to −7.05%**: its gross relative advantage widened from **+2.83 to +3.94%**. LIon remains the best recorded closed trade; no additional lending repayment was recorded.
+
+For return rows, Difference = agent return − HODL return; % is used as shorthand for this arithmetic gap, not a relative percentage increase.
 
 ### Transactions and measured costs
 
