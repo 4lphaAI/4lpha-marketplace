@@ -1339,3 +1339,87 @@ button { font: inherit; color: inherit; }
   color: var(--cat-lp);
   text-decoration: underline;
 }
+
+/* ── SIGMA pet ─────────────────────────────────────────────────────────────
+   Draggable mascot ported from 4lpha-0G (`components/SigmaPet.tsx`). Fixed to
+   the viewport and positioned by transform, so dragging never reflows the page.
+   The wrapper is pointer-transparent; only the sprite and the hide button take
+   pointer events, so the pet can never swallow a click on the app beneath it. */
+.fl-sigma {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 55;
+  pointer-events: none;
+  transition: opacity var(--dur-base, 180ms) var(--ease-out, ease-out);
+}
+.fl-sigma__bubble {
+  position: absolute;
+  top: 4px;
+  right: 76px;
+  width: min(268px, 32vw);
+  padding: var(--space-3, 8px) var(--space-4, 12px);
+  border: var(--border-width, 1px) solid var(--line-2);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--raised-2);
+  box-shadow: var(--shadow-pop);
+  color: var(--ink-1);
+  font: var(--weight-regular, 400) var(--text-sm, 13px) / 1.5 var(--font-sans);
+  pointer-events: none;
+}
+.fl-sigma__bubble--right { right: auto; left: 76px; }
+.fl-sigma__bubble p {
+  margin: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+.fl-sigma:hover .fl-sigma__bubble--greeting { display: none; }
+.fl-sigma__grab {
+  display: block;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+  outline: none;
+  transition: transform 150ms var(--ease-out, ease-out);
+}
+.fl-sigma__grab:active { cursor: grabbing; transform: scale(0.96); }
+.fl-sigma__grab:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.fl-sigma__sprite {
+  display: block;
+  aspect-ratio: 192 / 208;
+  background-image: url("/pets/sigma/spritesheet.webp");
+  background-repeat: no-repeat;
+  image-rendering: pixelated;
+}
+.fl-sigma__hide {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: var(--border-width, 1px) solid var(--line-2);
+  border-radius: var(--radius-pill, 999px);
+  background: var(--raised-2);
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.fl-sigma:hover .fl-sigma__hide,
+.fl-sigma__grab:focus-visible ~ .fl-sigma__hide,
+.fl-sigma__hide:focus-visible { display: flex; }
+.fl-sigma__hide:hover { color: var(--ink-1); border-color: var(--line-3); }
+@media (max-width: 720px) { .fl-sigma { display: none; } }
+@media (prefers-reduced-motion: reduce) { .fl-sigma, .fl-sigma__grab { transition: none; } }

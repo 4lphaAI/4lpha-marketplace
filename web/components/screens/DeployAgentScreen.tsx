@@ -14,6 +14,7 @@ import { RangeExplainer } from "@/components/explainers/RangeExplainer";
 import { CompoundExplainer } from "@/components/explainers/CompoundExplainer";
 import { Button, Checkbox, Icon, Input, SegmentedToggle, Select } from "@/design-system";
 import { RESOURCES } from "@/lib/design-resources";
+import { TUTORIAL_LINKS } from "@/lib/tutorials";
 import { LivePoolSection, UI_PRESET_TO_GEOMETRY } from "@/components/deploy/GridLiveDeploy";
 import { gridCapitalFloorBnb } from "@/lib/grid/economics";
 import { HireGridDeploy } from "@/components/deploy/HireGridDeploy";
@@ -72,7 +73,8 @@ const GUIDE_LINKS = {
   lp: "https://docs.4lpha.tech/#lp",
   health: "https://docs.4lpha.tech/#lending",
 };
-const TUTORIAL_LINK = "https://www.youtube.com/watch?v=1uIeKGeg1no&list=PLOMsGmPsK-0Q";
+// Per-agent tutorial videos live in `lib/tutorials.ts` — the header links the
+// whole playlist from the same file, so the two can never drift apart.
 
 // Every id here answers on the 0G router; the names the mock-up carried are
 // other providers' and three of the old 0G product's answer HTTP 404.
@@ -1347,7 +1349,7 @@ function DeployAgentScreen({ kind, go }) {
             <span className="fl-eyebrow">Execution model</span>
             <span className="fl-deploy-form-links">
               <a href={GUIDE_LINKS[id]} target="_blank" rel="noreferrer">Guides</a>
-              <a href={TUTORIAL_LINK} target="_blank" rel="noreferrer">Tutorial Videos</a>
+              <a href={TUTORIAL_LINKS[id]} target="_blank" rel="noreferrer">Tutorial Videos</a>
               <button type="button" onClick={() => { repayTouched.current = false; setRepaySuggestion(null); setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}>
                 Reset parameters to defaults
               </button>

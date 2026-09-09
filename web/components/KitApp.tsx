@@ -19,6 +19,8 @@ import { MyAgentsScreen } from "@/components/screens/MyAgentsScreen";
 import { HiredAgentScreen } from "@/components/screens/HiredAgentScreen";
 import { ListAgentScreen } from "@/components/screens/ListAgentScreen";
 import { DemoAgentDetail } from "@/components/demo/DemoAgentDetail";
+import { SigmaPet } from "@/components/SigmaPet";
+import { dispatchSigmaPetReaction } from "@/lib/sigma-pet";
 
 export function KitApp() {
   const [route, setRoute] = React.useState("/");
@@ -80,8 +82,11 @@ export function KitApp() {
         {screen}
         {hiring && (
           <HireFlow agent={hiring} sheet={sheet} onClose={() => setHiring(null)}
-            onDone={() => { setHiring(null); setEmpty(false); go("/account"); }} />
+            onDone={() => { setHiring(null); setEmpty(false); dispatchSigmaPetReaction("hire.success", { force: true }); go("/account"); }} />
         )}
+        {/* Decoration only — the pet reads no state and calls nothing. It lives
+            inside the desktop gate so the mobile notice stays alone. */}
+        <SigmaPet route={route} />
       </div>
       <div className="fl-mobile-gate" role="status">
         <Icon name="info" size={22} />
