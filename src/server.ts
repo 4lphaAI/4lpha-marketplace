@@ -93,6 +93,11 @@ import {
 } from "./auth/accountReadSession.js";
 import { buildAccountPortfolio } from "./account/portfolio.js";
 import {
+  agentGasFloor,
+  classifyAgentGas,
+  type AgentGasState,
+} from "./ops/gasFloor.js";
+import {
   DeclaredWalletNotOwnedError,
   readFinalizedSessionRevocation,
   readSessionRegistration,
@@ -364,6 +369,7 @@ import {
 } from "./lp/preBindRetirementFinalizer.js";
 import {
   DEFAULT_LP_SETTINGS,
+  type LpGridMode,
   alreadySatisfiedPriceTrigger,
   evaluateLpProtectBreach,
   gridModeOf,
@@ -1655,6 +1661,14 @@ export function createServer(deps: ServerDeps): Hono {
             store: deps.lp.store,
             observations: deps.lp.observations,
             workerIntervalMs: deps.lp.workerIntervalMs,
+            // AGENT-GAS-ATTENTION §3.1 — the two inputs the gas floor needs:
+            // the grid MODE (from the owner's settings) and the deployment's
+            // relay fee. Both optional at the seam, so a deployment that wires
+            // neither reports `gas: null` rather than a guessed floor.
+            settings: deps.lp.settingsStore,
+            ...(deps.lp.relayFeePerSubmitWei === undefined
+              ? {}
+              : { relayFeePerSubmitWei: deps.lp.relayFeePerSubmitWei }),
           } }),
           ...(deps.keyStoreReader === undefined ? {} : { keyStoreReader: deps.keyStoreReader }),
           ...(deps.balanceReader === undefined ? {} : { balanceReader: deps.balanceReader }),
@@ -9004,6 +9018,60 @@ export function createServer(deps: ServerDeps): Hono {
      * a store read of the arm group's ANCHOR row (C4): `null` when this ladder
      * has no anchor, which the markout gate refuses on rather than dividing by.
      */
+    /**
+     * AGENT-GAS-ATTENTION §3.2 — THE AGENT'S GAS POT, FOR EVERY PROFILE.
+     *
+     * GRID-GAS-RESERVE W2 shipped this figure for SHIFT grids only, sealed
+     * inside {@link ladderBufferView}'s `grid.shift !== undefined` branch. That
+     * is why the LP agents in the 2026-09-10 report could not warn about gas at
+     * all: not a missing UI, a missing FIELD. This lifts it out.
+     *
+     * It reads the chain, at the one layer this route allows a chain call (the
+     * same licence `ladderBufferView` takes, and for the same reason: it is
+     * what funds the next motion, and the alternative is a page that reports a
+     * figure nobody measured).
+     *
+     * `null` on ANY absence — no reader, a failed read, an unsizable floor —
+     * because the page renders `null` as a dash WITH a reason. A zero here
+     * would read as "the wallet is empty", which is a claim.
+     */
+    async function agentGasView(
+      agent: AgentRecord,
+      gridMode: LpGridMode | null,
+    ): Promise<{
+      readonly state: AgentGasState;
+      readonly nativeWei: string | null;
+      readonly nextMotionWei: string;
+      readonly warnWei: string;
+      readonly blockWei: string;
+      readonly enforcement: "block" | "warn-only";
+    } | null> {
+      const floor = agentGasFloor({
+        profile: agent.httpRuntimeProfile,
+        gridMode,
+        ...(lp.relayFeePerSubmitWei === undefined
+          ? {}
+          : { relayFeePerSubmitWei: lp.relayFeePerSubmitWei }),
+      });
+      if (floor === null) return null;
+      const readNative = lp.readers.walletNativeBalance;
+      if (readNative === undefined) return null;
+      let nativeWei: bigint | undefined;
+      try {
+        nativeWei = await readNative(agent.walletAddress);
+      } catch {
+        nativeWei = undefined;
+      }
+      return {
+        state: classifyAgentGas({ nativeWei, floor }),
+        nativeWei: nativeWei === undefined ? null : nativeWei.toString(10),
+        nextMotionWei: floor.nextMotionWei.toString(10),
+        warnWei: floor.warnWei.toString(10),
+        blockWei: floor.blockWei.toString(10),
+        enforcement: floor.enforcement,
+      };
+    }
+
     async function ladderBufferView(
       agent: AgentRecord,
       grid: LpGridSettings,
@@ -10157,6 +10225,15 @@ export function createServer(deps: ServerDeps): Hono {
 
       return c.json({
         data: {
+          // AGENT-GAS-ATTENTION §3.2 — top level, so it is reported for a plain
+          // LP agent exactly as for a shift grid. The grid `buffer` block keeps
+          // its own `nativeWei`/`nextShiftGasWei` unchanged: those two are the
+          // figures the SHIFT TRIGGER holds under, and "keep the two gates in
+          // step" means not replacing them with a differently-scoped number.
+          gas: await agentGasView(
+            agent,
+            effectiveSettings.grid === null ? null : gridModeOf(effectiveSettings.grid),
+          ),
           positions: positions.map((position, index) => ({
             ...lpPositionView(position),
               ...feeView(position, index),

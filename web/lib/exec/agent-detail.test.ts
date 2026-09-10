@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { USDT_56, WBNB_56 } from "./pairs";
-import { emptyRungPairs, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, rungFillTick, rungHoldsWbnb, shiftFills } from "./agent-detail";
+import { emptyRungPairs, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills } from "./agent-detail";
 import { priceAtTick as priceAtTickRef } from "./pairs";
 
 const NOW = 2_000_000_000_000;
@@ -365,8 +365,15 @@ describe("OHLCV request and HODL reducer", () => {
 
 describe("GRID-GAS-RESERVE W2: the gas block", () => {
   it("reads the shift buffer's native pot against the next shift's relay gas", () => {
+    // A plane that has not yet been redeployed reports only the shift `buffer`.
+    // AGENT-GAS-ATTENTION §3.2 projects it into the newer shape, with
+    // `warnWei: null` — that block never carried a warn threshold, and null is
+    // how the page says "not reported" rather than "above it".
     const view = mapAgentDetail(owner(), lp({ grid: { ...lp().data.grid, buffer: { quoteWei: "1", baseWei: "2", bookBaseWei: null, bookCostWbnbWei: null, nativeWei: "98693148720024", nextShiftGasWei: "155200000000000" } } }), NOW);
-    expect(view.gas).toEqual({ nativeWei: "98693148720024", nextShiftWei: "155200000000000", low: true });
+    expect(view.gas).toEqual({
+      nativeWei: "98693148720024", nextMotionWei: "155200000000000", blockWei: "155200000000000",
+      warnWei: null, state: "blocked", enforcement: "block", low: true,
+    });
     const funded = mapAgentDetail(owner(), lp({ grid: { ...lp().data.grid, buffer: { quoteWei: "1", baseWei: "2", bookBaseWei: null, bookCostWbnbWei: null, nativeWei: "155200000000000", nextShiftGasWei: "155200000000000" } } }), NOW);
     expect(funded.gas?.low).toBe(false);
   });
@@ -374,6 +381,45 @@ describe("GRID-GAS-RESERVE W2: the gas block", () => {
     expect(mapAgentDetail(owner(), lp(), NOW).gas).toBeNull();
     const half = mapAgentDetail(owner(), lp({ grid: { ...lp().data.grid, buffer: { quoteWei: "1", baseWei: "2", bookBaseWei: null, bookCostWbnbWei: null, nativeWei: "5" } } }), NOW);
     expect(half.gas).toBeNull();
+  });
+});
+
+describe("AGENT-GAS-ATTENTION §3.2: the top-level gas block", () => {
+  const block = (over: Record<string, unknown> = {}) => ({
+    state: "low", nativeWei: "300000000000000", nextMotionWei: "155200000000000",
+    warnWei: "465600000000000", blockWei: "155200000000000", enforcement: "block", ...over,
+  });
+
+  it("is read for every profile, and outranks the shift buffer when both are present", () => {
+    const view = mapAgentDetail(owner(), lp({ gas: block() }), NOW);
+    expect(view.gas?.state).toBe("low");
+    expect(view.gas?.warnWei).toBe("465600000000000");
+    expect(view.gas?.low).toBe(true);
+
+    const both = mapAgentDetail(owner(), lp({
+      gas: block(),
+      grid: { ...lp().data.grid, buffer: { quoteWei: "1", baseWei: "2", bookBaseWei: null, bookCostWbnbWei: null, nativeWei: "1", nextShiftGasWei: "155200000000000" } },
+    }), NOW);
+    expect(both.gas?.warnWei).toBe("465600000000000");
+  });
+
+  it("an unread balance is `unknown`, and reports no shortfall", () => {
+    const view = mapAgentDetail(owner(), lp({ gas: block({ state: "unknown", nativeWei: null }) }), NOW);
+    expect(view.gas?.state).toBe("unknown");
+    expect(view.gas?.nativeWei).toBeNull();
+    expect(view.gas?.low).toBe(false);
+  });
+
+  it("refuses a partly-formed block outright — a threshold nobody computed is worse than none", () => {
+    for (const broken of [
+      block({ state: "sideways" }),
+      block({ enforcement: "maybe" }),
+      block({ blockWei: "not-a-number" }),
+      block({ warnWei: null }),
+      { nativeWei: "1" },
+    ]) {
+      expect(mapAgentDetail(owner(), lp({ gas: broken }), NOW).gas).toBeNull();
+    }
   });
 });
 
@@ -463,5 +509,96 @@ describe("rungHoldsWbnb / rungFillTick", () => {
     expect(rungFillTick({ tickLower: -100_900, tickUpper: -100_850, holdsWbnb: false, wbnbIsToken0: false })).toBe(-100_850);
     expect(rungFillTick({ tickLower: -100_900, tickUpper: -100_850, holdsWbnb: true, wbnbIsToken0: false })).toBe(-100_900);
     expect(rungFillTick({ tickLower: -100_900, tickUpper: -100_850, holdsWbnb: false, wbnbIsToken0: true })).toBe(-100_900);
+  });
+});
+
+describe("AGENT-GAS-ATTENTION review fixes", () => {
+  const block = (over: Record<string, unknown> = {}) => ({
+    state: "low", nativeWei: "300000000000000", nextMotionWei: "155200000000000",
+    warnWei: "465600000000000", blockWei: "77600000000000", enforcement: "block", ...over,
+  });
+
+  it("FINDING 4: a trade or lending agent reaches the gas block too", () => {
+    // Both profiles enter through the NO-GRID branch (`notArmedView`), which
+    // returned a hard `gas: null` — so their banners could never render
+    // whatever the plane sent. The payload must therefore carry NO grid block,
+    // or this exercises the grid path and proves nothing.
+    const noGrid = (gas: unknown) => ({ data: { positions: [], sequences: [], gas } });
+    for (const name of ["trade-v1", "venus-v1"]) {
+      const view = mapAgentDetail(owner({ hireSizing: { name } }), noGrid(block()), NOW);
+      expect(view.grid.pool, name).toBeNull();
+      expect(view.gas?.state, name).toBe("low");
+      expect(view.gas?.blockWei, name).toBe("77600000000000");
+    }
+    // And the branch still answers null when the plane sends nothing.
+    expect(mapAgentDetail(owner({ hireSizing: { name: "trade-v1" } }), noGrid(undefined), NOW).gas)
+      .toBeNull();
+  });
+
+  it("FINDING 9: a zero or mis-ordered threshold is refused, not rendered", () => {
+    for (const broken of [
+      block({ nextMotionWei: "0" }),
+      block({ blockWei: "0" }),
+      block({ warnWei: "0" }),
+      // Stand-down line ABOVE the discretionary cost: the page would call a
+      // wallet healthy that the worker had already held.
+      block({ blockWei: "999999999999999999" }),
+      // Warning line BELOW the motion it counts three of.
+      block({ warnWei: "1" }),
+    ]) {
+      expect(mapAgentDetail(owner(), lp({ gas: broken }), NOW).gas).toBeNull();
+    }
+  });
+
+  it("FINDING 9: a balance and a state that contradict each other are refused", () => {
+    // Only an unread balance may be absent, and an unread balance may never be
+    // classified. Laundering a malformed balance into `null` would let a
+    // corrupt payload read as an honest "we could not check".
+    expect(mapAgentDetail(owner(), lp({ gas: block({ nativeWei: null }) }), NOW).gas).toBeNull();
+    expect(mapAgentDetail(owner(), lp({ gas: block({ state: "unknown" }) }), NOW).gas).toBeNull();
+    expect(mapAgentDetail(owner(), lp({ gas: block({ nativeWei: "not-a-number" }) }), NOW).gas).toBeNull();
+    // The consistent pair still parses.
+    expect(mapAgentDetail(owner(), lp({ gas: block({ state: "unknown", nativeWei: null }) }), NOW).gas?.state)
+      .toBe("unknown");
+  });
+
+  it("FINDING 7: a completed sequence with an unreadable outcome is a FAILURE", () => {
+    // The row an operator most needs to find, previously filed as a success
+    // because `state === "completed"` was tested before the failure evidence.
+    expect(sequenceOutcome({ state: "completed", outcomeUnavailable: true })).toBe("failed");
+    expect(sequenceOutcome({ state: "completed", stallCode: "shift-ambiguous" })).toBe("failed");
+    expect(sequenceOutcome({ state: "completed" })).toBe("succeeded");
+    expect(sequenceOutcome({ state: "active" })).toBe("in-flight");
+    // An in-flight row carrying a stall code is stuck, not in flight.
+    expect(sequenceOutcome({ state: "active", stallCode: "held" })).toBe("failed");
+    expect(sequenceOutcome({ state: "rolled-back" })).toBe("failed");
+  });
+});
+
+describe("AGENT-GAS-ATTENTION review 2: the gas block cannot contradict itself", () => {
+  const block = (over: Record<string, unknown> = {}) => ({
+    state: "low", nativeWei: "300000000000000", nextMotionWei: "155200000000000",
+    warnWei: "465600000000000", blockWei: "77600000000000", enforcement: "block", ...over,
+  });
+
+  it("a declared state that disagrees with its own thresholds is refused", () => {
+    // Review 2 probed `{nativeWei:"0", blockWei:"2", state:"ok"}` — a wallet
+    // with nothing in it, declared healthy — and every earlier check passed it.
+    // The thresholds ARE the evidence, so the state is re-derived from them.
+    expect(mapAgentDetail(owner(), lp({ gas: block({ nativeWei: "0", state: "ok" }) }), NOW).gas).toBeNull();
+    expect(mapAgentDetail(owner(), lp({ gas: block({ nativeWei: "0", state: "low" }) }), NOW).gas).toBeNull();
+    expect(mapAgentDetail(owner(), lp({ gas: block({ state: "blocked" }) }), NOW).gas).toBeNull();
+    expect(mapAgentDetail(owner(), lp({ gas: block({ nativeWei: "999999999999999999", state: "low" }) }), NOW).gas).toBeNull();
+  });
+
+  it("the three consistent classifications still parse", () => {
+    expect(mapAgentDetail(owner(), lp({ gas: block({ nativeWei: "0", state: "blocked" }) }), NOW).gas?.state).toBe("blocked");
+    expect(mapAgentDetail(owner(), lp({ gas: block() }), NOW).gas?.state).toBe("low");
+    expect(mapAgentDetail(owner(), lp({ gas: block({ nativeWei: "999999999999999999", state: "ok" }) }), NOW).gas?.state).toBe("ok");
+  });
+
+  it("a legacy shift buffer with a zero requirement is refused, not read as healthy", () => {
+    const buffer = { quoteWei: "1", baseWei: "2", bookBaseWei: null, bookCostWbnbWei: null, nativeWei: "5", nextShiftGasWei: "0" };
+    expect(mapAgentDetail(owner(), lp({ grid: { ...lp().data.grid, buffer } }), NOW).gas).toBeNull();
   });
 });

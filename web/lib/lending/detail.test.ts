@@ -8,6 +8,7 @@ import {
   lendingRecoveryOffered,
   lendingRemoveGate,
   lendingReserveMetric,
+  lendingTimeline,
   shortAddress,
 } from "./detail";
 import {
@@ -278,5 +279,38 @@ describe("which account the page is reading", () => {
   it("shortens an address without hiding which one it is", () => {
     expect(shortAddress(ACCOUNT)).toBe("0x1111…1111");
     expect(shortAddress("0x1234")).toBe("0x1234");
+  });
+});
+
+describe("AGENT-GAS-ATTENTION §5 / review 2: the timeline's run-log bucket", () => {
+  const rescue = (over: Record<string, unknown> = {}) => ({
+    rescueId: "r1", market: V_USDT, amountWei: "1000000000000000000",
+    hfBefore: "1100000000000000000", hfAfter: "1300000000000000000",
+    effect: "changed", partial: false, txHash: null, createdAtMs: 5, ...over,
+  });
+  const outcomeOf = (over: Record<string, unknown>) =>
+    lendingTimeline({
+      view: view({ rescues: [rescue(over)] as never }), config: null, usdtDecimals: 18,
+    }).find((event) => event.key.startsWith("rescue:"))?.outcome;
+
+  it("a CLAMPED rescue is Failed even though it moved the health factor", () => {
+    // Review 2: `effect === "changed"` alone filed a `partial: true` repay as a
+    // clean success. The guard did what it could and what it could was not the
+    // whole job — precisely the row this log exists to surface.
+    expect(outcomeOf({ partial: true, effect: "changed" })).toBe("failed");
+  });
+
+  it("a full rescue that moved the health factor is the only Succeeded case", () => {
+    expect(outcomeOf({ partial: false, effect: "changed" })).toBe("succeeded");
+    expect(outcomeOf({ partial: false, effect: "no-effect" })).toBe("failed");
+    expect(outcomeOf({ partial: true, effect: "no-effect" })).toBe("failed");
+  });
+
+  it("the arm and the hire are informational, under neither bucket", () => {
+    const events = lendingTimeline({ view: view(), config: null, usdtDecimals: 18 });
+    expect(events.find((event) => event.key === "hire")?.outcome).toBe("informational");
+    for (const event of events) {
+      expect(["succeeded", "failed", "informational"]).toContain(event.outcome);
+    }
   });
 });

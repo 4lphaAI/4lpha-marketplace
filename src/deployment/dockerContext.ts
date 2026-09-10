@@ -13,7 +13,6 @@ const EXACT_SCRIPTS = Object.freeze([
   "scripts/trade-worker.ts",
   "scripts/erc8004-worker.ts",
   "scripts/erc8004-identity.ts",
-  "scripts/erc8004-minter-migration.ts",
 ]);
 
 const EXPECTED_DOCKERIGNORE = Object.freeze([

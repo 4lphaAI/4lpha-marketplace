@@ -1,0 +1,16 @@
+{
+  "walletKeyThrowaway": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "hkdfInfoKey": "termix-quant-x25519-v1",
+  "hkdfInfoEnvelope": "termix-quant-envelope-v1",
+  "pkcs8Prefix": "302e020100300506032b656e04220420",
+  "spkiPrefix": "302a300506032b656e032100",
+  "publicKeyBase64": "Pv8srRNPH9nOLMcFt5/zvpe7q8xBRQgrKss1dRooFE4=",
+  "envelope": {
+    "ephemeralPublicKey": "o/A0cGvWfFLfGncNFMPUEC70BG37CMOCYfywu944bQs=",
+    "nonce": "BwcHBwcHBwcHBwcH",
+    "ciphertext": "TKPleGr6pL3LKv3NsANJslfKJZrmVS/eKS9f/P7h4S79GYKx56rVqvRuer8dZymZXBxWwRoxsJZ8nTz12h4dOGje3qCWPRGJrn/eWfovoDaZTAH+4qESjYpOuXK5W5hZqSOMX5ryGcQ9PMx8ryXyVkxAo57s+U611PEV",
+    "algorithm": "x25519-hkdf-chacha20poly1305"
+  },
+  "plaintext": "{\"version\":1,\"walletAddress\":\"0x000000000000000000000000000000000000dEaD\",\"note\":\"golden-vector-throwaway\"}",
+  "roundTrip": true
+}

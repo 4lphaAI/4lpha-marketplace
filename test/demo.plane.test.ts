@@ -15,13 +15,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { getAddress, type Address } from "viem";
-import tsModule from "typescript";
 
 import { createDemoRoutes, type DemoServerDeps } from "../src/demo/routes.js";
 import { resolveDemoConfig } from "../src/demo/config.js";
 import { runDemoCycle } from "../src/demo/worker.js";
 import { MemoryDemoAgentStore, type DemoAgentRecord } from "../src/store/demoAgents.js";
 import { asDemoOwnerId, type DemoOwnerId } from "../src/demo/types.js";
+import { scanModuleLoads, scanModuleSpecifiers } from "./support/moduleScan.js";
 
 const WBNB = getAddress("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c");
 const TOKEN = getAddress("0x2170ed0880ac9a755fd29b2688956bd959f933f8");
@@ -767,80 +767,11 @@ const DEMO_CLOSURE_FORBIDDEN = [
 ] as const;
 
 /**
- * Every module specifier a source file LOADS at runtime.
- *
- * Extracted from the walker so it can be tested against the bypasses the
- * fix-review demonstrated (finding 1): a scanner nobody checks is exactly how
- * the first version of this boundary came to agree with its own prose instead
- * of with the code.
+ * The scanner now lives in `test/support/moduleScan.ts` (QUANT-GRID R2.12 / M4):
+ * the quant plane pins its own closure with the SAME parser, and two copies of
+ * a scanner is how the first version of this boundary came to agree with its
+ * own prose instead of with the code. The assertions below are unchanged.
  */
-/** One module load found in a source file. */
-export type ScannedModule =
-  | { readonly kind: "literal"; readonly specifier: string }
-  /** A dynamic import whose specifier is computed — it cannot be followed. */
-  | { readonly kind: "computed" };
-
-export function scanModuleSpecifiers(source: string): string[] {
-  return scanModuleLoads(source).flatMap((load) =>
-    load.kind === "literal" ? [load.specifier] : [],
-  );
-}
-
-/**
- * Every module a source file LOADS at runtime, found by PARSING it.
- *
- * FIX-REVIEW-2 FINDING 1, and the reviewer's own recommendation: two successive
- * regex versions of this were each defeated within minutes — by `export * from`
- * on a line with a leading statement, by `import ("x")` with a space, by a
- * comment between `import` and its parenthesis. Each patch invited the next
- * bypass, because a regex cannot know what is code, what is a comment and what
- * is a type position.
- *
- * TypeScript's own parser does know. `import type` / `export type` are skipped
- * because the compiler erases them; a dynamic import in a TYPE position is a
- * `LiteralTypeNode` under an `ImportTypeNode`, never a `CallExpression`, so it
- * never reaches the visitor at all — no capitalisation heuristic required. A
- * dynamic import with a non-literal specifier is reported as `computed` rather
- * than dropped, so the caller can refuse it instead of missing it.
- */
-export function scanModuleLoads(source: string): ScannedModule[] {
-  const ts = tsModule;
-  const file = ts.createSourceFile("probe.ts", source, ts.ScriptTarget.ESNext, true);
-  const found: ScannedModule[] = [];
-
-  const visit = (node: import("typescript").Node): void => {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      const clause = ts.isImportDeclaration(node) ? node.importClause : node.exportClause;
-      const typeOnly =
-        (ts.isImportDeclaration(node) && node.importClause?.isTypeOnly === true)
-        || (ts.isExportDeclaration(node) && node.isTypeOnly);
-      const specifier = node.moduleSpecifier;
-      if (!typeOnly && specifier !== undefined && ts.isStringLiteral(specifier)) {
-        found.push({ kind: "literal", specifier: specifier.text });
-      }
-      void clause;
-    } else if (
-      ts.isCallExpression(node)
-      && node.expression.kind === ts.SyntaxKind.ImportKeyword
-    ) {
-      const argument = node.arguments[0];
-      found.push(
-        argument !== undefined && ts.isStringLiteral(argument)
-          ? { kind: "literal", specifier: argument.text }
-          : { kind: "computed" },
-      );
-    } else if (ts.isImportEqualsDeclaration(node)) {
-      const reference = node.moduleReference;
-      if (ts.isExternalModuleReference(reference) && ts.isStringLiteral(reference.expression)) {
-        found.push({ kind: "literal", specifier: reference.expression.text });
-      }
-    }
-    ts.forEachChild(node, visit);
-  };
-
-  ts.forEachChild(file, visit);
-  return found;
-}
 
 describe("demo mode's import scanner", () => {
   it("catches every form the fix-review used to slip past it", () => {

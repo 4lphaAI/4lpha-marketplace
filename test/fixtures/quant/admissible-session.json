@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "QUANT-GRID BC14/BC15/BC33 — a VALID admission fixture, checked in before W4.",
+    "The serialization fixture (bnbagent-serialized-session.json) is explicitly NOT one:",
+    "its publicKey does not derive from its privateKey, it grants only the router swap,",
+    "and it carries a single U day cap and no native row.",
+    "",
+    "This one is admissible end to end: the key matches the signer (throwaway 0x33..33),",
+    "both approvals are target-bound to U and WBNB, there are TWO WBNB cap rows (day AND",
+    "minute — the period a day-only meter read would miss), one U row and a native row.",
+    "Every value is a public fixture; the private key is 0x33 repeated, not a secret."
+  ],
+  "walletKeyThrowaway": "0x3333333333333333333333333333333333333333333333333333333333333333",
+  "session": {
+    "version": 1,
+    "walletAddress": "0x9BB0aB9dCEF83F0b39a4bE3EBE7a1c9D6d5c1111",
+    "publicKey": "0x043c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b13b306b0fe085665d8fc1b28ae1676cd3ad6e08eaeda225fe38d0da4de55703e0",
+    "expiry": 1800000000,
+    "permissions": {
+      "calls": [
+        {
+          "to": "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+          "signature": "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"
+        },
+        {
+          "to": "0xcE24439F2D9C6a2289F741120FE202248B666666",
+          "signature": "approve(address,uint256)"
+        },
+        {
+          "to": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+          "signature": "approve(address,uint256)"
+        }
+      ],
+      "spend": [
+        {
+          "token": "0xcE24439F2D9C6a2289F741120FE202248B666666",
+          "limit": { "$bigint": "40000000000000000000" },
+          "period": "day"
+        },
+        {
+          "token": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+          "limit": { "$bigint": "200000000000000000" },
+          "period": "day"
+        },
+        {
+          "token": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+          "limit": { "$bigint": "200000000000000000" },
+          "period": "minute"
+        },
+        {
+          "limit": { "$bigint": "3000000000000000" },
+          "period": "day"
+        }
+      ]
+    },
+    "signer": {
+      "type": "privateKey",
+      "privateKey": "0x3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  }
+}

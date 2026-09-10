@@ -32,9 +32,9 @@ const partial: AccountPortfolio = {
   wallets: [{ address: AGENT_WALLET, custodyModel: "passkey", depositable: true, source: "agents", availableUsdMicros: "1500000", deployedUsdMicros: "2500000", deployedReason: "none" }],
   totals: { walletUsdMicros: null, deployedUsdMicros: null, totalUsdMicros: null, grossLpPnlUsdMicros: null, grossLpPnlBps: null, eligibleLpBasisNativeWei: null },
   agents: [{
-    id: "live-agent", status: "armed", httpRuntimeProfile: "lp-v1", walletAddress: OWNER, attention: "partial-data",
+    id: "live-agent", status: "armed", httpRuntimeProfile: "lp-v1", walletAddress: OWNER, attention: "partial-data", gas: null,
     holdings: { method: "sellable-lp-exit-v1", state: "partial", reason: "missing-mark", valueUsdMicros: null, venusReference: null, held: false },
-    pnl: { method: "gross-lp-mark-to-declared-basis-v1", coverage: "partial", reason: "missing-mark", eligibleBasisNativeWei: null, markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null, basisSources: [], excluded: ["relay-and-gas", "wallet-residue", "closed-lineages", "prior-exits", "external-cashflows", "zero-basis-lineages"] },
+    pnl: { method: "gross-lp-mark-plus-residue-to-declared-basis-v2", coverage: "partial", reason: "missing-mark", eligibleBasisNativeWei: null, markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null, basisSources: [], excluded: ["relay-and-gas", "wallet-residue", "closed-lineages", "prior-exits", "external-cashflows", "zero-basis-lineages"] },
   }],
   coverage: { ...empty.coverage, wallet: { state: "partial", reasons: ["unreadable"] }, deployed: { state: "partial", reasons: ["missing-mark"] }, total: { state: "partial", reasons: ["unreadable", "missing-mark"] }, pnl: { state: "partial", reasons: ["missing-mark"] } },
 };

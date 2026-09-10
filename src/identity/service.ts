@@ -33,22 +33,18 @@ export class IdentityService {
     let cursor = "";
     do {
     const sources = id === undefined ? await this.sources.enrolled(cursor) : [await this.sources.get(id)]; this.fence.check();
-    await this.ledger.atomic(this.fence, (state, retainedNumbers) => {
+    await this.ledger.atomic(this.fence, (state) => {
       for (const source of sources) {
         if (source === null) { if (id !== undefined) fail("not_found"); continue; }
         if (!validIdentity(source.identity)) { if (id !== undefined) fail(source.identity === null ? "not_enrolled" : "invalid_identity"); continue; }
         const identity = source.identity;
         const old = state.jobs.find((job) => job.publicRef === identity.publicRef);
         if (old) { if (old.sourceId !== source.id || old.owner.toLowerCase() !== source.owner.toLowerCase() || old.category !== identity.category) fail("conflict"); continue; }
-        // A changed ref must not hide a current-minter source binding behind the
-        // old-minter discovery exception (IDENTITY-MINTER-MIGRATION-SPEC §6).
-        if (state.jobs.some((job) => job.sourceId === source.id)) fail("conflict");
-        if (identity.status !== "pending") { if (id !== undefined) fail("invalid_identity"); continue; }
-        const displayNumber = [...retainedNumbers, ...state.jobs].filter((job) => job.owner.toLowerCase() === source.owner.toLowerCase() && job.category === identity.category)
+        const displayNumber = state.jobs.filter((job) => job.owner.toLowerCase() === source.owner.toLowerCase() && job.category === identity.category)
           .reduce((max, job) => Math.max(max, job.displayNumber ?? 0), 0) + 1;
         state.jobs.push(newJob(source, this.config, this.now(), displayNumber));
       }
-    }, sources.flatMap((source) => source && validIdentity(source.identity) ? [{ owner: source.owner, category: source.identity.category }] : []));
+    });
     const persisted = await this.ledger.read(); this.fence.check();
     for (const source of sources) {
       if (!source || !validIdentity(source.identity)) continue;

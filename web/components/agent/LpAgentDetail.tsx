@@ -2,12 +2,13 @@
 import { lpSequenceLabel } from "../../lib/exec/remove-agent";
 import React, { useEffect, useState } from "react";
 import { Button, Category, Icon, MetricTile, Num, SegmentedToggle, StatusBadge } from "@/design-system";
+import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
 import { TRADE_LLM_MODELS } from "@/lib/trade";
 import { PairIcons } from "@/components/TokenIcon";
 import { ZeroGCredit } from "@/components/ZeroGCredit";
 import { HireRecoveryActions } from "@/components/deploy/HireRecoveryActions";
 import { LiquidityChart, displayOrientation, type LiquidityGeometry } from "@/components/lp/LiquidityChart";
-import { relativeTime, type AgentDetailView, type DetailMetric, type DetailPosition } from "@/lib/exec/agent-detail";
+import { relativeTime, sequenceOutcome, type AgentDetailView, type DetailMetric, type DetailPosition } from "@/lib/exec/agent-detail";
 import type { UseAgentDetailResult } from "@/lib/exec/use-agent-detail";
 import type { OnChainPosition, OnChainPositionRead } from "@/lib/altana/position-reader";
 import { formatAtomic } from "@/lib/exec/pairs";
@@ -270,6 +271,8 @@ export function LpRangeEvents({ live, lp, geometry, positionId, sequences, statu
 export function LpAgentDetail(props: Props) {
   const { view, detail } = props, lp = view?.lp ?? null, pool = lp?.pool ?? null;
   const [tab, setTab] = useState("Overview"), [expanded, setExpanded] = useState<string | null>(null), [unit, setUnit] = useState("USD"), [invert, setInvert] = useState(false), [now, setNow] = useState(Date.now());
+  // AGENT-GAS-ATTENTION §5 — the run-log bucket filter.
+  const [runFilter, setRunFilter] = useState("All");
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, []);
   useEffect(() => { setExpanded(null); setTab("Overview"); setInvert(false); }, [props.agentId, pool?.poolAddress]);
   const icons = useIcons(lp), cat = Category("lp"), sigma = lp?.model === "sigma";
@@ -310,6 +313,12 @@ export function LpAgentDetail(props: Props) {
   const discovered = props.discovered ?? [];
   const wbnbUsdMicros = lp?.wbnbUsd === null || lp?.wbnbUsd === undefined ? null : BigInt(Math.round(lp.wbnbUsd * 1_000_000));
   // The newest open row is the one the tiles speak for.
+  // AGENT-GAS-ATTENTION §5 — one classifier for the filter AND for the
+  // "Details" expander below, so the two can never disagree about which rows
+  // are worth debugging.
+  const shownSequences = (view?.sequences ?? []).filter(s =>
+    runFilter === "All"
+    || (runFilter === "Succeeded" ? sequenceOutcome(s) === "succeeded" : sequenceOutcome(s) === "failed"));
   const openRow = (view?.positions ?? []).find(row => row.state !== "closed");
   const tileRead = liveReadFor({ tokenId: openRow?.tokenId ?? null, chainReads: props.chainReads, discovered });
   const accounting = matchingLpAccounting({read:props.accounting,wallet:view?.walletAddress ?? null,
@@ -354,7 +363,10 @@ export function LpAgentDetail(props: Props) {
               pill
               status={view?.status === "armed" ? "live" : "paused"}
               label={view?.status ?? "state unavailable"} />
+            {/* AGENT-GAS-ATTENTION §3.3 */}
+            <AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." />
           </div>
+          <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
 
           {props.message ? <p role="status">
             {props.message}
@@ -434,11 +446,22 @@ export function LpAgentDetail(props: Props) {
     </div>
 
     {tab === "Run log" ? <Panel>
+      {/* AGENT-GAS-ATTENTION §5 — succeeded / failed / in-flight, so a stuck
+          sequence is findable without reading every row. "All" stays the
+          default: a log that filters itself by default hides its own
+          omissions. */}
+      <div style={{ padding: "12px 16px 0" }}>
+        <SegmentedToggle
+          options={["All", "Succeeded", "Failed"]}
+          value={runFilter}
+          onChange={setRunFilter} />
+      </div>
       {/* Bounded height: a busy agent logs a sequence per worker cycle, and an
           unbounded list turned the page into an endless footer (2026-09-06). */}
       <div data-testid="lp-run-log" style={{ padding: 16, maxHeight: 520, overflowY: "auto" }}>
-        {view?.sequences.length ? view.sequences.map(s => {
-          const debuggable = s.state === "rolled-back" || s.state === "held" || s.outcomeUnavailable || (s.stallCode ?? null) !== null;
+        {shownSequences.length ? shownSequences.map(s => {
+          // AGENT-GAS-ATTENTION §5 — the SAME predicate the filter uses.
+          const debuggable = sequenceOutcome(s) === "failed";
           const open = expanded === `log:${s.sequenceId}`;
           return <div key={s.sequenceId} style={{ padding: "12px 0", borderBottom: "1px solid var(--line-1)" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>

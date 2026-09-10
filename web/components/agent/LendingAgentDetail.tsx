@@ -26,6 +26,7 @@
 import * as React from "react";
 import { TokenIcon } from "@/components/TokenIcon";
 import { ActivityRow, Button, Category, Checkbox, Icon, Input, MetricTile, PermissionItem, SegmentedToggle, StatusBadge } from "@/design-system";
+import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
 import { portfolioApy, portfolioUsd, type LendingPortfolio } from "@/lib/exec/lending-portfolio";
 import { usePublicClient } from "wagmi";
 import type { Address } from "viem";
@@ -263,6 +264,7 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
   const publicClient = usePublicClient();
   const cat = Category("health");
   const [tab, setTab] = React.useState<Tab>("Overview");
+  const [runFilter, setRunFilter] = React.useState("All");
   const [now, setNow] = React.useState(Date.now());
   const [busy, setBusy] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
@@ -658,6 +660,13 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
     : null;
 
   const timeline = mapped === null ? [] : lendingTimeline({ view: mapped, config, usdtDecimals });
+  // AGENT-GAS-ATTENTION §5 — the run-log bucket filter, off the event's own
+  // `outcome` and NOT its colour (REVIEW FINDING 7). `informational` rows — the
+  // arm, the hire, the latest snapshot — appear under "All" only, the same
+  // three-way shape every other agent page uses.
+  const shownTimeline = timeline.filter((event) =>
+    runFilter === "All"
+    || (runFilter === "Succeeded" ? event.outcome === "succeeded" : event.outcome === "failed"));
 
   return <div className="fl-shell fl-hired-agent-page">
     <Button variant="ghost" size="sm" icon={<Icon name="chevron-right" size={14} style={{ transform: "rotate(180deg)" }} />} onClick={() => props.go("/account")}>My agents</Button>
@@ -671,7 +680,11 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <h1 style={{ font: "var(--type-page-title)" }}>{view?.id ?? props.agentId}</h1>
             <StatusBadge pill status={view?.status === "armed" ? "live" : "paused"} label={guard?.status ?? view?.status ?? "state unavailable"} />
+            {/* AGENT-GAS-ATTENTION §3.3 — WARN ONLY for a Venus guard: it is
+                never stood down for gas (src/lending/sizing.ts rule 2). */}
+            <AttentionChip state={gasAttention(view?.gas)} title="This guard wallet is low on BNB for relay gas." />
           </div>
+          <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
 
           {props.message ? <p role="status">{props.message}</p> : null}
           {notice !== null ? <p role="status" style={{ color: "var(--ink-1)", maxWidth: "70ch" }}>{notice}</p> : null}
@@ -846,10 +859,20 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
 
     {tab === "Run log" ? <div style={{ display: "grid", gap: 16 }}>
       <Panel>
-        <div data-testid="lending-timeline" style={{ padding: "8px 20px 16px" }}>
+        {/* AGENT-GAS-ATTENTION §5 — the same three buckets as every other agent
+            page. A lending event carries a TONE rather than a sequence state, so
+            that is what classifies it: `profit` is a rescue that worked,
+            `warn`/`loss` is one that did not, and `default` is a plain record
+            (the arm, a config note) that belongs under neither. */}
+        <div style={{ padding: "12px 20px 0" }}>
+          <SegmentedToggle options={["All", "Succeeded", "Failed"]} value={runFilter} onChange={setRunFilter} />
+        </div>
+        <div data-testid="lending-timeline" style={{ padding: "8px 20px 16px", maxHeight: 520, overflowY: "auto" }}>
           {timeline.length === 0
             ? <span style={{ color: "var(--text-subtle)" }}>— the guard view is not readable</span>
-            : timeline.map((event) => <TimelineRow key={event.key} event={event} now={now} />)}
+            : shownTimeline.length === 0
+              ? <span style={{ color: "var(--text-subtle)" }}>{`— no ${runFilter.toLowerCase()} events recorded`}</span>
+              : shownTimeline.map((event) => <TimelineRow key={event.key} event={event} now={now} />)}
         </div>
       </Panel>
 

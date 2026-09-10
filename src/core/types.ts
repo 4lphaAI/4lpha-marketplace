@@ -279,6 +279,56 @@ export type RestoreSessionParams = {
   readonly expiresAt: number;
 };
 
+/**
+ * Rebuild a session the plane did NOT grant, from a descriptor a third party
+ * produced (QUANT-GRID R2.1).
+ *
+ * TWO OBJECTS, never confused, and that separation IS the finding (REVIEW B1):
+ *
+ *   - `permissions` is the DESCRIPTOR — the granted `SessionPermissions`
+ *     verbatim out of the serialized session. The SDK forwards it to the relay
+ *     as the key descriptor, and whether the relay enforces that is unsettled
+ *     (FINDINGS (x)), so a REWRITTEN descriptor is a silent-decline risk. It is
+ *     passed through byte-for-byte and never re-derived.
+ *   - `spec` is the POLICY PROJECTION — a {@link SessionSpec} derived
+ *     deterministically FROM those permissions, which the caller has already
+ *     run `validateSessionSpec` over. It is what the pre-flight's granted
+ *     snapshot reads, so the existing checks (value movers capped, no wallet or
+ *     KeyStore targets, expiry bounds) apply to a session someone else granted
+ *     exactly as they apply to one we wrote.
+ *
+ * SYNCHRONOUS, no gas, no network — same contract as {@link WalletProvider.restoreSession}.
+ */
+export type RestoreGrantedSessionParams = {
+  readonly walletAddress: Address;
+  /** SEC1-encoded session public key, from the plaintext. */
+  readonly publicKey: Hex;
+  /** Unix epoch seconds, from the plaintext's `expiry`. */
+  readonly expiresAt: number;
+  /**
+   * The granted permissions, VERBATIM. Structurally `ProviderPermissions`;
+   * declared as `unknown` here so `src/core/types.ts` keeps no dependency on
+   * the SDK's shape and the provider does the narrowing.
+   */
+  readonly permissions: unknown;
+  /** The validated policy projection of those permissions. */
+  readonly spec: SessionSpec;
+  /** The agent authority holding the session signer from the plaintext. */
+  readonly agent: AgentAuthority;
+};
+
+/** One `spendInfos` row, normalized (QUANT-GRID R3.4). */
+export type SpendInfoReading = {
+  /** ERC-20 address, or `null` for the native meter (the zero-address row). */
+  readonly token: Address | null;
+  readonly period: SpendPeriod | "unknown";
+  /** The raw `period` byte, so an unmapped period is still evidence. */
+  readonly periodCode: number;
+  readonly limitWei: bigint;
+  /** The CURRENT period's usage — `currentSpent`, never `spent`. */
+  readonly currentSpentWei: bigint;
+};
+
 export type AwaitExecutionParams = RequestOptions & {
   /** The provider-side batch identifier returned by a prior execute. */
   readonly callsId: Hex;
@@ -594,6 +644,38 @@ export interface WalletProvider {
    * authority the wallet already has.
    */
   restoreSession(params: RestoreSessionParams): SessionRef;
+
+  /**
+   * Rebuild a session granted ELSEWHERE, from its descriptor plus a validated
+   * policy projection (QUANT-GRID R2.1). See {@link RestoreGrantedSessionParams}.
+   *
+   * OPTIONAL, and the optionality is a capability fact checked at BOOT: the
+   * quant worker refuses to start against a provider that does not implement
+   * it, rather than discovering it at the first action. No existing caller is
+   * affected — `restoreSession`, `grantSession` and the pre-flight are
+   * untouched.
+   */
+  restoreGrantedSession?(params: RestoreGrantedSessionParams): SessionRef;
+
+  /**
+   * EVERY `(token, period)` spend row the account is enforcing for one session
+   * key, normalized (QUANT-GRID R3.4 / REVIEW3 C7).
+   *
+   * {@link nativeDayMeter} answers about the DAY row only, which is the right
+   * question for the LP/trade exit reserve and the wrong one here: a granted
+   * session may carry a MINUTE cap that a day-only read reports as unlimited,
+   * and a sell sized against the day row would then be refused on chain after
+   * the journal had already reserved it. This returns the whole array and lets
+   * the caller check every period it cares about.
+   *
+   * Identified by the PUBLIC key, exactly as `nativeDayMeter` is: a read that
+   * needs no key must not ask for one.
+   *
+   * THROWS on a failed read, under the same deadline and the same
+   * `mapProviderError` classification. Optional for the same capability reason
+   * as `restoreGrantedSession`.
+   */
+  readSpendInfos?(params: NativeDayMeterParams): Promise<readonly SpendInfoReading[]>;
 
   /**
    * Answer "would this batch be refused before submission?" — and submit

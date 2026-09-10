@@ -1,6 +1,6 @@
 /** One bounded autonomous trading pass (TRADING-AGENT R3.8 / C31). */
 import { randomUUID } from "node:crypto";
-import type { Hex } from "viem";
+import type { Address, Hex } from "viem";
 import type { ExecutionReceipt, WalletProvider } from "../core/types.js";
 import { sanitizeMessage } from "../core/errors.js";
 import type { TradeRequest } from "../http/wire.js";
@@ -39,6 +39,7 @@ import {
 import type { TradeDataPlaneReads } from "./dataPlaneReads.js";
 import type { TradeReadiness } from "./readiness.js";
 import { pinnedTokens } from "./view.js";
+import { AGENT_GAS_MAX_BACKOFF_MS, agentGasFloor, agentGasReason, classifyAgentGas } from "../ops/gasFloor.js";
 import { normalizeTradeRunEvents, type TradeRunEvent } from "../store/tradeRunTrace.js";
 import { sizeTradeBuy } from "./sizing.js";
 import { enrichFeatures, featurePrompt, assessMomentum, featureModel } from "./features.js";
@@ -122,8 +123,38 @@ export type TradeWorkerDeps = {
   readonly recoverFill: (intent: TradeIntentRecord, txHash: Hex) => Promise<TradeExecutorFill>;
   readonly now?: () => number;
   readonly verdictCache?: TradeVerdictCache;
+  /**
+   * AGENT-GAS-ATTENTION §2.2 — the agent wallet's native balance.
+   *
+   * OPTIONAL, and its absence disables the gate entirely rather than blocking:
+   * an absent instrument is not a short wallet. Every offline fixture is in
+   * that shape, so the gate is opt-in per deployment and no existing test
+   * changes behaviour.
+   */
+  readonly walletNativeBalance?: (wallet: Address) => Promise<bigint>;
+  /**
+   * The backoff ladder, owned by the daemon and handed in like
+   * {@link TradeWorkerDeps.verdictCache}. In memory on purpose — see
+   * `LpWorkerState.gasBackoff` for why this must not be durable.
+   */
+  readonly gasBackoff?: TradeGasBackoff;
+  /** The daemon's cycle interval, for the backoff ladder. Defaults to 60 s. */
+  readonly intervalMs?: number;
   readonly log?: (message: string) => void;
 };
+
+/** AGENT-GAS-ATTENTION §2.4 — one agent's standing in the gas backoff ladder. */
+export type TradeGasBackoffEntry = {
+  readonly consecutiveBlockedProbes: number;
+  readonly nextProbeAtMs: number;
+  readonly reason: string;
+};
+
+export type TradeGasBackoff = Map<string, TradeGasBackoffEntry>;
+
+export function createTradeGasBackoff(): TradeGasBackoff {
+  return new Map<string, TradeGasBackoffEntry>();
+}
 
 export type RunTradeWorkerOptions = {
   readonly dryRun?: boolean;
@@ -800,6 +831,9 @@ export async function runTradeWorkerOnce(
     return { skippedNotReady: true, outcomes: [] };
   }
   const outcomes: TradeWorkerAgentOutcome[] = [];
+  // AGENT-GAS-ATTENTION §2.2 — one `eth_getBalance` per WALLET per cycle.
+  // Rebuilt per cycle: a balance from a previous cycle is not a reading.
+  const gasCache = new Map<string, bigint | undefined>();
   let cursor: string | null = null;
   for (;;) {
     const page = await deps.settingsStore.listTradeAgentsForWorker({ limit: 32, cursor });
@@ -808,7 +842,28 @@ export async function runTradeWorkerOnce(
       if (agent === null) continue;
       // AUDIT L9 / TRADING-AGENT R5/R9: pause deliberately stops entries AND exits, matching Venus D4.
       if (agent.status !== "armed") continue;
+      // AGENT-GAS-ATTENTION §2.2 — the gas gate, before `processAgent` reaches
+      // the data plane, the LLM or the router. It sits BELOW the projection
+      // sweep above on purpose: custody convergence must run for a broke agent
+      // exactly as it runs for a paused one, or a later-confirmed submission
+      // stays invisible. What it stops is the DISCRETIONARY work.
+      const gasSkip = await tradeAgentGasGate(deps, agent, gasCache);
+      if (gasSkip !== null) {
+        // No `insertRun`: a durable row per cycle for an agent that did
+        // nothing IS the churn this change exists to remove.
+        outcomes.push({ agentId: agent.id, dryRun: options.dryRun === true, reason: gasSkip,
+          candidates: 0, refusals: 0, entries: 0, exits: 0, heldNoPrice: 0 });
+        continue;
+      }
       try {
+        // REVIEW 3, MEDIUM — the wallet's cached reading is SPENT by this
+        // agent's cycle. Reproduced: two legacy self-EOA agents on one wallet,
+        // A spends its budget plus the relay fee, and B reaches the executor on
+        // A's pre-spend figure with the wallet at zero. Browser-hired wallets
+        // are exclusive, which narrows this — it does not remove legacy
+        // sharing. Dropped BEFORE, and again in `finally` so a throw (which may
+        // still have submitted) cannot leave a spent figure behind.
+        gasCache.delete(agent.walletAddress.toLowerCase());
         outcomes.push(await processAgent(deps, agent, row, options));
       } catch (error) {
         const counts: MutableCounts = { events: [], startedAt: Date.now(), candidates: 0, refusals: 0, entries: 0, exits: 0, heldNoPrice: 0 };
@@ -822,12 +877,106 @@ export async function runTradeWorkerOnce(
           // A broken run store for one tenant must not stop the remaining sweep.
         }
         outcomes.push({ agentId: agent.id, dryRun: options.dryRun === true, reason, ...counts });
+      } finally {
+        gasCache.delete(agent.walletAddress.toLowerCase());
       }
     }
     if (!page.hasMore || page.cursor === null) break;
     cursor = page.cursor;
   }
   return { skippedNotReady: false, outcomes };
+}
+
+/**
+ * AGENT-GAS-ATTENTION §2.2 — the trade agent's gas gate.
+ *
+ * Returns `null` to proceed, or the owner-facing reason to stand down. The
+ * shape mirrors `lpAgentGasGate` deliberately: same floor module, same
+ * fail-closed treatment of an unread balance, same backoff ladder, and the
+ * same rule that an ABSENT reader disables the gate rather than blocking with
+ * it. Two workers, one policy.
+ *
+ * A trade agent's next motion is one exit's relay reimbursement
+ * ({@link RELAY_FEE_PER_EXIT_WEI}). `nativeReserveFloor` already guards the
+ * SUBMIT seam against the day meter; this guards the CYCLE against a wallet
+ * that cannot pay for any submission at all.
+ */
+async function tradeAgentGasGate(
+  deps: TradeWorkerDeps,
+  agent: AgentRecord,
+  gasCache: Map<string, bigint | undefined>,
+): Promise<string | null> {
+  const readNative = deps.walletNativeBalance;
+  if (readNative === undefined) return null;
+  const floor = agentGasFloor({ profile: "trade-v1" });
+  if (floor === null) return null;
+
+  const nowMs = deps.now?.() ?? Date.now();
+  const intervalMs = deps.intervalMs ?? 60_000;
+  const backoff = deps.gasBackoff;
+
+  // Serve the ladder BEFORE any read: this is the branch that saves the cycle.
+  const standing = backoff?.get(agent.id);
+  if (standing !== undefined && nowMs < standing.nextProbeAtMs) return standing.reason;
+
+  const walletKey = agent.walletAddress.toLowerCase();
+  let nativeWei: bigint | undefined;
+  if (gasCache.has(walletKey)) {
+    nativeWei = gasCache.get(walletKey);
+  } else {
+    try {
+      nativeWei = await readNative(agent.walletAddress as Address);
+    } catch {
+      nativeWei = undefined;
+    }
+    gasCache.set(walletKey, nativeWei);
+  }
+
+  const state = classifyAgentGas({ nativeWei, floor });
+  if (state === "ok" || state === "low") {
+    backoff?.delete(agent.id);
+    return null;
+  }
+  const reason = sanitizeMessage(
+    agentGasReason({ state, floor, nativeWei, walletAddress: agent.walletAddress }),
+  );
+  const consecutiveBlockedProbes = (standing?.consecutiveBlockedProbes ?? 0) + 1;
+  backoff?.set(agent.id, {
+    consecutiveBlockedProbes,
+    // REVIEW FINDING 6 — CLAMPED IN WALL-CLOCK MS, not left as a count of
+    // intervals. This daemon's default interval is 60 s against the LP
+    // worker's 30 s, so the raw 60-interval rung would have made its deepest
+    // wait SIXTY minutes against a plan that promised thirty.
+    nextProbeAtMs:
+      nowMs + tradeGasBackoffDelayMs(consecutiveBlockedProbes, intervalMs),
+    reason,
+  });
+  return reason;
+}
+
+/** The ladder, clamped to {@link AGENT_GAS_MAX_BACKOFF_MS}. */
+export function tradeGasBackoffDelayMs(
+  consecutiveBlockedProbes: number,
+  intervalMs: number,
+): number {
+  const ladder = tradeGasBackoffIntervals(consecutiveBlockedProbes) * intervalMs;
+  return ladder > AGENT_GAS_MAX_BACKOFF_MS ? AGENT_GAS_MAX_BACKOFF_MS : ladder;
+}
+
+/**
+ * The same 1 / 10 / 60 ladder the LP worker uses (`lpGasBackoffIntervals`).
+ *
+ * Duplicated rather than imported across the two workers ON PURPOSE: importing
+ * `src/lp/worker.ts` into the trade worker would pull the entire LP saga graph
+ * into the trade daemon's module closure, and `test/demo.plane.test.ts` pins
+ * import closures precisely because that kind of coupling is how a plane grows
+ * reachability it did not intend. Six lines is the cheaper price, and
+ * `test/trade.gasGate.test.ts` pins the two ladders equal.
+ */
+export function tradeGasBackoffIntervals(consecutiveBlockedProbes: number): number {
+  if (consecutiveBlockedProbes <= 2) return 1;
+  if (consecutiveBlockedProbes <= 5) return 10;
+  return 60;
 }
 
 export function createWorkerVerdictCache(): TradeVerdictCache {

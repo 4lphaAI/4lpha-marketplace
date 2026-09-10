@@ -1,9 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PROTOCOL_VERSION, SERVER_INFO, TOOLS, handleMcpMessage } from "@/lib/mcp/server";
 
-/** The canonical public origin recorded in ERC-8004 metadata. */
-const PUBLIC_ORIGIN = "https://4lpha.tech";
-
 /**
  * MCP streamable-HTTP face at `/mcp` — the endpoint named in this agent's
  * ERC-8004 `services[]` entry, and the path `bag erc8004 register --protocol
@@ -23,15 +20,16 @@ function reply(message: unknown, origin: string): NextResponse {
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
+  const origin = request.nextUrl.origin;
   let payload: unknown;
   try {
     payload = await request.json();
   } catch {
     return NextResponse.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, { status: 200 });
   }
-  if (!Array.isArray(payload)) return reply(payload, PUBLIC_ORIGIN);
+  if (!Array.isArray(payload)) return reply(payload, origin);
 
-  const replies = payload.map((message) => handleMcpMessage(message, PUBLIC_ORIGIN)).filter((item) => item.body !== null).map((item) => item.body);
+  const replies = payload.map((message) => handleMcpMessage(message, origin)).filter((item) => item.body !== null).map((item) => item.body);
   return replies.length === 0 ? new NextResponse(null, { status: 202 }) : NextResponse.json(replies, { status: 200 });
 }
 
@@ -42,12 +40,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
  * that sees 200 + serverInfo classifies the endpoint healthy, which is the
  * whole point of publishing it.
  */
-export async function GET(_request: NextRequest): Promise<NextResponse> {
+export async function GET(request: NextRequest): Promise<NextResponse> {
   return NextResponse.json({
     protocolVersion: PROTOCOL_VERSION,
     serverInfo: SERVER_INFO,
     transport: "streamable-http",
-    endpoint: `${PUBLIC_ORIGIN}/mcp`,
+    endpoint: `${request.nextUrl.origin}/mcp`,
     tools: TOOLS.map((tool) => ({ name: tool.name, description: tool.description })),
   });
 }

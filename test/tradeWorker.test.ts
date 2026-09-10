@@ -17,10 +17,14 @@ import { TRADE_ENTRY_RELAY_HEADROOM_WEI } from "../src/trade/sizing.js";
 import { evaluateTradeRules } from "../src/rules/engine.js";
 import { DRAFT_KEY, cancelDraft, pendingDraft } from "./support/provisioningDraft.js";
 import {
+  createTradeGasBackoff,
   runTradeWorkerOnce,
+  tradeGasBackoffIntervals,
   type TradeExecutor,
   type TradeWorkerDeps,
 } from "../src/trade/worker.js";
+import { lpGasBackoffIntervals } from "../src/lp/worker.js";
+import { agentGasFloor } from "../src/ops/gasFloor.js";
 
 const OWNER = getAddress("0x1111111111111111111111111111111111111111");
 const WALLET = getAddress("0x2222222222222222222222222222222222222222");
@@ -781,4 +785,152 @@ it("enriches entry and blank-threshold exits while hard exits precede any option
 it("worker preserves69 granted candidates through50+19 and reaches an address after50",async()=>{
   const batches:number[]=[];const base=dataPlane(69);const h=await harness({reads:{...base,async tokensBatch(addresses){batches.push(addresses.length);return base.tokensBatch(addresses)}}});
   await runTradeWorkerOnce(h.deps);assert.deepEqual(batches,[50,19]);assert.equal(h.calls[0]!.token,address(168));
+});
+
+/* -------------------------------------------------------------------------- */
+/* AGENT-GAS-ATTENTION §2.2 — the trade worker's gas gate                      */
+/* -------------------------------------------------------------------------- */
+
+describe("trade worker gas gate", () => {
+  /** A trade agent's next motion is ONE exit's relay reimbursement. */
+  const FLOOR = agentGasFloor({ profile: "trade-v1" })!;
+
+  async function gated(input: {
+    readonly nativeWei?: bigint | undefined;
+    readonly gasBackoff?: ReturnType<typeof createTradeGasBackoff>;
+    readonly nowMs?: number;
+  }) {
+    const h = await harness();
+    const reads = { calls: 0 };
+    const deps: TradeWorkerDeps = {
+      ...h.deps,
+      walletNativeBalance: async () => {
+        reads.calls += 1;
+        if (input.nativeWei === undefined) throw new Error("balance unreadable");
+        return input.nativeWei;
+      },
+      ...(input.gasBackoff === undefined ? {} : { gasBackoff: input.gasBackoff }),
+      intervalMs: 60_000,
+      ...(input.nowMs === undefined ? {} : { now: () => input.nowMs! }),
+    };
+    return { h, deps, reads };
+  }
+
+  it("a short wallet spends no LLM, no quote and no execution", async () => {
+    const { h, deps } = await gated({ nativeWei: FLOOR.blockWei - 1n });
+    const report = await runTradeWorkerOnce(deps);
+    assert.equal(h.calls.length, 0, "nothing may be executed for a blocked agent");
+    assert.match(report.outcomes[0]!.reason, /^Deposit at least /u);
+    assert.equal(report.outcomes[0]?.candidates, 0);
+    // No durable run row: a row per cycle for an agent that did nothing is the
+    // churn this change removes.
+    assert.equal((await h.positions.listRuns?.(OWNER, "agent-a"))?.length ?? 0, 0);
+  });
+
+  it("a funded wallet is untouched by the gate", async () => {
+    const { h, deps } = await gated({ nativeWei: FLOOR.warnWei });
+    await runTradeWorkerOnce(deps);
+    assert.ok(h.calls.length > 0, "a funded agent still trades");
+  });
+
+  it("an unreadable balance fails closed", async () => {
+    const { h, deps } = await gated({ nativeWei: undefined });
+    const report = await runTradeWorkerOnce(deps);
+    assert.equal(h.calls.length, 0);
+    assert.match(report.outcomes[0]!.reason, /could not be read/u);
+  });
+
+  it("custody convergence still runs for a blocked agent", async () => {
+    // The projection sweep sits ABOVE the gate on purpose: a paused agent gets
+    // it, and a broke one must too, or a later-confirmed submission stays
+    // invisible for ever.
+    let reconciled = 0;
+    const { deps } = await gated({ nativeWei: 0n });
+    await runTradeWorkerOnce({ ...deps, reconcile: async () => { reconciled += 1; } });
+    assert.equal(reconciled, 1);
+  });
+
+  it("backs off, then probes again, then recovers", async () => {
+    const backoff = createTradeGasBackoff();
+    let nowMs = Date.UTC(2026, 8, 10, 12);
+    const h = await harness();
+    const reads = { calls: 0 };
+    let nativeWei = FLOOR.blockWei - 1n;
+    const deps: TradeWorkerDeps = {
+      ...h.deps,
+      walletNativeBalance: async () => { reads.calls += 1; return nativeWei; },
+      gasBackoff: backoff,
+      intervalMs: 60_000,
+      now: () => nowMs,
+    };
+
+    for (let i = 0; i < 3; i += 1) { await runTradeWorkerOnce(deps); nowMs += 60_000; }
+    assert.equal(reads.calls, 3, "the first probes retry at full cadence");
+
+    // Probe 3 set the ladder to 10 intervals; one interval on costs nothing.
+    await runTradeWorkerOnce(deps);
+    assert.equal(reads.calls, 3, "a backed-off cycle must not read the balance");
+
+    nowMs += 10 * 60_000;
+    nativeWei = FLOOR.warnWei * 2n;
+    await runTradeWorkerOnce(deps);
+    assert.equal(reads.calls, 4);
+    assert.equal(backoff.size, 0, "a funded wallet clears the ladder outright");
+    assert.ok(h.calls.length > 0, "and the agent trades again with no owner action");
+  });
+
+  it("the two workers' backoff ladders are the same ladder", () => {
+    // They are written twice (see `tradeGasBackoffIntervals`' comment on why
+    // importing across the two daemons is refused). This is what keeps the
+    // duplication honest.
+    for (const probes of [1, 2, 3, 4, 5, 6, 7, 100]) {
+      assert.equal(tradeGasBackoffIntervals(probes), lpGasBackoffIntervals(probes), `probe ${probes}`);
+    }
+  });
+});
+
+describe("trade worker gas cache across a shared wallet (review 3/4)", () => {
+  const FLOOR = agentGasFloor({ profile: "trade-v1" })!;
+
+  it("REVIEW 3: agent B is judged on the balance A LEFT, not the one A started with", async () => {
+    // Two legacy self-EOA agents on ONE wallet. A spends; B must not reach the
+    // executor on A's pre-spend figure. Removing the invalidations survived the
+    // earlier suite because nothing made the balance actually DECREASE.
+    const h = await harness({ ids: ["agent-a", "agent-b"] });
+    // Force both agents onto the same wallet.
+    const shared = async (id: string) => {
+      const agent = await h.agents.getAgentById(id);
+      return agent === null ? null : { ...agent, walletAddress: WALLET };
+    };
+    let balance = FLOOR.blockWei * 2n;
+    const reads: bigint[] = [];
+    const deps: TradeWorkerDeps = {
+      ...h.deps,
+      agentStore: { getAgentById: shared } as TradeWorkerDeps["agentStore"],
+      walletNativeBalance: async () => { reads.push(balance); return balance; },
+      gasBackoff: createTradeGasBackoff(),
+      intervalMs: 60_000,
+      executor: {
+        async execute(request) {
+          // Every executed trade costs the wallet one motion's relay fee.
+          balance = balance > FLOOR.blockWei ? balance - FLOOR.blockWei : 0n;
+          return {
+            kind: "committed" as const,
+            receipt: { status: "CONFIRMED" as const, transactionHash: HASH },
+            fill: request.request.side === "buy"
+              ? { side: "buy" as const, entryWei: request.request.amountWei, tokenAmount: request.request.quotedOutWei, fillStatus: "verified" as const }
+              : { side: "sell" as const, exitWei: request.request.quotedOutWei, fillStatus: "verified" as const },
+            meta: {},
+          };
+        },
+      },
+    };
+
+    await runTradeWorkerOnce(deps);
+    assert.ok(reads.length >= 2, `the wallet must be re-read per agent, got ${reads.length} read(s)`);
+    assert.ok(
+      reads.some((value) => value < reads[0]!),
+      `every read returned the pre-spend figure ${reads[0]}: the cache was not invalidated`,
+    );
+  });
 });

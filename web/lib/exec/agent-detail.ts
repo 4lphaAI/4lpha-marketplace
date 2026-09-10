@@ -66,6 +66,61 @@ export type DetailPosition = {
   readonly sideLabel: string | null;
 };
 
+/**
+ * AGENT-GAS-ATTENTION §3.2 — the agent's gas standing as the page reads it.
+ *
+ * `state` is the plane's own classification and is what the UI branches on;
+ * the wei figures are for the remedy sentence. `low` is kept as a convenience
+ * for the shipped grid banner and means `blocked || low` — never branch on it
+ * where the two need distinguishing.
+ *
+ * `warnWei: null` marks a block projected from the older shift-only `buffer`,
+ * which never carried a warn threshold. `nativeWei: null` means the balance
+ * could not be read — a dash with a reason, never a zero.
+ */
+export type AgentGasView = {
+  readonly nativeWei: string | null;
+  readonly nextMotionWei: string;
+  readonly warnWei: string | null;
+  readonly blockWei: string;
+  readonly state: "unknown" | "blocked" | "low" | "ok";
+  readonly enforcement: "block" | "warn-only";
+  readonly low: boolean;
+};
+
+/**
+ * AGENT-GAS-ATTENTION §5 — which bucket a run-log row belongs to.
+ *
+ * THREE buckets, not the two the operator first asked for, and the third is the
+ * point: `active` is a sequence still in flight. A two-way split would file it
+ * under one of the other two, and a stuck sequence would then be either
+ * celebrated as a success or lost among genuine failures — which is exactly the
+ * row an operator opens the run log to find.
+ *
+ * The FAILED predicate is the one `LpAgentDetail` already used to decide
+ * whether a row was worth a "Details" button, moved here so the filter and the
+ * expander cannot drift apart.
+ */
+export type SequenceOutcome = "succeeded" | "failed" | "in-flight";
+
+export function sequenceOutcome(sequence: {
+  readonly state: string;
+  readonly outcomeUnavailable?: boolean;
+  readonly stallCode?: string | null;
+}): SequenceOutcome {
+  // FAILURE EVIDENCE IS TESTED FIRST, and REVIEW FINDING 7 is why the order
+  // matters rather than reading as a style choice. The first build asked
+  // `state === "completed"` up front, so a sequence that completed while its
+  // journal outcome was UNREADABLE — or one carrying a stall code — was filed
+  // under "Succeeded". That is the single row an operator most needs to find,
+  // labelled as the one thing it is not.
+  if (sequence.outcomeUnavailable === true || (sequence.stallCode ?? null) !== null) return "failed";
+  if (sequence.state === "completed") return "succeeded";
+  if (sequence.state === "active") return "in-flight";
+  // `rolled-back`, `held`, `abandoning`, `resolving`, `retiring-pre-bind`.
+  return "failed";
+}
+
 export type DetailMotion = {
   readonly sequenceId: string;
   readonly classification: "settlement" | "drift" | "unknown";
@@ -201,12 +256,16 @@ export type AgentDetailView = {
   readonly cycleHistoryAvailable: boolean;
   readonly cycleNote: string;
   /**
-   * GRID-GAS-RESERVE W2 — the wallet's NATIVE pot against what the next shift
-   * needs for relay gas, both from the plane's own `buffer` block (the worker's
-   * gate reads the same figures). `null` when the plane did not report them:
-   * no source, no claim.
+   * AGENT-GAS-ATTENTION §3.2 — the wallet's NATIVE pot against what the agent's
+   * NEXT MOTION costs in relay gas, for every profile. `null` when the plane
+   * did not report it: no source, no claim.
+   *
+   * Superseded GRID-GAS-RESERVE W2, which reported this for shift grids ONLY
+   * (out of the grid `buffer` block). That narrowness is why the LP agents in
+   * the 2026-09-10 report could not warn about gas at all. A `buffer`-sourced
+   * block is still accepted, with `warnWei: null` — see {@link gasStatus}.
    */
-  readonly gas: { readonly nativeWei: string; readonly nextShiftWei: string; readonly low: boolean } | null;
+  readonly gas: AgentGasView | null;
   readonly motions: readonly DetailMotion[];
   readonly sequences: readonly DetailSequence[];
   readonly positions: readonly DetailPosition[];
@@ -699,7 +758,10 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
     levels: [],
     cycleHistoryAvailable: false,
     cycleNote: NOT_ARMED,
-    gas: null,
+    // REVIEW FINDING 4 — this branch serves EVERY non-grid profile, trade and
+    // lending included, so a hard-coded null here silently discarded their gas
+    // reading and their new banners never rendered.
+    gas: parseGasBlock(data["gas"]),
     motions: [],
     sequences: [],
     positions: [],
@@ -1020,7 +1082,9 @@ function mapLpAgentDetail(
     levels: [],
     cycleHistoryAvailable: false,
     cycleNote: "— not a grid agent",
-    gas: null,
+    // AGENT-GAS-ATTENTION §3.2 — was hard-coded `null` here, which is why an LP
+    // agent could not warn about gas no matter what the plane reported.
+    gas: parseGasBlock(data["gas"]),
     motions: [],
     sequences,
     positions,
@@ -1332,7 +1396,10 @@ export function mapAgentDetail(
     })),
     cycleHistoryAvailable: cycles["available"],
     cycleNote,
-    gas: gasStatus(buffer),
+    // AGENT-GAS-ATTENTION §3.2 — the top-level block first; the shift-only
+    // `buffer` projection remains the fallback so a plane that has not yet been
+    // redeployed keeps the banner it already had.
+    gas: parseGasBlock(data["gas"]) ?? gasStatus(buffer),
     motions,
     sequences: sequencesWithEvidence.map(({ recenterEvidence: _evidence, rawSteps: _steps, ...sequence }) => sequence),
     positions,
@@ -1548,11 +1615,85 @@ export function reduceOhlcv(
  * Both figures must be present and decimal, or the block is `null`: a pot
  * without its requirement (or the reverse) is a number without a meaning.
  */
-function gasStatus(buffer: Record<string, unknown> | null): { readonly nativeWei: string; readonly nextShiftWei: string; readonly low: boolean } | null {
+function gasStatus(buffer: Record<string, unknown> | null): AgentGasView | null {
   const native = buffer?.["nativeWei"];
   const next = buffer?.["nextShiftGasWei"];
   if (typeof native !== "string" || typeof next !== "string" || !/^\d+$/u.test(native) || !/^\d+$/u.test(next)) return null;
-  return { nativeWei: native, nextShiftWei: next, low: BigInt(native) < BigInt(next) };
+  // REVIEW 2 — a zero requirement is not "the next shift is free", it is a
+  // figure nobody computed; projecting it made every wallet look healthy.
+  if (BigInt(next) <= 0n) return null;
+  // The shift `buffer` block predates AGENT-GAS-ATTENTION and carries only the
+  // BLOCK threshold. Projected into the newer shape with `warnWei` absent, so a
+  // consumer can never mistake "no warn threshold was reported" for "the wallet
+  // is above it".
+  return {
+    nativeWei: native,
+    nextMotionWei: next,
+    blockWei: next,
+    warnWei: null,
+    state: BigInt(native) < BigInt(next) ? "blocked" : "ok",
+    enforcement: "block",
+    low: BigInt(native) < BigInt(next),
+  };
+}
+
+/**
+ * AGENT-GAS-ATTENTION §3.2 — the plane's TOP-LEVEL gas block, reported for
+ * every profile rather than only for a shift grid.
+ *
+ * Every field must parse or the whole block is `null`. A partial gas block is
+ * the one shape that could put a number on the page that no read supports —
+ * and the page's contract is a dash with a reason, never an invented figure.
+ */
+function parseGasBlock(value: unknown): AgentGasView | null {
+  const block = row(value);
+  if (block === null) return null;
+  const state = block["state"];
+  if (state !== "unknown" && state !== "blocked" && state !== "low" && state !== "ok") return null;
+  const enforcement = block["enforcement"];
+  if (enforcement !== "block" && enforcement !== "warn-only") return null;
+  const decimal = (candidate: unknown): string | null =>
+    typeof candidate === "string" && /^\d+$/u.test(candidate) ? candidate : null;
+  const nextMotionWei = decimal(block["nextMotionWei"]);
+  const warnWei = decimal(block["warnWei"]);
+  const blockWei = decimal(block["blockWei"]);
+  if (nextMotionWei === null || warnWei === null || blockWei === null) return null;
+  // REVIEW FINDING 9 — the thresholds must be POSITIVE and ORDERED, not merely
+  // numeric. The first build accepted `nextMotionWei: "0"`, which is a floor
+  // nobody could have computed and which reached a division in `GasNotice`.
+  // A threshold that is zero, or a stand-down line above the warning line, is
+  // not a conservative reading — it is a corrupt one, and the page's contract
+  // is a dash with a reason rather than a number it cannot stand behind.
+  if (BigInt(nextMotionWei) <= 0n || BigInt(blockWei) <= 0n || BigInt(warnWei) <= 0n) return null;
+  if (BigInt(blockWei) > BigInt(nextMotionWei)) return null;
+  if (BigInt(warnWei) < BigInt(nextMotionWei)) return null;
+  const nativeWei = block["nativeWei"] === null ? null : decimal(block["nativeWei"]);
+  // A malformed balance is not a missing one. `decimal` returning null for a
+  // present-but-invalid field would otherwise be laundered into the same
+  // `nativeWei: null` an honest unread balance produces.
+  if (nativeWei === null && block["nativeWei"] !== null) return null;
+  // And the two must agree: only an unread balance may be absent, and an
+  // unread balance may never be classified.
+  if ((nativeWei === null) !== (state === "unknown")) return null;
+  // REVIEW 2 — and the STATE must agree with the NUMBERS it arrived with.
+  // `{nativeWei: "0", blockWei: "2", state: "ok"}` passed every check above: a
+  // wallet with nothing in it, declared healthy. The thresholds are the
+  // evidence, so re-derive the classification and refuse a payload that
+  // contradicts itself rather than rendering whichever half is convenient.
+  if (nativeWei !== null) {
+    const balance = BigInt(nativeWei);
+    const derived = balance < BigInt(blockWei) ? "blocked" : balance < BigInt(warnWei) ? "low" : "ok";
+    if (derived !== state) return null;
+  }
+  return {
+    nativeWei,
+    nextMotionWei,
+    warnWei,
+    blockWei,
+    state,
+    enforcement,
+    low: state === "blocked" || state === "low",
+  };
 }
 
 /**

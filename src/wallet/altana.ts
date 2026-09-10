@@ -27,6 +27,7 @@ import {
   encodeFunctionData,
   getAddress,
   http,
+  isAddress,
   keccak256,
   padHex,
   toFunctionSelector,
@@ -56,6 +57,7 @@ import {
 import {
   ExecutionPlaneError,
   InfrastructureError,
+  InvalidSessionSpecError,
   NotAllowedError,
   NotImplementedError,
   ProviderError,
@@ -85,9 +87,12 @@ import {
   type NativeDayMeterParams,
   type PreflightExecuteParams,
   type ResolveOwnerWalletParams,
+  type RestoreGrantedSessionParams,
   type RestoreSessionParams,
   type RevokeSessionParams,
   type SessionRef,
+  type SpendInfoReading,
+  type SpendPeriod,
   type WalletCall,
   type WalletProvider,
 } from "../core/types.js";
@@ -162,6 +167,24 @@ export const DEFAULT_SUBMIT_TIMEOUT_MS = 45_000;
  * by a test.
  */
 export const SPEND_PERIOD_DAY = 2;
+
+/**
+ * The account's `period` byte, in the SDK's own declaration order
+ * (`SpendPermission["period"]`: minute, hour, day, week, month, year).
+ *
+ * Indexed rather than mapped so an UNKNOWN byte reads as `undefined` and the
+ * caller records `"unknown"` — a period this build does not model must be
+ * visible, never silently folded into one it does. `SPEND_PERIOD_DAY` above is
+ * this array's index 2 and the two are pinned equal by a test.
+ */
+const SPEND_PERIOD_NAMES: readonly SpendPeriod[] = [
+  "minute",
+  "hour",
+  "day",
+  "week",
+  "month",
+  "year",
+];
 
 /**
  * Ceiling on the gas a recovery sweep may budget for.
@@ -571,6 +594,110 @@ export class AltanaProvider implements WalletProvider {
       spec: params.spec,
       handle: { session } satisfies AltanaSessionHandle,
     };
+  }
+
+  /**
+   * QUANT-GRID R2.1. Rebuild a session someone ELSE granted.
+   *
+   * The one structural difference from {@link restoreSession}: the descriptor
+   * arrives verbatim instead of being re-derived from a spec, because it is the
+   * key descriptor the relay was handed at grant time and a rewritten one is a
+   * silent-decline risk (FINDINGS (x)). The POLICY the pre-flight reads is the
+   * caller's projection, which it has already run `validateSessionSpec` over —
+   * so a session we did not write is bounded by the same rules as one we did,
+   * without this method pretending the two objects are one.
+   *
+   * Structural checks that do not depend on trusting the caller run here:
+   * the permissions must be a complete `{calls, spend}` descriptor with a
+   * NON-EMPTY allowlist (Altana reads an omitted `calls` array as "every target
+   * allowed" — the safe-default inversion `validateSessionSpec` exists for),
+   * every target must be a real address, the expiry must be in the future, and
+   * the projection's `expiresAt` must agree with it.
+   */
+  restoreGrantedSession(params: RestoreGrantedSessionParams): SessionRef {
+    const permissions = assertGrantedPermissions(params.permissions);
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    if (!Number.isInteger(params.expiresAt) || params.expiresAt <= nowSeconds) {
+      throw new SessionExpiredError(
+        "The granted session's expiry has passed; it cannot be restored.",
+      );
+    }
+    if (params.spec.expiresAt !== params.expiresAt) {
+      throw new InvalidSessionSpecError(
+        "The policy projection's expiry does not equal the granted session's expiry.",
+      );
+    }
+    if (!/^0x[0-9a-fA-F]+$/u.test(params.publicKey)) {
+      throw new InvalidSessionSpecError("The granted session's public key is not hex.");
+    }
+    const { signer } = ownerHandle(params.agent);
+    const walletAddress = getAddress(params.walletAddress);
+    const session: Session = {
+      walletAddress,
+      signer,
+      publicKey: params.publicKey,
+      permissions,
+      expiry: params.expiresAt,
+    };
+    return {
+      walletAddress,
+      chainId: this.network.chainId,
+      publicKey: params.publicKey,
+      spec: params.spec,
+      handle: { session } satisfies AltanaSessionHandle,
+    };
+  }
+
+  /**
+   * QUANT-GRID R3.4. EVERY `(token, period)` spend row for one session key.
+   *
+   * The same ONE read `nativeDayMeter` makes, with the day-row selection and
+   * the token counting removed: this returns the array. The deadline, the
+   * shared-connect bound and the `mapProviderError` classification are
+   * identical, and for the identical reasons (PHASE2.5-AUDIT A3/A4,
+   * PHASE2.5-FIXREVIEW F4): a `view` call is not the account refusing
+   * anything, so only the transport classes are honest here.
+   */
+  async readSpendInfos(
+    params: NativeDayMeterParams,
+  ): Promise<readonly SpendInfoReading[]> {
+    throwIfAborted(params.signal);
+    const wallet = getAddress(params.walletAddress);
+    const keyHash = accountKeyHashForAddress(
+      publicKeyToAddress(params.publicKey),
+    );
+    let infos: readonly {
+      token: Address;
+      period: number;
+      limit: bigint;
+      currentSpent: bigint;
+    }[];
+    try {
+      infos = await withDeadline(
+        (async () => {
+          const { publicClient } = await this.#connected();
+          return publicClient.readContract({
+            address: wallet,
+            abi: ACCOUNT_ABI,
+            functionName: "spendInfos",
+            args: [keyHash],
+          });
+        })(),
+        this.#chainReadTimeoutMs,
+      );
+    } catch (cause) {
+      const mapped = mapProviderError(cause);
+      throw mapped instanceof InfrastructureError
+        ? mapped
+        : new ProviderError(mapped.message);
+    }
+    return infos.map((info) => ({
+      token: info.token === zeroAddress ? null : getAddress(info.token),
+      period: SPEND_PERIOD_NAMES[Number(info.period)] ?? "unknown",
+      periodCode: Number(info.period),
+      limitWei: info.limit,
+      currentSpentWei: info.currentSpent,
+    }));
   }
 
   /** Grant a scoped session. Costs gas, charged to the wallet. */
@@ -1045,6 +1172,13 @@ export class AltanaProvider implements WalletProvider {
       // hoisting it above would make it a pre-submission refusal under PHASE2.4
       // R3's positional rule, which would release budget for a trade that may
       // be mining. That is the double spend, arriving through the fix.
+      // QUANT-GRID R3.8 / R4.6. The cheap early stop, and it claims nothing
+      // more than that: the SDK exports no prepare/sign/send split, so a signal
+      // cannot reach an in-flight send. Its position is INSIDE the try on
+      // purpose — the positional rule (PHASE2.4) makes everything from here
+      // ambiguous, and a caller that has already marked its intent `submitted`
+      // must not be handed a "provably not sent" verdict by an abort race.
+      throwIfAborted(params.signal);
       const result = await withTimeout(
         this.#client.execute({
           session,
@@ -1857,6 +1991,62 @@ function snapshotAllows(
   call: { readonly to: Address; readonly data?: Hex },
 ): boolean {
   return session.spec.allowedCalls.some((rule) => ruleAllows(rule, call));
+}
+
+/**
+ * Narrow an externally-supplied permissions object to the SDK's shape, with
+ * the SAFE-DEFAULT INVERSIONS `validateSessionSpec` documents (QUANT-GRID R2.1).
+ *
+ * Altana reads an OMITTED `calls` array as "every target is allowed" and an
+ * omitted `spend` array as "no spending limit", so a descriptor missing either
+ * is not an under-specified session — it is an UNBOUNDED one, and this plane
+ * refuses to build a live `Session` object around it. The caller's projection
+ * runs the full policy check separately; this is the structural floor that
+ * cannot be delegated to a caller.
+ */
+function assertGrantedPermissions(value: unknown): SessionPermissions {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new InvalidSessionSpecError("Granted permissions are not an object.");
+  }
+  const record = value as Record<string, unknown>;
+  const calls = record["calls"];
+  const spend = record["spend"];
+  if (!Array.isArray(calls) || calls.length === 0) {
+    throw new InvalidSessionSpecError(
+      "Granted permissions carry no call allowlist; an omitted `calls` array grants every target.",
+    );
+  }
+  if (!Array.isArray(spend) || spend.length === 0) {
+    throw new InvalidSessionSpecError(
+      "Granted permissions carry no spend caps; an omitted `spend` array grants unlimited spending.",
+    );
+  }
+  for (const entry of calls) {
+    if (typeof entry !== "object" || entry === null) {
+      throw new InvalidSessionSpecError("A granted call permission is not an object.");
+    }
+    const to = (entry as Record<string, unknown>)["to"];
+    if (to !== undefined && (typeof to !== "string" || !isAddress(to, { strict: false }))) {
+      throw new InvalidSessionSpecError("A granted call permission has an invalid target.");
+    }
+    const signature = (entry as Record<string, unknown>)["signature"];
+    if (signature !== undefined && typeof signature !== "string") {
+      throw new InvalidSessionSpecError("A granted call permission has an invalid signature.");
+    }
+    if (to === undefined && signature === undefined) {
+      throw new InvalidSessionSpecError("A granted call permission constrains nothing.");
+    }
+  }
+  for (const entry of spend) {
+    if (typeof entry !== "object" || entry === null) {
+      throw new InvalidSessionSpecError("A granted spend permission is not an object.");
+    }
+    const limit = (entry as Record<string, unknown>)["limit"];
+    if (typeof limit !== "bigint" || limit <= 0n) {
+      throw new InvalidSessionSpecError("A granted spend permission has a non-positive limit.");
+    }
+  }
+  return value as SessionPermissions;
 }
 
 /** One `spendInfos` row, as `ACCOUNT_ABI` decodes it. */

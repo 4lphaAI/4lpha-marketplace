@@ -59,7 +59,12 @@ function deps(rows: readonly AgentRecord[]) {
 }
 
 function agent(id: string, profile: AgentRecord["httpRuntimeProfile"], custodyModel: AgentRecord["custodyModel"] = "self-eoa"): AgentRecord {
-  return { id, ownerAddress: OWNER, walletAddress: WALLET, custodyModel, sessionFacts: null, sessionRevocation: null, caps: null, status: "armed", httpRuntimeProfile: profile, erc8004AgentId: null, pendingGrant: null, rowVersion: 1, createdAt: 1, updatedAt: 1 };
+  // AGENT-GAS-ATTENTION review finding 3: an LP position's two legs must each
+  // produce an asset row before wallet residue may be attributed, and the token
+  // universe comes from the session spend caps. A production LP session always
+  // names both legs (it has to move them), so the fixture does too.
+  const spendCaps = [{ token: WBNB, limit: 1n, period: "day" as const }, { token: TOKEN, limit: 1n, period: "day" as const }];
+  return { id, ownerAddress: OWNER, walletAddress: WALLET, custodyModel, sessionFacts: { spec: { allowedCalls: [], spendCaps, expiresAt: 9_999_999_999 }, permissions: { calls: [], spend: [] }, publicKey: OTHER_PUBLIC_KEY, expiry: 9_999_999_999 } as unknown as AgentRecord["sessionFacts"], sessionRevocation: null, caps: null, status: "armed", httpRuntimeProfile: profile, erc8004AgentId: null, pendingGrant: null, rowVersion: 1, createdAt: 1, updatedAt: 1 };
 }
 
 describe("account portfolio", () => {
@@ -94,7 +99,7 @@ describe("account portfolio", () => {
 
   it("types each wallet as a deposit target carrying its own available and deployed value (R3/R4)", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
+    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
     const store = { listOwnerPositionsBounded: async () => ({ rows: [position], hasMore: false }) } as unknown as LpSequenceStore;
     const observations = { get: async () => ({ valuation: { method: "sellable-exit-v1", exitValueWei: 5n * 10n ** 17n, quoteToken: WBNB, tokenId: "7", positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } }) } as unknown as LpObservationStore;
     const view = await buildAccountPortfolio(OWNER, { ...base, lp: { store, observations, workerIntervalMs: 30_000 } });
@@ -114,7 +119,7 @@ describe("account portfolio", () => {
 
   it("refuses a per-wallet deployed figure it cannot complete", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
+    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
     const store = { listOwnerPositionsBounded: async () => ({ rows: [position], hasMore: false }) } as unknown as LpSequenceStore;
     const observations = { get: async () => null } as unknown as LpObservationStore;
     const view = await buildAccountPortfolio(OWNER, { ...base, lp: { store, observations, workerIntervalMs: 30_000 } });
@@ -138,7 +143,7 @@ describe("account portfolio", () => {
 
   it("nulls partial LP figures and every aggregate on position capacity", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
+    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
     const store = { listOwnerPositionsBounded: async () => ({ rows: [position], hasMore: true }) } as unknown as LpSequenceStore;
     const observations = { get: async () => ({ valuation: { method: "sellable-exit-v1", exitValueWei: 12n * 10n ** 17n, quoteToken: WBNB, tokenId: "7", positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } }) } as unknown as LpObservationStore;
     const view = await buildAccountPortfolio(OWNER, { ...base, lp: { store, observations, workerIntervalMs: 30_000 } });
@@ -153,7 +158,7 @@ describe("account portfolio", () => {
 
   it("does not publish eligible LP subsets when one mark is missing", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const positions = ["p-1", "p-2"].map((positionId, index) => ({ positionId, agentId: "lp-agent", tokenId: String(index + 1), rowVersion: 1, quoteToken: WBNB, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" })) as unknown as readonly LpPositionRecord[];
+    const positions = ["p-1", "p-2"].map((positionId, index) => ({ positionId, agentId: "lp-agent", tokenId: String(index + 1), rowVersion: 1, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" })) as unknown as readonly LpPositionRecord[];
     const store = { listOwnerPositionsBounded: async () => ({ rows: positions, hasMore: false }) } as unknown as LpSequenceStore;
     const observations = { get: async (_owner: unknown, _agent: unknown, positionId: string) => positionId === "p-1" ? { valuation: { method: "sellable-exit-v1", exitValueWei: 12n * 10n ** 17n, quoteToken: WBNB, tokenId: "1", positionRowVersion: 1, blockNumber: 10n, valuedAtMs: NOW } } : null } as unknown as LpObservationStore;
     const view = await buildAccountPortfolio(OWNER, { ...base, lp: { store, observations, workerIntervalMs: 30_000 } });
@@ -165,7 +170,7 @@ describe("account portfolio", () => {
 
   it("computes positive full LP mark-to-declared-basis PnL", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
+    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
     const store = { listOwnerPositionsBounded: async () => ({ rows: [position], hasMore: false }) } as unknown as LpSequenceStore;
     const observations = { get: async () => ({ valuation: { method: "sellable-exit-v1", exitValueWei: 12n * 10n ** 17n, quoteToken: WBNB, tokenId: "7", positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } }) } as unknown as LpObservationStore;
     const view = await buildAccountPortfolio(OWNER, { ...base, lp: { store, observations, workerIntervalMs: 30_000 } });
@@ -176,7 +181,7 @@ describe("account portfolio", () => {
 
   it("excludes a zero-basis lineage from PnL", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, state: "open", basisWei: 0n, basisSource: "minted" } as unknown as LpPositionRecord;
+    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 0n, basisSource: "minted" } as unknown as LpPositionRecord;
     const store = { listOwnerPositionsBounded: async () => ({ rows: [position], hasMore: false }) } as unknown as LpSequenceStore;
     const observations = { get: async () => ({ valuation: { method: "sellable-exit-v1", exitValueWei: 1n, quoteToken: WBNB, tokenId: "7", positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } }) } as unknown as LpObservationStore;
     const view = await buildAccountPortfolio(OWNER, { ...base, lp: { store, observations, workerIntervalMs: 30_000 } });
@@ -296,7 +301,7 @@ describe("account portfolio", () => {
 
   it("rejects stale and row-version-mismatched LP marks", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
+    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
     const store = { listOwnerPositionsBounded: async () => ({ rows: [position], hasMore: false }) } as unknown as LpSequenceStore;
     for (const valuation of [
       { method: "sellable-exit-v1", exitValueWei: 2n * 10n ** 18n, quoteToken: WBNB, tokenId: "7", positionRowVersion: 1, blockNumber: 10n, valuedAtMs: NOW },
@@ -311,7 +316,7 @@ describe("account portfolio", () => {
 
   it("includes the BNB price timestamp when a zero LP mark publishes negative PnL", async () => {
     const base = deps([agent("lp-agent", "lp-v1")]);
-    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
+    const position = { positionId: "p-1", agentId: "lp-agent", tokenId: "7", rowVersion: 2, quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget" } as unknown as LpPositionRecord;
     const store = { listOwnerPositionsBounded: async () => ({ rows: [position], hasMore: false }) } as unknown as LpSequenceStore;
     const observations = { get: async () => ({ valuation: { method: "sellable-exit-v1", exitValueWei: 0n, quoteToken: WBNB, tokenId: "7", positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } }) } as unknown as LpObservationStore;
     const view = await buildAccountPortfolio(OWNER, { ...base, lp: { store, observations, workerIntervalMs: 30_000 } });
@@ -530,5 +535,247 @@ describe("account portfolio", () => {
       assert.equal(view.venus, null);
       assert.equal(view.totals.totalUsdMicros, null);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* AGENT-GAS-ATTENTION §4 — wallet residue in the Account PnL                  */
+/* -------------------------------------------------------------------------- */
+
+describe("account portfolio wallet residue (PnL v2)", () => {
+  /** An agent whose session names both position legs, so both are swept. */
+  function lpAgentWithLegs(id: string, walletAddress = WALLET): AgentRecord {
+    return {
+      ...agent(id, "lp-v1"),
+      walletAddress,
+      sessionFacts: {
+        spec: { allowedCalls: [], spendCaps: [{ token: WBNB, limit: 1n, period: "day" }, { token: TOKEN, limit: 1n, period: "day" }], expiresAt: 9_999_999_999 },
+        permissions: { calls: [], spend: [] },
+        publicKey: OTHER_PUBLIC_KEY,
+        expiry: 9_999_999_999,
+      },
+    } as unknown as AgentRecord;
+  }
+
+  function lpStores(agentIds: readonly string[]) {
+    const rows = agentIds.map((agentId, index) => ({
+      positionId: `p-${index}`, agentId, tokenId: String(index + 1), rowVersion: 2,
+      quoteToken: WBNB, token0: WBNB, token1: TOKEN, state: "open",
+      basisWei: 10n ** 18n, basisSource: "owner-budget",
+    })) as unknown as readonly LpPositionRecord[];
+    return {
+      store: { listOwnerPositionsBounded: async () => ({ rows, hasMore: false }) } as unknown as LpSequenceStore,
+      observations: { get: async (_o: unknown, _a: unknown, positionId: string) => {
+        const index = rows.findIndex((row) => row.positionId === positionId);
+        return index < 0 ? null : { valuation: { method: "sellable-exit-v1", exitValueWei: 10n ** 18n,
+          quoteToken: WBNB, tokenId: rows[index]!.tokenId, positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } };
+      } } as unknown as LpObservationStore,
+    };
+  }
+
+  it("attributes residue to the sole live agent on the wallet", async () => {
+    // Position marks exactly at basis (PnL 0 before residue), then 1 WBNB and
+    // 1 TOKEN of idle dust at $600 each = $1200 = 2 BNB of gross gain.
+    const base = deps([lpAgentWithLegs("lp-agent")]);
+    const view = await buildAccountPortfolio(OWNER, {
+      ...base,
+      provider: { ...base.provider, getTokenBalance: async () => 10n ** 18n, getTokenMetadata: async () => ({ decimals: 18, symbol: "T" }) } as unknown as WalletProvider,
+      lp: { ...lpStores(["lp-agent"]), workerIntervalMs: 30_000 },
+    });
+
+    const pnl = view.agents[0]!.pnl;
+    assert.equal(pnl.method, "gross-lp-mark-plus-residue-to-declared-basis-v2");
+    assert.equal(pnl.coverage, "full");
+    assert.equal(pnl.pnlNativeWei, (2n * 10n ** 18n).toString());
+    // And the exclusion list stops claiming the residue was left out.
+    assert.ok(!pnl.excluded.includes("wallet-residue"));
+    assert.ok(pnl.excluded.includes("relay-and-gas"), "gas stays excluded: PnL is GROSS");
+  });
+
+  it("refuses to attribute residue on a wallet shared by two live agents", async () => {
+    const base = deps([lpAgentWithLegs("lp-a"), lpAgentWithLegs("lp-b")]);
+    const view = await buildAccountPortfolio(OWNER, {
+      ...base,
+      provider: { ...base.provider, getTokenBalance: async () => 10n ** 18n, getTokenMetadata: async () => ({ decimals: 18, symbol: "T" }) } as unknown as WalletProvider,
+      lp: { ...lpStores(["lp-a", "lp-b"]), workerIntervalMs: 30_000 },
+    });
+
+    for (const view_ of view.agents) {
+      assert.equal(view_.pnl.coverage, "partial");
+      assert.equal(view_.pnl.reason, "shared-wallet");
+      assert.ok(view_.pnl.excluded.includes("wallet-residue"), "an unattributable residue stays declared as excluded");
+      assert.equal(view_.pnl.pnlNativeWei, null, "no guess, no split, no published figure");
+    }
+    assert.equal(view.totals.grossLpPnlUsdMicros, null);
+  });
+
+  it("THE TRAP: residue must not reach the deployed aggregate or the account total", async () => {
+    // Wallet residue is ALREADY counted in `totals.walletUsdMicros` via the
+    // `assets` rows. If it also entered `deployedUsdMicros`, the account total
+    // would count the same dust twice. This is the assertion the plan asks the
+    // review to check.
+    const base = deps([lpAgentWithLegs("lp-agent")]);
+    const withDust = await buildAccountPortfolio(OWNER, {
+      ...base,
+      provider: { ...base.provider, getTokenBalance: async () => 10n ** 18n, getTokenMetadata: async () => ({ decimals: 18, symbol: "T" }) } as unknown as WalletProvider,
+      lp: { ...lpStores(["lp-agent"]), workerIntervalMs: 30_000 },
+    });
+    const noDust = await buildAccountPortfolio(OWNER, {
+      ...base,
+      provider: { ...base.provider, getTokenBalance: async () => 0n, getTokenMetadata: async () => ({ decimals: 18, symbol: "T" }) } as unknown as WalletProvider,
+      lp: { ...lpStores(["lp-agent"]), workerIntervalMs: 30_000 },
+    });
+
+    // Deployed counts the POSITION only, so the dust changes it not at all.
+    assert.equal(withDust.totals.deployedUsdMicros, noDust.totals.deployedUsdMicros);
+    // The total moves by exactly the dust's own wallet value, and by no more.
+    const walletDelta = BigInt(withDust.totals.walletUsdMicros!) - BigInt(noDust.totals.walletUsdMicros!);
+    const totalDelta = BigInt(withDust.totals.totalUsdMicros!) - BigInt(noDust.totals.totalUsdMicros!);
+    assert.equal(totalDelta, walletDelta, "the dust must be counted exactly once");
+  });
+
+  it("publishes nothing when a leg cannot be priced", async () => {
+    const base = deps([lpAgentWithLegs("lp-agent")]);
+    const view = await buildAccountPortfolio(OWNER, {
+      ...base,
+      provider: { ...base.provider, getTokenBalance: async () => { throw new Error("rpc down"); } } as unknown as WalletProvider,
+      lp: { ...lpStores(["lp-agent"]), workerIntervalMs: 30_000 },
+    });
+    assert.equal(view.agents[0]?.pnl.coverage, "partial");
+    assert.equal(view.agents[0]?.pnl.pnlNativeWei, null);
+  });
+});
+
+describe("AGENT-GAS-ATTENTION review fixes", () => {
+  function lpAgentWithLegs2(id: string): AgentRecord {
+    return {
+      ...agent(id, "lp-v1"),
+      sessionFacts: {
+        spec: { allowedCalls: [], spendCaps: [{ token: WBNB, limit: 1n, period: "day" }, { token: TOKEN, limit: 1n, period: "day" }], expiresAt: 9_999_999_999 },
+        permissions: { calls: [], spend: [] },
+        publicKey: OTHER_PUBLIC_KEY,
+        expiry: 9_999_999_999,
+      },
+    } as unknown as AgentRecord;
+  }
+
+  function stores(agentId: string) {
+    const rows = [{
+      positionId: "p-0", agentId, tokenId: "1", rowVersion: 2, quoteToken: WBNB,
+      token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget",
+    }] as unknown as readonly LpPositionRecord[];
+    return {
+      store: { listOwnerPositionsBounded: async () => ({ rows, hasMore: false }) } as unknown as LpSequenceStore,
+      observations: { get: async () => ({ valuation: { method: "sellable-exit-v1", exitValueWei: 10n ** 18n,
+        quoteToken: WBNB, tokenId: "1", positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } }) } as unknown as LpObservationStore,
+    };
+  }
+
+  it("REVIEW FINDING 3: a leg with no asset row makes the residue UNKNOWN, not zero", async () => {
+    // The defect: the residue summed the rows it could SEE and never proved the
+    // rows it NEEDED existed. Here the session grants only ONE of the two legs,
+    // so the other never produces an asset row — exactly what token/pair
+    // truncation does on a busy account. The first build published
+    // `coverage: "full"` with the missing leg counted as nothing.
+    const oneLeg = {
+      ...agent("lp-agent", "lp-v1"),
+      sessionFacts: {
+        spec: { allowedCalls: [], spendCaps: [{ token: WBNB, limit: 1n, period: "day" }], expiresAt: 9_999_999_999 },
+        permissions: { calls: [], spend: [] }, publicKey: OTHER_PUBLIC_KEY, expiry: 9_999_999_999,
+      },
+    } as unknown as AgentRecord;
+    const base = deps([oneLeg]);
+    const view = await buildAccountPortfolio(OWNER, {
+      ...base,
+      provider: { ...base.provider, getTokenBalance: async () => 10n ** 18n, getTokenMetadata: async () => ({ decimals: 18, symbol: "T" }) } as unknown as WalletProvider,
+      lp: { ...stores("lp-agent"), workerIntervalMs: 30_000 },
+    });
+    assert.equal(view.agents[0]?.pnl.coverage, "partial");
+    assert.equal(view.agents[0]?.pnl.pnlNativeWei, null);
+    assert.ok(view.agents[0]?.pnl.excluded.includes("wallet-residue"));
+  });
+
+  it("REVIEW FINDING 5: a short Venus wallet is gas-low, never gas-blocked", async () => {
+    // A Venus guard is WARN-ONLY: it keeps submitting reduced repays. Reporting
+    // it as stood down would tell an owner their liquidation guard had given up
+    // while it was still working for them.
+    const base = deps([agent("venus-agent", "venus-v1")]);
+    const view = await buildAccountPortfolio(OWNER, {
+      ...base,
+      provider: { ...base.provider, getBalance: async () => 1n } as unknown as WalletProvider,
+      lp: { store: {} as unknown as LpSequenceStore, observations: {} as unknown as LpObservationStore,
+        workerIntervalMs: 30_000, relayFeePerSubmitWei: 38_800_000_000_000n },
+    });
+    const venus = view.agents.find((row) => row.id === "venus-agent");
+    assert.equal(venus?.gas?.enforcement, "warn-only");
+    assert.equal(venus?.gas?.state, "blocked", "the plane still classifies the shortfall honestly");
+    assert.equal(venus?.attention, "gas-low", "but it must never be REPORTED as stood down");
+  });
+});
+
+describe("AGENT-GAS-ATTENTION review 2: the truncation vetoes have teeth", () => {
+  function lpAgentLegs(id: string): AgentRecord {
+    return {
+      ...agent(id, "lp-v1"),
+      sessionFacts: {
+        spec: { allowedCalls: [], spendCaps: [{ token: WBNB, limit: 1n, period: "day" }, { token: TOKEN, limit: 1n, period: "day" }], expiresAt: 9_999_999_999 },
+        permissions: { calls: [], spend: [] }, publicKey: OTHER_PUBLIC_KEY, expiry: 9_999_999_999,
+      },
+    } as unknown as AgentRecord;
+  }
+  const rows = [{
+    positionId: "p-0", agentId: "lp-agent", tokenId: "1", rowVersion: 2, quoteToken: WBNB,
+    token0: WBNB, token1: TOKEN, state: "open", basisWei: 10n ** 18n, basisSource: "owner-budget",
+  }] as unknown as readonly LpPositionRecord[];
+  const lpDeps = {
+    store: { listOwnerPositionsBounded: async () => ({ rows, hasMore: false }) } as unknown as LpSequenceStore,
+    observations: { get: async () => ({ valuation: { method: "sellable-exit-v1", exitValueWei: 10n ** 18n,
+      quoteToken: WBNB, tokenId: "1", positionRowVersion: 2, blockNumber: 10n, valuedAtMs: NOW } }) } as unknown as LpObservationStore,
+    workerIntervalMs: 30_000,
+  };
+  const provider = (base: ReturnType<typeof deps>) => ({
+    ...base.provider, getTokenBalance: async () => 10n ** 18n,
+    getTokenMetadata: async () => ({ decimals: 18, symbol: "T" }),
+  } as unknown as WalletProvider);
+
+  it("a TRUNCATED AGENT census cannot prove the wallet is sole-tenant", async () => {
+    // Review 2: removing both truncation vetoes survived the previous suite,
+    // because nothing exercised a truncated read. 33 agents forces
+    // `truncated.agents`, and the sole-live-agent count is then unprovable —
+    // attributing dust on it would hand one agent another's money.
+    const base = deps([lpAgentLegs("lp-agent")]);
+    const truncatedAgents = {
+      listAgentsBounded: async () => ({ rows: [lpAgentLegs("lp-agent")], hasMore: true }),
+    } as unknown as AgentStore;
+    const view = await buildAccountPortfolio(OWNER, {
+      ...base, agents: truncatedAgents, provider: provider(base), lp: lpDeps,
+    });
+    assert.equal(view.coverage.truncated.agents, true, "the fixture must actually truncate");
+    const row = view.agents.find((entry) => entry.id === "lp-agent");
+    assert.equal(row?.pnl.reason, "shared-wallet");
+    assert.equal(row?.pnl.pnlNativeWei, null);
+    assert.ok(row?.pnl.excluded.includes("wallet-residue"));
+  });
+
+  it("a TRUNCATED TOKEN sweep cannot prove the legs were all read", async () => {
+    // 65 granted tokens forces `truncated.tokens`. The fillers are chosen to
+    // sort AFTER both legs (`0xff…`), so the legs DO survive the 64-token cap
+    // and their rows are present — which means only the VETO can produce
+    // `partial` here. With low-sorting fillers the legs are cut instead and the
+    // leg-presence check fires, which would test the wrong thing: verified by
+    // mutation, where removing the tokens veto alone survived that version.
+    const caps = Array.from({ length: 65 }, (_, i) => ({
+      token: `0xff${(i + 1).toString(16).padStart(38, "0")}`, limit: 1n, period: "day",
+    }));
+    const wide = {
+      ...agent("lp-agent", "lp-v1"),
+      sessionFacts: { spec: { allowedCalls: [], spendCaps: [...caps, { token: WBNB, limit: 1n, period: "day" }, { token: TOKEN, limit: 1n, period: "day" }], expiresAt: 9_999_999_999 },
+        permissions: { calls: [], spend: [] }, publicKey: OTHER_PUBLIC_KEY, expiry: 9_999_999_999 },
+    } as unknown as AgentRecord;
+    const base = deps([wide]);
+    const view = await buildAccountPortfolio(OWNER, { ...base, provider: provider(base), lp: lpDeps });
+    assert.equal(view.coverage.truncated.tokens, true, "the fixture must actually truncate");
+    assert.equal(view.agents[0]?.pnl.coverage, "partial");
+    assert.equal(view.agents[0]?.pnl.pnlNativeWei, null);
   });
 });

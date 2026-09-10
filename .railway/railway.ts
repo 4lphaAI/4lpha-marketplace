@@ -229,6 +229,62 @@ export default defineRailway(() => {
     },
   });
 
+  // ─── TermiX Agent.family Quant — `quant-worker` (QUANT-GRID §7.5 / W11) ────
+  //
+  // COMMENTED ON PURPOSE, and the reason is NOT the lending one.
+  // `scripts/quant-worker.ts` EXITS 0 when `QUANT_ENABLED` is off (a deliberate
+  // departure from the lending worker, whose throw crash-loops) — but
+  // `restartPolicyType: "ALWAYS"` restarts a CLEAN exit too, so an early
+  // declaration is still a restart loop, just a quiet one. R2.13 therefore
+  // keeps the lending RULE: this block goes live in the SAME change that sets
+  // `QUANT_ENABLED=true`.
+  //
+  // EXACTLY ONE REPLICA, EVER. The per-job fence protects a job against two
+  // cycles; it does not protect the INBOX against two pollers, and a first
+  // fetch marks an envelope DELIVERED to the client. `src/deployment/
+  // workerSingleton.ts`'s `quant-worker` role is the enforcement — the daemon
+  // AND `npm run live-quant -- worker` take the same lock — but two daemons is
+  // not a supported configuration and the lock is not a licence to try.
+  //
+  // Enabling quant touches ONE service only: there is no HTTP route, no `web/`
+  // surface and no `execution-api` flag (§11). What it DOES require is the
+  // DEPLOYMENT ORDER RULE (R2.7): every service that calls `reconcile` —
+  // `execution-api`, `lp-worker`, `trade-worker`, `lending-worker` — must
+  // already be running a commit that knows the `quantTrade` journal kind, or a
+  // crashed quant row falls through their unrecognized-kind branch and parks as
+  // a permanent UNKNOWN. Railway builds every service from one commit, so the
+  // precondition is simply "all services healthy on the new commit".
+  //
+  // SECRETS. `QUANT_ENVELOPE_KEY` (the HKDF seed for our X25519 pair) and
+  // `QUANT_API_KEY` (the TermiX REST bearer) are `preserve()` on THIS SERVICE
+  // ONLY. Neither is ever read by `execution-api`, `web`, or any other worker;
+  // the seed signs nothing and is used for HKDF alone. `QUANT_PARAMS_DIGEST`
+  // must equal `keccak(canonical params)` of the resolved economics or the boot
+  // refuses (R3.6) — changing a band or a tolerance is therefore a new digest
+  // AND a new strategy version on TermiX, not a quiet variable edit.
+  //
+  // const quant = service("quant-worker", {
+  //   source,
+  //   build: servicesImage,
+  //   deploy: {
+  //     startCommand: "node --import tsx scripts/quant-worker.ts",
+  //     restartPolicyType: "ALWAYS",
+  //   },
+  //   env: {
+  //     ...plane,
+  //     QUANT_ENABLED: "true",
+  //     QUANT_AGENT_ID: "<the TermiX agent id for 4lpha>",
+  //     QUANT_STRATEGY_ID: "<the listed strategy id>",
+  //     QUANT_API_BASE_URL: "https://platform-backend.prod.termix.live",
+  //     QUANT_PARAMS_DIGEST: "<keccak of the resolved params; boot refuses on a mismatch>",
+  //     // Optional; the defaults are the cleared ones (band 700 bps, 3 levels,
+  //     // 10 U min clip, 50 bps edge, 50/50 bps tolerances, 50 bps impact).
+  //     // QUANT_WORKER_INTERVAL_MS: "60000",   // floor 30000, ceiling 600000
+  //     QUANT_ENVELOPE_KEY: preserve(),
+  //     QUANT_API_KEY: preserve(),
+  //   },
+  // });
+
   const identity = service("identity-worker", {
     source,
     build: servicesImage,
@@ -244,7 +300,7 @@ export default defineRailway(() => {
       ERC8004_MINTER_EXCLUSIVE: "true",
       ERC8004_REGISTRY_ADDRESS: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
       ERC8004_RPC_URL: "https://bsc-dataseed.binance.org",
-      ERC8004_MINTER_ADDRESS: "0x273987e9d86D5231b0Be928Aba88129AC479Ca9d",
+      ERC8004_MINTER_ADDRESS: "0xD7E004CBda24E079aA3A657Ba7f8E2915192a966",
       ERC8004_CHAIN_ID: "56",
       ERC8004_MAX_GAS_PER_TX: "2000000",
       ERC8004_MAX_GAS_PRICE_WEI: "100000000",

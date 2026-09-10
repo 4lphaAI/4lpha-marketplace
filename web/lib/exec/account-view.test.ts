@@ -115,3 +115,57 @@ describe("Account browser boundary", () => {
     expect(withdrawableTokens(portfolio, OWNER_B)).toHaveLength(1);
   });
 });
+
+describe("AGENT-GAS-ATTENTION: the account DTO's gas block", () => {
+  const agentRow = (gas: unknown) => ({
+    id: "lp-agent", status: "armed", httpRuntimeProfile: "lp-v1", walletAddress: OWNER_A,
+    attention: "none", gas,
+    holdings: { method: "sellable-lp-exit-v1", state: "empty", reason: "none", valueUsdMicros: null, venusReference: null, held: false },
+    pnl: { method: "gross-lp-mark-plus-residue-to-declared-basis-v2", coverage: "unavailable", reason: "none",
+      eligibleBasisNativeWei: null, markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null,
+      basisSources: [], excluded: ["relay-and-gas", "wallet-residue", "closed-lineages", "prior-exits", "external-cashflows", "zero-basis-lineages"] },
+  });
+  const withAgent = (gas: unknown) =>
+    accountPortfolioForOwner({ data: { ...payload.data, agents: [agentRow(gas)] } } as unknown, OWNER_A);
+  const block = (over: Record<string, unknown> = {}) => ({
+    state: "low", nativeWei: "300000000000000", nextMotionWei: "155200000000000",
+    warnWei: "465600000000000", blockWei: "77600000000000", enforcement: "block", ...over,
+  });
+
+  it("accepts the well-formed cases — the CONTROL for every refusal below", () => {
+    // Without this, a validator that refused EVERYTHING would pass the rest of
+    // this suite while breaking the Account page outright.
+    expect(withAgent(null)).not.toBeNull();
+    expect(withAgent(block())?.agents[0]?.gas?.state).toBe("low");
+    expect(withAgent(block({ nativeWei: "0", state: "blocked" }))?.agents[0]?.gas?.state).toBe("blocked");
+    expect(withAgent(block({ nativeWei: "999999999999999999", state: "ok" }))?.agents[0]?.gas?.state).toBe("ok");
+    expect(withAgent(block({ nativeWei: null, state: "unknown" }))?.agents[0]?.gas?.state).toBe("unknown");
+  });
+
+  it("refuses a state that contradicts its own thresholds", () => {
+    // Review 2 probed a zero balance declared healthy against a positive floor.
+    expect(withAgent(block({ nativeWei: "0", state: "ok" }))).toBeNull();
+    expect(withAgent(block({ nativeWei: "0", state: "low" }))).toBeNull();
+    expect(withAgent(block({ state: "blocked" }))).toBeNull();
+    expect(withAgent(block({ nativeWei: "999999999999999999", state: "low" }))).toBeNull();
+  });
+
+  it("refuses zero, mis-ordered, malformed and contradictory-balance blocks", () => {
+    expect(withAgent(block({ nextMotionWei: "0" }))).toBeNull();
+    expect(withAgent(block({ blockWei: "0" }))).toBeNull();
+    expect(withAgent(block({ warnWei: "0" }))).toBeNull();
+    expect(withAgent(block({ blockWei: "999999999999999999" }))).toBeNull();
+    expect(withAgent(block({ warnWei: "1" }))).toBeNull();
+    expect(withAgent(block({ enforcement: "sometimes" }))).toBeNull();
+    expect(withAgent(block({ state: "sideways" }))).toBeNull();
+    expect(withAgent(block({ nativeWei: null }))).toBeNull();
+    expect(withAgent(block({ state: "unknown" }))).toBeNull();
+    // Unknown keys are still refused outright.
+    expect(withAgent({ ...block(), extra: 1 })).toBeNull();
+  });
+
+  it("still refuses an agent row that omits the gas key entirely", () => {
+    const { gas: _gas, ...withoutGas } = agentRow(null);
+    expect(accountPortfolioForOwner({ data: { ...payload.data, agents: [withoutGas] } } as unknown, OWNER_A)).toBeNull();
+  });
+});

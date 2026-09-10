@@ -13,6 +13,7 @@ import {
   createTradeReadiness,
 } from "../src/trade/readiness.js";
 import {
+  createTradeGasBackoff,
   createWorkerVerdictCache,
   runTradeWorkerOnce,
   type TradeExecutor,
@@ -168,6 +169,13 @@ async function main(): Promise<void> {
     agentStore, settingsStore, positions, intents, journal, dataPlane, provider, llmFor, executor,
     executorDeps, readiness, rpcUrls, routeReader,
     verdictCache: createWorkerVerdictCache(),
+    // AGENT-GAS-ATTENTION §2.2 — through the PROVIDER's chain-id-verified
+    // client, the same seam `src/account/portfolio.ts` reads native balances
+    // on. The daemon owns the backoff ladder, exactly as it owns the verdict
+    // cache, so it lives for the daemon's lifetime and not one cycle's.
+    walletNativeBalance: (wallet) => provider.getBalance({ address: wallet }),
+    gasBackoff: createTradeGasBackoff(),
+    intervalMs: args.intervalMs,
     forbiddenAddresses: (agent) => forbiddenTokenAddresses({
       wallet: agent.walletAddress, keyStore, venues: trade.venues,
       ...(trade.feeTreasury === undefined ? {} : { treasury: trade.feeTreasury }),

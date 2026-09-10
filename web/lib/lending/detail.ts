@@ -568,6 +568,17 @@ export type LendingTimelineEvent = {
   readonly atMs: number | null;
   readonly timeReason: string | null;
   readonly tone: "default" | "profit" | "warn" | "loss";
+  /**
+   * AGENT-GAS-ATTENTION §5 — the run-log bucket, stated EXPLICITLY.
+   *
+   * REVIEW FINDING 7: the run-log filter first classified on {@link tone},
+   * which is a PRESENTATION choice. A clamped-but-successful repay
+   * (partial: true, effect: "changed") is coloured profit and a merely STALE
+   * observation is coloured warn, so the filter called the first a clean
+   * success and the second a failure. Colour is not outcome; this field is,
+   * and it is derived where the real fields are in scope.
+   */
+  readonly outcome: "succeeded" | "failed" | "informational";
   readonly txHash: string | null;
 };
 
@@ -595,6 +606,7 @@ export function lendingTimeline(input: {
     atMs: view.snapshot.presentAt,
     timeReason: view.snapshot.presentAt === null ? "the plane records no time for the last snapshot" : null,
     tone: view.snapshot.stale ? "warn" : observation?.breach === true ? "warn" : "default",
+    outcome: "informational",
     txHash: null,
   });
 
@@ -609,6 +621,7 @@ export function lendingTimeline(input: {
       atMs: guard.updatedAtMs,
       timeReason: null,
       tone: guard.status === "retiring" ? "warn" : "default",
+      outcome: "informational",
       txHash: null,
     });
   }
@@ -629,6 +642,13 @@ export function lendingTimeline(input: {
       atMs: rescue.createdAtMs,
       timeReason: null,
       tone: rescue.effect === "changed" ? "profit" : rescue.effect === "no-effect" ? "warn" : "default",
+      // REVIEW 2 — a CLAMPED rescue belongs under Failed even though it moved
+      // the health factor. The first fix read `effect === "changed"` alone and
+      // filed a `partial: true` repay as a clean success, which is precisely
+      // the row an operator opens this log to find: the guard did what it
+      // could, and what it could was not the whole job. Colour still says
+      // "profit" — it DID help — while the bucket says "look at this".
+      outcome: rescue.effect === "changed" && !rescue.partial ? "succeeded" : "failed",
       txHash: rescue.txHash,
     });
   }
@@ -638,6 +658,7 @@ export function lendingTimeline(input: {
   if (guard.armTxHash !== null || guard.armBlock !== null) {
     events.push({
       key: "arm",
+      outcome: "informational",
       title: "Reserve armed on Venus",
       detail: guard.armBlock === null
         ? "no block is recorded for the arm"
@@ -657,6 +678,7 @@ export function lendingTimeline(input: {
   //    reaches this page, so the time dashes rather than being invented.
   events.push({
     key: "hire",
+    outcome: "informational",
     title: "Hired",
     detail: `guarding ${shortAddress(guard.guardedAccount)} on ${guard.debtMarkets.length} pinned market${guard.debtMarkets.length === 1 ? "" : "s"}`,
     atMs: null,

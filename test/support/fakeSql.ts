@@ -2830,7 +2830,8 @@ export class FakeSqlClient implements SqlClient {
           row["agent_id"] === params[0] &&
           row["decision_id"] === params[1] &&
           // `kind in ('execute','trade','lp','venusRepay','venusSupply',
-          // 'venusClaim','venusClaimRepayLeg','billingCollect','lending')`: one
+          // 'venusClaim','venusClaimRepayLeg','billingCollect','lending',
+          // 'quantTrade')`: one
           // decisionId namespace across every money route. Mirrors journal.ts's
           // SQL literal by hand — the journal.lp, journal.venus and
           // lending.journal tests pin the two against each other.
@@ -2842,7 +2843,8 @@ export class FakeSqlClient implements SqlClient {
             row["kind"] === "venusClaim" ||
             row["kind"] === "venusClaimRepayLeg" ||
             row["kind"] === "billingCollect" ||
-            row["kind"] === "lending"),
+            row["kind"] === "lending" ||
+            row["kind"] === "quantTrade"),
       )
       .sort((a, b) => asTime(a["created_at"]) - asTime(b["created_at"]));
     const row = matches[0];

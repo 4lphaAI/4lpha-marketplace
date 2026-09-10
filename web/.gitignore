@@ -4,3 +4,10 @@ out/
 .env*.local
 npm-debug.log*
 *.tsbuildinfo
+
+# Demo-recording fixture: a posed grid history used to film the marketplace,
+# reachable only from `?mock=1` on /account/<id>. Local-only on purpose - it is
+# fabricated data and must never reach a deployed build. The one-line seam it
+# needs in HiredAgentScreen.tsx lives beside it as a patch, so that tracked
+# file can be restored before any push (see the patch's own header).
+lib/mock/

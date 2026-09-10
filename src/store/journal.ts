@@ -183,6 +183,18 @@ export type JournalKind =
   | "lendingArm"
   | "lendingSettings"
   | "lendingRetire"
+  // QUANT-GRID R2.7. ONE money kind for the TermiX Quant grid, and it is
+  // enumerated in the SAME five hand-maintained places every kind above names:
+  // this union, {@link MONEY_KINDS}, the Postgres `getByDecision` SQL literal,
+  // `test/support/fakeSql.ts`'s copy of that filter, and `resolveRow`'s callsId
+  // branch. There is no quant OWNER-ACTION kind, because this plane has no HTTP
+  // route and no owner signature — the client's authority is the on-chain
+  // session their wizard granted, and everything we do under it is money.
+  //
+  // `JournalExternalRef` gains NO fields: the level and side live on
+  // `quant_actions`, and the body's `externalRef: { level, side }` was withdrawn
+  // by R2.7 for exactly that reason.
+  | "quantTrade"
   // The ONE money kind for EVERY session-key submission this phase makes: the
   // arm batch, every rescue batch, and the retire batch. `lendingRescue` does
   // NOT exist as a kind — one namespace, `lending:<agentId>:<day>:<n>`, so a
@@ -219,6 +231,13 @@ export const MONEY_KINDS: ReadonlySet<JournalKind> = new Set<JournalKind>([
   // shares this decision-id namespace so a decision used on `/trade` cannot be
   // reused by a lending rescue with the replay check silently passing.
   "lending",
+  // QUANT-GRID R2.7. The quant grid submits through the same
+  // `executeViaSession` relay as `trade`, `lp` and `lending`, records a
+  // `callsId`, and shares this decision-id namespace. Its `agentId` is the
+  // TermiX `quantJobId` and its `ownerAddress` is the client's task wallet —
+  // both opaque strings to the journal, which is what lets `sumNativeSpendSince`
+  // and `reconcile` work here unmodified.
+  "quantTrade",
 ]);
 
 /** Journal states that HOLD budget. Only `ROLLED_BACK` releases it. */
@@ -2397,7 +2416,7 @@ export class PostgresExecutionJournal implements ExecutionJournal {
       `/* journal.getByDecision */
        select ${JOURNAL_COLUMNS}
        from execution_journal
-       where agent_id = $1 and decision_id = $2 and kind in ('execute', 'trade', 'lp', 'venusRepay', 'venusSupply', 'venusClaim', 'venusClaimRepayLeg', 'billingCollect', 'lending')
+       where agent_id = $1 and decision_id = $2 and kind in ('execute', 'trade', 'lp', 'venusRepay', 'venusSupply', 'venusClaim', 'venusClaimRepayLeg', 'billingCollect', 'lending', 'quantTrade')
        order by created_at asc
        limit 1`,
       [agentId, decisionId],
@@ -2874,6 +2893,21 @@ async function resolveRow(
     // unrecognized-kind branch below and park as a PERMANENT UNKNOWN, because
     // v1 ships no owner-signed resolver for this kind either.
     || kind === "lending"
+    // QUANT-GRID R2.7. The fifth hand-maintained site. A `quantTrade` row is
+    // one relay submission with a `callsId`, so it resolves exactly as `lp`,
+    // the Venus kinds and `lending` do — and WITHOUT this branch a crashed
+    // quant buy or sell would fall through to the unrecognized-kind branch and
+    // park as a PERMANENT UNKNOWN. `src/quant/reconcile.ts` is what resolves a
+    // quant UNKNOWN with evidence; generic reconcile is what stops one from
+    // being manufactured by a restart in the first place.
+    //
+    // DEPLOYMENT ORDER RULE (R2.7): every service that calls `reconcile` —
+    // `execution-api`, `trade-worker`, `lp-worker`, `lending-worker`,
+    // `dev-stack` — must be running the commit that knows this kind BEFORE
+    // `QUANT_ENABLED=true` is set anywhere. Railway builds all services from
+    // one commit; the runbook makes "all services healthy on the new commit"
+    // the precondition of enablement.
+    || kind === "quantTrade"
   ) {
     // An `lp` row is one saga step submitted through the same relay, so it
     // resolves identically: only its callsId — never a live session, never the

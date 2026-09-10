@@ -2,11 +2,13 @@ import type { AccountCoverageReason, AccountPortfolio } from "./types";
 
 type Row = Record<string, unknown>;
 const STATES = new Set(["complete", "partial", "empty", "unavailable"]);
-const REASONS = new Set<AccountCoverageReason>(["none", "capacity", "dependency", "stale", "unpriced", "unreadable", "identity-conflict", "unsupported-profile", "zero-basis", "missing-mark", "held", "declared"]);
-const REASON_ORDER = ["none", "capacity", "dependency", "stale", "unpriced", "unreadable", "identity-conflict", "unsupported-profile", "zero-basis", "missing-mark", "held", "declared"] as const;
+const REASONS = new Set<AccountCoverageReason>(["none", "capacity", "dependency", "stale", "unpriced", "unreadable", "identity-conflict", "unsupported-profile", "zero-basis", "missing-mark", "held", "declared", "shared-wallet"]);
+const REASON_ORDER = ["none", "capacity", "dependency", "stale", "unpriced", "unreadable", "identity-conflict", "unsupported-profile", "zero-basis", "missing-mark", "held", "declared", "shared-wallet"] as const;
 const STATUSES = new Set(["provisioning", "armed", "paused", "revoked", "retired"]);
 const PROFILES = new Set(["unbound-v1", "trade-v1", "raw-v1", "lp-v1", "venus-v1"]);
-const ATTENTION = new Set(["none", "paused", "provisioning", "partial-data"]);
+// AGENT-GAS-ATTENTION §3.1 — the two derived states join the explicit ones.
+const ATTENTION = new Set(["none", "paused", "provisioning", "partial-data", "gas-blocked", "gas-low"]);
+const GAS_STATES = new Set(["unknown", "blocked", "low", "ok"]);
 const HOLDING_METHODS = new Set(["wallet-native-v1", "wallet-known-erc20-v1", "sellable-lp-exit-v1", "owner-wide-venus-stored-net-v1", "none"]);
 const PNL_COVERAGE = new Set(["full", "partial", "unsupported", "unavailable"]);
 const BASIS_SOURCES = new Set(["owner-budget", "imported"]);
@@ -46,21 +48,66 @@ function validAsset(value: unknown): boolean {
   return asset["status"] !== "unreadable" || asset["balanceAtomic"] === null;
 }
 
+/**
+ * AGENT-GAS-ATTENTION §3.1 — the per-agent gas block, or `null`.
+ *
+ * Validated as strictly as every other block on this view, and for the same
+ * reason the rest of this file is: what reaches the browser here is a figure a
+ * user acts on by sending BNB somewhere. A partially-formed gas block would
+ * render a threshold nobody computed.
+ */
+function validGas(value: unknown): boolean {
+  if (value === null) return true;
+  const gas = row(value);
+  if (gas === null || !exact(gas, ["state", "nativeWei", "nextMotionWei", "warnWei", "blockWei", "enforcement"])) return false;
+  if (typeof gas["state"] !== "string" || !GAS_STATES.has(gas["state"])) return false;
+  if (gas["enforcement"] !== "block" && gas["enforcement"] !== "warn-only") return false;
+  if (!decimal(gas["nextMotionWei"]) || !decimal(gas["warnWei"]) || !decimal(gas["blockWei"])) return false;
+  if (!decimalOrNull(gas["nativeWei"])) return false;
+  // REVIEW FINDING 9 — POSITIVE and ORDERED, not merely numeric. A zero
+  // threshold is a floor nobody computed; a stand-down line above the warning
+  // line is a wallet the page would call healthy while the worker held it.
+  const next = BigInt(gas["nextMotionWei"] as string);
+  const warn = BigInt(gas["warnWei"] as string);
+  const block = BigInt(gas["blockWei"] as string);
+  if (next <= 0n || warn <= 0n || block <= 0n) return false;
+  if (block > next || warn < next) return false;
+  // A balance nobody read can only be `unknown`, and an `unknown` state can
+  // carry no balance. Either way round, the two must agree.
+  if ((gas["nativeWei"] === null) !== (gas["state"] === "unknown")) return false;
+  // REVIEW 2 — the STATE must agree with the NUMBERS. A wallet holding zero,
+  // declared `"ok"` against a positive floor, passed every check above.
+  if (gas["nativeWei"] !== null) {
+    const balance = BigInt(gas["nativeWei"] as string);
+    const derived = balance < block ? "blocked" : balance < warn ? "low" : "ok";
+    if (derived !== gas["state"]) return false;
+  }
+  return true;
+}
+
 function validAgent(value: unknown): boolean {
   const agent = row(value); const holdings = row(agent?.["holdings"]); const pnl = row(agent?.["pnl"]);
-  if (agent === null || holdings === null || pnl === null || !exact(agent, ["id", "status", "httpRuntimeProfile", "walletAddress", "attention", "holdings", "pnl"])) return false;
+  if (agent === null || holdings === null || pnl === null || !exact(agent, ["id", "status", "httpRuntimeProfile", "walletAddress", "attention", "gas", "holdings", "pnl"]) || !validGas(agent["gas"])) return false;
   if (typeof agent["id"] !== "string" || typeof agent["status"] !== "string" || !STATUSES.has(agent["status"]) || typeof agent["httpRuntimeProfile"] !== "string" || !PROFILES.has(agent["httpRuntimeProfile"]) || typeof agent["walletAddress"] !== "string" || !ADDRESS.test(agent["walletAddress"]) || typeof agent["attention"] !== "string" || !ATTENTION.has(agent["attention"])) return false;
   if (!exact(holdings, ["method", "state", "reason", "valueUsdMicros", "venusReference", "held"]) || typeof holdings["method"] !== "string" || !HOLDING_METHODS.has(holdings["method"]) || typeof holdings["state"] !== "string" || !STATES.has(holdings["state"]) || typeof holdings["reason"] !== "string" || !REASONS.has(holdings["reason"] as AccountCoverageReason) || !decimalOrNull(holdings["valueUsdMicros"], true) || holdings["venusReference"] !== null && holdings["venusReference"] !== "owner-wide" || typeof holdings["held"] !== "boolean") return false;
   if ((holdings["state"] === "partial" || holdings["state"] === "unavailable") && holdings["valueUsdMicros"] !== null) return false;
-  if (!exact(pnl, ["method", "coverage", "reason", "eligibleBasisNativeWei", "markNativeWei", "pnlNativeWei", "pnlUsdMicros", "pnlBps", "basisSources", "excluded"]) || (pnl["method"] !== "gross-lp-mark-to-declared-basis-v1" && pnl["method"] !== "none") || typeof pnl["coverage"] !== "string" || !PNL_COVERAGE.has(pnl["coverage"]) || typeof pnl["reason"] !== "string" || !REASONS.has(pnl["reason"] as AccountCoverageReason)) return false;
+  if (!exact(pnl, ["method", "coverage", "reason", "eligibleBasisNativeWei", "markNativeWei", "pnlNativeWei", "pnlUsdMicros", "pnlBps", "basisSources", "excluded"]) || (pnl["method"] !== "gross-lp-mark-plus-residue-to-declared-basis-v2" && pnl["method"] !== "none") || typeof pnl["coverage"] !== "string" || !PNL_COVERAGE.has(pnl["coverage"]) || typeof pnl["reason"] !== "string" || !REASONS.has(pnl["reason"] as AccountCoverageReason)) return false;
   if (!decimalOrNull(pnl["eligibleBasisNativeWei"]) || !decimalOrNull(pnl["markNativeWei"]) || !decimalOrNull(pnl["pnlNativeWei"], true) || !decimalOrNull(pnl["pnlUsdMicros"], true) || !decimalOrNull(pnl["pnlBps"], true)) return false;
   if (!Array.isArray(pnl["basisSources"]) || !pnl["basisSources"].every((source) => typeof source === "string" && BASIS_SOURCES.has(source)) || !Array.isArray(pnl["excluded"]) || !pnl["excluded"].every((entry) => typeof entry === "string" && EXCLUDED.has(entry))) return false;
   if (pnl["coverage"] !== "full" && [pnl["eligibleBasisNativeWei"], pnl["markNativeWei"], pnl["pnlNativeWei"], pnl["pnlUsdMicros"], pnl["pnlBps"]].some((field) => field !== null)) return false;
   if (pnl["coverage"] !== "full" && pnl["basisSources"].length !== 0) return false;
   const canonicalSources = [...new Set(pnl["basisSources"] as string[])].sort();
   if (canonicalSources.join(",") !== pnl["basisSources"].join(",")) return false;
+  // AGENT-GAS-ATTENTION §4 — `...-v2` publishes ONE of two exclusion lists: the
+  // full one when the residue could not be attributed (a shared wallet, an
+  // unpriced leg), and the shorter one when it WAS counted. Both are pinned, in
+  // order, so a plane that starts omitting an exclusion is still refused.
   const canonicalExcluded = ["relay-and-gas", "wallet-residue", "closed-lineages", "prior-exits", "external-cashflows", "zero-basis-lineages"];
-  if (pnl["method"] === "none" && (pnl["basisSources"].length !== 0 || pnl["excluded"].length !== 0) || pnl["method"] === "gross-lp-mark-to-declared-basis-v1" && pnl["excluded"].join(",") !== canonicalExcluded.join(",")) return false;
+  const residueCountedExcluded = ["relay-and-gas", "closed-lineages", "prior-exits", "external-cashflows", "zero-basis-lineages"];
+  const excludedText = pnl["excluded"].join(",");
+  if (pnl["method"] === "none" && (pnl["basisSources"].length !== 0 || pnl["excluded"].length !== 0)) return false;
+  if (pnl["method"] === "gross-lp-mark-plus-residue-to-declared-basis-v2"
+    && excludedText !== canonicalExcluded.join(",") && excludedText !== residueCountedExcluded.join(",")) return false;
   if (holdings["method"] === "owner-wide-venus-stored-net-v1" && holdings["venusReference"] !== "owner-wide" || holdings["method"] !== "owner-wide-venus-stored-net-v1" && holdings["venusReference"] !== null) return false;
   return true;
 }

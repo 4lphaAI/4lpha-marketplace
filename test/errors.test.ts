@@ -496,9 +496,27 @@ describe("E9 item 2's tripwire — where INFRASTRUCTURE_ERROR is branched on", (
     // The exit path never reaches it: a sell is not gated by F1 and takes no
     // meter read. So the accepted transport residue E9 item 2 describes is
     // unchanged, and item 2 did not need revisiting.
+    //
+    // THE THIRD `wallet/altana.ts` SITE IS QUANT-GRID R3.4, and E9 item 2 is
+    // satisfied for the same reason as the second — deliberately updated here,
+    // with the argument written down, because this tripwire exists precisely so
+    // a new branch cannot arrive unexamined.
+    //
+    // The branch is in `readSpendInfos`'s catch, which is `nativeDayMeter`'s
+    // catch copied verbatim for the same reason: a `view` call is not the
+    // account refusing anything, so an `InfrastructureError` survives as itself
+    // and every other mapped class becomes a `ProviderError`.
+    //
+    // It sits STRICTLY ABOVE EVERY SUBMIT, and on this path there is only one
+    // caller: `checkQuantMeters` (`src/quant/execute.ts`), which runs INSIDE
+    // `withJobSession` but BEFORE the `intended → submitted` CAS that precedes
+    // `executeViaSession`. Being wrong there yields `meter-unreadable`, which
+    // the quant execute path treats as a PRE-SUBMIT failure: `markRolledBack`,
+    // the action `failed`, the level restored. It can never produce a
+    // resubmission decision, because nothing has been submitted when it runs.
     assert.deepEqual(
       sites,
-      ["lp/sagas.ts", "wallet/altana.ts", "wallet/altana.ts"],
+      ["lp/sagas.ts", "wallet/altana.ts", "wallet/altana.ts", "wallet/altana.ts"],
       E9,
     );
   });

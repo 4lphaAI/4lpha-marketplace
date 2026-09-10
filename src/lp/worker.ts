@@ -175,6 +175,7 @@ import {
   type LpRangeProposalContext,
   type LpRotateDeps,
   type LpSagaDeps,
+  type LpSagaRunCode,
   type LpSagaRunResult,
   type LpSagaVenue,
 } from "./sagas.js";
@@ -194,6 +195,14 @@ import type { LpGridCycleStore } from "../store/gridCycles.js";
 import { runLpOpen } from "./open.js";
 import { valueLpPosition } from "./valuation.js";
 import type { LpWorkerChainReaders } from "./readers.js";
+import {
+  AGENT_GAS_MAX_BACKOFF_MS,
+  agentGasFloor,
+  agentGasReason,
+  classifyAgentGas,
+  type AgentGasFloor,
+} from "../ops/gasFloor.js";
+import { MAX_SUBMISSIONS_PER_GRID_SHIFT } from "../ops/policy.js";
 
 /* -------------------------------------------------------------------------- */
 /* Boot config (rails resolved ONCE; missing ⇒ the worker refuses to start)   */
@@ -516,10 +525,68 @@ export type LpWorkerDeps = {
  */
 export type LpWorkerState = {
   readonly dryRunObservations: Map<string, LpTriggerObservation>;
+  /**
+   * AGENT-GAS-ATTENTION §2.4 — the per-agent gas backoff, keyed by `agentId`.
+   *
+   * DELIBERATELY IN MEMORY AND NOT DURABLE. This is a cadence optimisation, not
+   * a fact about money: a worker restart that forgets it costs exactly one
+   * cycle of full evaluation and then re-derives the same answer from the same
+   * chain read. Persisting it would add a migration, a second source of truth
+   * about an agent's health, and a way for a stale row to keep a funded agent
+   * asleep — three costs for no correctness.
+   *
+   * The map is small by construction (live agents only) and entries are DELETED
+   * the moment an agent reads `ok`/`low`, so it cannot grow without bound.
+   */
+  readonly gasBackoff: Map<string, LpGasBackoff>;
 };
 
+/** One agent's standing in the gas backoff ladder. */
+export type LpGasBackoff = {
+  /** How many probes in a row have found the wallet short. Never resets down. */
+  readonly consecutiveBlockedProbes: number;
+  /** Before this instant the agent is skipped WITHOUT any read at all. */
+  readonly nextProbeAtMs: number;
+  /** The remedy text, so a skipped cycle can still say why. */
+  readonly reason: string;
+};
+
+/**
+ * AGENT-GAS-ATTENTION §2.4 — how many worker intervals to wait before probing a
+ * short wallet again.
+ *
+ * The first two blocked probes retry at FULL cadence, so an owner who tops up
+ * within a minute of seeing the warning is picked up almost immediately. Only a
+ * wallet that stays short settles into the cheap cadences.
+ *
+ *   probes 1-2  ->  1 interval   (30 s at the LP default)
+ *   probes 3-5  -> 10 intervals  (5 min)
+ *   probes 6+   -> 60 intervals  (30 min)
+ *
+ * Exported pure so the ladder is pinned by a test rather than inferred from
+ * behaviour.
+ */
+export function lpGasBackoffIntervals(consecutiveBlockedProbes: number): number {
+  if (consecutiveBlockedProbes <= 2) return 1;
+  if (consecutiveBlockedProbes <= 5) return 10;
+  return 60;
+}
+
+
+/**
+ * The delay before the next probe: the ladder, clamped to
+ * {@link AGENT_GAS_MAX_BACKOFF_MS}.
+ */
+export function lpGasBackoffDelayMs(
+  consecutiveBlockedProbes: number,
+  intervalMs: number,
+): number {
+  const ladder = lpGasBackoffIntervals(consecutiveBlockedProbes) * intervalMs;
+  return ladder > AGENT_GAS_MAX_BACKOFF_MS ? AGENT_GAS_MAX_BACKOFF_MS : ladder;
+}
+
 export function createLpWorkerState(): LpWorkerState {
-  return { dryRunObservations: new Map() };
+  return { dryRunObservations: new Map(), gasBackoff: new Map() };
 }
 
 export type LpWorkerAction =
@@ -892,8 +959,133 @@ export async function runLpWorkerOnce(
   // (3) Trigger evaluation for open positions with nothing in flight.
   const positions = await deps.store.listOpenPositionsForWorker();
 
+  // AGENT-GAS-ATTENTION §2.1 — one `eth_getBalance` per WALLET per cycle, not
+  // per position. Rebuilt each cycle: a balance is a reading, and a reading
+  // from a previous cycle is not one.
+  const gasCache = new Map<string, LpNativeReading>();
+  // And one agent row per AGENT per cycle, for the wallet the cheap gate needs
+  // before `loadPositionContext` runs.
+  const agentCache = new Map<string, AgentRecord | null>();
+  const agentFor = async (agentId: string): Promise<AgentRecord | null> => {
+    const cached = agentCache.get(agentId);
+    if (cached !== undefined) return cached;
+    const loaded = await deps.agentStore.getAgentById(agentId);
+    agentCache.set(agentId, loaded);
+    return loaded;
+  };
+
+  // ─── GAS COMMITTED TO WORK THAT HAS NOT RESOLVED ─────────────────────────
+  //
+  // Cache invalidation fixed the SPENT case (review 2). It cannot fix the
+  // PENDING one: a submission that returns `PENDING` has not moved the balance
+  // yet, so the next read legitimately returns the same figure and a second
+  // motion passes its floor on money the first is already committed to.
+  //
+  // ═══ WHY THIS IS AN AMOUNT AND NOT A FLAG (REVIEW 4) ══════════════════════
+  //
+  // Round 3 wrote this as a BOOLEAN — "this wallet has outstanding work, refuse
+  // every discretionary motion on it" — and review 4 found three defects in
+  // that shape, all introduced by it rather than by the original gap:
+  //
+  //  1. Nothing RELEASED the flag. An agent whose every cycle ends
+  //     `rolled-back / QUOTA` — the exact state both live LP agents are in
+  //     today — claimed the wallet for the rest of the cycle with NO sequence
+  //     in flight at all, and its sibling was told one was.
+  //  2. A permanently stalled sequence froze healthy siblings FOR EVER,
+  //     however much BNB the wallet held, and changed grid behaviour that
+  //     `gridShiftGasGate` had allowed. The stalled sequence's missing recovery
+  //     door is pre-existing; extending its paralysis to other agents was not.
+  //  3. Money is not a boolean. A wallet holding twenty motions' worth is not
+  //     "occupied" because one motion is in flight.
+  //
+  // So each unresolved sequence RESERVES a conservative, FINITE amount, and the
+  // discretionary gate asks whether what is LEFT still covers the next motion.
+  // A funded wallet is unaffected; a thin one is held; a stalled sequence costs
+  // one reservation for ever rather than the whole wallet for ever.
+  //
+  // DISCRETIONARY ONLY. `protect` is never held by this (review 1 finding 1),
+  // and the RESUME path is untouched — driving a sequence to a conclusion is
+  // what frees its reservation.
+  const obligations: LpWalletObligations = { reservedByWallet: new Map(), seedFailed: false };
+  // REVIEW 5 — seeded from a FRESH read, not from the snapshot taken before the
+  // resume pass. A sequence the resume loop just drove to a terminal state had
+  // been captured as outstanding, so its wallet carried a reservation for work
+  // that had already finished. One store read, after the resumes that change
+  // the answer.
+  let outstandingNow: readonly LpSequenceRecord[] = nonTerminal;
+  try {
+    outstandingNow = await deps.store.listNonTerminalSequencesForWorker();
+  } catch {
+    // A failed re-read is uncertainty, not zero: fall back to the pre-resume
+    // snapshot (conservative — it can only over-reserve) and say so.
+    obligations.seedFailed = true;
+  }
+  for (const sequence of outstandingNow) {
+    try {
+      const agent = await agentFor(sequence.agentId);
+      // A sequence whose agent row has vanished still spent gas. It cannot be
+      // attributed to a wallet, so it is treated as uncertainty, not as zero.
+      if (agent === null) obligations.seedFailed = true;
+      else reserveWalletMotion(obligations, agent.walletAddress);
+    } catch {
+      // REVIEW 4 defect 3: this loop used to `await` outside every error
+      // boundary, so ONE failed agent lookup rejected `runLpWorkerOnce` and no
+      // position was evaluated at all — protective work included. A seed
+      // failure is now UNCERTAINTY: it fails the discretionary gate closed for
+      // the cycle and touches nothing else.
+      obligations.seedFailed = true;
+    }
+  }
+
   for (const position of positions) {
     if (resumedPositions.has(position.positionId)) continue;
+    // AGENT-GAS-ATTENTION §2.4 — the backoff, served BEFORE any read of any
+    // kind. This is the branch that actually saves the Railway cycle and the
+    // RPC quota: an agent deep in the ladder costs nothing at all until its
+    // next probe falls due. The reason is the one its last probe recorded, so
+    // a skipped cycle still explains itself rather than going silent.
+    const backoff = state.gasBackoff.get(position.agentId);
+    if (backoff !== undefined && cycleNowMs < backoff.nextProbeAtMs) {
+      emit({
+        agentId: position.agentId,
+        positionId: position.positionId,
+        action: "skipped",
+        reason: backoff.reason,
+      });
+      continue;
+    }
+    // AGENT-GAS-ATTENTION §2.1 — the CHEAP stand-down gate, before
+    // `loadPositionContext` and therefore before its `getPool` and `ownerOf`
+    // reads (REVIEW FINDING 8). One agent row and one balance per wallet, both
+    // cached for the cycle; nothing else is touched for a stood-down agent.
+    try {
+      const agent = await agentFor(position.agentId);
+      // A missing or cross-owner agent row is `loadPositionContext`'s refusal
+      // to make, with its own wording; the gate simply declines to gate.
+      if (
+        agent !== null
+        && agent.ownerAddress.toLowerCase() === position.ownerAddress.toLowerCase()
+      ) {
+        const standDown = await lpStandDownGate(deps, state, agent, cycleNowMs, gasCache);
+        if (standDown !== null) {
+          emit({
+            agentId: position.agentId,
+            positionId: position.positionId,
+            action: "skipped",
+            reason: standDown,
+          });
+          continue;
+        }
+      }
+    } catch (error) {
+      emit({
+        agentId: position.agentId,
+        positionId: position.positionId,
+        action: "error",
+        reason: sanitizeMessage(messageOf(error)),
+      });
+      continue;
+    }
     try {
       const outcome = await evaluatePosition(
         deps,
@@ -903,6 +1095,8 @@ export async function runLpWorkerOnce(
         // PHASE3.20 item 16: the array this loop is already iterating, so the
         // last-slot arbitration can read the sibling's persisted stamp.
         positions,
+        gasCache,
+        obligations,
       );
       emit(outcome);
     } catch (error) {
@@ -925,6 +1119,348 @@ export async function runLpWorkerOnce(
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * AGENT-GAS-ATTENTION §2.1 — the LP agent's own gas floor, for the mode it is
+ * actually running.
+ *
+ * `null` when the deployment supplies no relay fee estimate — the same posture
+ * `gridShiftGasGate` takes, and `classifyAgentGas` then answers `"unknown"`.
+ */
+function lpFloorFor(deps: LpWorkerDeps, context: PositionContext): AgentGasFloor | null {
+  const grid = context.settings.grid;
+  return agentGasFloor({
+    profile: "lp-v1",
+    gridMode: grid === null ? null : gridModeOf(grid),
+    relayFeePerSubmitWei: deps.relayFeePerSubmitWei,
+  });
+}
+
+/**
+ * THE CYCLE'S NATIVE BALANCE FOR ONE WALLET, read at most once.
+ *
+ * ═══ THE THREE ANSWERS, AND WHY THEY ARE THREE ════════════════════════════
+ *
+ * REVIEW FINDING 2. The first build folded "this deployment wired no reader"
+ * and "the read failed" into one `undefined`, cached that `undefined`, and then
+ * classified it — so the FIRST position on a reader-less deployment proceeded
+ * (the early return) while the SECOND position on the same wallet read the
+ * cached `undefined`, classified it `"unknown"`, and was BLOCKED. Two positions,
+ * one wallet, one cycle, opposite verdicts.
+ *
+ *   `"unwired"`  no reader exists. The gate is not armed at all — see below.
+ *   `"unread"`   a reader exists and failed. FAIL CLOSED.
+ *   a balance    the reading.
+ *
+ * ═══ WHY `"unwired"` DOES NOT BLOCK, AND `"unread"` DOES ══════════════════
+ *
+ * They are different facts. A failed read is evidence the wallet MIGHT be
+ * short, and the 3.19 posture applies: a transport failure must never read as
+ * "funded", and a hold costs one free cycle. An ABSENT READER is evidence of
+ * nothing about the wallet — it is a deployment that never wired the
+ * instrument, and blocking every agent on it would be the (bd) shape: a gate
+ * whose own input was never supplied, silently stopping everything, including
+ * the protect exits this gate was reshaped to preserve.
+ *
+ * Every production composition root wires it (`createLpChainReaders` supplies
+ * `walletNativeBalance`; `scripts/trade-worker.ts` supplies its own), so
+ * `"unwired"` is reachable only from an offline fixture.
+ *
+ * The plan's §2 said "reader absent ⇒ blocked"; that sentence is WRONG and is
+ * corrected in the plan's build record rather than silently ignored here.
+ */
+type LpNativeReading = bigint | "unread" | "unwired";
+
+async function lpCycleNative(
+  deps: LpWorkerDeps,
+  wallet: Address,
+  gasCache?: Map<string, LpNativeReading>,
+): Promise<LpNativeReading> {
+  const walletKey = wallet.toLowerCase();
+  const cached = gasCache?.get(walletKey);
+  if (cached !== undefined) return cached;
+  const readNative = deps.readers.walletNativeBalance;
+  let reading: LpNativeReading;
+  if (readNative === undefined) {
+    reading = "unwired";
+  } else {
+    try {
+      reading = await readNative(wallet);
+    } catch {
+      reading = "unread";
+    }
+  }
+  gasCache?.set(walletKey, reading);
+  return reading;
+}
+
+/** `undefined` for a reading `classifyAgentGas` should treat as unknown. */
+function asNativeWei(reading: LpNativeReading): bigint | undefined {
+  return typeof reading === "bigint" ? reading : undefined;
+}
+
+/**
+ * AGENT-GAS-ATTENTION §2.1 — THE CHEAP STAND-DOWN GATE.
+ *
+ * Answers "can this agent afford ANY motion at all?" against `blockWei`, which
+ * is the PROTECT cost and is therefore INDEPENDENT OF GRID MODE. That
+ * independence is what lets this run before `loadPositionContext` and its
+ * `getPool` / `ownerOf` reads (REVIEW FINDING 8) — the first build sat after
+ * them and its test claimed "zero chain reads" while two were being made.
+ *
+ * `null` to proceed. A blocked agent is SKIPPED: no sequence, no reservation,
+ * no lane charge, nothing durable written.
+ */
+async function lpStandDownGate(
+  deps: LpWorkerDeps,
+  state: LpWorkerState,
+  agent: AgentRecord,
+  cycleNowMs: number,
+  gasCache?: Map<string, LpNativeReading>,
+): Promise<string | null> {
+  const floor = agentGasFloor({
+    profile: "lp-v1",
+    // Mode-independent by construction: `blockWei` is the protect cost.
+    gridMode: null,
+    relayFeePerSubmitWei: deps.relayFeePerSubmitWei,
+  });
+  // A deployment with no relay-fee estimate cannot size ANY motion. Refusing
+  // every LP agent on that basis would be an outage with no evidence behind it;
+  // the money-side gates (`gridShiftGasGate`, the relay's own quote) still
+  // stand behind this one.
+  if (floor === null) return null;
+
+  const reading = await lpCycleNative(deps, agent.walletAddress, gasCache);
+  if (reading === "unwired") return null;
+
+  const stateNow = classifyAgentGas({ nativeWei: asNativeWei(reading), floor });
+  if (stateNow === "ok" || stateNow === "low") {
+    // Recovery is the ABSENCE of a reason to wait, not a second countdown.
+    state.gasBackoff.delete(agent.id);
+    return null;
+  }
+
+  const reason = sanitizeMessage(
+    agentGasReason({
+      state: stateNow,
+      floor,
+      nativeWei: asNativeWei(reading),
+      walletAddress: agent.walletAddress,
+    }),
+  );
+  // The ladder advances on the PROBE, never on a skip that read nothing, so a
+  // cycle already serving a backoff does not deepen it.
+  const previous = state.gasBackoff.get(agent.id);
+  const consecutiveBlockedProbes = (previous?.consecutiveBlockedProbes ?? 0) + 1;
+  state.gasBackoff.set(agent.id, {
+    consecutiveBlockedProbes,
+    nextProbeAtMs: cycleNowMs + lpGasBackoffDelayMs(consecutiveBlockedProbes, deps.intervalMs),
+    reason,
+  });
+  return reason;
+}
+
+/**
+ * Whether a dispatched saga must clear the DISCRETIONARY gas floor.
+ *
+ * FALSE for `protect`, and that exemption is the whole of review finding 1: a
+ * protect exit costs {@link PROTECT_SUBMISSIONS_PER_POSITION} = 2 fee units,
+ * the stand-down gate has already proved the wallet can pay that, and gating it
+ * again at the 3-4-unit discretionary floor would suppress the one motion that
+ * exists to save the owner's money.
+ *
+ * EXPORTED AS A PREDICATE rather than left as an inline `!==` because review 2
+ * showed the inline form was untestable: a mutation that gated protect too
+ * survived the whole suite, since no offline fixture drives a protect dispatch.
+ * As a pure function the rule is a VALUE, and a value can be pinned.
+ */
+export function lpMotionNeedsDiscretionaryGas(sagaKind: LpDispatchKind): boolean {
+  return sagaKind !== "protect";
+}
+
+/**
+ * AGENT-GAS-ATTENTION §2.1 — the DISCRETIONARY refusal, after the trigger.
+ *
+ * `null` to dispatch. Only reached for a non-protect saga, and only when the
+ * cheap gate has already passed — so the wallet can afford SOMETHING, just not
+ * this. Reuses the cycle's cached balance: no second read.
+ */
+async function lpDiscretionaryGasHold(
+  deps: LpWorkerDeps,
+  context: PositionContext,
+  gasCache?: Map<string, LpNativeReading>,
+  obligations?: LpWalletObligations,
+): Promise<string | null> {
+  const floor = lpFloorFor(deps, context);
+  if (floor === null) return null;
+  const reading = await lpCycleNative(deps, context.agent.walletAddress, gasCache);
+  if (reading === "unwired") return null;
+  const nativeWei = asNativeWei(reading);
+
+  // REVIEW 4 — the balance MINUS what work already in flight has committed.
+  // A seed failure is uncertainty and fails closed HERE, at the discretionary
+  // gate alone, rather than aborting the sweep as round 3's version did.
+  if (obligations?.seedFailed === true) {
+    return sanitizeMessage(lpOutstandingWorkHoldReason({
+      walletAddress: context.agent.walletAddress,
+      reservedWei: 0n,
+      availableWei: null,
+      requiredWei: floor.nextMotionWei,
+    }));
+  }
+  const outstanding = obligations?.reservedByWallet.get(context.agent.walletAddress.toLowerCase()) ?? 0;
+  const reservedWei = lpOutstandingReserveWei(outstanding, deps.relayFeePerSubmitWei);
+
+  if (nativeWei === undefined) {
+    // Unread fails closed, the same posture the cheap gate takes.
+    return sanitizeMessage(
+      `Holding this motion: it needs ${formatBnb(floor.nextMotionWei)} BNB of relay gas and the `
+      + `balance of wallet ${context.agent.walletAddress} could not be read. Protective exits are `
+      + `unaffected and still fire. Nothing is spent and no quota is used.`,
+    );
+  }
+  const availableWei = nativeWei > reservedWei ? nativeWei - reservedWei : 0n;
+  if (availableWei >= floor.nextMotionWei) return null;
+  if (reservedWei > 0n) {
+    return sanitizeMessage(lpOutstandingWorkHoldReason({
+      walletAddress: context.agent.walletAddress,
+      reservedWei,
+      availableWei,
+      requiredWei: floor.nextMotionWei,
+    }));
+  }
+  return sanitizeMessage(
+    `Holding this motion: it needs ${formatBnb(floor.nextMotionWei)} BNB of relay gas and the `
+    + `wallet ${context.agent.walletAddress} holds ${formatBnb(nativeWei)} BNB. `
+    + `Protective exits are unaffected and still fire. Nothing is spent and no quota is used.`,
+  );
+}
+
+/**
+ * REVIEW 3 — the hold text for a wallet whose gas is committed to work that has
+ * not resolved.
+ *
+ * Deliberately NOT phrased as a shortfall: the balance may be perfectly
+ * healthy, and telling an owner to deposit BNB they already have would send
+ * them chasing a problem that is not theirs. What is happening is a QUEUE.
+ */
+export function lpOutstandingWorkHoldReason(input: {
+  readonly walletAddress: string;
+  readonly reservedWei: bigint;
+  readonly availableWei: bigint | null;
+  readonly requiredWei: bigint;
+}): string {
+  if (input.availableWei === null) {
+    return (
+      `Holding this motion: wallet ${input.walletAddress} has work in flight whose gas could not be `
+      + `accounted for this cycle. Protective exits are unaffected and still fire. Nothing is spent `
+      + `and no quota is used; this motion is re-evaluated next cycle.`
+    );
+  }
+  return (
+    `Holding this motion: ${formatBnb(input.reservedWei)} BNB of wallet ${input.walletAddress} is `
+    + `reserved for work already in flight, leaving ${formatBnb(input.availableWei)} BNB against the `
+    + `${formatBnb(input.requiredWei)} BNB this motion needs. Protective exits still fire. Nothing `
+    + `is spent; it retries once that work settles or the wallet is topped up.`
+  );
+}
+
+/**
+ * REVIEW 4 — one unresolved sequence's conservative gas reservation.
+ *
+ * The WORST-CASE LP motion (`MAX_SUBMISSIONS_PER_GRID_SHIFT` fee units), not
+ * the kind's own cost. Over-reserving is the safe direction and needs no second
+ * kind-to-cost mapping that could drift from the one in `gasFloor.ts`.
+ */
+export const LP_OUTSTANDING_SEQUENCE_RESERVE_UNITS = MAX_SUBMISSIONS_PER_GRID_SHIFT;
+
+export function lpOutstandingReserveWei(
+  outstandingCount: number,
+  relayFeePerSubmitWei: bigint,
+): bigint {
+  if (outstandingCount <= 0) return 0n;
+  return BigInt(outstandingCount) * BigInt(LP_OUTSTANDING_SEQUENCE_RESERVE_UNITS) * relayFeePerSubmitWei;
+}
+
+/**
+ * The cycle's gas obligations, per wallet.
+ *
+ * `seedFailed` is UNCERTAINTY, not zero: an agent row this cycle could not read
+ * may still own a sequence that is spending. It fails the discretionary gate
+ * closed and leaves protect and resume alone.
+ */
+export type LpWalletObligations = {
+  readonly reservedByWallet: Map<string, number>;
+  seedFailed: boolean;
+};
+
+/**
+ * REVIEW 5 — codes that PROVE a dispatch reached the relay with NOTHING
+ * submitted, so its provisional gas reservation can be released.
+ *
+ * Every one of these is refused BEFORE the saga builds a call: an exhausted
+ * quota, a paused agent, a halted plane, a session that is gone, a settings
+ * digest that moved, a row another process holds. None can leave a submission
+ * in flight.
+ *
+ * DELIBERATELY AN ALLOW-LIST, not "anything rolled back". `HELD_AMBIGUOUS`,
+ * `POST_VERIFY_FAILED`, every rail failure and every build/step refusal that
+ * could have followed a send stay RESERVED — review 5's warning is exact:
+ * *"unconditionally decrementing in `finally` would restore the pending-gas
+ * defect"*. A code absent from this list keeps its reservation, which is the
+ * safe direction.
+ *
+ * WHY IT MATTERS RIGHT NOW: `QUOTA` is the state both live LP agents are in
+ * today. Round 3's version reserved gas for those refusals for ever, so one
+ * agent's exhausted quota silently held its sibling on a shared wallet — a NEW
+ * production fault invented by a fix. Review 5 reproduced it over five cycles.
+ */
+const LP_PRE_SUBMIT_REFUSAL_CODES: ReadonlySet<LpSagaRunCode> = new Set<LpSagaRunCode>([
+  "QUOTA",
+  "DAILY_CAP",
+  "AGENT_PAUSED",
+  "AGENT_NOT_ARMED",
+  "GLOBAL_HALT",
+  "NO_SESSION",
+  "SESSION_EXPIRED",
+  "SETTINGS_DIGEST_MISMATCH",
+  "SEQUENCE_CONFLICT",
+  "SEQUENCE_FENCED",
+]);
+
+/**
+ * Whether this outcome proves the wallet owes nothing for the attempt.
+ *
+ * `confirmedSteps === 0` is required as well as the code: a refusal that
+ * somehow followed a confirmed step is not a pre-submit refusal, whatever it
+ * calls itself.
+ */
+export function lpDispatchSpentNothing(result: LpSagaRunResult): boolean {
+  return (
+    result.status === "rolled-back"
+    && result.confirmedSteps === 0
+    && LP_PRE_SUBMIT_REFUSAL_CODES.has(result.code)
+  );
+}
+
+function releaseWalletMotion(obligations: LpWalletObligations, wallet: Address): void {
+  const key = wallet.toLowerCase();
+  const held = obligations.reservedByWallet.get(key) ?? 0;
+  if (held <= 1) obligations.reservedByWallet.delete(key);
+  else obligations.reservedByWallet.set(key, held - 1);
+}
+
+function reserveWalletMotion(obligations: LpWalletObligations, wallet: Address): void {
+  const key = wallet.toLowerCase();
+  obligations.reservedByWallet.set(key, (obligations.reservedByWallet.get(key) ?? 0) + 1);
+}
+
+/** Wei as BNB with seven fractional digits, matching `agentGasReason`. */
+function formatBnb(wei: bigint): string {
+  const whole = wei / 10n ** 18n;
+  const fraction = (wei % 10n ** 18n).toString(10).padStart(18, "0").slice(0, 7);
+  return `${whole}.${fraction}`;
 }
 
 /**
@@ -2109,6 +2645,20 @@ async function evaluatePosition(
    * this row wins the slot. That is the correct direction.
    */
   cyclePositions?: readonly LpPositionRecord[],
+  /**
+   * AGENT-GAS-ATTENTION §2.1 — the CYCLE's native-balance cache, keyed by
+   * lowercased wallet. Two positions of one agent, and two agents sharing one
+   * wallet, must cost ONE `eth_getBalance` between them; without this the gate
+   * that exists to save reads would add one per position. Optional so every
+   * existing caller and fixture is unchanged (they then read per position,
+   * which is correct, only less thrifty).
+   */
+  gasCache?: Map<string, LpNativeReading>,
+  /**
+   * The cycle GAS OBLIGATIONS, per wallet. See the seeding comment in
+   * runLpWorkerOnce for why this is an AMOUNT rather than a flag.
+   */
+  obligations?: LpWalletObligations,
 ): Promise<LpWorkerPositionOutcome> {
   const base = { agentId: position.agentId, positionId: position.positionId };
   /** The status fields the silent-skip paths can still answer with. */
@@ -2296,14 +2846,16 @@ async function evaluatePosition(
     // fixtures must stay byte-identical). Same failure posture: an unread pot
     // is `undefined`, and the trigger's gas gate holds on it.
     if (gridSettings.shift !== undefined) {
-      const nativeOf = deps.readers.walletNativeBalance;
-      if (nativeOf !== undefined) {
-        try {
-          bufferNativeWei = await nativeOf(context.agent.walletAddress);
-        } catch {
-          bufferNativeWei = undefined;
-        }
-      }
+      // REVIEW 2, HIGH (second half) — through the CYCLE's reading, not a
+      // second independent one. This read and `lpDiscretionaryGasHold` decide
+      // the same question about the same wallet in the same cycle, and two
+      // reads can straddle a spend: `gridShiftGasGate` would then hold on one
+      // balance while the discretionary guard passed on another. "Keep the two
+      // gates in step" (GRID-GAS-RESERVE P2) means one reading, not two
+      // agreeing formulas over different numbers.
+      bufferNativeWei = asNativeWei(
+        await lpCycleNative(deps, context.agent.walletAddress, gasCache),
+      );
     }
   }
   // ─── PHASE3.20 items 17-19 / C9 — THE LANE USAGE, READ PER POSITION ──────
@@ -2748,6 +3300,41 @@ async function evaluatePosition(
   // `protect` default. See {@link lpDispatchKindFor} for what the default cost.
   const sagaKind = lpDispatchKindFor(decision);
 
+  // ─── AGENT-GAS-ATTENTION §2.1 — THE DISCRETIONARY GAS REFUSAL ────────────
+  //
+  // The CHEAP gate in `runLpWorkerOnce` has already stood the agent down if it
+  // cannot afford even a PROTECT exit. This second, dearer threshold refuses
+  // only the DISCRETIONARY motions, and only once the trigger has spoken.
+  //
+  // REVIEW FINDING 1 is why the two are separate. One threshold at the
+  // discretionary cost skipped the position before `protect` was evaluated, so
+  // a wallet holding exactly two fee units — enough to honour a breached
+  // stop-loss — sat on a breach it could have paid to exit. Protection must
+  // never be suppressed to save an RPC call.
+  //
+  // A `protect` NEVER reaches this branch. It is a hold (R2.10 shape): no
+  // sequence, no reservation, no lane charge, re-evaluated free next cycle.
+  if (lpMotionNeedsDiscretionaryGas(sagaKind)) {
+    const discretionary = await lpDiscretionaryGasHold(deps, context, gasCache, obligations);
+    if (discretionary !== null) {
+      const observationPersisted = await persistObservation(
+        deps,
+        state,
+        position,
+        portfolioObservation,
+      );
+      return {
+        ...base,
+        action: "hold",
+        decision: "hold",
+        reason: discretionary,
+        triggerReason: evaluation.triggerReason,
+        observationPersisted,
+        protection,
+      };
+    }
+  }
+
   if (deps.dryRun) {
     // Overlay only — a rehearsal leaves no durable state that could arm a live
     // protect on one live look at the market (Rev2 items 7/8).
@@ -2792,7 +3379,29 @@ async function evaluatePosition(
     };
   }
 
+  // ─── REVIEW 2, HIGH — THE CYCLE CACHE IS SPENT BY A DISPATCH ─────────────
+  //
+  // The cache exists so one wallet costs one `eth_getBalance` per cycle. But a
+  // SAGA SPENDS from that wallet, and the cached figure is a reading from
+  // BEFORE it did. Reproduced by the review: two LP agents on one wallet, a
+  // harvest needing 116,400,000,000,000 wei; the first dispatched at exactly
+  // that balance, the second read the same stale number and dispatched too —
+  // with 77,600,000,000,000 wei actually left. The second motion starts below
+  // its own floor and can run out of gas MID-SAGA, which is the wedge shape
+  // GRID-GAS-RESERVE exists to prevent.
+  //
+  // Dropped BEFORE the saga rather than after, and in a `finally` so a throw
+  // cannot leave a spent figure behind: a submission that failed may still have
+  // been metered. The next position on this wallet re-reads — one extra call
+  // per dispatch, which is rare, against a motion that cannot pay for itself.
+  gasCache?.delete(context.agent.walletAddress.toLowerCase());
+  // REVIEW 3 — and the wallet now carries an obligation for the REST of this
+  // cycle, whether the submission confirms, stays pending, or throws. Added
+  // BEFORE the saga so a throw cannot skip it.
+  if (obligations !== undefined) reserveWalletMotion(obligations, context.agent.walletAddress);
+
   let result: LpSagaRunResult;
+  try {
   if (sagaKind === "rotate") {
     result = await runLpRotate(
       await buildRotateDeps(deps, context),
@@ -2844,6 +3453,18 @@ async function evaluatePosition(
     );
   } else {
     result = await runLpProtect(buildSagaDeps(deps, context), position.positionId);
+  }
+  } finally {
+    // Belt and braces: the entry was dropped above, but a saga that threw must
+    // not leave one either — including one a LATER position wrote by re-reading
+    // between the delete and the throw.
+    gasCache?.delete(context.agent.walletAddress.toLowerCase());
+  }
+  // REVIEW 5 — release the provisional reservation ONLY when the outcome proves
+  // nothing was submitted. A throw never reaches here, and that is correct: an
+  // exception may have left a submission in flight, so its reservation stands.
+  if (obligations !== undefined && lpDispatchSpentNothing(result)) {
+    releaseWalletMotion(obligations, context.agent.walletAddress);
   }
   // AFTER the dispatch has been acted on. A write that fails here leaves the
   // PREVIOUS observation in place, so the next cycle would recompute

@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { formatEther } from "viem";
 import { Button, Icon, StatusBadge } from "@/design-system";
+import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
 import { TradeRunLog } from "./TradeRunLog";
 import { TokenIcon } from "@/components/TokenIcon";
@@ -271,7 +272,8 @@ export function TradeAgentDetail(props: Props) {
   return <div className="fl-shell fl-hired-agent-page fl-trade-detail-page">
     <Button variant="ghost" size="sm" icon={<Icon name="chevron-right" size={14} style={{ transform: "rotate(180deg)" }} />} onClick={() => props.go("/account")}>My agents</Button>
     <div className="fl-trade-hero">
-      <div className="fl-trade-title"><span className="fl-card__glyph"><Icon name="yield" size={22} /></span><h1>{settings?.name ?? view?.id ?? agentId}</h1><StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} /></div>
+      <div className="fl-trade-title"><span className="fl-card__glyph"><Icon name="yield" size={22} /></span><h1>{settings?.name ?? view?.id ?? agentId}</h1><StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} /><AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." /></div>
+      <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
       <div className="fl-hired-actions">
         {signedOut ? <Button variant="primary" onClick={() => void props.signIn()}>Sign in to view</Button> : null}
         <Button variant={editing ? "primary" : "secondary"} icon={<Icon name="settings" size={15} />} disabled={busy || settings === null || draining || unresolved.length > 0} onClick={() => setEditing((value) => !value)}>{editing ? "Editing" : "Edit"}</Button>

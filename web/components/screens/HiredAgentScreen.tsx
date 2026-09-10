@@ -5,7 +5,7 @@ import { lpWithdrawOutcome } from "@/lib/lp/withdraw";
 import { formatEther, isHex, size } from "viem";
 import { ActivityRow, Button, Category, ChartFrame, Icon, MetricTile, Num, SegmentedToggle, StatusBadge } from "@/design-system";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
-import { CHART_INTERVALS, emptyRungPairs, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult } from "@/lib/exec/agent-detail";
+import { CHART_INTERVALS, emptyRungPairs, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult } from "@/lib/exec/agent-detail";
 import { REVIEWED_MAJORS_56, formatAtomic, midpointWbnbUsdtPrice, rangePrices, reviewedPair, type ReviewedPair, priceAtTick } from "@/lib/exec/pairs";
 import { gridModelLabel } from "@/lib/grid/economics";
 import { useAgentDetail, type ChartUnit, type UseAgentDetailResult } from "@/lib/exec/use-agent-detail";
@@ -21,6 +21,7 @@ import { TradeAgentDetail } from "@/components/trade/TradeAgentDetail";
 import { LpAgentDetail } from "@/components/agent/LpAgentDetail";
 import { LendingAgentDetail } from "@/components/agent/LendingAgentDetail";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
+import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
 import {
   EMPTY_REMOVE_PROGRESS,
   advanceRemoveAttempt,
@@ -506,7 +507,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
       motion: {
         sequenceId: fill.sequenceId,
         classification: "settlement",
-        label: fill.side === "buy" ? "Buy rung filled" : "Sell rung filled",
+        label: fill.side === "buy" ? "Buy level filled" : "Sell level filled",
         collected: "",
         price: { value: fill.price === null ? null : `${fill.price} ${context?.quote ?? ""}`, reason: fill.price === null ? "— price unavailable" : null },
         time: relativeTime(fill.atMs, Date.now()).text,
@@ -722,6 +723,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   // the flag absent this is the real result by identity.
   const detail = useMockAgentDetail(useAgentDetail(agentId), agentId);
   const owner = useOwnerActions();
+  const [runFilter, setRunFilter] = useState("All");
   const [tab, setTab] = useState<Tab>("Overview");
   const [delegatedUnit, setDelegatedUnit] = useState<"USD" | "BNB">("USD");
   const [message, setMessage] = useState("");
@@ -1398,6 +1400,10 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   const removeCallsId = progress.revokeAttempt?.callsId;
   const removeTransactionHash = progress.revokeAttempt?.receipt?.transactionHash ?? progress.revokeAttempt?.transactionHash;
   const sequences = view?.sequences ?? [];
+  // AGENT-GAS-ATTENTION §5 — the run-log bucket filter.
+  const shownSequences = sequences.filter((sequence) =>
+    runFilter === "All"
+    || (runFilter === "Succeeded" ? sequenceOutcome(sequence) === "succeeded" : sequenceOutcome(sequence) === "failed"));
   const identityStatus = <Erc8004IdentityStatus identity={view?.erc8004Identity} />;
 
   if (trading) {
@@ -1491,6 +1497,9 @@ export function HiredAgentScreen({ agentId, go }: Props) {
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <h1 style={{ font: "var(--type-page-title)" }}>{view?.id ?? agentId}</h1>
               <StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} />
+              {/* AGENT-GAS-ATTENTION §3.3 — the same chip the Account list shows,
+                  so an agent that needs gas is identifiable without opening it. */}
+              <AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." />
             </div>
             {statusMessage ? <span role="status" style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>{statusMessage}</span> : null}
             {identityStatus}
@@ -1500,14 +1509,11 @@ export function HiredAgentScreen({ agentId, go }: Props) {
                 {removeTransactionHash === undefined ? null : <> · <a href={`https://bscscan.com/tx/${removeTransactionHash}`} target="_blank" rel="noreferrer" style={{ color: "inherit", textDecoration: "underline" }}>View transaction</a></>}
               </span>
             ) : null}
-            {view?.gas?.low === true
-              // GRID-GAS-RESERVE W2: the pot the relay bills a shift from, against
-              // what the worker's gate holds under. Same two figures the plane
-              // reports; the worker will not move this grid until they cross.
-              ? <span role="alert" style={{ font: "var(--type-mono-xs)", color: "var(--warning)" }}>
-                  Gas low: the agent wallet holds {formatEther(BigInt(view.gas.nativeWei))} BNB and the next shift needs at least {formatEther(BigInt(view.gas.nextShiftWei))} BNB for relay gas. Deposit BNB to {view.walletAddress} — the grid holds until then.
-                </span>
-              : null}
+            {/* AGENT-GAS-ATTENTION §3.3 — the shared banner. Replaces the
+                GRID-GAS-RESERVE W2 sentence written here, so this screen, the
+                LP/trade/lending pages and the Account list all say the same
+                thing about the same wallet. */}
+            <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
           </div>
         </div>
         <div className="fl-hired-actions" style={{ display: "flex", gap: 8 }}>
@@ -1570,11 +1576,26 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       {tab === "Run log" && (
         <div className="fl-detail-grid" style={{ display: "grid", gap: 16, alignItems: "start" }}>
           <section style={{ border: "1px solid var(--border-card)", borderRadius: "var(--radius-md)", background: "var(--surface-card)", padding: "8px 20px 16px" }}>
-            {sequences.map((sequence) => {
-              const time = relativeTime(sequence.updatedAt, detail.asOfMs ?? Date.now());
-              const txHash = sequence.txHashes.at(-1);
-              return <ActivityRow key={sequence.sequenceId} timeline title={sequence.kind} detail={sequence.state} time={time.text} {...(txHash === undefined ? {} : { txHash: short(txHash), href: `https://bscscan.com/tx/${txHash}` })} />;
-            })}
+            {/* AGENT-GAS-ATTENTION §5 — the same three buckets the LP page uses. */}
+            <div style={{ padding: "8px 0 12px" }}>
+              <SegmentedToggle options={["All", "Succeeded", "Failed"]} value={runFilter} onChange={setRunFilter} />
+            </div>
+            {/* Bounded height. This list had NONE, so a grid that shifts every
+                few minutes turned the page into an endless footer — the defect
+                `LpAgentDetail` fixed for itself on 2026-09-06 and this screen
+                inherited nothing from. */}
+            <div data-testid="grid-run-log" style={{ maxHeight: 520, overflowY: "auto" }}>
+              {shownSequences.map((sequence) => {
+                const time = relativeTime(sequence.updatedAt, detail.asOfMs ?? Date.now());
+                const txHash = sequence.txHashes.at(-1);
+                return <ActivityRow key={sequence.sequenceId} timeline title={sequence.kind} detail={sequence.state} time={time.text} {...(txHash === undefined ? {} : { txHash: short(txHash), href: `https://bscscan.com/tx/${txHash}` })} />;
+              })}
+              {shownSequences.length === 0
+                ? <p style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>
+                    {sequences.length === 0 ? "No runs recorded yet." : `No ${runFilter.toLowerCase()} runs in this history.`}
+                  </p>
+                : null}
+            </div>
           </section>
         </div>
       )}

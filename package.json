@@ -37,6 +37,8 @@
     "venus-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/venus-worker.ts",
     "lending-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/lending-worker.ts",
     "live-lending": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-lending.ts",
+    "quant-worker": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/quant-worker.ts",
+    "live-quant": "node --import tsx --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/live-quant.ts",
     "billing-worker": "node --import tsx --env-file-if-exists=.env scripts/billing-worker.ts",
     "billing-status": "node --import tsx --env-file-if-exists=.env scripts/billing-status.ts",
     "billing-reconcile": "node --import tsx --env-file-if-exists=.env scripts/billing-reconcile.ts",

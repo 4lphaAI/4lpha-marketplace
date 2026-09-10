@@ -2783,6 +2783,37 @@ describe("GRID-GAS-RESERVE P2: gridShiftGasGate holds a shift the relay could no
     assert.notEqual(funding, -1);
     assert.equal(gate < funding, true, "gas gate first, funding conjunct second");
     const worker = readFileSync(new URL("../src/lp/worker.ts", import.meta.url), "utf8");
-    assert.match(worker, /bufferNativeWei = await nativeOf\(context\.agent\.walletAddress\)/u, "the worker reads the pot through readers.walletNativeBalance");
+    // AGENT-GAS-ATTENTION review 2 — the read moved behind `lpCycleNative`, and
+    // the pin follows it rather than being relaxed. The GUARANTEE is unchanged
+    // (the worker still populates `bufferNativeWei` from a real native read),
+    // and one is added: it is now the CYCLE's single reading, so this gate and
+    // the discretionary gas guard cannot straddle a spend and judge the same
+    // wallet on two different balances.
+    assert.match(
+      worker,
+      /bufferNativeWei = asNativeWei\(\r?\n?\s*await lpCycleNative\(deps, context\.agent\.walletAddress, gasCache\),?\r?\n?\s*\)/u,
+      "the worker reads the pot through the cycle's single native reading",
+    );
+    // REVIEW 3 (LOW) — the pin must cover the WHOLE CHAIN, not its two ends.
+    // Checking only "a reader binding exists" and "the shift call site reads
+    // bufferNativeWei" left the middle free: replacing the reader call with a
+    // fabricated balance, or detaching the discretionary read from the shared
+    // cache, both survived. Each link is pinned now.
+    assert.match(
+      worker,
+      /reading = await readNative\(wallet\);/u,
+      "lpCycleNative must actually invoke the reader, not synthesise a balance",
+    );
+    assert.match(
+      worker,
+      /const readNative = deps\.readers\.walletNativeBalance;/u,
+      "and that reader is readers.walletNativeBalance",
+    );
+    assert.match(
+      worker,
+      /const reading = await lpCycleNative\(deps, context\.agent\.walletAddress, gasCache\);/u,
+      "the discretionary guard must read through the SAME cycle cache, or it and "
+      + "gridShiftGasGate can judge one wallet on two balances straddling a spend",
+    );
   });
 });

@@ -10,15 +10,12 @@ export interface LockConnection {
   on(event: "error" | "end", listener: () => void): unknown;
   end(): Promise<void>;
 }
-export function identityFenceKey(binding: IdentityBinding): string {
-  return `4lpha:erc8004:v1:${binding.chainId}:${binding.minter.toLowerCase()}`;
-}
 export async function acquireIdentityFence(connection: LockConnection, binding: IdentityBinding): Promise<IdentityFence> {
   let live = true;
   connection.on("error", () => { live = false; }); connection.on("end", () => { live = false; });
   const check = () => { if (!live) fail("lock_lost"); };
   try {
-    const result = await connection.query(`select pg_try_advisory_lock(hashtextextended($1,0)) as locked`, [identityFenceKey(binding)]);
+    const result = await connection.query(`select pg_try_advisory_lock(hashtextextended($1,0)) as locked`, [`4lpha:erc8004:v1:${binding.chainId}:${binding.minter.toLowerCase()}`]);
     check(); if (result.rows[0]?.locked !== true) fail("lock_busy");
   } catch (error) { live = false; await connection.end().catch(() => {}); throw error; }
   return { check, async close() { live = false; await connection.end(); } };

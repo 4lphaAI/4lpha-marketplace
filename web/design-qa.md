@@ -33,3 +33,34 @@ No actionable P0/P1/P2 mismatch found.
 - [x] Typecheck, tests and production build pass.
 
 final result: passed
+
+---
+
+# Design QA — Deploy settings UI import (2026-09-08)
+
+source visual truth path: `C:/Users/Pro/AppData/Local/Temp/codex-clipboard-d6ca07f7-6d43-489d-b464-8c58cdcd3395.png`
+implementation screenshot path: unavailable; the current local/public `/deploy/grid` route stays on the marketplace shell after the existing client interaction, so a faithful browser capture of the deploy screen could not be obtained without changing routing outside this request.
+viewport: source 1114 × 997 px; implementation screenshot not captured
+state: deploy settings form, Demo/Live control unchanged
+
+## Evidence and checks
+
+- Static render verification covered `grid`, `trading`, `lp`, and `health` screens.
+- Each screen renders the scoped deploy styling, protocol chip, Guides, Tutorial Videos, and Reset parameters controls.
+- The existing Demo/Live values and deploy components remain wired unchanged.
+- No image asset was invented; existing PancakeSwap, BNB Chain, and Venus protocol assets are reused.
+
+## Findings
+
+- [P1] Browser comparison blocked by the pre-existing `/deploy/*` client route not transitioning from the marketplace shell. No route or hydration change was made because the request is UI-only and explicitly excludes unrelated app behavior.
+
+## Implementation Checklist
+
+- [x] Shared Claude Design form treatment applied to Grid, Trading, LP, and Lending.
+- [x] Protocol chip added for each deploy kind.
+- [x] Demo/Live semantics, defaults, API calls, and deploy handlers preserved.
+- [x] Web typecheck passes.
+- [x] Static render checks pass for all four deploy kinds.
+- [ ] Browser screenshot comparison after the existing route-transition blocker is resolved.
+
+final result: blocked

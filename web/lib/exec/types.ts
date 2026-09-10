@@ -12,7 +12,7 @@ export type AccountCoverage = {
   readonly reasons: readonly AccountCoverageReason[];
 };
 
-export type AccountCoverageReason = "none" | "capacity" | "dependency" | "stale" | "unpriced" | "unreadable" | "identity-conflict" | "unsupported-profile" | "zero-basis" | "missing-mark" | "held" | "declared";
+export type AccountCoverageReason = "none" | "capacity" | "dependency" | "stale" | "unpriced" | "unreadable" | "identity-conflict" | "unsupported-profile" | "zero-basis" | "missing-mark" | "held" | "declared" | "shared-wallet";
 
 export type AccountPortfolio = {
   readonly generatedAt: number;
@@ -74,7 +74,16 @@ export type AccountPortfolio = {
     readonly status: "provisioning" | "armed" | "paused" | "revoked" | "retired";
     readonly httpRuntimeProfile: "unbound-v1" | "trade-v1" | "raw-v1" | "lp-v1" | "venus-v1";
     readonly walletAddress: string;
-    readonly attention: "none" | "paused" | "provisioning" | "partial-data";
+    readonly attention: "none" | "paused" | "provisioning" | "gas-blocked" | "gas-low" | "partial-data";
+    /** AGENT-GAS-ATTENTION §3.1 — the reading behind a `gas-*` attention. */
+    readonly gas: {
+      readonly state: "unknown" | "blocked" | "low" | "ok";
+      readonly nativeWei: string | null;
+      readonly nextMotionWei: string;
+      readonly warnWei: string;
+      readonly blockWei: string;
+      readonly enforcement: "block" | "warn-only";
+    } | null;
     readonly holdings: {
       readonly method: "wallet-native-v1" | "wallet-known-erc20-v1" | "sellable-lp-exit-v1" | "owner-wide-venus-stored-net-v1" | "none";
       readonly state: "complete" | "partial" | "empty" | "unavailable";
@@ -84,7 +93,7 @@ export type AccountPortfolio = {
       readonly held: boolean;
     };
     readonly pnl: {
-      readonly method: "gross-lp-mark-to-declared-basis-v1" | "none";
+      readonly method: "gross-lp-mark-plus-residue-to-declared-basis-v2" | "none";
       readonly coverage: "full" | "partial" | "unsupported" | "unavailable";
       readonly reason: AccountCoverageReason;
       readonly eligibleBasisNativeWei: string | null;

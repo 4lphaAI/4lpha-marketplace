@@ -39,3 +39,6 @@ marketing-video-v2/
 # as the visual reference; the components ported out of them are the source of
 # truth in this repo.
 *Marketplace Standalone.html
+
+# QUANT-GRID gate-1 self-test fixture (ciphertext + public job record; never commit)
+.quant-selftest*.json
