@@ -547,23 +547,49 @@ function matchingValuation(position: Row): Row | null {
  * supports the conversion, the WBNB amount when it does not. Two decimals,
  * because a PnL that reads "+$0.0002" tells nobody anything.
  */
-function signedUsdOrWbnb(deltaWei: bigint, quoteUsd: number | null): string {
+function signedUsdOrWbnb(
+  deltaWei: bigint,
+  quoteUsd: number | null,
+  unit: { readonly decimals: number; readonly symbol: string } = { decimals: 18, symbol: "WBNB" },
+): string {
   const sign = deltaWei > 0n ? "+" : deltaWei < 0n ? "-" : "";
-  if (quoteUsd === null) {
-    return `${deltaWei > 0n ? "+" : ""}${formatSignedAtomic(deltaWei.toString(10))} WBNB`;
-  }
   const magnitude = deltaWei < 0n ? -deltaWei : deltaWei;
+  if (quoteUsd === null) {
+    return `${sign}${formatAtomic(magnitude.toString(10), unit.decimals, 6) ?? "—"} ${unit.symbol}`;
+  }
   // Cents, computed on the integer wei so the rounding happens once.
-  const cents = (magnitude * BigInt(Math.round(quoteUsd * 100)) + 10n ** 18n / 2n) / 10n ** 18n;
+  const one = 10n ** BigInt(unit.decimals);
+  const cents = (magnitude * BigInt(Math.round(quoteUsd * 100)) + one / 2n) / one;
   return `${sign}$${cents / 100n}.${(cents % 100n).toString(10).padStart(2, "0")}`;
 }
 
-/** Independent of chart windows: base-token holding priced from the arm receipt. */
+/**
+ * GRID-PNL-QUOTE (2026-09-11) — an amount of WBNB wei expressed in the OTHER
+ * leg's smallest units at a sqrt price. token1-per-token0 = sqrt² / 2^192 on
+ * raw units, so no decimal scaling is needed: the result is already in that
+ * token's wei.
+ */
+export function wbnbWeiInOtherLeg(wei: bigint, sqrtPriceX96: bigint, wbnbIsToken0: boolean): bigint {
+  const q = 1n << 192n;
+  return wbnbIsToken0 ? (wei * sqrtPriceX96 * sqrtPriceX96) / q : (wei * q) / (sqrtPriceX96 * sqrtPriceX96);
+}
+
+/**
+ * Independent of chart windows: the DISPLAY BASE held from the arm receipt.
+ *
+ * The benchmark is "hold the display base instead": for mubarak/WBNB that is
+ * the non-WBNB leg bought with the whole capital at the arm price and valued
+ * back in WBNB now (the default); for a grid whose display base is WBNB
+ * (`holdWbnb`, USDT/WBNB — GRID-PNL-QUOTE 2026-09-11) it is the WBNB capital
+ * itself, measured in the other leg: c·P_now against c·P_arm. Both are pure
+ * ratios of the arm and live sqrt prices, so no amount leaves the receipt.
+ */
 export function onChainGridHodl(input: {
   readonly benchmark: unknown; readonly capitalWei: string | null;
   readonly pool: string | null; readonly token0: string; readonly token1: string;
   readonly liveTick: LiveTick | null; readonly nowMs: number;
-}): { readonly metric: DetailMetric; readonly armedAtMs?: number; readonly txHash?: string } {
+  readonly holdWbnb?: boolean;
+}): { readonly metric: DetailMetric; readonly armedAtMs?: number; readonly txHash?: string; readonly armSqrtPriceX96?: bigint } {
   const missing = (reason: string) => ({ metric: { value: null, reason: `— ${reason}` } });
   const evidence = row(input.benchmark);
   if (evidence?.["status"] !== "ready") {
@@ -584,17 +610,25 @@ export function onChainGridHodl(input: {
   const tick = input.liveTick;
   if (!tick || tick.poolAddress?.toLowerCase() !== input.pool?.toLowerCase() || input.nowMs - tick.readAtMs < 0
     || input.nowMs - tick.readAtMs > 60_000 || !Number.isSafeInteger(tick.tick) || tick.tick < -887272 || tick.tick >= 887272
-    || !DECIMAL.test(tick.blockNumber) || BigInt(tick.blockNumber) < BigInt(evidence["blockNumber"])) return missing("waiting for a fresh pool price");
+    || !DECIMAL.test(tick.blockNumber) || BigInt(tick.blockNumber) < BigInt(evidence["blockNumber"])) return { ...missing("waiting for a fresh pool price"), armSqrtPriceX96: start };
   const wbnb0 = input.token0.toLowerCase() === WBNB_56;
   if (wbnb0 === (input.token1.toLowerCase() === WBNB_56)) return missing("invalid quote token");
   const q = 1n << 192n, s2 = start * start, current = getSqrtRatioAtTick(tick.tick), n2 = current * current;
+  const percentOf = (delta: bigint, over: bigint) => {
+    const magnitude = delta < 0n ? -delta : delta;
+    const hundredths = magnitude * 10_000n / over;
+    return `${delta < 0n ? "-" : delta > 0n ? "+" : ""}${hundredths / 100n}.${(hundredths % 100n).toString().padStart(2, "0")}%`;
+  };
+  if (input.holdWbnb === true) {
+    // Other-leg per WBNB is sqrt²/2^192 when WBNB is token0, else 2^192/sqrt²;
+    // the capital cancels, so the return is n2/s2 − 1 (or s2/n2 − 1).
+    const now = wbnb0 ? n2 : s2, arm = wbnb0 ? s2 : n2;
+    return { metric: { value: percentOf(now - arm, arm), reason: null, note: "if you had held WBNB instead · measured in the quote" }, armedAtMs, txHash, armSqrtPriceX96: start };
+  }
   const base = wbnb0 ? c * s2 / q : c * q / s2;
   if (base === 0n) return missing("capital is below one token unit");
   const held = wbnb0 ? base * q / n2 : base * n2 / q;
-  const delta = held - c, magnitude = delta < 0n ? -delta : delta;
-  const hundredths = magnitude * 10_000n / c;
-  const percent = `${delta < 0n ? "-" : delta > 0n ? "+" : ""}${hundredths / 100n}.${(hundredths % 100n).toString().padStart(2, "0")}%`;
-  return { metric: { value: percent, reason: null }, armedAtMs, txHash };
+  return { metric: { value: percentOf(held - c, c), reason: null }, armedAtMs, txHash, armSqrtPriceX96: start };
 }
 
 function grossHoldingsWei(input: {
@@ -1357,32 +1391,63 @@ export function mapAgentDetail(
     wbnbIsToken0: grid["wbnbIsToken0"],
   });
   const armedBudgetWei = owner.armedBudgetWei;
-  // USD per WBNB, from the same fresh snapshot the delegated tile uses. Absent
-  // (stale or unread) the figure stays in WBNB rather than inventing a rate.
-  // Asked for WBNB directly rather than through the pair: the holdings are
-  // already WBNB wei — every grid quotes in it — so the dollar figure must not
-  // also wait for the BASE token's decimals to arrive.
-  const grossQuoteUsd = quoteUsdFor("WBNB", tokenSnapshot, nowMs);
-  const grossPnl: DetailMetric = "reason" in holdings
-    ? { value: null, reason: holdings.reason }
+  // GRID-PNL-QUOTE (2026-09-11) — a grid whose DISPLAY base is WBNB
+  // (USDT/WBNB) is measured in its quote: the plane's WBNB figures read
+  // "holding USDT while BNB rose = losing WBNB", which is true and useless to
+  // a reader pricing that grid in USDT. The benchmark and the arm price come
+  // from the same on-chain arm receipt the HODL tile already stands on.
+  const quoteMeasured = pair !== null && gridSideInverted(pair);
+  const hodl = onChainGridHodl({ benchmark: grid["benchmark"], capitalWei: armedBudgetWei,
+    pool: typeof grid["poolAddress"] === "string" ? grid["poolAddress"] : poolAddressFor(token0, token1, safeInteger(pool["fee"]) ? pool["fee"] : 0),
+    token0, token1, liveTick: liveTick ?? null, nowMs, holdWbnb: quoteMeasured });
+  const quoteUnit = pair === null ? null : {
+    symbol: pairQuoting(pair).quote,
+    decimals: pairQuoting(pair).invert ? pair.decimals0 : pair.decimals1,
+  };
+  // The gross figures: holdings and budget in the MEASURING unit — WBNB wei by
+  // default; the quote's wei when `quoteMeasured`, holdings at the observed
+  // tick and the budget at the arm price, or a dash with the reason.
+  const measured: { readonly holdings: bigint; readonly budget: bigint; readonly unit: { readonly symbol: string; readonly decimals: number }; readonly usd: number | null } | { readonly reason: string } = "reason" in holdings
+    ? { reason: holdings.reason }
     : armedBudgetWei === null
-      ? { value: null, reason: "— the armed budget is not recorded on this agent" }
-      : {
-          // A PnL without a sign is ambiguous, and `formatSignedAtomic` only
-          // writes the minus. The plus is explicit here.
-          value: signedUsdOrWbnb(holdings.wei - BigInt(armedBudgetWei), grossQuoteUsd),
-          reason: null,
-          bnb: `${(holdings.wei - BigInt(armedBudgetWei)) > 0n ? "+" : ""}${formatSignedAtomic((holdings.wei - BigInt(armedBudgetWei)).toString(10))} WBNB`,
-          ...(grossQuoteUsd === null ? {} : { usd: signedUsdOrWbnb(holdings.wei - BigInt(armedBudgetWei), grossQuoteUsd) }),
-        };
-  const grossPnlPercent: DetailMetric = "reason" in holdings || armedBudgetWei === null || BigInt(armedBudgetWei) <= 0n
+      ? { reason: "— the armed budget is not recorded on this agent" }
+      : !quoteMeasured || quoteUnit === null
+        // USD per WBNB, from the same fresh snapshot the delegated tile uses.
+        // Absent (stale or unread) the figure stays in WBNB rather than
+        // inventing a rate. Asked for WBNB directly rather than through the
+        // pair: the holdings are already WBNB wei, so the dollar figure must
+        // not also wait for the BASE token's decimals to arrive.
+        ? { holdings: holdings.wei, budget: BigInt(armedBudgetWei), unit: { symbol: "WBNB", decimals: 18 }, usd: quoteUsdFor("WBNB", tokenSnapshot, nowMs) }
+        : hodl.armSqrtPriceX96 === undefined
+          ? { reason: `${hodl.metric.reason ?? "— arm price unavailable"} (needed to measure in ${quoteUnit.symbol})` }
+          : observed?.observedTick === null || observed === undefined
+            ? { reason: `— no observed tick to measure in ${quoteUnit.symbol}` }
+            : {
+                holdings: wbnbWeiInOtherLeg(holdings.wei, getSqrtRatioAtTick(observed.observedTick), grid["wbnbIsToken0"]),
+                budget: wbnbWeiInOtherLeg(BigInt(armedBudgetWei), hodl.armSqrtPriceX96, grid["wbnbIsToken0"]),
+                unit: quoteUnit,
+                usd: quoteUsdFor(quoteUnit.symbol, tokenSnapshot, nowMs),
+              };
+  const grossNote = quoteMeasured && quoteUnit !== null ? `gross · measured in ${quoteUnit.symbol}, budget at the arm price` : undefined;
+  const grossPnl: DetailMetric = "reason" in measured
+    ? { value: null, reason: measured.reason }
+    : {
+        // A PnL without a sign is ambiguous, and `formatSignedAtomic` only
+        // writes the minus. The plus is explicit here.
+        value: signedUsdOrWbnb(measured.holdings - measured.budget, measured.usd, measured.unit),
+        reason: null,
+        ...(grossNote === undefined ? {} : { note: grossNote }),
+        bnb: signedUsdOrWbnb(measured.holdings - measured.budget, null, measured.unit),
+        ...(measured.usd === null ? {} : { usd: signedUsdOrWbnb(measured.holdings - measured.budget, measured.usd, measured.unit) }),
+      };
+  const grossPnlPercent: DetailMetric = "reason" in measured || measured.budget <= 0n
     ? { value: null, reason: grossPnl.reason ?? "— no armed budget to measure against" }
     : (() => {
-        const delta = holdings.wei - BigInt(armedBudgetWei);
+        const delta = measured.holdings - measured.budget;
         const magnitude = delta < 0n ? -delta : delta;
-        const hundredths = (magnitude * 10_000n) / BigInt(armedBudgetWei);
+        const hundredths = (magnitude * 10_000n) / measured.budget;
         const sign = delta < 0n ? "-" : delta > 0n ? "+" : "";
-        return { value: `${sign}${hundredths / 100n}.${(hundredths % 100n).toString(10).padStart(2, "0")}%`, reason: null };
+        return { value: `${sign}${hundredths / 100n}.${(hundredths % 100n).toString(10).padStart(2, "0")}%`, reason: null, ...(grossNote === undefined ? {} : { note: grossNote }) };
       })();
   const provisioning = owner.status === "provisioning";
   const levelPositionIds = new Set(levels.map((entry) => entry.positionId));
@@ -1395,9 +1460,6 @@ export function mapAgentDetail(
       : [];
   });
   const sessionPublicKey = typeof owner.session?.["publicKey"] === "string" ? owner.session["publicKey"] : null;
-  const hodl = onChainGridHodl({ benchmark: grid["benchmark"], capitalWei: armedBudgetWei,
-    pool: typeof grid["poolAddress"] === "string" ? grid["poolAddress"] : poolAddressFor(token0, token1, safeInteger(pool["fee"]) ? pool["fee"] : 0),
-    token0, token1, liveTick: liveTick ?? null, nowMs });
   return {
     id: owner.id,
     status: owner.status,

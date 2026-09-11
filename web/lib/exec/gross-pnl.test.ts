@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mapAgentDetail } from "./agent-detail";
+import { getSqrtRatioAtTick } from "./pairs";
 
 /**
  * Gross PnL exists because realised PnL waits for a completed round trip: a
@@ -162,5 +163,63 @@ describe("gross PnL in USD", () => {
 
   it("signs a profit in dollars too", () => {
     expect(mapAgentDetail(owner("20000000000000000"), lp(), NOW, snapshot).grossPnl.value?.startsWith("+$")).toBe(true);
+  });
+});
+
+describe("gross PnL measured in the quote (GRID-PNL-QUOTE, 2026-09-11)", () => {
+  // USDT/WBNB: the display base is WBNB, so the grid is measured in USDT. The
+  // operator's live case: BNB rose ~4.14 % since arm, the grid sold WBNB three
+  // times on the way up and its holdings read 0.9746 × budget in WBNB — a loss
+  // in WBNB, a gain in USDT, and behind holding BNB.
+  const USDT = "0x55d398326f99059ff775485246999027b3197955";
+  const POOL = "0x172fcd41e0913e95784454622d1c3724f546f849";
+  const ARM_TICK = -65_600, NOW_TICK = -66_006; // token1/token0 = WBNB per USDT: a LOWER tick is a HIGHER BNB price.
+  const budget = 100_000_000_000_000_000n; // 0.1 WBNB
+  const benchmark = { status: "ready", method: "arm-transaction-post-swap-v1", txHash: `0x${"11".repeat(32)}`, blockHash: `0x${"22".repeat(32)}`, blockNumber: "100", armedAtMs: 1_000, pool: POOL, token0: USDT, token1: WBNB, sqrtPriceX96: getSqrtRatioAtTick(ARM_TICK).toString(), capitalWei: budget.toString() };
+  const liveTick = { poolAddress: POOL, tick: NOW_TICK, blockNumber: "200", readAtMs: NOW };
+  function usdtGrid(holdingsWei: bigint, overrides: Record<string, unknown> = {}): unknown {
+    return {
+      data: {
+        positions: [],
+        sequences: [],
+        grid: {
+          pool: { token0: USDT, token1: WBNB, fee: 100 }, poolAddress: POOL, wbnbIsToken0: false, tickSpacing: 1,
+          buyRange: { tickLower: -66_100, tickUpper: -66_050 }, sellRange: { tickLower: -65_950, tickUpper: -65_900 },
+          levels: [], cycles: { available: true, recorded: 0, rows: [], note: "no cycles yet" },
+          buffer: { quoteWei: holdingsWei.toString(), baseWei: "0" },
+          benchmark,
+          ...overrides,
+        },
+        settingsDigest: "0xabc",
+      },
+    };
+  }
+  const priceAt = (tick: number) => 1 / Math.pow(1.0001, tick);
+  const bnbReturn = priceAt(NOW_TICK) / priceAt(ARM_TICK) - 1; // ≈ +4.14 %
+
+  it("measures PnL and HODL in USDT: a WBNB loss is a USDT gain behind holding BNB", () => {
+    const holdings = (budget * 9_746n) / 10_000n;
+    const view = mapAgentDetail(owner(budget.toString()), usdtGrid(holdings), NOW, undefined, undefined, liveTick);
+    expect(view.grid.sideInverted).toBe(true);
+    expect(view.hodl?.value).toBe(`+${(bnbReturn * 100).toFixed(2)}%`);
+    const expectedPct = 0.9746 * (1 + bnbReturn) - 1; // ≈ +1.50 %
+    // Percent truncates to hundredths like every other tile.
+    expect(view.grossPnlPercent.value).toBe(`+${(Math.floor(expectedPct * 10_000) / 100).toFixed(2)}%`);
+    // USDT is a dollar, so the tile reads in $: budget ≈ $73.4 at the arm price.
+    const budgetUsd = 0.1 * priceAt(ARM_TICK);
+    expect(view.grossPnl.value).toBe(`+$${(expectedPct * budgetUsd).toFixed(2)}`);
+    expect(view.grossPnl.bnb).toMatch(/^\+1\.05\d+ USDT$/u);
+    expect(view.grossPnl.note).toBe("gross · measured in USDT, budget at the arm price");
+    // The same grid in WBNB would have read -2.54 %: that is the figure the operator saw.
+    const inWbnb = mapAgentDetail(owner(budget.toString()), { ...(usdtGrid(holdings) as { data: object }), data: { ...(usdtGrid(holdings) as { data: { grid: object } }).data, grid: { ...(usdtGrid(holdings) as { data: { grid: object } }).data.grid, pool: { token0: MUBARAK, token1: WBNB, fee: 2500 }, benchmark: { ...benchmark, token0: MUBARAK } } } }, NOW, undefined, undefined, liveTick);
+    expect(inWbnb.grid.sideInverted).toBe(false);
+    expect(inWbnb.grossPnlPercent.value).toBe("-2.54%");
+  });
+
+  it("dashes with the reason rather than falling back to WBNB when the arm price is missing", () => {
+    const view = mapAgentDetail(owner(budget.toString()), usdtGrid(budget, { benchmark: undefined }), NOW, undefined, undefined, liveTick);
+    expect(view.grossPnl.value).toBeNull();
+    expect(view.grossPnl.reason).toContain("needed to measure in USDT");
+    expect(view.grossPnlPercent.value).toBeNull();
   });
 });
