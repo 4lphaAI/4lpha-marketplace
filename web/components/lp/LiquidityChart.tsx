@@ -6,14 +6,24 @@ export type LiquidityGeometry = {
   orientation: { quoteIsToken0: boolean; decimals0: number; decimals1: number; symbol0: string; symbol1: string };
   display: { invert: boolean };
 };
+/** A grid rung painted over the profile: a bid holds quote below the price, an ask holds base above it. */
+export type LiquidityRung = { tickLower: number; tickUpper: number; tone: "bid" | "ask" };
 export type LiquidityChartProps = {
   showSnapshot?: boolean;
   poolAddress: string; geometry: LiquidityGeometry | null;
-  range: { mode: "live" | "reference"; tickLower: number; tickUpper: number } | { mode: "unavailable"; reason: string };
-  legend: { range: string };
+  range:
+    | { mode: "live" | "reference"; tickLower: number; tickUpper: number }
+    | { mode: "unavailable"; reason: string }
+    /** GRID-DETAIL-ORIENTATION-HOTFIX — a grid's signed rungs (two, or four for a dual level), each in its own tone. */
+    | { mode: "rungs"; rungs: readonly LiquidityRung[] };
+  legend: { range: string } | { bid: string; ask: string };
   /** Present only where a unit flip is offered; the deploy form passes none. */
   onFlipUnits?: () => void;
 };
+const RUNG_TONE = { bid: "var(--cat-grid)", ask: "var(--warn)" } as const;
+function toneColor(tone: "range" | "bid" | "ask"): string {
+  return tone === "range" ? "var(--cat-lp)" : RUNG_TONE[tone];
+}
 export function displayOrientation(g: LiquidityGeometry) {
   const quoteIsToken0 = g.orientation.quoteIsToken0 !== g.display.invert;
   return { quoteIsToken0, decimals0: g.orientation.decimals0, decimals1: g.orientation.decimals1,
@@ -53,8 +63,11 @@ function liquidityAutoZoom(spacing: number, currentTick: number, lo: number | nu
  */
 export function LiquidityChart({ poolAddress, geometry: input, range, legend, showSnapshot = true, onFlipUnits }: LiquidityChartProps) {
   const geometry = input === null ? null : { ...input, display: displayOrientation(input) };
-  const lo = range.mode === "unavailable" ? null : range.tickLower;
-  const hi = range.mode === "unavailable" ? null : range.tickUpper;
+  // The painted span: one range, or the outer envelope of every rung so the
+  // auto-zoom frames the whole grid.
+  const rungs: readonly LiquidityRung[] = range.mode === "rungs" ? range.rungs : [];
+  const lo = range.mode === "unavailable" ? null : range.mode === "rungs" ? (rungs.length === 0 ? null : Math.min(...rungs.map((r) => r.tickLower))) : range.tickLower;
+  const hi = range.mode === "unavailable" ? null : range.mode === "rungs" ? (rungs.length === 0 ? null : Math.max(...rungs.map((r) => r.tickUpper))) : range.tickUpper;
   const [zoom, setZoom] = React.useState({ pool: "", index: 1 });
   const zoomIndex = zoom.pool === poolAddress
     ? zoom.index
@@ -115,14 +128,19 @@ export function LiquidityChart({ poolAddress, geometry: input, range, legend, sh
     // A grouped bar is "in range" only when EVERY bin it covers is signed;
     // a bar that merely straddles a signed boundary is marked partial and
     // drawn in between, so the highlight never overstates the signed range.
-    const fullyInside = range.mode === "live" && lo !== null && hi !== null && first >= lo && last <= hi;
-    const overlaps = range.mode === "live" && lo !== null && hi !== null && first < hi && last > lo;
+    // In rungs mode the same rule runs per rung, and the bar takes that rung's tone.
+    const spans: readonly { lo: number; hi: number; tone: "range" | "bid" | "ask" }[] = range.mode === "rungs"
+      ? rungs.map((r) => ({ lo: r.tickLower, hi: r.tickUpper, tone: r.tone }))
+      : range.mode === "live" && lo !== null && hi !== null ? [{ lo, hi, tone: "range" }] : [];
+    const inside = spans.find((s) => first >= s.lo && last <= s.hi);
+    const straddled = inside === undefined ? spans.find((s) => first < s.hi && last > s.lo) : undefined;
     bars.push({
       tickLower: first,
       tickUpper: last,
       liquidity: group.reduce((m, b) => Math.max(m, b.liquidity), 0),
-      inRange: fullyInside,
-      partial: overlaps && !fullyInside,
+      inRange: inside !== undefined,
+      partial: straddled !== undefined,
+      tone: (inside ?? straddled)?.tone ?? "range",
       isMarket: activeBin !== null && activeBin >= first && activeBin < last,
     });
   }
@@ -159,14 +177,19 @@ export function LiquidityChart({ poolAddress, geometry: input, range, legend, sh
             }}>{geometry.display.quoteSymbol} per {geometry.display.baseSymbol} ⇄</button>}
         </span>
         <span>
-          {!geometry ? poolAddress ? "Price geometry unavailable" : "Select a pool" : current.error ? current.error : current.blockNumber === null ? <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span className="fl-spin" aria-hidden="true" data-testid="lp-liquidity-spinner" />Reading the pool…</span> : `${range.mode === "live" ? "live" : "pool snapshot"}${current.truncated ? " · edges truncated" : ""} · refreshes every 30 s`}
+          {!geometry ? poolAddress ? "Price geometry unavailable" : "Select a pool" : current.error ? current.error : current.blockNumber === null ? <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span className="fl-spin" aria-hidden="true" data-testid="lp-liquidity-spinner" />Reading the pool…</span> : `${range.mode === "live" || range.mode === "rungs" ? "live" : "pool snapshot"}${current.truncated ? " · edges truncated" : ""} · refreshes every 30 s`}
         </span>
       </div>
       {showSnapshot && current.blockNumber !== null ? <small style={{color:"var(--text-subtle)"}}>Pool snapshot · block {current.blockNumber} · read {current.readAtMs === undefined ? "time unavailable" : new Date(current.readAtMs).toLocaleTimeString()}</small> : null}
       <div data-testid="lp-liquidity-legend" data-block={current.blockNumber ?? ""} data-lower={lo ?? ""} data-upper={hi ?? ""} style={{ display: "flex", gap: 14, flexWrap: "wrap", font: "var(--weight-regular) var(--text-xs)/1.2 var(--font-mono)", color: "var(--text-subtle)" }}>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: "#f7931a", display: "inline-block" }} />
           current price{geometry && current.currentTick !== null ? ` · ${formatPrice(priceFromTick(current.currentTick, geometry.display))} ${geometry.display.quoteSymbol}` : ""}</span>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: "var(--cat-lp)", display: "inline-block" }} />{legend.range}</span>
+        {"range" in legend
+          ? <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: "var(--cat-lp)", display: "inline-block" }} />{legend.range}</span>
+          : <>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: RUNG_TONE.bid, display: "inline-block" }} />{legend.bid}</span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: RUNG_TONE.ask, display: "inline-block" }} />{legend.ask}</span>
+          </>}
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: "var(--line-1)", display: "inline-block" }} />other liquidity</span>
       </div>
       {range.mode === "unavailable" ? <span>{range.reason}</span> : null}
@@ -186,9 +209,9 @@ export function LiquidityChart({ poolAddress, geometry: input, range, legend, sh
         ) : bars.map((b, i) => {
           const heightPct = Math.max(3, b.liquidity * 100);
           return (
-            <div key={b.tickLower} data-tick={b.tickLower} data-tick-upper={b.tickUpper} data-in-range={b.inRange ? "true" : "false"} data-partial={b.partial ? "true" : "false"} data-market={b.isMarket ? "true" : "false"}
+            <div key={b.tickLower} data-tick={b.tickLower} data-tick-upper={b.tickUpper} data-in-range={b.inRange ? "true" : "false"} data-partial={b.partial ? "true" : "false"} data-tone={b.inRange || b.partial ? b.tone : ""} data-market={b.isMarket ? "true" : "false"}
               onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
-              style={{ flex: 1, height: `${heightPct}%`, background: b.isMarket ? "#f7931a" : b.inRange ? "var(--cat-lp)" : b.partial ? "var(--cat-lp-tint, var(--line-1))" : "var(--line-1)", opacity: b.inRange || b.isMarket ? 1 : b.partial ? 0.85 : 0.7, outline: hover === i ? "2px solid #4ade80" : "none", outlineOffset: 1, borderRadius: 1, cursor: "pointer", transition: "background 120ms" }} />
+              style={{ flex: 1, height: `${heightPct}%`, background: b.isMarket ? "#f7931a" : b.inRange ? toneColor(b.tone) : b.partial ? (b.tone === "range" ? "var(--cat-lp-tint, var(--line-1))" : toneColor(b.tone)) : "var(--line-1)", opacity: b.inRange || b.isMarket ? 1 : b.partial ? (b.tone === "range" ? 0.85 : 0.45) : 0.7, outline: hover === i ? "2px solid #4ade80" : "none", outlineOffset: 1, borderRadius: 1, cursor: "pointer", transition: "background 120ms" }} />
           );
         })}
       </div>

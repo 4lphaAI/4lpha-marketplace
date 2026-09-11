@@ -80,6 +80,7 @@ function baseView(): AgentDetailView {
       token1: "",
       fee: 0,
       wbnbIsToken0: false,
+      sideInverted: false,
       observedPrice: null,
       quoteUsd: null,
       baseAddress: null,

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { USDT_56, WBNB_56 } from "./pairs";
-import { emptyRungPairs, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills } from "./agent-detail";
+import { displaySide, emptyRungPairs, gridSideInverted, gridSideLabel, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, reduceTokenKlines, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, tokenKlinesPath } from "./agent-detail";
 import { priceAtTick as priceAtTickRef } from "./pairs";
 
 const NOW = 2_000_000_000_000;
@@ -154,9 +154,13 @@ describe("strict agent-detail mapper", () => {
     expect(view.recordedCycleDelta.value).toBe("-0.01 WBNB");
     expect(view.recordedCycleDelta.note).toBe(NOTE);
     expect(view.recordedCycles.value).toBe("1 recorded · 1 round trips");
+    // `to-sell` is the PLANE's buy rung (bought USDT with WBNB) completing. The
+    // fixture is USDT/WBNB, whose display base is WBNB, so the reader SOLD
+    // WBNB — the label names the display side (GRID-DETAIL-ORIENTATION-HOTFIX).
+    expect(view.grid.sideInverted).toBe(true);
     expect(view.motions[0]).toMatchObject({
       classification: "settlement",
-      label: "Buy rung filled",
+      label: "Sell rung filled",
       txHash: TX,
     });
     expect(view.motions[0]?.collected).toContain("USDT");
@@ -204,7 +208,38 @@ describe("strict agent-detail mapper", () => {
     expect(view.recordedCycleDelta.reason).toBe("— no agent-wide total; see level rows");
     expect(view.recordedCycles.reason).toBe("— no agent-wide total; see level rows");
     expect(view.levels.map((level) => level.roundTrips)).toEqual([0, 0]);
-    expect(view.motions.map((motion) => motion.label)).toEqual(["Sell rung filled", "Sell rung filled"]);
+    // `to-buy` = the plane's sell rung (sold USDT for WBNB) = the reader BOUGHT WBNB.
+    expect(view.motions.map((motion) => motion.label)).toEqual(["Buy rung filled", "Buy rung filled"]);
+  });
+
+  it("names a rung and a fill by the DISPLAY side: inverted on USDT/WBNB, identity on mubarak/WBNB", () => {
+    const usdtWbnb = { chainId: 56 as const, token0: USDT_56, token1: WBNB_56, symbol0: "USDT", symbol1: "WBNB", decimals0: 18, decimals1: 18, wbnbIsToken0: false };
+    const mubarakWbnb = { chainId: 56 as const, token0: "0x5c85d6c6825ab4032337f11ee92a72df936b46f6", token1: WBNB_56, symbol0: "mubarak", symbol1: "WBNB", decimals0: 18, decimals1: 18, wbnbIsToken0: false };
+    const wbnbBtcb = { chainId: 56 as const, token0: "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", token1: WBNB_56, symbol0: "BTCB", symbol1: "WBNB", decimals0: 18, decimals1: 18, wbnbIsToken0: false };
+    expect(gridSideInverted(usdtWbnb)).toBe(true);
+    expect(gridSideInverted(mubarakWbnb)).toBe(false);
+    expect(gridSideInverted(wbnbBtcb)).toBe(false);
+    expect(displaySide("buy", true)).toBe("sell");
+    expect(displaySide("sell", true)).toBe("buy");
+    expect(displaySide("buy", false)).toBe("buy");
+    // The plane's buy rung holds WBNB: on USDT/WBNB that is the reader's ask
+    // of WBNB; the plane's sell rung holds USDT, the reader's bid.
+    expect(gridSideLabel("buy", usdtWbnb)).toBe("ASK WBNB");
+    expect(gridSideLabel("sell", usdtWbnb)).toBe("BID USDT");
+    expect(gridSideLabel("buy", mubarakWbnb)).toBe("BID WBNB");
+    expect(gridSideLabel("sell", mubarakWbnb)).toBe("ASK mubarak");
+  });
+
+  it("fills a USDT/WBNB rung at the DISPLAY edge: the plane's sell rung (holds USDT) is the bid and completes at its price-low edge", () => {
+    const base = lp().data.grid;
+    const asSell = lp({ grid: { ...base, levels: [{ ...base.levels[0], gridRole: "sell" }] } });
+    const sellView = mapAgentDetail(owner(), asSell, NOW);
+    expect(sellView.positions[0]?.sideLabel).toBe("BID USDT");
+    expect(sellView.positions[0]?.rung?.fillPrice).toBe(sellView.positions[0]?.rung?.priceLow);
+    // …and the plane's buy rung (holds WBNB) is the ask, completing at the high edge.
+    const buyView = mapAgentDetail(owner(), lp(), NOW);
+    expect(buyView.positions[0]?.sideLabel).toBe("ASK WBNB");
+    expect(buyView.positions[0]?.rung?.fillPrice).toBe(buyView.positions[0]?.rung?.priceHigh);
   });
 
   it("does not call a zero delta comparable before one complete round trip", () => {
@@ -336,6 +371,32 @@ describe("OHLCV request and HODL reducer", () => {
     const otherLeg = reduceOhlcv(response(USDT_56, WBNB_56), NOW - 60_000, NOW, { base: WBNB_56, quote: USDT_56, baseSymbol: "WBNB" });
     expect(otherLeg.candles).toEqual([]);
     expect(otherLeg.banner).toBe("chart prices the other leg, not WBNB");
+  });
+
+  it("reads WBNB's own token klines as the chart of a WBNB-base grid, same shape and HODL as the pool feed", () => {
+    // Measured 2026-09-11: the pool feed for USDT/WBNB prices USDT (≈ 0.999);
+    // `kind=token` for WBNB is the USDT-per-WBNB series the page wants.
+    expect(tokenKlinesPath(WBNB_56, 8, "1m")).toBe(`/api/market-data/ohlcv?kind=token&address=${WBNB_56}&interval=1m&limit=8`);
+    const klines = {
+      data: [
+        { timestamp: NOW, open: 705, high: 721, low: 704, close: 720, volume: 2 },
+        { timestamp: NOW - 60_000, open: 700, high: 711, low: 699, close: 705, volume: 1 },
+      ],
+      meta: { address: WBNB_56, interval: "1m", limit: 2, source: "onchainos", asOf: NOW, staleness: "fresh", count: 2 },
+    };
+    const result = reduceTokenKlines(klines, NOW - 60_000, NOW, { baseSymbol: "WBNB", interval: "1m" });
+    expect(result.candles.map((candle) => candle.timestamp)).toEqual([NOW - 60_000, NOW]);
+    expect(result.candles[1]?.volume).toBe(2);
+    expect(result.stale).toBe(false);
+    expect(result.banner).toBeNull();
+    expect(result.priceNow).toBe(720);
+    expect(result.hodl.value).toBe("2.13%");
+    expect(result.hodl.note).toContain("WBNB spot return since arm");
+    const stale = reduceTokenKlines({ ...klines, meta: { ...klines.meta, staleness: "stale" } }, NOW - 60_000, NOW, { baseSymbol: "WBNB" });
+    expect(stale.stale).toBe(true);
+    expect(stale.priceNow).toBeNull();
+    expect(stale.hodl.reason).toBe("— chart data is stale");
+    expect(() => reduceTokenKlines({ data: [], meta: { source: "x", asOf: NOW } }, NOW, NOW, { baseSymbol: null })).toThrow("Klines staleness is missing.");
   });
 
   it("accepts any reviewed pool the agent actually trades", () => {

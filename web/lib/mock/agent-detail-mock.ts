@@ -310,6 +310,7 @@ export function mockAgentDetailView(agentId: string): AgentDetailView {
       token1: WBNB,
       fee: 2_500,
       wbnbIsToken0: false,
+      sideInverted: false,
       observedPrice: priceOf(OBSERVED_TICK),
       quoteUsd: QUOTE_USD,
       baseAddress: MUBARAK,

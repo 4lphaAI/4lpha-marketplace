@@ -59,3 +59,29 @@ it("offers the unit flip only where a handler is given, and names the unit it is
     expect([...host.querySelectorAll("button")].find(b => b.textContent?.includes("per"))!.textContent).toContain("WBNB per USDT");
   } finally { await act(async () => root.unmount()); }
 });
+
+it("rungs mode paints each signed rung in its own tone, frames both, and shows a bid/ask legend", async () => {
+  // GRID-DETAIL-ORIENTATION-HOTFIX: the grid detail's Liquidity panel, ported from LP.
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { bins: [-30, -20, -10, 0, 10, 20, 30].map((tickLower) => ({ tickLower, liquidity: "10" })), currentTick: 5, blockNumber: "7", truncated: false } }), { status: 200 })));
+  const host = document.createElement("div"), root = createRoot(host);
+  const g = { ...geometry, orientation: { ...geometry.orientation, quoteIsToken0: false } };
+  try {
+    await act(async () => {
+      root.render(<LiquidityChart poolAddress="0x1111111111111111111111111111111111111111" geometry={g}
+        range={{ mode: "rungs", rungs: [{ tickLower: -30, tickUpper: -10, tone: "bid" }, { tickLower: 20, tickUpper: 40, tone: "ask" }] }}
+        legend={{ bid: "BIDS · BUY WBNB", ask: "ASKS · SELL WBNB" }} />);
+      await Promise.resolve();
+    });
+    const tones = [...host.querySelectorAll("[data-tick]")].map((el) => `${el.getAttribute("data-tick")}:${el.getAttribute("data-tone")}`);
+    expect(tones).toEqual(["-30:bid", "-20:bid", "-10:", "0:", "10:", "20:ask", "30:ask"]);
+    expect(host.querySelectorAll('[data-in-range="true"]').length).toBe(4);
+    expect(host.querySelector('[data-market="true"]')?.getAttribute("data-tick")).toBe("0");
+    expect(host.textContent).toContain("BIDS · BUY WBNB");
+    expect(host.textContent).toContain("ASKS · SELL WBNB");
+    expect(host.textContent).toContain("live");
+    // The envelope of both rungs is what the legend reports and the auto-zoom frames.
+    const legend = host.querySelector('[data-testid="lp-liquidity-legend"]');
+    expect(legend?.getAttribute("data-lower")).toBe("-30");
+    expect(legend?.getAttribute("data-upper")).toBe("40");
+  } finally { await act(async () => root.unmount()); }
+});

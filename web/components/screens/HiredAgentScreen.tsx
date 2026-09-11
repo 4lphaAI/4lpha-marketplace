@@ -5,8 +5,9 @@ import { lpWithdrawOutcome } from "@/lib/lp/withdraw";
 import { formatEther, isHex, size } from "viem";
 import { ActivityRow, Button, Category, ChartFrame, Icon, MetricTile, Num, SegmentedToggle, StatusBadge } from "@/design-system";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
-import { CHART_INTERVALS, emptyRungPairs, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult } from "@/lib/exec/agent-detail";
-import { REVIEWED_MAJORS_56, formatAtomic, midpointWbnbUsdtPrice, rangePrices, reviewedPair, type ReviewedPair, priceAtTick } from "@/lib/exec/pairs";
+import { CHART_INTERVALS, displaySide, emptyRungPairs, gridSideLabel, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult } from "@/lib/exec/agent-detail";
+import { REVIEWED_MAJORS_56, formatAtomic, midpointWbnbUsdtPrice, pairQuoting, rangePrices, reviewedPair, type ReviewedPair, priceAtTick } from "@/lib/exec/pairs";
+import { LiquidityChart, type LiquidityGeometry } from "@/components/lp/LiquidityChart";
 import { gridModelLabel } from "@/lib/grid/economics";
 import { useAgentDetail, type ChartUnit, type UseAgentDetailResult } from "@/lib/exec/use-agent-detail";
 import { useMockAgentDetail } from "@/lib/mock/use-mock-agent-detail";
@@ -47,12 +48,12 @@ import { HireRecoveryActions } from "@/components/deploy/HireRecoveryActions";
 
 type Props = { readonly agentId: string; readonly go: (route: string) => void };
 type Tab = "Overview" | "Run log";
+/** `side` is the DISPLAY side (`displaySide`): "buy" bought the display base, "sell" sold it. */
 type Fill = { readonly motion: DetailMotion; readonly side: "buy" | "sell" };
 
 const TICK_ASK = "var(--warn)", TICK_BID = "var(--cat-grid)";
 const LP_HIRE_STORAGE_KEY = "4lpha:lp-hire:v1";
 const LENDING_HIRE_STORAGE_KEY = "4lpha:lending-hire:v1";
-const DESIGN_NEUTRAL_BAR_HEIGHTS = [38, 46, 42, 54, 50, 62, 58, 74, 66, 82, 96, 98, 90, 114, 96, 106, 94, 86, 96, 102, 78, 70, 62, 54, 58, 50, 46, 42, 38, 34] as const;
 
 function Panel({ title, right, children, pad = 0, className = "" }: { readonly title?: React.ReactNode; readonly right?: React.ReactNode; readonly children: React.ReactNode; readonly pad?: number; readonly className?: string }) {
   return (
@@ -163,44 +164,40 @@ function pairContext(view: AgentDetailView | null | undefined): { readonly pair:
  */
 function rangePrice(view: AgentDetailView | null, role: "bid" | "ask"): string | null {
   if (view === null) return null;
-  const prices = role === "bid" ? view.grid.buyPrices : view.grid.sellPrices;
+  // `buyPrices` is the PLANE's buy rung; on a grid whose display base is
+  // WBNB that rung is the reader's ASK (`sideInverted`).
+  const planeBuyIsBid = !view.grid.sideInverted;
+  const prices = (role === "bid") === planeBuyIsBid ? view.grid.buyPrices : view.grid.sellPrices;
   if (prices === null) return null;
   return role === "bid" ? prices.low : prices.high;
 }
 
+/** The plane's signed range for a DISPLAY side, through the same seam. */
+function displayRange(view: AgentDetailView, role: "bid" | "ask"): { readonly tickLower: number; readonly tickUpper: number } {
+  const planeBuyIsBid = !view.grid.sideInverted;
+  return (role === "bid") === planeBuyIsBid ? view.grid.buyRange : view.grid.sellRange;
+}
+
 /**
- * The leg a rung holds, in its own asset: "191.1 mubarak" for an ask, "0.0105
- * WBNB" for a bid. Decimals from the resolved pair; a pair the page cannot
- * resolve still shows the WBNB leg, which is always 18-decimal.
+ * The leg a rung holds, in its own asset: "191.1 mubarak" for a rung holding
+ * mubarak, "0.0105 WBNB" for one holding WBNB, "13.735 USDT" on USDT/WBNB.
+ * The non-WBNB leg is named by ITS OWN symbol — not by the display base, which
+ * on USDT/WBNB is WBNB and printed "13.735 WBNB" for 13.735 USDT. Decimals
+ * from the resolved pair; a pair the page cannot resolve still shows the WBNB
+ * leg, which is always 18-decimal.
  */
 function heldLegText(nft: OnChainPosition, holdsWbnb: boolean, wbnbIsToken0: boolean, context: ReturnType<typeof pairContext>): string | null {
   const wbnbLeg = wbnbIsToken0 ? nft.amounts.amount0 : nft.amounts.amount1;
-  const baseLeg = wbnbIsToken0 ? nft.amounts.amount1 : nft.amounts.amount0;
+  const otherLeg = wbnbIsToken0 ? nft.amounts.amount1 : nft.amounts.amount0;
   if (holdsWbnb) {
     const text = formatAtomic(wbnbLeg.toString(10), 18, 6);
     return text === null ? null : `${text} WBNB`;
   }
   if (context === null) return null;
   const decimals = wbnbIsToken0 ? context.pair.decimals1 : context.pair.decimals0;
-  const text = formatAtomic(baseLeg.toString(10), decimals, 3);
-  return text === null ? null : `${text} ${context.base}`;
-}
-
-function observedPrice(view: AgentDetailView | null, tick: number | null): string | null {
-  const context = pairContext(view);
-  if (view === null || context === null || tick === null || tick <= -887_272 || tick >= 887_272) return null;
-  if (tick === view.grid.observedTick && view.grid.observedPrice !== null) return view.grid.observedPrice;
-  return priceAtTick(tick, context.pair);
-}
-
-function midpointTick(lower: number, upper: number): string {
-  const twice = lower + upper;
-  return twice % 2 === 0 ? String(twice / 2) : `${twice < 0 ? "-" : ""}${Math.floor(Math.abs(twice) / 2)}.5`;
-}
-
-function displayPrice(value: string | null, quote: string | null): string {
-  if (value === null) return "—";
-  return quote === "USDT" || quote === "USDC" ? `$${value}` : value;
+  const symbol = wbnbIsToken0 ? context.pair.symbol1 : context.pair.symbol0;
+  const text = formatAtomic(otherLeg.toString(10), decimals, 3);
+  return text === null ? null : `${text} ${symbol}`;
 }
 
 /**
@@ -242,18 +239,17 @@ function short(value: string): string {
   return value.length <= 12 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`;
 }
 
+/** The position page PancakeSwap shows for a V3 NFT — the same link the LP detail uses. */
+function pancakePositionUrl(tokenId: string): string {
+  return `https://pancakeswap.finance/liquidity/${tokenId}`;
+}
+
 function fills(view: AgentDetailView | null): readonly Fill[] {
+  // The mapper already labels a motion by its DISPLAY side (`displaySide`).
   return view?.motions.flatMap((motion) => motion.classification !== "settlement" ? [] : [{
     motion,
     side: motion.label === "Buy rung filled" ? "buy" as const : "sell" as const,
   }]) ?? [];
-}
-
-function collected(fill: Fill, view: AgentDetailView | null): string {
-  const context = pairContext(view);
-  const symbol = fill.side === "buy" ? "WBNB" : context?.quote;
-  if (symbol === undefined) return "—";
-  return fill.motion.collected.split(" + ").find((part) => part.endsWith(` ${symbol}`)) ?? `— ${symbol}`;
 }
 
 function fillPrice(fill: Fill, view: AgentDetailView | null): string {
@@ -418,57 +414,46 @@ function resolutionSummary(payload: unknown): string {
   return "Resolve submitted; the plane recorded its disposition.";
 }
 
-function rungValue(view: AgentDetailView | null, role: "buy" | "sell"): string {
-  const position = view?.positions.find((entry) => entry.role === role && entry.state !== "closed");
-  return position === undefined ? "—" : metricValue(position.value);
-}
-
-function LiquidityTicks({ view }: { readonly view: AgentDetailView | null }) {
-  const [hover, setHover] = React.useState<number | null>(null);
+/**
+ * GRID-DETAIL-ORIENTATION-HOTFIX — the pool's LIVE liquidity profile with the
+ * two signed rungs painted over it, ported from the LP detail's
+ * `LiquidityChart` (finalized-block reader, 30 s refresh, zoom). The mock-up
+ * it replaces painted design-time bar heights with only three data-bearing
+ * columns. Rungs reach the chart through `displayRange`, so a bid is a bid
+ * whichever side the plane calls it; the footer keeps the grid's own line.
+ */
+function GridLiquidity({ view }: { readonly view: AgentDetailView | null }) {
+  const [invert, setInvert] = React.useState(false);
+  React.useEffect(() => { setInvert(false); }, [view?.grid.pool]);
   const context = pairContext(view);
   const observedTick = view?.grid.observedTick ?? null;
   const buyPrice = rangePrice(view, "bid");
   const sellPrice = rangePrice(view, "ask");
-  const bar = (index: number): { readonly kind: "bid" | "active" | "ask" | "neutral"; readonly tick: string; readonly price: string } => {
-    if (index === 10) return { kind: "bid", tick: view === null ? "—" : midpointTick(view.grid.buyRange.tickLower, view.grid.buyRange.tickUpper), price: displayPrice(buyPrice, context?.quote ?? null) };
-    if (index === 14) return { kind: "active", tick: observedTick === null ? "—" : String(observedTick), price: displayPrice(observedPrice(view, observedTick), context?.quote ?? null) };
-    if (index === 18) return { kind: "ask", tick: view === null ? "—" : midpointTick(view.grid.sellRange.tickLower, view.grid.sellRange.tickUpper), price: displayPrice(sellPrice, context?.quote ?? null) };
-    const tick = observedTick === null || view === null ? null : observedTick + (index - 14) * view.grid.tickSpacing;
-    return { kind: "neutral", tick: tick === null ? "—" : String(tick), price: displayPrice(observedPrice(view, tick), context?.quote ?? null) };
-  };
+  const geometry: LiquidityGeometry | null = view !== null && context !== null && observedTick !== null && view.grid.tickSpacing > 0
+    ? {
+      spacing: view.grid.tickSpacing,
+      currentTick: observedTick,
+      currentTickAsOfMs: view.grid.observationAgeMs === null ? 0 : Date.now() - view.grid.observationAgeMs,
+      orientation: { quoteIsToken0: pairQuoting(context.pair).invert, decimals0: context.pair.decimals0, decimals1: context.pair.decimals1, symbol0: context.pair.symbol0, symbol1: context.pair.symbol1 },
+      display: { invert },
+    }
+    : null;
+  const range: React.ComponentProps<typeof LiquidityChart>["range"] = view === null
+    ? { mode: "unavailable", reason: "— no owner view yet" }
+    : view.grid.rangeUnavailableBecause !== null
+      ? { mode: "unavailable", reason: `— ${view.grid.rangeUnavailableBecause}` }
+      : { mode: "rungs", rungs: [{ ...displayRange(view, "bid"), tone: "bid" }, { ...displayRange(view, "ask"), tone: "ask" }] };
   return (
-    <div style={{ display: "grid", gap: 12, padding: 16, position: "relative" }}>
-      {hover !== null ? (() => {
-        const d = bar(hover);
-        return (
-          <div style={{ position: "absolute", left: `calc(${((hover + 0.5) / DESIGN_NEUTRAL_BAR_HEIGHTS.length) * 100}% - 96px)`, top: -6, zIndex: 5, width: 192, padding: "10px 12px", background: "var(--surface-card)", border: "1px solid var(--brand)", borderRadius: "var(--radius-sm)", display: "grid", gap: 5, pointerEvents: "none", boxShadow: "var(--shadow-2, 0 8px 24px rgb(0 0 0 / 0.45))" }}>
-            {[["TICK", d.tick], ["PRICE", d.price], ["LIQUIDITY", "—"],
-              ["YOUR LIQUIDITY", d.kind === "bid" ? rungValue(view, "buy") : d.kind === "ask" ? rungValue(view, "sell") : "—"]].map(([k, v]) => (
-              <span key={k} style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.05em" }}>{k}</span>
-                <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--ink-1)" }}>{v}</span>
-              </span>
-            ))}
-          </div>
-        );
-      })() : null}
-      <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 96 }} onMouseLeave={() => setHover(null)}>
-        {DESIGN_NEUTRAL_BAR_HEIGHTS.map((height, i) => {
-          const d = bar(i);
-          const special = d.kind !== "neutral";
-          const bg = d.kind === "bid" ? TICK_BID : d.kind === "ask" ? TICK_ASK : d.kind === "active" ? "var(--ink-2)" : "var(--raised-3)";
-          return (
-            <div key={i} onMouseEnter={() => setHover(i)} style={{ flex: 1, display: "grid", gap: 6, justifyItems: "center", cursor: "crosshair" }}>
-              <div style={{ width: "100%", height: special ? 96 : height, background: bg, borderRadius: 2, outline: hover === i ? "1px solid var(--brand)" : "none", outlineOffset: 1 }} />
-              {special ? <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", whiteSpace: "nowrap" }}>{d.price}</span> : null}
-            </div>
-          );
-        })}
-      </div>
+    <div style={{ display: "grid", gap: 12, padding: 16 }}>
+      <LiquidityChart
+        showSnapshot={false}
+        poolAddress={view?.grid.pool ?? ""}
+        geometry={geometry}
+        range={range}
+        legend={{ bid: `BIDS · BUY ${context?.base ?? "—"}`, ask: `ASKS · SELL ${context?.base ?? "—"}` }}
+        onFlipUnits={() => setInvert((value) => !value)}
+      />
       <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", paddingTop: 10, borderTop: "1px solid var(--line-1)", font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" }}>
-        <span style={{ display: "flex", alignItems: "center", gap: 6 }}><i style={{ width: 8, height: 8, background: TICK_ASK, borderRadius: 1 }} />ASKS · SELL {context?.base ?? "—"}</span>
-        <span style={{ display: "flex", alignItems: "center", gap: 6 }}><i style={{ width: 8, height: 8, background: TICK_BID, borderRadius: 1 }} />BIDS · BUY {context?.quote ?? "—"}</span>
-        <span style={{ display: "flex", alignItems: "center", gap: 6 }}><i style={{ width: 8, height: 8, background: "var(--ink-2)", borderRadius: 1 }} />ACTIVE TICK</span>
         <span style={{ marginLeft: "auto", display: "flex", gap: 18, flexWrap: "wrap" }}>
           <span title={view?.grid.tickSource === "live" ? "Read straight from the pool by this page, independent of the worker" : view?.grid.tickSource === "worker" ? "The worker's last finalized observation" : undefined}>ACTIVE TICK {observedTick ?? "—"}{view?.grid.tickSource === "live" ? " · LIVE" : ""}</span><span>TICK SPACING {view?.grid.tickSpacing || "—"}</span><span>QUOTES {buyPrice ?? "—"} – {sellPrice ?? "—"} {context?.quote ?? "—"}</span><span>—</span><span>{view?.grid.liveRows ?? "—"} LIVE ORDERS</span>
         </span>
@@ -502,19 +487,23 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
       priorPairs: emptyRungPairs(emptyRungs, view.grid.wbnbIsToken0),
       wbnbIsToken0: view.grid.wbnbIsToken0,
       pair: context?.pair ?? null,
-    }).map((fill): Fill => ({
-      side: fill.side,
+    }).map((fill): Fill => {
+      // `shiftFills` answers in the PLANE's sides; the feed shows the display side.
+      const side = displaySide(fill.side, view.grid.sideInverted);
+      return {
+      side,
       motion: {
         sequenceId: fill.sequenceId,
         classification: "settlement",
-        label: fill.side === "buy" ? "Buy level filled" : "Sell level filled",
+        label: side === "buy" ? "Buy level filled" : "Sell level filled",
         collected: "",
         price: { value: fill.price === null ? null : `${fill.price} ${context?.quote ?? ""}`, reason: fill.price === null ? "— price unavailable" : null },
         time: relativeTime(fill.atMs, Date.now()).text,
         timeTitle: new Date(fill.atMs).toISOString(),
         txHash: fill.txHash,
       },
-    }));
+      };
+    });
     const known = new Set(crosses.map((fill) => fill.motion.sequenceId));
     return [...crosses, ...fills(view).filter((fill) => !known.has(fill.motion.sequenceId))]
       .sort((a, b) => b.motion.timeTitle.localeCompare(a.motion.timeTitle));
@@ -559,7 +548,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
                   {fill.side === "buy" ? "BID BUY" : "ASK SELL"} @ {fillPrice(fill, view)}
                 </span>
                 <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", textAlign: "right" }} title={fill.motion.timeTitle}>{fill.motion.time}</span>
-                <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-sans)", color: "var(--text-subtle)" }}>{fill.side === "buy" ? `Bought ${pairContext(view)?.base ?? "base"} with WBNB` : `Sold ${context?.base ?? "base"} for WBNB`}</span>
+                <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-sans)", color: "var(--text-subtle)" }}>{fill.side === "buy" ? `Bought ${context?.base ?? "base"} with ${context?.quote ?? "quote"}` : `Sold ${context?.base ?? "base"} for ${context?.quote ?? "quote"}`}</span>
                 {fill.motion.txHash ? <a href={`https://bscscan.com/tx/${fill.motion.txHash}`} target="_blank" rel="noreferrer" style={{ display: "flex", gap: 4, alignItems: "center", font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>{short(fill.motion.txHash)}<Icon name="external" size={11} /></a> : <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>—</span>}
               </div>
             ))}
@@ -568,7 +557,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
       </div>
 
       <Panel title="Liquidity" right={<><span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>{view?.grid.pair ?? "—"} · PANCAKESWAP V3</span></>}>
-        <LiquidityTicks view={view} />
+        <GridLiquidity view={view} />
       </Panel>
       </>) : null}
 
@@ -625,7 +614,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
                 />
                 <span style={{ display: "grid", gap: 4 }}>
                 <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>{position.pair}</span>
-                <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>{position.tokenId === null ? "—" : short(position.tokenId)} · GRID ORDER</span>
+                <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>{position.tokenId === null ? "—" : <a className="fl-lp-nft-link" href={pancakePositionUrl(position.tokenId)} target="_blank" rel="noreferrer" title="Open this position on PancakeSwap">{short(position.tokenId)}</a>} · GRID ORDER</span>
                 </span>
               </span>
               <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-muted)" }} title={position.ageTitle}>{position.age}</span>
@@ -664,7 +653,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
               <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <span style={{ display: "grid", gap: 3 }}>
                   <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>{view?.grid.pair ?? "—"}</span>
-                  <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--warning)" }} title="On chain in the agent wallet now; the plane records it once the relay confirms the batch.">{id} · NEW RUNG · NOT RECORDED YET</span>
+                  <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--warning)" }} title="On chain in the agent wallet now; the plane records it once the relay confirms the batch."><a className="fl-lp-nft-link" href={pancakePositionUrl(id)} target="_blank" rel="noreferrer" style={{ color: "inherit" }}>{id}</a> · NEW RUNG · NOT RECORDED YET</span>
                 </span>
               </span>
               <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-muted)" }}>just now</span>
@@ -673,7 +662,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
                 <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>Price @ {fillPrice ?? "—"} {context?.quote ?? "—"}</span>
               </span>
               <span style={{ display: "grid", gap: 4 }}>
-                <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--ink-1)", letterSpacing: "0.04em" }}>{holdsWbnb === null ? "—" : holdsWbnb ? "BID WBNB" : `ASK ${context?.base ?? ""}`}</span>
+                <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--ink-1)", letterSpacing: "0.04em" }}>{holdsWbnb === null || context === null ? "—" : gridSideLabel(holdsWbnb ? "buy" : "sell", context.pair)}</span>
                 <span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-sans)", color: "var(--text-subtle)" }}>Open order</span>
               </span>
               <Num value="—" tone="flat" size="sm" />
@@ -696,8 +685,10 @@ function sideIcon(
   role: string,
 ): React.ReactNode {
   if (view == null) return null;
-  const address = role === "sell" ? view.grid.baseAddress : role === "buy" ? view.grid.quoteAddress : null;
-  const symbol = role === "sell" ? view.grid.base : role === "buy" ? view.grid.quote : null;
+  // The icon is the asset the rung HOLDS, read through the display seam.
+  const side = role === "buy" || role === "sell" ? displaySide(role, view.grid.sideInverted) : null;
+  const address = side === "sell" ? view.grid.baseAddress : side === "buy" ? view.grid.quoteAddress : null;
+  const symbol = side === "sell" ? view.grid.base : side === "buy" ? view.grid.quote : null;
   if (address === null && symbol === null) return null;
   return <TokenIcon src={icons[address?.toLowerCase() ?? ""] ?? null} symbol={symbol} size={16} />;
 }

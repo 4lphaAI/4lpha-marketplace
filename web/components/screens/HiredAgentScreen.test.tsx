@@ -65,7 +65,7 @@ const view: AgentDetailView = {
   sequences: [{ sequenceId: "sequence-real", positionId: "real-position-7", kind: "grid-flip", state: "completed", recoveryState: "none", note: "settled", outcomeUnavailable: false, txHashes: [`0x${"44".repeat(32)}`], steps: [{ index: 0, kind: "zap-out", decisionId: "lp:sequence-real:0", state: "COMMITTED" }], updatedAt: 2_000, createdAt: 1_500, shiftCause: null, targetBuyRange: null, targetSellRange: null }],
   positions: [{ positionId: "real-position-7", state: "open", tokenId: "9007199254740993", pair: "WBNB / USDT", role: "buy", sideLabel: "BID USDT", rung: { tickLower: -9, tickUpper: 1, priceLow: "640.00000000", priceHigh: "645.00000000", fillPrice: "640.00000000" }, age: "2h ago", ageTitle: "2026-09-02T00:00:00.000Z", value: metric("0.081 WBNB"), unrealised: metric("-0.004 WBNB"), fees: { value: null, reason: "— fees are counted in unrealised" }, nftUrl: "https://bscscan.com/nft/0x46a15b0b27311cedf172ab29e4f4766fbe7f4364/9007199254740993" }],
   lp: null,
-  grid: { pool: "0x5555555555555555555555555555555555555555", pair: "WBNB / USDT", base: "WBNB" as const, quote: "USDT" as const, symbol0: "USDT", symbol1: "WBNB", decimals0: 18, decimals1: 18, token0: "0x55d398326f99059ff775485246999027b3197955", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", fee: 100, wbnbIsToken0: false, observedPrice: "645.00000000", quoteUsd: 1, baseAddress: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", quoteAddress: "0x55d398326f99059ff775485246999027b3197955", buyPrices: { low: "640.00000000", high: "645.00000000" }, sellPrices: { low: "646.00000000", high: "650.00000000" }, tickSpacing: 10, mode: "shift", gapTicks: 150, widthTicks: 100, driftPctOfGap: 0, buyRange: { tickLower: -9, tickUpper: 1 }, sellRange: { tickLower: 1, tickUpper: 11 }, observedTick: -3, observationAgeMs: 2_000, observationStale: false, tickSource: "worker", rangeUnavailableBecause: null, liveRows: 1 },
+  grid: { pool: "0x5555555555555555555555555555555555555555", pair: "WBNB / USDT", base: "WBNB" as const, quote: "USDT" as const, symbol0: "USDT", symbol1: "WBNB", decimals0: 18, decimals1: 18, token0: "0x55d398326f99059ff775485246999027b3197955", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", fee: 100, wbnbIsToken0: false, sideInverted: true, observedPrice: "645.00000000", quoteUsd: 1, baseAddress: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", quoteAddress: "0x55d398326f99059ff775485246999027b3197955", buyPrices: { low: "640.00000000", high: "645.00000000" }, sellPrices: { low: "646.00000000", high: "650.00000000" }, tickSpacing: 10, mode: "shift", gapTicks: 150, widthTicks: 100, driftPctOfGap: 0, buyRange: { tickLower: -9, tickUpper: 1 }, sellRange: { tickLower: 1, tickUpper: 11 }, observedTick: -3, observationAgeMs: 2_000, observationStale: false, tickSource: "worker", rangeUnavailableBecause: null, liveRows: 1 },
 };
 function lpFixture(): NonNullable<AgentDetailView["lp"]> {
   return {model:"custom",pool:{...view.grid,poolAddress:view.grid.pool},openingRange:{source:"explicit",tickLower:-9,tickUpper:1},
@@ -104,7 +104,9 @@ describe("Hired agent detail provenance", () => {
     expect(html).toContain("+2.89%");
     expect(html).not.toContain("0.78%"); // Chart return is no longer the HODL baseline.
     expect(html).toContain("Position");
-    expect(html).toContain("900719…0993 · GRID ORDER");
+    // The NFT id links to its PancakeSwap position page (operator ask 2026-09-11), the LP detail's link.
+    expect(html).toContain("</a> · GRID ORDER");
+    expect(html).toMatch(/<a class="fl-lp-nft-link" href="https:\/\/pancakeswap\.finance\/liquidity\/9007199254740993"[^>]*>900719…0993<\/a> · GRID ORDER/u);
     expect(html).toContain("0.081 WBNB");
     expect(html).toContain("-0.004 WBNB");
     expect(html).toContain("https://bscscan.com/nft/0x46a15b0b27311cedf172ab29e4f4766fbe7f4364/9007199254740993");

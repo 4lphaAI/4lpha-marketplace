@@ -10,6 +10,7 @@ import {
   rangePrices,
   priceAtTick,
   type MajorSymbol,
+  type ReviewedPair,
   nftPositionUrl,
   resolvePair,
   getSqrtRatioAtTick,
@@ -296,6 +297,13 @@ export type AgentDetailView = {
     readonly token1: string;
     readonly fee: number;
     readonly wbnbIsToken0: boolean;
+    /**
+     * The plane quotes EVERY grid in WBNB (`buy` = buy the non-WBNB leg with
+     * WBNB); the page quotes stable-first. When the DISPLAY base is WBNB
+     * (USDT/WBNB) every plane side reads the other way round on this page —
+     * see {@link displaySide}. `false` while the pair is unresolved.
+     */
+    readonly sideInverted: boolean;
     /** Quote-per-base price at the observed tick, and at each signed rung edge. */
     readonly observedPrice: string | null;
     /** USD per ONE unit of the quote asset, when a fresh price supports it. */
@@ -795,6 +803,7 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
       token1: "",
       fee: 0,
       wbnbIsToken0: false,
+      sideInverted: false,
       observedPrice: null,
       quoteUsd: null,
       baseAddress: null,
@@ -1118,6 +1127,7 @@ function mapLpAgentDetail(
       token1: "",
       fee: 0,
       wbnbIsToken0: false,
+      sideInverted: false,
       observedPrice: null,
       quoteUsd: null,
       baseAddress: null,
@@ -1238,9 +1248,12 @@ export function mapAgentDetail(
     let classification: DetailMotion["classification"] = "unknown";
     if (sequence?.kind === "grid-flip" || (sequence?.kind === "grid-recenter" && sequence.recenterEvidence === "settlement")) classification = "settlement";
     if (sequence?.kind === "grid-recenter" && sequence.recenterEvidence === "drift") classification = "drift";
+    // `to-sell` is the PLANE's buy rung completing; the label names the DISPLAY
+    // side (`displaySide`), so the run log and the fill feed tell one story.
+    const filledSide = displaySide(direction === "to-sell" ? "buy" : "sell", pair === null ? false : gridSideInverted(pair));
     const label = classification === "drift" ? "Rung re-centred (drift)"
       : classification === "unknown" ? "Motion — cause unavailable"
-        : direction === "to-sell" ? "Buy rung filled" : "Sell rung filled";
+        : filledSide === "buy" ? "Buy rung filled" : "Sell rung filled";
     const freed0 = requiredDecimal(cycle["freed0Wei"]);
     const freed1 = requiredDecimal(cycle["freed1Wei"]);
     const collected = pair === null
@@ -1292,12 +1305,15 @@ export function mapAgentDetail(
         tickUpper: signed.tickUpper,
         priceLow: edges.low,
         priceHigh: edges.high,
-        fillPrice: role === "sell" ? edges.high : edges.low,
+        // The edge the order completes at is a DISPLAY question: a rung that
+        // sells the display base completes at the price-high edge, whichever
+        // side the plane calls it.
+        fillPrice: displaySide(role === "sell" ? "sell" : "buy", gridSideInverted(pair)) === "sell" ? edges.high : edges.low,
       };
     })();
     const sideLabel = pair === null || (role !== "buy" && role !== "sell")
       ? null
-      : role === "sell" ? `ASK ${pairQuoting(pair).base}` : `BID ${pairQuoting(pair).quote}`;
+      : gridSideLabel(role, pair);
     return {
       positionId,
       state,
@@ -1434,6 +1450,7 @@ export function mapAgentDetail(
       token1,
       fee: safeInteger(pool["fee"]) ? pool["fee"] : 0,
       wbnbIsToken0: grid["wbnbIsToken0"],
+      sideInverted: pair === null ? false : gridSideInverted(pair),
       observedPrice: pair === null || observed?.observedTick === null || observed === undefined
         ? null
         : priceAtTick(observed.observedTick, pair),
@@ -1490,13 +1507,63 @@ export function ohlcvRequestPath(pool: string, armMs: number, nowMs: number, int
   return `/api/market-data/ohlcv?kind=pool&address=${pool.toLowerCase()}&interval=${interval}&limit=${ohlcvLimit(armMs, nowMs, interval)}`;
 }
 
-// The quote leg's own USD klines. The pool feed prices only the base in USD, and
-// the data plane has no `token=base|quote` parameter, so pricing this grid in
-// its quote asset is a ratio of two USD series rather than a feed we can ask for.
-export function quoteKlinesPath(quote: string, limit: number, interval: ChartInterval): string {
-  if (!ADDRESS.test(quote)) throw new Error("Quote address is invalid.");
+// A single token's own USD klines. The pool feed prices only ITS base in USD,
+// and the data plane has no `token=base|quote` parameter, so pricing a grid in
+// its quote asset is a ratio of two USD series rather than a feed we can ask
+// for — and a grid whose display base is WBNB (USDT/WBNB) reads WBNB's own
+// series, because the pool feed prices USDT there ({@link reduceTokenKlines}).
+export function tokenKlinesPath(token: string, limit: number, interval: ChartInterval): string {
+  if (!ADDRESS.test(token)) throw new Error("Token address is invalid.");
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("Kline limit is invalid.");
-  return `/api/market-data/ohlcv?kind=token&address=${quote.toLowerCase()}&interval=${interval}&limit=${limit}`;
+  return `/api/market-data/ohlcv?kind=token&address=${token.toLowerCase()}&interval=${interval}&limit=${limit}`;
+}
+
+/**
+ * GRID-DETAIL-ORIENTATION-HOTFIX — the token klines feed as the SAME
+ * `OhlcvResult` the pool feed produces, for a grid whose display base is
+ * WBNB. Measured 2026-09-11: the pool feed for the USDT/WBNB pools prices
+ * USDT (closes ≈ 0.999), so `reduceOhlcv` rightly refuses it; WBNB's own USD
+ * series (`kind=token`) IS the USDT-per-WBNB price the page wants. The
+ * feed carries no `base`/`quote` identity, so the caller vouches for the
+ * address it asked for; freshness and the HODL return follow `reduceOhlcv`.
+ */
+export function reduceTokenKlines(
+  payload: unknown,
+  armMs: number,
+  nowMs: number,
+  expected: { readonly baseSymbol: string | null; readonly interval?: ChartInterval },
+): OhlcvResult {
+  const bar = INTERVAL_MS[expected.interval ?? "1m"];
+  if (!safeInteger(armMs) || !safeInteger(nowMs)) throw new Error("OHLCV time is invalid.");
+  const body = row(payload);
+  const meta = row(body?.["meta"]);
+  if (body === null || meta === null || !Array.isArray(body["data"])) throw new Error("Klines returned an unexpected response.");
+  if (typeof meta["source"] !== "string" || meta["source"].length === 0 || !safeInteger(meta["asOf"])) throw new Error("Klines metadata is invalid.");
+  if (meta["staleness"] !== "fresh" && meta["staleness"] !== "stale" && meta["staleness"] !== "dead") throw new Error("Klines staleness is missing.");
+  const candles: ChartCandle[] = body["data"].map((value) => {
+    const candle = row(value);
+    if (candle === null || !safeInteger(candle["timestamp"]) || !finitePositive(candle["open"])
+      || !finitePositive(candle["high"]) || !finitePositive(candle["low"])
+      || !finitePositive(candle["close"])) throw new Error("Kline candle is invalid.");
+    const volume = typeof candle["volume"] === "number" && Number.isFinite(candle["volume"]) && candle["volume"] >= 0 ? candle["volume"] : 0;
+    return { timestamp: candle["timestamp"], open: candle["open"], high: candle["high"], low: candle["low"], close: candle["close"], volume };
+  }).sort((a, b) => a.timestamp - b.timestamp);
+  const latest = candles[candles.length - 1];
+  const latestAge = latest === undefined ? null : nowMs - latest.timestamp;
+  const fresh = meta["staleness"] === "fresh" && latestAge !== null && latestAge >= 0 && latestAge <= bar * 2;
+  const start = candles.find((candle) => candle.timestamp >= armMs);
+  const startValid = start !== undefined && start.timestamp - armMs >= 0 && start.timestamp - armMs < bar;
+  const symbol = expected.baseSymbol ?? "WBNB";
+  const hodl = !startValid ? { value: null, reason: "— no candle at arm time" }
+    : !fresh || latest === undefined ? { value: null, reason: "— chart data is stale" }
+      : { value: `${(((latest.close - start.close) / start.close) * 100).toFixed(2)}%`, reason: null, note: `${symbol} spot return since arm · if you had held ${symbol} instead` };
+  return {
+    candles,
+    stale: !fresh,
+    banner: fresh ? null : `chart data is stale (as of ${new Date(meta["asOf"]).toISOString()})`,
+    priceNow: fresh && latest !== undefined ? latest.close : null,
+    hodl,
+  };
 }
 
 export function reduceQuoteKlines(payload: unknown): ReadonlyMap<number, ChartCandle> {
@@ -1726,6 +1793,37 @@ export function liveRungValueWei(input: {
     : input.amount1 + (input.amount0 * sqrt * sqrt) / (1n << 192n);
 }
 
+
+/**
+ * GRID-DETAIL-ORIENTATION-HOTFIX — the ONE seam between the plane's sides and
+ * the page's.
+ *
+ * The plane's `buy` rung holds WBNB and buys the other leg; its `sell` rung
+ * holds the other leg and sells it for WBNB (`src/lp/gridGeometry.ts`). The
+ * page prices a pair stable-first (`pairQuoting`), so on USDT/WBNB the display
+ * BASE is WBNB and the plane's `buy` (buy USDT with WBNB) is, to the reader,
+ * a SELL of WBNB. `true` exactly when the display base is WBNB.
+ */
+export function gridSideInverted(pair: ReviewedPair): boolean {
+  const displayBase = pairQuoting(pair).invert ? pair.token1 : pair.token0;
+  return displayBase.toLowerCase() === WBNB_56;
+}
+
+/** A plane side as the page reads it: `buy` = the rung or fill that BUYS the display base. */
+export function displaySide(role: "buy" | "sell", inverted: boolean): "buy" | "sell" {
+  if (!inverted) return role;
+  return role === "buy" ? "sell" : "buy";
+}
+
+/**
+ * A rung is named by the asset it HOLDS: a display-sell rung holds the base it
+ * is waiting to sell ("ASK mubarak", "ASK WBNB"), a display-buy rung holds the
+ * quote it will pay ("BID WBNB", "BID USDT").
+ */
+export function gridSideLabel(role: "buy" | "sell", pair: ReviewedPair): string {
+  const quoting = pairQuoting(pair);
+  return displaySide(role, gridSideInverted(pair)) === "sell" ? `ASK ${quoting.base}` : `BID ${quoting.quote}`;
+}
 
 export type ShiftFill = {
   readonly sequenceId: string;

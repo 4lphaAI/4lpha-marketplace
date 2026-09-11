@@ -13,7 +13,8 @@ import {
   ohlcvLimit,
   ohlcvRequestPath,
   priceInQuote,
-  quoteKlinesPath,
+  tokenKlinesPath,
+  reduceTokenKlines,
   reduceOhlcv,
   reduceQuoteKlines,
   type AgentDetailView,
@@ -141,6 +142,42 @@ function detailQuoteSymbol(view: AgentDetailView | null): string | null {
   return view.hireSizingName === "lp-v1"
     ? view.lp?.pool?.quote ?? null
     : view.grid.quote;
+}
+
+/**
+ * GRID-DETAIL-ORIENTATION-HOTFIX — the USD series of this agent's DISPLAY
+ * base. The pool feed prices the pool's own base, which for the USDT/WBNB
+ * pools is USDT (measured 2026-09-11: closes ≈ 0.999) — a flat line that is
+ * not this agent's price. When the display base is WBNB the page reads WBNB's
+ * own token klines instead; every other pair keeps the pool feed and its
+ * pair-identity checks exactly as before.
+ */
+async function fetchBaseSeries(
+  view: AgentDetailView,
+  pool: string,
+  armMs: number,
+  nowMs: number,
+  interval: ChartInterval,
+  signal: AbortSignal,
+): Promise<{ readonly ok: true; readonly result: OhlcvResult } | { readonly ok: false; readonly status: number }> {
+  const base = detailBaseAddress(view);
+  const baseSymbol = detailBaseSymbol(view);
+  if (base !== null && base.toLowerCase() === WBNB_56) {
+    const response = await fetch(tokenKlinesPath(base, ohlcvLimit(armMs, nowMs, interval), interval), { cache: "no-store", signal });
+    if (!response.ok) return { ok: false, status: response.status };
+    return { ok: true, result: reduceTokenKlines(await response.json() as unknown, armMs, nowMs, { baseSymbol, interval }) };
+  }
+  const response = await fetch(ohlcvRequestPath(pool, armMs, nowMs, interval), { cache: "no-store", signal });
+  if (!response.ok) return { ok: false, status: response.status };
+  return {
+    ok: true,
+    result: reduceOhlcv(await response.json() as unknown, armMs, nowMs, {
+      base,
+      quote: detailQuoteAddress(view),
+      baseSymbol,
+      interval,
+    }),
+  };
 }
 
 function detailTokens(view: AgentDetailView | null): readonly string[] {
@@ -352,17 +389,13 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
         );
         return;
       }
-      const response = await fetch(ohlcvRequestPath(pool, current.armMs, Date.now()), { cache: "no-store", signal: controller.signal });
-      if (response.ok) {
-        setMarket(reduceOhlcv(await response.json() as unknown, current.armMs, Date.now(), {
-          base: detailBaseAddress(current),
-          quote: detailQuoteAddress(current),
-          baseSymbol: detailBaseSymbol(current),
-        }));
+      const series = await fetchBaseSeries(current, pool, current.armMs, Date.now(), "1m", controller.signal);
+      if (series.ok) {
+        setMarket(series.result);
         setMarketReason(null);
       } else {
-        if (response.status === 404) setMarket({ candles: [], stale: true, banner: "— no candles for this pool", priceNow: null, hodl: { value: null, reason: "— no candles for this pool" } });
-        setMarketReason(response.status === 404 ? "no candles for this pool" : `market data HTTP ${response.status}`);
+        if (series.status === 404) setMarket({ candles: [], stale: true, banner: "— no candles for this pool", priceNow: null, hodl: { value: null, reason: "— no candles for this pool" } });
+        setMarketReason(series.status === 404 ? "no candles for this pool" : `market data HTTP ${series.status}`);
       }
     } catch (error) {
       // Market telemetry is independently optional — the verified owner view
@@ -395,21 +428,13 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
     chartAbortRef.current = controller;
     try {
       const nowMs = Date.now();
-      const response = await fetch(ohlcvRequestPath(pool, current.armMs, nowMs, interval), {
-        cache: "no-store",
-        signal: controller.signal,
-      });
-      if (!response.ok) {
+      const series = await fetchBaseSeries(current, pool, current.armMs, nowMs, interval, controller.signal);
+      if (!series.ok) {
         setChartCandles([]);
-        setChartBanner(response.status === 404 ? `no ${interval} candles for this pool` : `chart data HTTP ${response.status}`);
+        setChartBanner(series.status === 404 ? `no ${interval} candles for this pool` : `chart data HTTP ${series.status}`);
         return;
       }
-      const reduced = reduceOhlcv(await response.json() as unknown, current.armMs, nowMs, {
-        base: detailBaseAddress(current),
-        quote: detailQuoteAddress(current),
-        baseSymbol: detailBaseSymbol(current),
-        interval,
-      });
+      const reduced = series.result;
       if (unit === "usd") {
         setChartCandles(reduced.candles);
         setChartBanner(reduced.banner);
@@ -422,7 +447,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
         setChartBanner("this grid names no quote asset");
         return;
       }
-      const klines = await fetch(quoteKlinesPath(quoteAddress, ohlcvLimit(current.armMs, nowMs, interval), interval), {
+      const klines = await fetch(tokenKlinesPath(quoteAddress, ohlcvLimit(current.armMs, nowMs, interval), interval), {
         cache: "no-store",
         signal: controller.signal,
       });
