@@ -562,16 +562,22 @@ describe("AGENT-GAS-ATTENTION review fixes", () => {
       .toBe("unknown");
   });
 
-  it("FINDING 7: a completed sequence with an unreadable outcome is a FAILURE", () => {
-    // The row an operator most needs to find, previously filed as a success
-    // because `state === "completed"` was tested before the failure evidence.
-    expect(sequenceOutcome({ state: "completed", outcomeUnavailable: true })).toBe("failed");
-    expect(sequenceOutcome({ state: "completed", stallCode: "shift-ambiguous" })).toBe("failed");
+  it("HOTFIX 2026-09-11: `completed` is the verdict, whatever else the row carries", () => {
+    // Review finding 7 had this the other way round, and the first deploy
+    // proved it wrong against real rows: `stallCode` is never cleared when a
+    // stalled sequence later completes, and a completed rotate can carry an
+    // unreadable journal step. Both put every landed grid shift — confirmed tx
+    // and all — under Failed, with Succeeded reading "No succeeded runs".
+    expect(sequenceOutcome({ state: "completed", stallCode: "shift-ambiguous" })).toBe("succeeded");
+    expect(sequenceOutcome({ state: "completed", outcomeUnavailable: true })).toBe("succeeded");
     expect(sequenceOutcome({ state: "completed" })).toBe("succeeded");
+    // Those signals still mean "stuck" on a sequence that has NOT finished.
     expect(sequenceOutcome({ state: "active" })).toBe("in-flight");
-    // An in-flight row carrying a stall code is stuck, not in flight.
     expect(sequenceOutcome({ state: "active", stallCode: "held" })).toBe("failed");
-    expect(sequenceOutcome({ state: "rolled-back" })).toBe("failed");
+    expect(sequenceOutcome({ state: "active", outcomeUnavailable: true })).toBe("failed");
+    for (const state of ["rolled-back", "held", "abandoning", "resolving", "retiring-pre-bind"]) {
+      expect(sequenceOutcome({ state }), state).toBe("failed");
+    }
   });
 });
 

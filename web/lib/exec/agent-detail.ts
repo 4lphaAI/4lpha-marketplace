@@ -108,15 +108,27 @@ export function sequenceOutcome(sequence: {
   readonly outcomeUnavailable?: boolean;
   readonly stallCode?: string | null;
 }): SequenceOutcome {
-  // FAILURE EVIDENCE IS TESTED FIRST, and REVIEW FINDING 7 is why the order
-  // matters rather than reading as a style choice. The first build asked
-  // `state === "completed"` up front, so a sequence that completed while its
-  // journal outcome was UNREADABLE — or one carrying a stall code — was filed
-  // under "Succeeded". That is the single row an operator most needs to find,
-  // labelled as the one thing it is not.
-  if (sequence.outcomeUnavailable === true || (sequence.stallCode ?? null) !== null) return "failed";
+  // `completed` IS THE VERDICT. Review finding 7 asked for the failure evidence
+  // to be tested first, and the first deploy (2026-09-11) showed why that was
+  // wrong against what the plane actually persists:
+  //
+  //   - `stallCode` is written when a resume PARKS and is never cleared when
+  //     the sequence later completes, so every grid shift that stalled once
+  //     and then landed — four of them, each with a confirmed tx — was filed
+  //     under Failed, and Succeeded read "No succeeded runs".
+  //   - `outcomeUnavailable` means SOME step's journal row could not be read,
+  //     which happens on completed rotates too; a telemetry gap on a motion
+  //     that landed is not a failed motion.
+  //
+  // A historical stall or a missing journal row is DETAIL — the LP page's
+  // "Details" expander still surfaces both — not a bucket. Only a sequence
+  // that is still `active` and carries either signal is genuinely stuck.
   if (sequence.state === "completed") return "succeeded";
-  if (sequence.state === "active") return "in-flight";
+  if (sequence.state === "active") {
+    return sequence.outcomeUnavailable === true || (sequence.stallCode ?? null) !== null
+      ? "failed"
+      : "in-flight";
+  }
   // `rolled-back`, `held`, `abandoning`, `resolving`, `retiring-pre-bind`.
   return "failed";
 }
