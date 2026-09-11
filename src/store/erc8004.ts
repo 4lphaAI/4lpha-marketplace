@@ -1,11 +1,12 @@
 import type { SqlClient } from "./sql.js";
 import { IDENTITY_AGENT_INDEX, IDENTITY_AGENT_MIGRATION } from "./erc8004Sources.js";
-import { ERROR_CODES, fail, isObject, validId, validRef, validHash, validCategory, REGISTRY, type IdentityBinding, type IdentityFence, type IdentityJob, type IdentityTransaction, type LedgerState } from "../identity/types.js";
+import { ERROR_CODES, fail, isObject, validId, validRef, validHash, validCategory, REGISTRY, type IdentityBinding, type IdentityCategory, type IdentityFence, type IdentityJob, type IdentityTransaction, type LedgerState } from "../identity/types.js";
 import { metadataUriFor } from "../identity/metadata.js";
 import { phaseCalldata } from "../identity/registry.js";
 
 export const IDENTITY_DDL = [IDENTITY_AGENT_MIGRATION, IDENTITY_AGENT_INDEX,
   `create table if not exists erc8004_jobs (public_ref text primary key, owner_address text not null, source_id text not null, chain integer not null check(chain=56), minter text not null, document jsonb not null, unique(owner_address,source_id))`,
+  `create unique index if not exists erc8004_owner_category_number on erc8004_jobs (lower(owner_address), (document->>'category'), ((document->>'displayNumber')::numeric))`,
   `create table if not exists erc8004_transactions (hash text primary key, job_ref text not null references erc8004_jobs(public_ref), phase text not null check(phase in ('register','update')), chain integer not null check(chain=56), minter text not null, nonce bigint not null check(nonce>=0), document jsonb not null, unique(job_ref,phase), unique(chain,minter,nonce))`,
   `create table if not exists erc8004_nonces (chain integer not null check(chain=56), minter text not null, next_nonce bigint check(next_nonce>=0), primary key(chain,minter))`,
 ] as const;
@@ -37,12 +38,41 @@ export async function checkIdentitySchema(sql: SqlClient): Promise<void> {
 }
 export interface IdentityLedger {
   read(): Promise<LedgerState>;
-  atomic<T>(fence: IdentityFence, fn: (state: LedgerState) => Promise<T> | T): Promise<T>;
+  atomic<T>(fence: IdentityFence, fn: (state: LedgerState, retainedNumbers: readonly IdentityNumber[]) => Promise<T> | T, scopes?: readonly IdentityNumberScope[]): Promise<T>;
+}
+export type IdentityNumberScope = { readonly owner: string; readonly category: IdentityCategory };
+export type IdentityNumber = IdentityNumberScope & { readonly displayNumber?: number };
+const numberKey = (scope: IdentityNumberScope) => `${scope.owner.toLowerCase()}:${scope.category}`;
+/** Kept separate from the original identity schema contract for older readers. */
+export async function checkIdentityNumberingSchema(sql: SqlClient): Promise<void> {
+  const result = await sql.query<{ installed: boolean }>(`/* erc8004.numberSchema */ select exists (
+    select 1 from pg_index i join pg_class t on t.oid=i.indrelid join pg_namespace n on n.oid=t.relnamespace
+    where n.nspname=current_schema() and t.relname='erc8004_jobs' and i.indisunique and i.indisvalid and i.indimmediate
+      and i.indpred is null and i.indnkeyatts=3
+      and pg_get_indexdef(i.indexrelid,1,true)='lower(owner_address)'
+      and pg_get_indexdef(i.indexrelid,2,true)=$1 and pg_get_indexdef(i.indexrelid,3,true)=$2
+  ) as installed`, ["(document ->> 'category'::text)", "((document ->> 'displayNumber'::text)::numeric)"]);
+  if (result.rows[0]?.installed !== true) fail("schema_missing");
 }
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 function decimal(value: unknown): value is string { return validId(value); }
 function epoch(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) >= 0; }
 function address(value: unknown): value is string { return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value); }
+/** Validate persisted JSON before either ledger replay or migration trusts it. */
+export function validateIdentityTransaction(value: unknown, binding: IdentityBinding): asserts value is IdentityTransaction {
+  if (!isObject(value) || Object.keys(value).sort().join() !== "blockHash,blockNumber,finalizedAt,hash,intent,jobRef,outcome,phase,preparedAt"
+    || !validHash(value.hash) || !validRef(value.jobRef) || (value.phase !== "register" && value.phase !== "update")
+    || !epoch(value.preparedAt) || value.finalizedAt !== null && !epoch(value.finalizedAt)) fail("intent_mismatch");
+  const intent = value.intent;
+  if (!isObject(intent) || Object.keys(intent).sort().join() !== "chainId,data,gas,gasPrice,minter,nonce,to,type,value"
+    || intent.chainId !== 56 || !address(intent.minter) || intent.minter.toLowerCase() !== binding.minter.toLowerCase()
+    || !address(intent.to) || intent.to.toLowerCase() !== binding.registry.toLowerCase()
+    || intent.value !== "0" || intent.type !== "legacy" || !epoch(intent.nonce)
+    || !decimal(intent.gas) || BigInt(intent.gas) === 0n || !decimal(intent.gasPrice) || BigInt(intent.gasPrice) === 0n
+    || typeof intent.data !== "string" || !/^0x(?:[0-9a-fA-F]{2})+$/.test(intent.data)) fail("intent_mismatch");
+  if (value.finalizedAt === null ? value.outcome !== null || value.blockNumber !== null || value.blockHash !== null
+    : (value.outcome !== "success" && value.outcome !== "reverted") || !validId(value.blockNumber) || !validHash(value.blockHash)) fail("intent_mismatch");
+}
 export function validateLedger(state: LedgerState, binding: IdentityBinding): void {
   if (state.nextNonce !== null && !epoch(state.nextNonce)) fail("intent_mismatch");
   const refs = new Set<string>(); const sourceIds = new Set<string>(); const displayNumbers = new Set<string>(); const hashes = new Set<string>(); const phases = new Set<string>(); const nonces = new Set<number>();
@@ -76,16 +106,11 @@ export function validateLedger(state: LedgerState, binding: IdentityBinding): vo
       || (job.status === "registered") !== (job.completedAt !== null)) fail("intent_mismatch");
   }
   for (const tx of state.transactions) {
+    validateIdentityTransaction(tx, binding);
     const intent = tx.intent;
-    if (!validHash(tx.hash) || !refs.has(tx.jobRef) || (tx.phase !== "register" && tx.phase !== "update") || !isObject(intent)
-      || intent.chainId !== 56 || intent.minter.toLowerCase() !== binding.minter.toLowerCase() || intent.to.toLowerCase() !== binding.registry.toLowerCase()
-      || intent.value !== "0" || intent.type !== "legacy" || !epoch(intent.nonce) || !decimal(intent.gas) || BigInt(intent.gas) === 0n || !decimal(intent.gasPrice) || BigInt(intent.gasPrice) === 0n
-      || !epoch(tx.preparedAt) || tx.finalizedAt !== null && !epoch(tx.finalizedAt)
-      || typeof intent.data !== "string" || !/^0x(?:[0-9a-fA-F]{2})+$/.test(intent.data)
+    if (!refs.has(tx.jobRef)
       || hashes.has(tx.hash) || phases.has(`${tx.jobRef}:${tx.phase}`) || nonces.has(intent.nonce)
       || state.nextNonce === null || intent.nonce >= state.nextNonce) fail("intent_mismatch");
-    if (tx.finalizedAt === null ? tx.outcome !== null || tx.blockNumber !== null || tx.blockHash !== null
-      : (tx.outcome !== "success" && tx.outcome !== "reverted") || !validId(tx.blockNumber) || !validHash(tx.blockHash)) fail("intent_mismatch");
     hashes.add(tx.hash); phases.add(`${tx.jobRef}:${tx.phase}`); nonces.add(intent.nonce);
     const job = state.jobs.find((item) => item.publicRef === tx.jobRef)!;
     if ((tx.phase === "register" ? job.registrationHash : job.updateHash) !== tx.hash || intent.data !== phaseCalldata(job, tx.phase)) fail("intent_mismatch");
@@ -108,7 +133,7 @@ function validateTransition(before: LedgerState, after: LedgerState, binding: Id
   if (before.nextNonce !== null && (after.nextNonce === null || after.nextNonce < before.nextNonce)) fail("intent_mismatch");
   for (const old of before.jobs) {
     const next = after.jobs.find((job) => job.publicRef === old.publicRef); if (!next) fail("intent_mismatch");
-    for (const key of ["owner", "sourceId", "publicRef", "category", "chainId", "registry", "minter", "createdAt", "initialUri"] as const) if (old[key] !== next[key]) fail("intent_mismatch");
+    for (const key of ["owner", "sourceId", "publicRef", "category", "chainId", "registry", "minter", "createdAt", "initialUri", "displayNumber", "metadataVersion"] as const) if (old[key] !== next[key]) fail("intent_mismatch");
     for (const key of ["registrationHash", "updateHash", "mintedId", "finalUri", "envelope", "updateGasCeiling", "updatePriceCeiling", "completedAt"] as const) if (old[key] !== null && old[key] !== next[key]) fail("intent_mismatch");
     if (old.effectiveCeiling !== null && (next.effectiveCeiling === null || BigInt(next.effectiveCeiling) > BigInt(old.effectiveCeiling))) fail("fee_limit");
   }
@@ -118,14 +143,29 @@ function validateTransition(before: LedgerState, after: LedgerState, binding: Id
     for (const key of ["finalizedAt", "blockNumber", "blockHash", "outcome"] as const) if (old[key] !== null && old[key] !== next[key]) fail("intent_mismatch");
   }
 }
+/** Share this backing store when testing multiple minters against one database. */
+export class MemoryIdentityDatabase {
+  readonly states = new Map<string, LedgerState>(); tail: Promise<void> = Promise.resolve();
+}
 export class MemoryIdentityLedger implements IdentityLedger {
-  #state: LedgerState = { jobs: [], transactions: [], nextNonce: null }; #tail: Promise<void> = Promise.resolve();
-  constructor(readonly binding: IdentityBinding) {}
+  constructor(readonly binding: IdentityBinding, readonly database = new MemoryIdentityDatabase()) {}
+  get #state(): LedgerState { return this.database.states.get(this.binding.minter.toLowerCase()) ?? { jobs: [], transactions: [], nextNonce: null }; }
   async read(): Promise<LedgerState> { validateLedger(this.#state, this.binding); return structuredClone(this.#state); }
-  async atomic<T>(fence: IdentityFence, fn: (state: LedgerState) => Promise<T> | T): Promise<T> {
-    const predecessor = this.#tail; let release!: () => void; this.#tail = new Promise<void>((resolve) => { release = resolve; });
+  async atomic<T>(fence: IdentityFence, fn: (state: LedgerState, retainedNumbers: readonly IdentityNumber[]) => Promise<T> | T): Promise<T> {
+    const predecessor = this.database.tail; let release!: () => void; this.database.tail = new Promise<void>((resolve) => { release = resolve; });
     await predecessor;
-    try { fence.check(); const next = await this.read(); const result = await fn(next); validateTransition(this.#state, next, this.binding); fence.check(); this.#state = structuredClone(next); return result; }
+    try {
+      fence.check(); const next = await this.read();
+      const others = [...this.database.states.entries()].filter(([minter]) => minter !== this.binding.minter.toLowerCase()).flatMap(([, state]) => state.jobs);
+      const result = await fn(next, structuredClone([...others, ...next.jobs])); validateTransition(this.#state, next, this.binding);
+      const refs = new Set<string>(); const sources = new Set<string>(); const numbers = new Set<string>();
+      for (const job of [...others, ...next.jobs]) {
+        const source = `${job.owner.toLowerCase()}:${job.sourceId}`; const number = `${numberKey(job)}:${job.displayNumber}`;
+        if (refs.has(job.publicRef) || sources.has(source) || job.displayNumber !== undefined && numbers.has(number)) fail("conflict");
+        refs.add(job.publicRef); sources.add(source); if (job.displayNumber !== undefined) numbers.add(number);
+      }
+      fence.check(); this.database.states.set(this.binding.minter.toLowerCase(), structuredClone(next)); return result;
+    }
     finally { release(); }
   }
 }
@@ -143,14 +183,37 @@ export class PostgresIdentityLedger implements IdentityLedger {
     return state;
   }
   read(): Promise<LedgerState> { return this.#read(this.sql); }
-  async atomic<T>(fence: IdentityFence, fn: (state: LedgerState) => Promise<T> | T): Promise<T> {
+  async atomic<T>(fence: IdentityFence, fn: (state: LedgerState, retainedNumbers: readonly IdentityNumber[]) => Promise<T> | T, scopes: readonly IdentityNumberScope[] = []): Promise<T> {
     return this.sql.transaction(async (sql) => {
       fence.check();
+      const retainedNumbers: IdentityNumber[] = [];
+      if (scopes.length > 0) {
+        await checkIdentityNumberingSchema(sql);
+        // Lock the entire page in a stable order before the minter nonce row.
+        // All minters use these same owner/category keys; locks last to commit.
+        for (const key of [...new Set(scopes.map(numberKey))].sort()) {
+          await sql.query(`/* erc8004.numberLock */ select pg_advisory_xact_lock(hashtextextended($1,0))`, [`erc8004:number:${key}`]);
+          fence.check();
+        }
+        const rows = await sql.query<{ public_ref: string; source_id: string; owner_address: string; chain: number; minter: string; document: unknown }>(
+          `/* erc8004.numberJobs */ select public_ref,source_id,owner_address,chain,minter,document from erc8004_jobs
+            where lower(owner_address)=any($1::text[]) or lower(document->>'owner')=any($1::text[])`,
+          [[...new Set(scopes.map((scope) => scope.owner.toLowerCase()))]]);
+        for (const row of rows.rows) {
+          const job = row.document;
+          if (!isObject(job) || !address(job.owner) || job.owner.toLowerCase() !== row.owner_address
+            || !validCategory(job.category) || !validRef(job.publicRef) || job.publicRef !== row.public_ref || job.sourceId !== row.source_id
+            || job.chainId !== 56 || row.chain !== 56 || !address(job.minter) || job.minter.toLowerCase() !== row.minter
+            || job.displayNumber !== undefined && (!epoch(job.displayNumber) || job.displayNumber === 0)
+            || job.displayNumber === undefined && job.metadataVersion !== undefined && job.metadataVersion !== 1) fail("intent_mismatch");
+          retainedNumbers.push({ owner: job.owner, category: job.category, ...(job.displayNumber === undefined ? {} : { displayNumber: job.displayNumber as number }) });
+        }
+      }
       await sql.query(`/* erc8004.nonceEnsure */ insert into erc8004_nonces(chain,minter,next_nonce) values($1,$2,null) on conflict(chain,minter) do nothing`, [56, this.binding.minter.toLowerCase()]);
       fence.check();
       await sql.query(`/* erc8004.nonceLock */ select next_nonce from erc8004_nonces where chain=$1 and minter=$2 for update`, [56, this.binding.minter.toLowerCase()]);
       fence.check();
-      const before = await this.#read(sql); const state = structuredClone(before); const result = await fn(state);
+      const before = await this.#read(sql); const state = structuredClone(before); const result = await fn(state, retainedNumbers);
       validateTransition(before, state, this.binding);
       for (const job of state.jobs) {
         const old = before.jobs.find((item) => item.publicRef === job.publicRef); if (same(old, job)) continue;

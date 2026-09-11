@@ -61,14 +61,19 @@ export class IdentitySql implements SqlClient {
     if (tag === this.failTag) { this.failTag = null; throw new Error("injected SQL failure"); }
     let rows: unknown[] = [];
     switch (tag) {
-      case "erc8004.jobs": rows = [...this.jobs.values()].map((document) => ({ document })); break;
-      case "erc8004.transactions": rows = [...this.txs.values()].map((document) => ({ document })); break;
+      case "erc8004.jobs": rows = [...this.jobs.values()].filter((job) => String(job.minter).toLowerCase() === params[1]).map((document) => ({ document })); break;
+      case "erc8004.transactions": rows = [...this.txs.values()].filter((tx) => (tx.intent as UnsignedIntent).minter.toLowerCase() === params[1]).map((document) => ({ document })); break;
+      case "erc8004.numberSchema": rows = [{ installed: true }]; break;
+      case "erc8004.numberLock": break;
+      case "erc8004.numberJobs": rows = [...this.jobs.values()].filter((job) => (params[0] as string[]).includes(String(job.owner).toLowerCase()))
+        .map((document) => ({ public_ref: document.publicRef, source_id: document.sourceId, owner_address: String(document.owner).toLowerCase(), chain: document.chainId, minter: String(document.minter).toLowerCase(), document })); break;
       case "erc8004.nonce": case "erc8004.nonceLock": rows = [{ next_nonce: this.nonce }]; break;
       case "erc8004.nonceEnsure": break;
       case "erc8004.nonceUpdate": this.nonce = String(params[2]); break;
       case "erc8004.jobInsert": {
         const ref = String(params[0]); const document = JSON.parse(String(params[5])) as Record<string, unknown>;
         if (this.jobs.has(ref) || [...this.jobs.values()].some((job) => job.owner === document.owner && job.sourceId === document.sourceId)) throw new Error("duplicate job");
+        if ([...this.jobs.values()].some((job) => String(job.owner).toLowerCase() === String(document.owner).toLowerCase() && job.category === document.category && job.displayNumber !== undefined && job.displayNumber === document.displayNumber)) throw new Error("duplicate number");
         this.jobs.set(ref, document); break;
       }
       case "erc8004.jobUpdate": this.jobs.set(String(params[0]), JSON.parse(String(params[1])) as Record<string, unknown>); break;

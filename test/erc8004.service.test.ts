@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { keccak256, type Hex } from "viem";
 import { IdentityError, newIdentity } from "../src/identity/types.js";
-import { dailyLiability } from "../src/store/erc8004.js";
+import { dailyLiability, type IdentityNumber, type IdentityNumberScope } from "../src/store/erc8004.js";
 import { MemoryIdentityFence } from "../src/identity/fence.js";
 import { IdentityService, previewIdentity, verifyIdentity } from "../src/identity/service.js";
 import { CONFIG, fixture } from "./support/erc8004.js";
@@ -148,8 +148,8 @@ test("concurrent service preparations reserve one phase and one nonce", async ()
 });
 test("loss of minter lock after committed preparation preserves evidence and never broadcasts", async () => {
   const f = fixture(); await f.service.discover();
-  const ledger = { read: () => f.ledger.read(), async atomic<T>(fence: Parameters<typeof f.ledger.atomic>[0], fn: (state: Awaited<ReturnType<typeof f.ledger.read>>) => T | Promise<T>) {
-    const result = await f.ledger.atomic(fence, fn);
+  const ledger = { read: () => f.ledger.read(), async atomic<T>(fence: Parameters<typeof f.ledger.atomic>[0], fn: (state: Awaited<ReturnType<typeof f.ledger.read>>, retainedNumbers: readonly IdentityNumber[]) => T | Promise<T>, scopes?: readonly IdentityNumberScope[]) {
+    const result = await f.ledger.atomic(fence, fn, scopes);
     if ((await f.ledger.read()).transactions.length > 0) await f.fence.close();
     return result;
   } };

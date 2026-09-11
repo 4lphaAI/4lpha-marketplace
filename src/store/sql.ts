@@ -22,6 +22,8 @@ export type SqlQueryOptions = { readonly signal?: AbortSignal; readonly timeoutM
  * as `$n` bind parameters and never interpolate them into the text.
  */
 export interface SqlClient {
+  /** Explicit capability: unmarked adapters cannot promise an independent rollback. */
+  readonly transactionScope?: "top-level" | "nested";
   query<Row = Record<string, unknown>>(
     text: string,
     params?: readonly unknown[],
@@ -45,7 +47,9 @@ type PgQueryResult = { readonly rows: readonly unknown[] };
 type PgQueryConfig = { readonly text: string; readonly values: readonly unknown[]; readonly query_timeout?: number; readonly signal?: AbortSignal };
 type PgPoolClient = {
   query(text: string | PgQueryConfig, params?: readonly unknown[]): Promise<PgQueryResult>;
-  release(): void;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  removeListener(event: "error", listener: (error: Error) => void): unknown;
+  release(discard?: boolean): void;
 };
 
 type PgPool = {
@@ -74,6 +78,7 @@ export async function createPgSqlClient(
   const pool = new mod.default.Pool({ connectionString });
 
   const fromPool: SqlClient = {
+    transactionScope: "top-level",
     async query<Row>(text: string, params?: readonly unknown[], options?: SqlQueryOptions) {
       const result = options === undefined
         ? await pool.query(text, params)
@@ -83,6 +88,7 @@ export async function createPgSqlClient(
     async transaction<T>(fn: (tx: SqlClient) => Promise<T>): Promise<T> {
       const connection = await pool.connect();
       const tx: SqlClient = {
+        transactionScope: "nested",
         async query<Row>(text: string, params?: readonly unknown[], options?: SqlQueryOptions) {
           const result = options === undefined
             ? await connection.query(text, params)
@@ -93,16 +99,24 @@ export async function createPgSqlClient(
         transaction: (nested) => nested(tx),
         close: async () => {},
       };
+      let discard = false;
+      let connectionError: Error | undefined;
+      const onError = (error: Error) => { discard = true; connectionError = error; };
+      connection.on("error", onError);
       try {
         await connection.query("begin");
         const result = await fn(tx);
+        if (connectionError) throw connectionError;
         await connection.query("commit");
         return result;
       } catch (error) {
-        await connection.query("rollback");
+        // A lost connection cannot roll back or safely return to the idle pool.
+        // Preserve the operation error and discard it if rollback also fails.
+        try { await connection.query("rollback"); } catch { discard = true; }
         throw error;
       } finally {
-        connection.release();
+        connection.release(discard);
+        connection.removeListener("error", onError);
       }
     },
     async close() {
