@@ -438,11 +438,14 @@ function GridLiquidity({ view }: { readonly view: AgentDetailView | null }) {
       display: { invert },
     }
     : null;
+  // The rungs drawn are the ones the page KNOWS: `liveView` replaces the
+  // plane's recorded ranges with the wallet's live NFTs the moment they are
+  // read, so a shift grid paints its floating rungs rather than the arm
+  // geometry. The plane's `rangeUnavailableBecause` prose is not shown here
+  // (operator, 2026-09-11) — the QUOTES line below already names the rungs.
   const range: React.ComponentProps<typeof LiquidityChart>["range"] = view === null
     ? { mode: "unavailable", reason: "— no owner view yet" }
-    : view.grid.rangeUnavailableBecause !== null
-      ? { mode: "unavailable", reason: `— ${view.grid.rangeUnavailableBecause}` }
-      : { mode: "rungs", rungs: [{ ...displayRange(view, "bid"), tone: "bid" }, { ...displayRange(view, "ask"), tone: "ask" }] };
+    : { mode: "rungs", rungs: [{ ...displayRange(view, "bid"), tone: "bid" }, { ...displayRange(view, "ask"), tone: "ask" }] };
   return (
     <div style={{ display: "grid", gap: 12, padding: 16 }}>
       <LiquidityChart

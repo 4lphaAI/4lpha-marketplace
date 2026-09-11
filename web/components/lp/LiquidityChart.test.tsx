@@ -85,3 +85,26 @@ it("rungs mode paints each signed rung in its own tone, frames both, and shows a
     expect(legend?.getAttribute("data-upper")).toBe("40");
   } finally { await act(async () => root.unmount()); }
 });
+
+it("rungs mode labels each rung by its completing edge and the market bar by the current price, market bar white", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { bins: [-30, -20, -10, 0, 10, 20, 30].map((tickLower) => ({ tickLower, liquidity: "10" })), currentTick: 5, blockNumber: "7", truncated: false } }), { status: 200 })));
+  const host = document.createElement("div"), root = createRoot(host);
+  // quoteIsToken0 (USDT per WBNB): a HIGHER tick is a LOWER price, so the bid
+  // rung sits at the high ticks and its low-price edge is its tickUpper.
+  try {
+    await act(async () => {
+      root.render(<LiquidityChart poolAddress="0x1111111111111111111111111111111111111111" geometry={geometry}
+        range={{ mode: "rungs", rungs: [{ tickLower: 20, tickUpper: 40, tone: "bid" }, { tickLower: -30, tickUpper: -10, tone: "ask" }] }}
+        legend={{ bid: "BIDS · BUY WBNB", ask: "ASKS · SELL WBNB" }} />);
+      await Promise.resolve();
+    });
+    const labels = [...host.querySelectorAll("[data-label-price]")].map((el) => el.getAttribute("data-label-price"));
+    expect(labels).toHaveLength(3);
+    const price = (tick: number) => 1 / Math.pow(1.0001, tick);
+    expect(labels).toContain(price(40).toPrecision(8).replace(/0+$/u, ""));
+    expect(labels).toContain(price(-30).toPrecision(8).replace(/0+$/u, ""));
+    expect(labels).toContain(price(5).toPrecision(8).replace(/0+$/u, ""));
+    const market = host.querySelector('[data-market="true"]') as HTMLElement;
+    expect(market.style.background).toBe("var(--ink-1)");
+  } finally { await act(async () => root.unmount()); }
+});

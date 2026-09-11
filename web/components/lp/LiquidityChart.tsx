@@ -150,6 +150,28 @@ export function LiquidityChart({ poolAddress, geometry: input, range, legend, sh
   // (operator hotfix 2026-09-06).
   if (geometry?.display.quoteIsToken0) bars.reverse();
   const hovered = hover !== null ? bars[hover] : null;
+  // The market bar is orange on the LP chart; a grid paints its asks orange,
+  // so there the market bar is white (operator, 2026-09-11).
+  const marketColor = range.mode === "rungs" ? "var(--ink-1)" : "#f7931a";
+  // Price labels under the rungs and the market bar, grid only: each rung is
+  // named by the edge its order completes at (a bid at its low price, an ask
+  // at its high), centred under the bars it covers.
+  const labels: { readonly at: number; readonly text: string; readonly color: string }[] = [];
+  if (range.mode === "rungs" && geometry !== null && bars.length > 0) {
+    const price = (tick: number) => priceFromTick(tick, geometry.display);
+    for (const rung of rungs) {
+      const covered = bars.map((b, i) => (b.tickLower < rung.tickUpper && b.tickUpper > rung.tickLower ? i : -1)).filter((i) => i >= 0);
+      if (covered.length === 0) continue;
+      const edges = [price(rung.tickLower), price(rung.tickUpper)];
+      labels.push({
+        at: (Math.min(...covered) + Math.max(...covered) + 1) / 2 / bars.length,
+        text: formatPrice(rung.tone === "bid" ? Math.min(...edges) : Math.max(...edges)),
+        color: RUNG_TONE[rung.tone],
+      });
+    }
+    const market = bars.findIndex((b) => b.isMarket);
+    if (market >= 0 && current.currentTick !== null) labels.push({ at: (market + 0.5) / bars.length, text: formatPrice(price(current.currentTick)), color: marketColor });
+  }
   const canZoomIn = zoomIndex > 0;
   const canZoomOut = zoomIndex < LIQUIDITY_ZOOM_LEVELS.length - 1;
   const setZoomIndex = (index: number) => setZoom({ pool: poolAddress, index: Math.max(0, Math.min(LIQUIDITY_ZOOM_LEVELS.length - 1, index)) });
@@ -182,7 +204,7 @@ export function LiquidityChart({ poolAddress, geometry: input, range, legend, sh
       </div>
       {showSnapshot && current.blockNumber !== null ? <small style={{color:"var(--text-subtle)"}}>Pool snapshot · block {current.blockNumber} · read {current.readAtMs === undefined ? "time unavailable" : new Date(current.readAtMs).toLocaleTimeString()}</small> : null}
       <div data-testid="lp-liquidity-legend" data-block={current.blockNumber ?? ""} data-lower={lo ?? ""} data-upper={hi ?? ""} style={{ display: "flex", gap: 14, flexWrap: "wrap", font: "var(--weight-regular) var(--text-xs)/1.2 var(--font-mono)", color: "var(--text-subtle)" }}>
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: "#f7931a", display: "inline-block" }} />
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: marketColor, display: "inline-block" }} />
           current price{geometry && current.currentTick !== null ? ` · ${formatPrice(priceFromTick(current.currentTick, geometry.display))} ${geometry.display.quoteSymbol}` : ""}</span>
         {"range" in legend
           ? <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, background: "var(--cat-lp)", display: "inline-block" }} />{legend.range}</span>
@@ -211,10 +233,17 @@ export function LiquidityChart({ poolAddress, geometry: input, range, legend, sh
           return (
             <div key={b.tickLower} data-tick={b.tickLower} data-tick-upper={b.tickUpper} data-in-range={b.inRange ? "true" : "false"} data-partial={b.partial ? "true" : "false"} data-tone={b.inRange || b.partial ? b.tone : ""} data-market={b.isMarket ? "true" : "false"}
               onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
-              style={{ flex: 1, height: `${heightPct}%`, background: b.isMarket ? "#f7931a" : b.inRange ? toneColor(b.tone) : b.partial ? (b.tone === "range" ? "var(--cat-lp-tint, var(--line-1))" : toneColor(b.tone)) : "var(--line-1)", opacity: b.inRange || b.isMarket ? 1 : b.partial ? (b.tone === "range" ? 0.85 : 0.45) : 0.7, outline: hover === i ? "2px solid #4ade80" : "none", outlineOffset: 1, borderRadius: 1, cursor: "pointer", transition: "background 120ms" }} />
+              style={{ flex: 1, height: `${heightPct}%`, background: b.isMarket ? marketColor : b.inRange ? toneColor(b.tone) : b.partial ? (b.tone === "range" ? "var(--cat-lp-tint, var(--line-1))" : toneColor(b.tone)) : "var(--line-1)", opacity: b.inRange || b.isMarket ? 1 : b.partial ? (b.tone === "range" ? 0.85 : 0.45) : 0.7, outline: hover === i ? "2px solid #4ade80" : "none", outlineOffset: 1, borderRadius: 1, cursor: "pointer", transition: "background 120ms" }} />
           );
         })}
       </div>
+      {labels.length > 0 ? (
+        <div data-testid="lp-liquidity-labels" style={{ position: "relative", height: 14 }}>
+          {labels.map((label) => (
+            <span key={`${label.at}-${label.text}`} data-label-price={label.text} style={{ position: "absolute", left: `${label.at * 100}%`, transform: "translateX(-50%)", whiteSpace: "nowrap", font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: label.color }}>{label.text}</span>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
