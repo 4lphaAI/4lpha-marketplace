@@ -103,31 +103,54 @@ export function parseGridArmBenchmark(
     pool: input.pool, token0: input.token0, token1: input.token1, sqrtPriceX96: sqrt.toString(), capitalWei: input.capitalWei };
 }
 
-/** Pending work is retained, not repeatedly timed out and relaunched by polls. */
+/**
+ * Pending work is retained, not repeatedly timed out and relaunched by polls.
+ *
+ * GRID-BENCHMARK-LATENCY (2026-09-11): a `ready` result is the decoded arm
+ * receipt — immutable — so it never expires (it can still be evicted by the
+ * 128-entry bound and re-read). Only a failed read is retried, after 15 s.
+ * Before this, `ready` lapsed every 300 s, and with the page polling the owner
+ * view every 30 s the HODL tile went blank for up to half a minute every five
+ * minutes, for evidence that cannot change. `getOrWait` lets the FIRST request
+ * wait a short budget for the read it just launched, so a page opening on a
+ * cold cache gets `ready` in its first response instead of its second poll.
+ */
 export function createGridBenchmarkCache(now: () => number = Date.now) {
-  type Entry = { result: GridBenchmarkResult; pending: boolean; expires: number };
+  type Entry = { result: GridBenchmarkResult; pending: boolean; expires: number; done: Promise<void> };
   const cache = new Map<string, Entry>();
   let active = 0;
+  const getOrStart = (input: GridArmBenchmarkInput, read: ((input: GridArmBenchmarkInput) => Promise<GridArmBenchmark>) | undefined): GridBenchmarkResult => {
+    if (!read) return unavailable("arm-reader-unavailable");
+    const key = JSON.stringify(input);
+    const existing = cache.get(key);
+    if (existing && (existing.pending || existing.expires > now())) return existing.result;
+    if (existing) cache.delete(key);
+    if (active >= 4) return { status: "pending", reason: "arm-evidence-loading" };
+    if (cache.size >= 128) {
+      const victim = [...cache].find(([, e]) => !e.pending);
+      if (!victim) return { status: "pending", reason: "arm-evidence-loading" };
+      cache.delete(victim[0]);
+    }
+    const entry: Entry = { result: { status: "pending", reason: "arm-evidence-loading" }, pending: true, expires: Infinity, done: Promise.resolve() };
+    entry.done = Promise.resolve().then(() => read(input)).then(result => {
+      entry.result = result; entry.expires = Infinity;
+    }, () => {
+      entry.result = unavailable("arm-receipt-unavailable"); entry.expires = now() + 15_000;
+    }).finally(() => { entry.pending = false; active--; });
+    cache.set(key, entry); active++;
+    return entry.result;
+  };
   return {
-    getOrStart(input: GridArmBenchmarkInput, read: ((input: GridArmBenchmarkInput) => Promise<GridArmBenchmark>) | undefined): GridBenchmarkResult {
-      if (!read) return unavailable("arm-reader-unavailable");
-      const key = JSON.stringify(input);
-      const existing = cache.get(key);
-      if (existing && (existing.pending || existing.expires > now())) return existing.result;
-      if (existing) cache.delete(key);
-      if (active >= 4) return { status: "pending", reason: "arm-evidence-loading" };
-      if (cache.size >= 128) {
-        const victim = [...cache].find(([, e]) => !e.pending);
-        if (!victim) return { status: "pending", reason: "arm-evidence-loading" };
-        cache.delete(victim[0]);
-      }
-      const entry: Entry = { result: { status: "pending", reason: "arm-evidence-loading" }, pending: true, expires: Infinity };
-      cache.set(key, entry); active++;
-      void Promise.resolve().then(() => read(input)).then(result => {
-        entry.result = result; entry.expires = now() + 300_000;
-      }, () => {
-        entry.result = unavailable("arm-receipt-unavailable"); entry.expires = now() + 15_000;
-      }).finally(() => { entry.pending = false; active--; });
+    getOrStart,
+    /** `getOrStart`, then wait up to `waitMs` for a read still in flight for this key. */
+    async getOrWait(input: GridArmBenchmarkInput, read: ((input: GridArmBenchmarkInput) => Promise<GridArmBenchmark>) | undefined, waitMs: number): Promise<GridBenchmarkResult> {
+      const first = getOrStart(input, read);
+      if (first.status !== "pending" || waitMs <= 0) return first;
+      const entry = cache.get(JSON.stringify(input));
+      if (!entry || !entry.pending) return first;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([entry.done, new Promise<void>(resolve => { timer = setTimeout(resolve, waitMs); })]);
+      if (timer !== undefined) clearTimeout(timer);
       return entry.result;
     },
   };

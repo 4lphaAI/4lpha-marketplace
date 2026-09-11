@@ -115,9 +115,32 @@ describe("bounded reporting cache", () => {
     assert.equal(cache.getOrStart(input, async () => evidence).status, "pending");
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(cache.getOrStart(input, fail), evidence);
+    // GRID-BENCHMARK-LATENCY: a decoded receipt is immutable, so `ready` never
+    // lapses back to `pending` — before, it did every 300 s.
     now += 300001;
-    assert.equal(cache.getOrStart(input, fail).status, "pending");
+    assert.deepEqual(cache.getOrStart(input, fail), evidence);
+    now += 86_400_000;
+    assert.deepEqual(cache.getOrStart(input, fail), evidence);
+    assert.equal(calls, 1);
+  });
+  it("getOrWait answers ready within the wait budget on a cold cache, pending when the read outlasts it", async () => {
+    const cache = createGridBenchmarkCache();
+    let release: (() => void) | undefined;
+    const slow = () => new Promise<typeof evidence>(resolve => { release = () => resolve(evidence); });
+    // Read outlasts a 20 ms budget: the first answer is pending, the entry stays pending.
+    assert.equal((await cache.getOrWait(input, slow, 20)).status, "pending");
+    assert.equal(cache.getOrStart(input, slow).status, "pending");
+    release!();
     await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(await cache.getOrWait(input, slow, 20), evidence);
+    // A read that lands inside the budget is answered by the FIRST request.
+    const fast = createGridBenchmarkCache();
+    assert.deepEqual(await fast.getOrWait(input, async () => evidence, 1_000), evidence);
+    // A zero budget is exactly `getOrStart`.
+    const none = createGridBenchmarkCache();
+    assert.equal((await none.getOrWait(input, async () => evidence, 0)).status, "pending");
+    // No reader is still no reader.
+    assert.equal((await none.getOrWait(input, undefined, 1_000)).status, "unavailable");
   });
   it("never launches more than four jobs even as 128 distinct owners poll", async () => {
     const cache = createGridBenchmarkCache(); let calls = 0;

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { USDT_56, WBNB_56 } from "./pairs";
-import { displaySide, emptyRungPairs, gridSideInverted, gridSideLabel, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, reduceTokenKlines, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, tokenKlinesPath } from "./agent-detail";
+import { displaySide, emptyRungPairs, gridSideInverted, gridSideLabel, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, reduceTokenKlines, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, stickyArmBenchmark, tokenKlinesPath } from "./agent-detail";
 import { priceAtTick as priceAtTickRef } from "./pairs";
 
 const NOW = 2_000_000_000_000;
@@ -667,5 +667,35 @@ describe("AGENT-GAS-ATTENTION review 2: the gas block cannot contradict itself",
   it("a legacy shift buffer with a zero requirement is refused, not read as healthy", () => {
     const buffer = { quoteWei: "1", baseWei: "2", bookBaseWei: null, bookCostWbnbWei: null, nativeWei: "5", nextShiftGasWei: "0" };
     expect(mapAgentDetail(owner(), lp({ grid: { ...lp().data.grid, buffer } }), NOW).gas).toBeNull();
+  });
+});
+
+describe("stickyArmBenchmark (GRID-BENCHMARK-LATENCY)", () => {
+  const ready = { status: "ready", method: "arm-transaction-post-swap-v1", txHash: TX, sqrtPriceX96: "1" };
+  const payload = (benchmark: unknown) => ({ data: { positions: [], sequences: [], grid: { pool: {}, benchmark } } });
+  it("remembers a ready receipt, substitutes it for a later pending, and forgets it on anything else", () => {
+    const first = stickyArmBenchmark(payload(ready), null);
+    expect(first.remembered).toEqual(ready);
+    expect(first.pending).toBe(false);
+    const again = stickyArmBenchmark(payload({ status: "pending", reason: "arm-evidence-loading" }), first.remembered);
+    expect(again.pending).toBe(false);
+    expect((again.payload as { data: { grid: { benchmark: unknown } } }).data.grid.benchmark).toEqual(ready);
+    expect(again.remembered).toEqual(ready);
+    // A closed or re-armed grid answers `unavailable`: the old receipt is dropped…
+    const gone = stickyArmBenchmark(payload({ status: "unavailable", reason: "arm-unavailable" }), again.remembered);
+    expect(gone.remembered).toBeNull();
+    // …so the next pending is genuinely pending, with nothing to substitute.
+    const cold = stickyArmBenchmark(payload({ status: "pending", reason: "arm-evidence-loading" }), gone.remembered);
+    expect(cold.pending).toBe(true);
+    expect((cold.payload as { data: { grid: { benchmark: { status: string } } } }).data.grid.benchmark.status).toBe("pending");
+    // No grid block at all forgets too.
+    expect(stickyArmBenchmark({ data: { positions: [], sequences: [] } }, ready).remembered).toBeNull();
+  });
+  it("marks the quote-measured PnL loading while the receipt is pending, so the tile shows a skeleton", () => {
+    const view = mapAgentDetail(owner({ hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "1000000000000000000" } }), lp({ grid: { ...lp().data.grid, buffer: { quoteWei: "1000000000000000000", baseWei: "0" }, benchmark: { status: "pending", reason: "arm-evidence-loading" } } }), NOW);
+    expect(view.grossPnl.value).toBeNull();
+    expect(view.grossPnl.loading).toBe(true);
+    expect(view.grossPnlPercent.loading).toBe(true);
+    expect(view.hodl?.loading).toBe(true);
   });
 });

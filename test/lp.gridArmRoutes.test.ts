@@ -437,12 +437,14 @@ describe("on-chain HODL owner projection", () => {
     const forbidden = await call(f.harness, `/agents/${AGENT_ID}/lp`);
     assert.notEqual(forbidden.status, 200);
     assert.equal(reads, 0);
+    // GRID-BENCHMARK-LATENCY: the FIRST owner view waits (bounded) for the
+    // read it launched, so a receipt that decodes promptly is ready at once —
+    // the page no longer needs a second poll to see it.
     const first = await viewCall(f);
-    assert.equal(((first["grid"] as Record<string, unknown>)["benchmark"] as { status: string }).status, "pending");
-    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(((first["grid"] as Record<string, unknown>)["benchmark"] as { status: string }).status, "ready");
     const second = await viewCall(f);
     assert.equal(((second["grid"] as Record<string, unknown>)["benchmark"] as { status: string }).status, "ready");
-    assert.equal(reads, 1);
+    assert.equal(reads, 1, "a ready receipt is served from cache, never re-read");
     assert.equal(f.harness.provider.executeCalls.length, 1, "reporting never executes another batch");
   });
 });

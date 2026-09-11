@@ -11,6 +11,8 @@ vi.mock("../trade", () => ({ parseTradeViewEnvelope: (value: unknown) => value }
 vi.mock("./agent-detail", () => ({
   mapAgentDetail: () => ({ id: "trader", hireSizingName: "trade-v1", armMs: null,
     grid: { pool: null, token0: "", token1: "" } }),
+  // The receipt pass-through the hook runs on every owner read; a trading agent has no grid block, so it is identity here.
+  stickyArmBenchmark: (payload: unknown) => ({ payload, remembered: null, pending: false }),
 }));
 
 let root: Root;

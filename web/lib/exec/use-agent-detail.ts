@@ -17,6 +17,7 @@ import {
   reduceTokenKlines,
   reduceOhlcv,
   reduceQuoteKlines,
+  stickyArmBenchmark,
   type AgentDetailView,
   type ChartCandle,
   type ChartInterval,
@@ -108,6 +109,9 @@ type AuthWindow = { readonly expiryMs: number; readonly signedHeader?: string };
  * `/api/pool-state` for the empty string.
  */
 const LENDING_PRESET = "lending-v1";
+/** A cold arm-receipt read lands in a few seconds; three quick re-polls cover it without hammering the plane. */
+const PENDING_BENCHMARK_RETRIES = 3;
+const PENDING_BENCHMARK_RETRY_MS = 3_000;
 
 function detailPool(view: AgentDetailView | null): string | null {
   if (view === null || view.hireSizingName === LENDING_PRESET) return null;
@@ -226,6 +230,11 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
   // an armed grid shows dashes for minutes. See `mapAgentDetail`'s `liveTick`.
   const liveTick = useRef<LiveTick | null>(null);
   const liveTickAbortRef = useRef<AbortController | null>(null);
+  // GRID-BENCHMARK-LATENCY: the last `ready` arm receipt (`stickyArmBenchmark`)
+  // and the bounded quick re-poll while the plane's read is in flight.
+  const rememberedBenchmark = useRef<{ readonly agentId: string; readonly benchmark: Record<string, unknown> } | null>(null);
+  const pendingRetries = useRef(0);
+  const pendingRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const publishView = useCallback((nowMs: number) => {
     if (ownerPayload.current === undefined || lpPayload.current === undefined) return;
@@ -292,7 +301,20 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
         return;
       }
       ownerPayload.current = await ownerResponse.json() as unknown;
-      lpPayload.current = await lpResponse.json() as unknown;
+      // GRID-BENCHMARK-LATENCY: reuse the immutable arm receipt across a
+      // `pending` answer, and when it is genuinely still loading re-poll in a
+      // few seconds (a bounded burst) instead of waiting the full 30 s cadence.
+      const sticky = stickyArmBenchmark(await lpResponse.json() as unknown, rememberedBenchmark.current?.agentId === agentId ? rememberedBenchmark.current.benchmark : null);
+      lpPayload.current = sticky.payload;
+      rememberedBenchmark.current = sticky.remembered === null ? null : { agentId, benchmark: sticky.remembered };
+      if (sticky.pending && pendingRetries.current < PENDING_BENCHMARK_RETRIES) {
+        pendingRetries.current += 1;
+        if (pendingRetryTimer.current !== null) clearTimeout(pendingRetryTimer.current);
+        pendingRetryTimer.current = setTimeout(() => {
+          pendingRetryTimer.current = null;
+          if (abortRef.current === null) void pollOwner(window);
+        }, PENDING_BENCHMARK_RETRY_MS);
+      } else if (!sticky.pending) pendingRetries.current = 0;
       const ownerData = typeof ownerPayload.current === "object" && ownerPayload.current !== null
         ? (ownerPayload.current as { readonly data?: { readonly hireSizing?: { readonly name?: unknown } } }).data : undefined;
       if (ownerData?.hireSizing?.name === "trade-v1") {
@@ -606,6 +628,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
       window.clearInterval(marketTimer);
       window.clearInterval(freshnessTimer);
       window.clearInterval(liveTickTimer);
+      if (pendingRetryTimer.current !== null) { clearTimeout(pendingRetryTimer.current); pendingRetryTimer.current = null; }
       liveTickAbortRef.current?.abort();
       abortRef.current?.abort();
       marketAbortRef.current?.abort();

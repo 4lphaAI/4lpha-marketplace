@@ -123,6 +123,15 @@ describe("Hired agent detail provenance", () => {
     expect(html).not.toContain("On-chain arm:");
     expect(html).not.toContain("0.78%");
   });
+  it("shows a skeleton, not the reason, for a tile whose dash is a read in flight (GRID-BENCHMARK-LATENCY)", () => {
+    const loading = { value: null, reason: "— reading on-chain arm (needed to measure in USDT)", loading: true as const };
+    const html = render({ ...view, grossPnl: loading, grossPnlPercent: loading, hodl: { value: null, reason: "— reading on-chain arm", loading: true } });
+    expect(html.match(/class="fl-skel"/gu)?.length).toBe(3);
+    expect(html).not.toContain("reading on-chain arm");
+    // A dash with a structural reason keeps the reason.
+    const unavailable = render({ ...view, grossPnl: { value: null, reason: "— the armed budget is not recorded on this agent" } });
+    expect(unavailable).toContain("the armed budget is not recorded on this agent");
+  });
 
   it("keeps ordinary lifecycle actions disabled and offers cancellation for an incomplete hire", () => {
     const html = render({ ...view, status: "provisioning", provisioning: true, actionDisabledReason: "This agent is still being hired. Finish the on-chain grant, or cancel the hire." });

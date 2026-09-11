@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { lpWithdrawOutcome } from "@/lib/lp/withdraw";
 import { formatEther, isHex, size } from "viem";
-import { ActivityRow, Button, Category, ChartFrame, Icon, MetricTile, Num, SegmentedToggle, StatusBadge } from "@/design-system";
+import { ActivityRow, Button, Category, ChartFrame, Icon, MetricTile, Num, SegmentedToggle, Skeleton, StatusBadge } from "@/design-system";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
 import { CHART_INTERVALS, displaySide, emptyRungPairs, gridSideLabel, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult } from "@/lib/exec/agent-detail";
 import { REVIEWED_MAJORS_56, formatAtomic, midpointWbnbUsdtPrice, pairQuoting, rangePrices, reviewedPair, type ReviewedPair, priceAtTick } from "@/lib/exec/pairs";
@@ -71,6 +71,15 @@ function Panel({ title, right, children, pad = 0, className = "" }: { readonly t
 
 function metricValue(metric: DetailMetric | null | undefined): string {
   return metric?.value ?? "—";
+}
+
+/**
+ * GRID-BENCHMARK-LATENCY — a tile whose dash is TRANSIENT (`loading`: the arm
+ * receipt or the page's first tick, seconds away) shows a skeleton and no
+ * reason; every other dash keeps its reason (operator, 2026-09-11).
+ */
+function tileValue(metric: DetailMetric | null | undefined): React.ReactNode {
+  return metric?.loading === true ? <Skeleton w={88} h={22} style={{ display: "inline-block", verticalAlign: "middle" }} /> : metricValue(metric);
 }
 
 function fixedSix(value: string | null | undefined, unit: "BNB" | "WBNB"): bigint | null {
@@ -1552,9 +1561,9 @@ export function HiredAgentScreen({ agentId, go }: Props) {
         {/* A dash still needs its reason — "why is this empty" is the question
             an empty tile provokes — but a tile that HAS a number says it with
             the number alone. */}
-        <MetricTile label="PnL since hire" value={delta} tone={metricTone(delta)} note={emptyNote(view?.grossPnl)} style={{ height: "100%" }} />
-        <MetricTile label="PNL by percent" value={percent} tone={metricTone(percent)} note={emptyNote(view?.grossPnlPercent)} style={{ height: "100%" }} />
-        <MetricTile label="HODL benchmark" value={hodl} tone={metricTone(hodl)} style={{ height: "100%" }} />
+        <MetricTile label="PnL since hire" value={tileValue(view?.grossPnl)} tone={metricTone(delta)} note={view?.grossPnl?.loading === true ? undefined : emptyNote(view?.grossPnl)} style={{ height: "100%" }} />
+        <MetricTile label="PNL by percent" value={tileValue(view?.grossPnlPercent)} tone={metricTone(percent)} note={view?.grossPnlPercent?.loading === true ? undefined : emptyNote(view?.grossPnlPercent)} style={{ height: "100%" }} />
+        <MetricTile label="HODL benchmark" value={tileValue(view?.hodl)} tone={metricTone(hodl)} style={{ height: "100%" }} />
       </div>
 
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>

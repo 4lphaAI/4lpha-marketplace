@@ -47,3 +47,12 @@ describe("on-chain base token HODL", () => {
     ["negative arm time", { benchmark: { ...arm, armedAtMs: -1 } }],
   ] as const) it(`does not invent HODL for ${name}`, () => expect(onChainGridHodl({ ...input, ...override }).metric.value).toBeNull());
 });
+
+describe("transient dashes are marked loading (GRID-BENCHMARK-LATENCY)", () => {
+  it("flags the plane's in-flight read and the page's missing tick, never a structural refusal", () => {
+    expect(onChainGridHodl({ ...input, benchmark: { status: "pending", reason: "arm-evidence-loading" } }).metric).toEqual({ value: null, reason: "— reading on-chain arm", loading: true });
+    expect(onChainGridHodl({ ...input, liveTick: null }).metric).toEqual({ value: null, reason: "— waiting for a fresh pool price", loading: true });
+    expect(onChainGridHodl({ ...input, benchmark: { status: "unavailable", reason: "arm-ambiguous" } }).metric.loading).toBeUndefined();
+    expect(onChainGridHodl({ ...input, capitalWei: "1" }).metric.loading).toBeUndefined();
+  });
+});

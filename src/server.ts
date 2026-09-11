@@ -4491,6 +4491,10 @@ export function createServer(deps: ServerDeps): Hono {
    */
   function registerLpRoutes(lp: LpServerDeps): void {
     const gridBenchmarkCache = createGridBenchmarkCache();
+    // GRID-BENCHMARK-LATENCY: how long the owner view waits for a cold arm
+    // receipt read before answering `pending`. Public-RPC receipt+block reads
+    // land well inside this; a slower one still answers, just on the next poll.
+    const GRID_BENCHMARK_FIRST_READ_WAIT_MS = 2_500;
     /** Digest an agent that never signed `lpSettings` runs under. */
     const defaultSettingsDigest = paramsHash("lpSettings", defaultLpSettingsParams());
     // Tests and the dev stack deliberately use the explicit snapshot
@@ -10323,7 +10327,7 @@ export function createServer(deps: ServerDeps): Hono {
                   // omits the block rather than reporting a zero balance, which
                   // would be a claim.
                   ...(await ladderBufferView(agent, effectiveSettings.grid, positions)),
-                }), benchmark: (() => {
+                }), benchmark: await (async () => {
                   const grid = effectiveSettings.grid!;
                   const selected = selectGridArmBenchmark({
                     owner: agent.ownerAddress, agentId: agent.id, wallet: agent.walletAddress,
@@ -10332,7 +10336,7 @@ export function createServer(deps: ServerDeps): Hono {
                     capitalWei: agent.sessionFacts?.hireSizing?.openNativeBudgetWei ?? null,
                     positions, sequences, outcomes: stepOutcomes, nativeSpends: stepNativeSpends,
                   });
-                  return "status" in selected ? selected : gridBenchmarkCache.getOrStart(selected, lp.readers.gridArmBenchmark);
+                  return "status" in selected ? selected : await gridBenchmarkCache.getOrWait(selected, lp.readers.gridArmBenchmark, GRID_BENCHMARK_FIRST_READ_WAIT_MS);
                 })() },
               }),
           ...(lpOwnerBlock === undefined ? {} : { lp: lpOwnerBlock }),

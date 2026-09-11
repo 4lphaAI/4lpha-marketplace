@@ -33,6 +33,13 @@ export type DetailMetric = {
   /** Same quantity in each unit, when both are known. The tile picks one. */
   readonly bnb?: string;
   readonly usd?: string;
+  /**
+   * The dash is TRANSIENT: a read this page or the plane has already started
+   * (the arm receipt, the page's first pool tick) and will answer within
+   * seconds. A tile shows a skeleton for it, never the reason; a dash without
+   * this flag is a state the reader must be told about.
+   */
+  readonly loading?: true;
 };
 
 export type DetailPosition = {
@@ -590,10 +597,11 @@ export function onChainGridHodl(input: {
   readonly liveTick: LiveTick | null; readonly nowMs: number;
   readonly holdWbnb?: boolean;
 }): { readonly metric: DetailMetric; readonly armedAtMs?: number; readonly txHash?: string; readonly armSqrtPriceX96?: bigint } {
-  const missing = (reason: string) => ({ metric: { value: null, reason: `— ${reason}` } });
+  const missing = (reason: string, loading = false) => ({ metric: { value: null, reason: `— ${reason}`, ...(loading ? { loading: true as const } : {}) } });
   const evidence = row(input.benchmark);
   if (evidence?.["status"] !== "ready") {
-    return missing(evidence?.["status"] === "pending" ? "reading on-chain arm" : "on-chain arm evidence unavailable");
+    // `pending` = the plane has the read in flight: a skeleton, not a reason.
+    return evidence?.["status"] === "pending" ? missing("reading on-chain arm", true) : missing("on-chain arm evidence unavailable");
   }
   const sqrtText = evidence["sqrtPriceX96"], capital = evidence["capitalWei"];
   const armedAtMs = evidence["armedAtMs"], txHash = evidence["txHash"];
@@ -610,7 +618,7 @@ export function onChainGridHodl(input: {
   const tick = input.liveTick;
   if (!tick || tick.poolAddress?.toLowerCase() !== input.pool?.toLowerCase() || input.nowMs - tick.readAtMs < 0
     || input.nowMs - tick.readAtMs > 60_000 || !Number.isSafeInteger(tick.tick) || tick.tick < -887272 || tick.tick >= 887272
-    || !DECIMAL.test(tick.blockNumber) || BigInt(tick.blockNumber) < BigInt(evidence["blockNumber"])) return { ...missing("waiting for a fresh pool price"), armSqrtPriceX96: start };
+    || !DECIMAL.test(tick.blockNumber) || BigInt(tick.blockNumber) < BigInt(evidence["blockNumber"])) return { ...missing("waiting for a fresh pool price", true), armSqrtPriceX96: start };
   const wbnb0 = input.token0.toLowerCase() === WBNB_56;
   if (wbnb0 === (input.token1.toLowerCase() === WBNB_56)) return missing("invalid quote token");
   const q = 1n << 192n, s2 = start * start, current = getSqrtRatioAtTick(tick.tick), n2 = current * current;
@@ -1407,7 +1415,7 @@ export function mapAgentDetail(
   // The gross figures: holdings and budget in the MEASURING unit — WBNB wei by
   // default; the quote's wei when `quoteMeasured`, holdings at the observed
   // tick and the budget at the arm price, or a dash with the reason.
-  const measured: { readonly holdings: bigint; readonly budget: bigint; readonly unit: { readonly symbol: string; readonly decimals: number }; readonly usd: number | null } | { readonly reason: string } = "reason" in holdings
+  const measured: { readonly holdings: bigint; readonly budget: bigint; readonly unit: { readonly symbol: string; readonly decimals: number }; readonly usd: number | null } | { readonly reason: string; readonly loading?: true } = "reason" in holdings
     ? { reason: holdings.reason }
     : armedBudgetWei === null
       ? { reason: "— the armed budget is not recorded on this agent" }
@@ -1419,7 +1427,7 @@ export function mapAgentDetail(
         // not also wait for the BASE token's decimals to arrive.
         ? { holdings: holdings.wei, budget: BigInt(armedBudgetWei), unit: { symbol: "WBNB", decimals: 18 }, usd: quoteUsdFor("WBNB", tokenSnapshot, nowMs) }
         : hodl.armSqrtPriceX96 === undefined
-          ? { reason: `${hodl.metric.reason ?? "— arm price unavailable"} (needed to measure in ${quoteUnit.symbol})` }
+          ? { reason: `${hodl.metric.reason ?? "— arm price unavailable"} (needed to measure in ${quoteUnit.symbol})`, ...(hodl.metric.loading === true ? { loading: true as const } : {}) }
           : observed?.observedTick === null || observed === undefined
             ? { reason: `— no observed tick to measure in ${quoteUnit.symbol}` }
             : {
@@ -1430,7 +1438,7 @@ export function mapAgentDetail(
               };
   const grossNote = quoteMeasured && quoteUnit !== null ? `gross · measured in ${quoteUnit.symbol}, budget at the arm price` : undefined;
   const grossPnl: DetailMetric = "reason" in measured
-    ? { value: null, reason: measured.reason }
+    ? { value: null, reason: measured.reason, ...(measured.loading === true ? { loading: true as const } : {}) }
     : {
         // A PnL without a sign is ambiguous, and `formatSignedAtomic` only
         // writes the minus. The plus is explicit here.
@@ -1441,7 +1449,7 @@ export function mapAgentDetail(
         ...(measured.usd === null ? {} : { usd: signedUsdOrWbnb(measured.holdings - measured.budget, measured.usd, measured.unit) }),
       };
   const grossPnlPercent: DetailMetric = "reason" in measured || measured.budget <= 0n
-    ? { value: null, reason: grossPnl.reason ?? "— no armed budget to measure against" }
+    ? { value: null, reason: grossPnl.reason ?? "— no armed budget to measure against", ...(grossPnl.loading === true ? { loading: true as const } : {}) }
     : (() => {
         const delta = measured.holdings - measured.budget;
         const magnitude = delta < 0n ? -delta : delta;
@@ -1578,6 +1586,35 @@ export function tokenKlinesPath(token: string, limit: number, interval: ChartInt
   if (!ADDRESS.test(token)) throw new Error("Token address is invalid.");
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("Kline limit is invalid.");
   return `/api/market-data/ohlcv?kind=token&address=${token.toLowerCase()}&interval=${interval}&limit=${limit}`;
+}
+
+/**
+ * GRID-BENCHMARK-LATENCY (2026-09-11) — the arm receipt, once `ready`, is
+ * immutable, so the page keeps it and reuses it whenever a later owner view
+ * answers `pending` (the plane's read in flight again after an API restart or
+ * an evicted cache entry). Anything else — `unavailable`, no grid block —
+ * FORGETS it: a closed or re-armed grid must never inherit the old receipt,
+ * and the next `pending` after that starts clean.
+ *
+ * Returns the payload to map (the benchmark substituted when it applies) and
+ * the receipt to remember for the next poll.
+ */
+export function stickyArmBenchmark(
+  payload: unknown,
+  remembered: Record<string, unknown> | null,
+): { readonly payload: unknown; readonly remembered: Record<string, unknown> | null; readonly pending: boolean } {
+  const body = row(payload);
+  const data = row(body?.["data"]);
+  const grid = row(data?.["grid"]);
+  const benchmark = row(grid?.["benchmark"]);
+  if (benchmark?.["status"] === "ready") return { payload, remembered: benchmark, pending: false };
+  if (benchmark?.["status"] !== "pending") return { payload, remembered: null, pending: false };
+  if (remembered === null || body === null || data === null || grid === null) return { payload, remembered, pending: true };
+  return {
+    payload: { ...body, data: { ...data, grid: { ...grid, benchmark: remembered } } },
+    remembered,
+    pending: false,
+  };
 }
 
 /**
