@@ -86,11 +86,9 @@ it("rungs mode paints each signed rung in its own tone, frames both, and shows a
   } finally { await act(async () => root.unmount()); }
 });
 
-it("rungs mode labels each rung by its completing edge and the market bar by the current price, market bar white", async () => {
+it("rungs mode paints the market bar white and prints no price labels under the bars (they overlapped on long prices)", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { bins: [-30, -20, -10, 0, 10, 20, 30].map((tickLower) => ({ tickLower, liquidity: "10" })), currentTick: 5, blockNumber: "7", truncated: false } }), { status: 200 })));
   const host = document.createElement("div"), root = createRoot(host);
-  // quoteIsToken0 (USDT per WBNB): a HIGHER tick is a LOWER price, so the bid
-  // rung sits at the high ticks and its low-price edge is its tickUpper.
   try {
     await act(async () => {
       root.render(<LiquidityChart poolAddress="0x1111111111111111111111111111111111111111" geometry={geometry}
@@ -98,12 +96,8 @@ it("rungs mode labels each rung by its completing edge and the market bar by the
         legend={{ bid: "BIDS · BUY WBNB", ask: "ASKS · SELL WBNB" }} />);
       await Promise.resolve();
     });
-    const labels = [...host.querySelectorAll("[data-label-price]")].map((el) => el.getAttribute("data-label-price"));
-    expect(labels).toHaveLength(3);
-    const price = (tick: number) => 1 / Math.pow(1.0001, tick);
-    expect(labels).toContain(price(40).toPrecision(8).replace(/0+$/u, ""));
-    expect(labels).toContain(price(-30).toPrecision(8).replace(/0+$/u, ""));
-    expect(labels).toContain(price(5).toPrecision(8).replace(/0+$/u, ""));
+    // Operator, 2026-09-12: a mubarak price is 0.0000414…, three of those under adjacent bars overlapped into an unreadable smear.
+    expect(host.querySelectorAll("[data-label-price]")).toHaveLength(0);
     const market = host.querySelector('[data-market="true"]') as HTMLElement;
     expect(market.style.background).toBe("var(--ink-1)");
   } finally { await act(async () => root.unmount()); }
