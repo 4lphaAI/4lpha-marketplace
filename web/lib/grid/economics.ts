@@ -180,10 +180,10 @@ export function gridCapitalFloor(input: {
  * conservative, never wrong: the floor scales with the fee.
  */
 export const GRID_CAPITAL_FLOOR_BNB: Record<GridPresetId, Record<number, string>> = {
-  tight: { 100: "0.4141", 500: "0.2722", 2500: "0.0943", 10000: "0.0229" },
-  standard: { 100: "0.2094", 500: "0.1905", 2500: "0.0943", 10000: "0.0229" },
-  wide: { 100: "0.0939", 500: "0.0859", 2500: "0.0627", 10000: "0.0229" },
-  "very-wide": { 100: "0.0466", 500: "0.0456", 2500: "0.0415", 10000: "0.0229" },
+  tight: { 100: "0.5953", 500: "0.3175", 2500: "0.0943", 10000: "0.0229" },
+  standard: { 100: "0.3073", 500: "0.2382", 2500: "0.0943", 10000: "0.0229" },
+  wide: { 100: "0.1245", 500: "0.1053", 2500: "0.0627", 10000: "0.0229" },
+  "very-wide": { 100: "0.0623", 500: "0.0587", 2500: "0.0467", 10000: "0.0229" },
 };
 
 /** Fee tiers the table covers; 0.01% is also the worst case of every preset. */
@@ -204,24 +204,22 @@ export function gridCapitalFloorBnb(presetId: GridPresetId, fee: number | null):
  * signed.
  *
  * The preset name is never signed (backend ruling Q6) — what the owner's
- * signature carries is the quantized gap and width — so the only honest way to
- * name the model on the agent page is to re-derive it: quantize each preset at
- * this pool's spacing and see which one produces these ticks. Two presets can
+ * signature carries is the quantized gap and one-spacing width, so the only
+ * honest way to name the model on the agent page is to re-derive it: quantize each preset at
+ * this pool's spacing and see which one produces this gap. Two presets can
  * collapse onto the same geometry on a coarse pool (tight and standard are
  * identical at spacing 50), so the FIRST match wins and the ambiguity is real:
  * the agent is running that geometry whatever it was called at deploy.
  */
 export function gridModelLabel(input: {
   readonly gapTicks: number | null;
-  readonly widthTicks: number | null;
   readonly tickSpacing: number;
 }): string | null {
-  const { gapTicks, widthTicks, tickSpacing } = input;
-  if (gapTicks === null || widthTicks === null || !Number.isInteger(tickSpacing) || tickSpacing <= 0) return null;
+  const { gapTicks, tickSpacing } = input;
+  if (gapTicks === null || !Number.isInteger(tickSpacing) || tickSpacing <= 0) return null;
   for (const [presetId, preset] of Object.entries(GRID_PRESETS)) {
     const gap = gridQuantizeUpToSpacing(preset.gapBps, tickSpacing).ticks;
-    const width = gridQuantizeUpToSpacing(preset.widthBps, tickSpacing).ticks;
-    if (gap === gapTicks && width === widthTicks) return GRID_PRESETS[presetId as GridPresetId].label;
+    if (gap === gapTicks) return GRID_PRESETS[presetId as GridPresetId].label;
   }
   return "Custom";
 }

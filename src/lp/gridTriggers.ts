@@ -112,6 +112,10 @@ import {
 /** Which signed level the live position IS. */
 export type LpGridRole = "buy" | "sell";
 
+export type LpGridShiftCrossRecheck = {
+  readonly verdict: "filled" | "inside" | "armed-side" | "range-unknown";
+};
+
 /**
  * PHASE3.17 — WHICH of a dual grid's two levels a position belongs to.
  *
@@ -2231,6 +2235,25 @@ export function lpGridShiftQuotaHoldReason(input: {
       + `Remedy: lower minMinutesBetweenExits, or wait one interval.`;
 }
 
+export function lpGridShiftCrossRecheckHoldReason(input: {
+  readonly siblingRole: LpGridRole;
+  readonly siblingRange?: LpGridRange;
+  readonly siblingCrossConsecutive: number;
+  readonly currentTick: number;
+  readonly verdict: "inside" | "armed-side" | "range-unknown";
+}): string {
+  if (input.verdict === "range-unknown") {
+    return `Shift cross evidence cannot be re-checked: the ${input.siblingRole} rung's persisted observation carries no range for its live NFT (pre-upgrade row, or a rung re-minted since). The pair holds until that rung's next finalized observation.`;
+  }
+  const range = input.siblingRange;
+  if (range === undefined) {
+    throw new Error("A shift cross recheck range is required for a ranged verdict.");
+  }
+  return input.verdict === "inside"
+    ? `Shift cross evidence is stale: the ${input.siblingRole} rung [${range.tickLower}, ${range.tickUpper}) was recorded crossed ${input.siblingCrossConsecutive}x, but at this cycle's tick ${input.currentTick} the price is INSIDE it (partly converted). The pair holds; no counter is reset. A wick is not a fill.`
+    : `Shift cross evidence is stale: the ${input.siblingRole} rung [${range.tickLower}, ${range.tickUpper}) was recorded crossed ${input.siblingCrossConsecutive}x, but at this cycle's tick ${input.currentTick} it is back on its armed side (the move reversed). The pair holds; no counter is reset. A wick is not a fill.`;
+}
+
 /**
  * PHASE3.22 R7 — THE SHIFT DECISION'S OWN REASON LINE.
  *
@@ -2943,14 +2966,10 @@ export type EvaluateGridTriggersInput = EvaluateLpTriggersInput & {
     readonly liveRoles: readonly LpGridRole[];
   };
   /**
-   * PHASE3.22 R2.3 point 2 (as superseded by R4.4/P9 and D8) — THE SIBLING
-   * RUNG'S EVIDENCE, from its DURABLE OBSERVATION ROW.
-   *
-   * NO `range` FIELD. R2.3's original shape carried one and P9 proved it has no
-   * source: position rows carry no ticks, and re-reading the sibling's NFT to
-   * get them would be a chain read the trigger has no business making. What the
-   * sibling's own evaluation ALREADY computed and persisted is its cross and
-   * drift readings, and those are exactly what the union needs.
+   * PHASE3.22 R2.3 point 2, amended by GRID-ONE-TICK-SHIFT-RECHECK R2-B2 — THE
+   * SIBLING RUNG'S EVIDENCE, from its DURABLE OBSERVATION ROW. The range comes
+   * from the worker's persisted `portfolioObservation`, is bound to the
+   * observation's NFT tokenId, and requires no chain read here.
    *
    * THE UNION IS THE POINT (R7): the pair's motion condition is that EITHER
    * row's cross or drift evidence is ready, because a fill on either rung means
@@ -2967,6 +2986,8 @@ export type EvaluateGridTriggersInput = EvaluateLpTriggersInput & {
     readonly gridDriftConsecutive: number;
     readonly crossSide?: SwaplessRotationSide;
     readonly driftSide?: SwaplessRotationSide;
+    /** GRID-ONE-TICK-SHIFT-RECHECK R2-B2: current-NFT-bound persisted range. */
+    readonly range?: LpGridRange;
     /** PHASE3.23 R3.6: absent is explicitly unknown, never inferred. */
     readonly gridRangeRelation?: "inside" | "outside";
   };
@@ -3372,9 +3393,27 @@ export function evaluateGridTriggers(
       // the live set (D8) — so a one-sided pair reads only its own evidence and
       // a stale dormant observation is never consulted.
       const sibling = input.shiftSibling;
-      const crossReady =
-        (cross.filled && gridCrossConsecutive >= 2)
-        || (sibling !== undefined && sibling.gridCrossConsecutive >= 2);
+      // Own-row evidence IS this cycle's reading (`cross` above): same-cycle by
+      // construction. The sibling's counter is durable, so its fill fact is
+      // re-read at this cycle's tick against the tokenId-bound range (R2-B3).
+      const ownCrossReady = cross.filled && gridCrossConsecutive >= 2;
+      const siblingRecheck: LpGridShiftCrossRecheck | undefined =
+        sibling === undefined || sibling.gridCrossConsecutive < 2
+          ? undefined
+          : sibling.range === undefined
+            ? { verdict: "range-unknown" }
+            : (() => {
+                const reading = gridCrossReading({
+                  currentTick: position.currentTick,
+                  range: sibling.range,
+                  role: sibling.role,
+                  wbnbIsToken0: grid.wbnbIsToken0,
+                });
+                return reading.filled
+                  ? { verdict: "filled" as const }
+                  : { verdict: reading.side === undefined ? "inside" as const : "armed-side" as const };
+              })();
+      const crossReady = ownCrossReady || siblingRecheck?.verdict === "filled";
       const driftReady =
         (drift !== null && drift.drifted && gridDriftConsecutive >= 2)
         || (shift.driftPctOfGap !== 0
@@ -3389,6 +3428,16 @@ export function evaluateGridTriggers(
       const cause: "cross" | "drift" | null = crossReady
         ? "cross"
         : driftReady ? "drift" : null;
+      if (cause === null && sibling !== undefined && siblingRecheck !== undefined && siblingRecheck.verdict !== "filled") {
+        const held = build("hold", lpGridShiftCrossRecheckHoldReason({
+          siblingRole: sibling.role,
+          ...(sibling.range === undefined ? {} : { siblingRange: sibling.range }),
+          siblingCrossConsecutive: sibling.gridCrossConsecutive,
+          currentTick: position.currentTick,
+          verdict: siblingRecheck.verdict,
+        }));
+        return { ...held, holdReason: held.triggerReason.reason };
+      }
       let targetRoles: readonly LpGridRole[] = ["sell", "buy"];
       if (cause === "drift" && group.liveRoles.includes("buy") && group.liveRoles.includes("sell")) {
         const ownRelation = cross.side === undefined ? "inside" : "outside";

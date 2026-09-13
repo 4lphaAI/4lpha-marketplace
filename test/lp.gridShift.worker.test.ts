@@ -48,18 +48,20 @@ import { MemoryExecutionJournal } from "../src/store/journal.js";
 import { MemoryKillSwitch } from "../src/killswitch/killswitch.js";
 import { MemoryLpSequenceStore } from "../src/store/lpSequences.js";
 import { MemoryLpSettingsStore } from "../src/store/lpSettings.js";
-import { MemoryLpObservationStore } from "../src/store/lpObservations.js";
+import { MemoryLpObservationStore, type PutLpObservationInput } from "../src/store/lpObservations.js";
 import { MemoryLpGridCycleStore } from "../src/store/gridCycles.js";
 import type { SessionSpec } from "../src/core/types.js";
 import type { LpRailConfig } from "../src/lp/rails.js";
 import type { LpPositionSnapshot } from "../src/lp/sagas.js";
 import type { LpWorkerChainReaders } from "../src/lp/readers.js";
 import { gridDeriveRanges } from "../src/lp/gridGeometry.js";
+import { gridCrossReading } from "../src/lp/gridTriggers.js";
 import { MAX_TICK, MIN_TICK } from "../src/lp/tickMath.js";
 import {
   DEFAULT_LP_SETTINGS,
   type LpAutomationSettings,
   type LpGridSettings,
+  type LpTriggerObservation,
 } from "../src/lp/triggers.js";
 import { lpSettingsParamsView } from "../src/http/lpWire.js";
 import { paramsHash } from "../src/auth/canonical.js";
@@ -125,6 +127,18 @@ const SHIFT_GRID: LpGridSettings = {
   },
 };
 
+const T_X = [DERIVED.sellRange.tickLower - 1, DERIVED.sellRange.tickUpper]
+  .find((tick) => gridCrossReading({ currentTick: tick, range: DERIVED.sellRange, role: "sell", wbnbIsToken0: true }).filled
+    && !gridCrossReading({ currentTick: tick, range: DERIVED.buyRange, role: "buy", wbnbIsToken0: true }).filled)
+  ?? (() => { throw new Error("The worker fixture must have a clean sell-cross tick."); })();
+const T_IN = Math.floor((DERIVED.sellRange.tickLower + DERIVED.sellRange.tickUpper) / 2);
+assert.equal(gridCrossReading({ currentTick: T_IN, range: DERIVED.sellRange, role: "sell", wbnbIsToken0: true }).side, undefined);
+
+const RECHECK_GRID: LpGridSettings = {
+  ...SHIFT_GRID,
+  shift: { ...SHIFT_GRID.shift!, driftPctOfGap: 0 },
+};
+
 /** The SAME rows and geometry as a LADDER, for the mode-first control. */
 const LADDER_GRID: LpGridSettings = {
   pool: SHIFT_GRID.pool,
@@ -174,6 +188,9 @@ function lpSessionFacts(expiresAt: number): SessionFacts {
 
 type Chain = {
   tick: number;
+  tickFor?: (tokenId: string) => number;
+  currentRow: string | null;
+  calls: string[];
   /** The cycle clock and block, advanced between cycles so the protect
    * hysteresis can actually confirm — two observations ONE INTERVAL APART. */
   nowMs: number;
@@ -183,26 +200,56 @@ type Chain = {
   balances: Map<Address, bigint>;
 };
 
+class FailingPuts extends MemoryLpObservationStore {
+  readonly failFor = new Set<string>();
+  readonly failGetFor = new Set<string>();
+
+  override async put(input: PutLpObservationInput): Promise<void> {
+    if (this.failFor.has(input.positionId)) throw new Error("scripted");
+    return super.put(input);
+  }
+
+  override async get(
+    ownerAddress: Address,
+    agentId: string,
+    positionId: string,
+    signal?: AbortSignal,
+  ): Promise<LpTriggerObservation | null> {
+    if (this.failGetFor.has(positionId)) throw new Error("scripted");
+    return super.get(ownerAddress, agentId, positionId, signal);
+  }
+}
+
 function fakeReaders(chain: Chain): LpWorkerChainReaders {
   return {
     getPool: async () => POOL,
-    poolState: async () => ({
-      pool: POOL,
-      tickSpacing: SPACING,
-      currentTick: chain.tick,
-      evidence: {
-        blockNumber: chain.block,
-        finalizedBlockNumber: chain.block,
-        observationCardinality: 500,
-        poolLiquidity: 10n ** 24n,
-        priceImpactBps: 0n,
-        spotSqrtPriceX96: 2n ** 96n,
-        twapSqrtPriceX96: 2n ** 96n,
-      },
-    }),
+    poolState: async () => {
+      const tokenId = chain.currentRow ?? "";
+      chain.calls.push(`poolState(${tokenId})`);
+      const tick = chain.tickFor?.(tokenId) ?? chain.tick;
+      return {
+        pool: POOL,
+        tickSpacing: SPACING,
+        currentTick: tick,
+        evidence: {
+          blockNumber: chain.block,
+          finalizedBlockNumber: chain.block,
+          observationCardinality: 500,
+          poolLiquidity: 10n ** 24n,
+          priceImpactBps: 0n,
+          spotSqrtPriceX96: 2n ** 96n,
+          twapSqrtPriceX96: 2n ** 96n,
+        },
+      };
+    },
     positions: async (tokenId) => chain.positions.get(tokenId.toString(10)) ?? "burned",
     positionFees: async () => ({ amount0Wei: 0n, amount1Wei: 0n }),
-    ownerOf: async () => chain.nftOwner,
+    ownerOf: async (tokenId) => {
+      const id = tokenId.toString(10);
+      chain.currentRow = id;
+      chain.calls.push(`ownerOf(${id})`);
+      return chain.nftOwner;
+    },
     quote: async (params) => params.amountInWei,
     walletTokenBalance: async (token: Address) => chain.balances.get(token) ?? 0n,
     // GRID-GAS-RESERVE P2: the gas pot is funded so what these journeys test
@@ -241,6 +288,9 @@ async function fixture(
   options: {
     readonly grid?: LpGridSettings;
     readonly tick?: number;
+    readonly rowOrder?: "buy-first" | "sell-first";
+    readonly sellTokenId?: string;
+    readonly observations?: MemoryLpObservationStore;
     /**
      * FINDINGS (bc): the always-firing price stop below is what makes the
      * group-lock tests non-vacuous, but protect is priority 0 — so a test that
@@ -257,16 +307,18 @@ async function fixture(
   const killswitch = new MemoryKillSwitch(now);
   const store = new MemoryLpSequenceStore(now);
   const settingsStore = new MemoryLpSettingsStore(now);
-  const observations = new MemoryLpObservationStore();
+  const observations = options.observations ?? new MemoryLpObservationStore();
   const provider = new FakeWalletProvider();
   const chain: Chain = {
     tick: options.tick ?? TICK_ANCHOR,
+    currentRow: null,
+    calls: [],
     get nowMs() { return chainClock.nowMs; },
     set nowMs(value: number) { chainClock.nowMs = value; },
     block: 100n,
     positions: new Map([
       [BUY_TOKEN_ID, { liquidity: 1_000n, ...DERIVED.buyRange }],
-      [SELL_TOKEN_ID, { liquidity: 1_000n, ...DERIVED.sellRange }],
+      [options.sellTokenId ?? SELL_TOKEN_ID, { liquidity: 1_000n, ...DERIVED.sellRange }],
     ]),
     nftOwner: ownerAccount.address,
     balances: new Map<Address, bigint>([
@@ -296,18 +348,19 @@ async function fixture(
     gridLevel: 1 as const,
     armGroupId: ARM_GROUP_ID,
   };
-  await store.createPosition({
-    ...base,
-    positionId: BUY_ID,
-    tokenId: BUY_TOKEN_ID,
-    gridRole: "buy",
-  });
-  await store.createPosition({
-    ...base,
-    positionId: SELL_ID,
-    tokenId: SELL_TOKEN_ID,
-    gridRole: "sell",
-  });
+  const rows = options.rowOrder === "sell-first"
+    ? [
+        { positionId: SELL_ID, tokenId: options.sellTokenId ?? SELL_TOKEN_ID, gridRole: "sell" as const },
+        { positionId: BUY_ID, tokenId: BUY_TOKEN_ID, gridRole: "buy" as const },
+      ]
+    : [
+        { positionId: BUY_ID, tokenId: BUY_TOKEN_ID, gridRole: "buy" as const },
+        { positionId: SELL_ID, tokenId: options.sellTokenId ?? SELL_TOKEN_ID, gridRole: "sell" as const },
+      ];
+  for (const [index, row] of rows.entries()) {
+    if (index > 0 && options.rowOrder !== undefined) chainClock.nowMs += 1;
+    await store.createPosition({ ...base, ...row });
+  }
 
   const grid = options.grid ?? SHIFT_GRID;
   const settings: LpAutomationSettings = {
@@ -678,5 +731,257 @@ describe("FINDINGS (be): drift must not exit a rung that is mid-conversion", () 
     assert.equal(shift.shiftCause, "drift");
     assert.notEqual(shift.targetTickLower, null);
     assert.notEqual(shift.targetSellTickLower, null, "a clean drift targets both rungs");
+  });
+});
+
+describe("GRID-ONE-TICK-SHIFT-RECHECK B: worker threading of the sibling's range", () => {
+  async function cycle(f: Fixture): Promise<readonly { readonly positionId: string; readonly action: string; readonly kind?: string; readonly reason: string }[]> {
+    f.chain.calls.length = 0;
+    const report = await runLpWorkerOnce(f.deps, createLpWorkerState());
+    let lastOwner: string | null = null;
+    for (const call of f.chain.calls) {
+      if (call.startsWith("ownerOf(")) lastOwner = call.slice("ownerOf(".length, -1);
+      if (!call.startsWith("poolState(")) continue;
+      const tokenId = call.slice("poolState(".length, -1);
+      assert.equal(lastOwner, tokenId, "poolState must use the row most recently checked by ownerOf");
+    }
+    return report.outcomes.map((outcome) => ({
+      positionId: outcome.positionId,
+      action: outcome.action,
+      ...(outcome.kind === undefined ? {} : { kind: outcome.kind }),
+      reason: outcome.reason,
+    }));
+  }
+
+  function outcome(outcomes: readonly { readonly positionId: string; readonly action: string; readonly kind?: string; readonly reason: string }[], positionId: string): { readonly positionId: string; readonly action: string; readonly kind?: string; readonly reason: string } {
+    const found = outcomes.find((entry) => entry.positionId === positionId);
+    assert.ok(found, `missing outcome for ${positionId}`);
+    return found;
+  }
+
+  async function noShift(f: Fixture): Promise<void> {
+    assert.equal((await f.store.listSequences(ownerAccount.address, AGENT_ID)).some((row) => row.kind === "grid-shift"), false);
+  }
+
+  async function seedSellObservation(
+    f: Fixture,
+    input: { readonly tokenId: string; readonly lower?: boolean; readonly upper?: boolean },
+  ): Promise<void> {
+    const side = gridCrossReading({ currentTick: T_X, range: DERIVED.sellRange, role: "sell", wbnbIsToken0: true }).side;
+    if (side === undefined) throw new Error("The worker fixture must have a sell cross side.");
+    await f.observations.put({
+      ownerAddress: ownerAccount.address,
+      agentId: AGENT_ID,
+      positionId: SELL_ID,
+      observation: {
+        blockNumber: f.chain.block,
+        currentTick: T_X,
+        evaluatedAtMs: f.chain.nowMs - INTERVAL_MS,
+        poolAddress: POOL,
+        protectConsecutive: 0,
+        rotationBreach: false,
+        rotationConsecutive: 0,
+        gridCrossConsecutive: 2,
+        gridCrossSide: side,
+        gridRangeRelation: "outside",
+        ...(input.lower === false ? {} : { tickLower: DERIVED.sellRange.tickLower }),
+        ...(input.upper === false ? {} : { tickUpper: DERIVED.sellRange.tickUpper }),
+        tokenId: input.tokenId,
+      },
+    });
+  }
+
+  async function matchingTokenObservation(f: Fixture): Promise<LpTriggerObservation> {
+    const row = await f.observations.get(ownerAccount.address, AGENT_ID, SELL_ID);
+    assert.ok(row);
+    return row;
+  }
+
+  it("BW-1a buy-first: hold on a dispatcher-only reversal, then dispatch", async () => {
+    const f = await fixture({ grid: RECHECK_GRID, rowOrder: "buy-first", priceStop: false });
+    f.chain.tickFor = () => T_X;
+    await cycle(f);
+    advance(f);
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 2);
+    f.chain.tickFor = (tokenId) => tokenId === BUY_TOKEN_ID ? T_IN : T_X;
+    advance(f);
+    const held = outcome(await cycle(f), BUY_ID);
+    assert.equal(held.action, "hold");
+    assert.match(held.reason, /Shift cross evidence is stale/u);
+    assert.match(held.reason, /INSIDE/u);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 3);
+    await noShift(f);
+    delete f.chain.tickFor;
+    f.chain.tick = T_X;
+    advance(f);
+    const shifted = outcome(await cycle(f), BUY_ID);
+    assert.equal(shifted.kind, "grid-shift");
+    assert.notEqual(shifted.reason, "");
+  });
+
+  it("BW-1b sell-first: the same hold appears when the sibling is crossed and the dispatcher is inside", async () => {
+    const f = await fixture({ grid: RECHECK_GRID, rowOrder: "sell-first", priceStop: false });
+    f.chain.tickFor = () => T_X;
+    await cycle(f);
+    advance(f);
+    f.chain.tickFor = (tokenId) => tokenId === BUY_TOKEN_ID ? T_IN : T_X;
+    const held = outcome(await cycle(f), BUY_ID);
+    assert.equal(held.action, "hold");
+    assert.match(held.reason, /Shift cross evidence is stale/u);
+    await noShift(f);
+    delete f.chain.tickFor;
+    f.chain.tick = T_X;
+    advance(f);
+    assert.equal(outcome(await cycle(f), BUY_ID).kind, "grid-shift");
+  });
+
+  it("BW-1c sell-first: a persisted reversal requires two fresh crossings before dispatch", async () => {
+    const f = await fixture({ grid: RECHECK_GRID, rowOrder: "sell-first", priceStop: false });
+    f.chain.tickFor = () => T_X;
+    await cycle(f);
+    advance(f);
+    f.chain.tickFor = (tokenId) => tokenId === BUY_TOKEN_ID ? T_IN : T_X;
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 2);
+    delete f.chain.tickFor;
+    f.chain.tick = T_IN;
+    advance(f);
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 0);
+    await noShift(f);
+    f.chain.tick = T_X;
+    advance(f);
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 1);
+    await noShift(f);
+    const beforeDispatch = await matchingTokenObservation(f);
+    assert.equal(beforeDispatch.gridCrossConsecutive, 1);
+    advance(f);
+    assert.equal(outcome(await cycle(f), BUY_ID).kind, "grid-shift");
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 2);
+  });
+
+  it("BW-1c' buy-first: a persisted reversal requires two fresh crossings before dispatch", async () => {
+    const f = await fixture({ grid: RECHECK_GRID, rowOrder: "buy-first", priceStop: false });
+    f.chain.tickFor = () => T_X;
+    await cycle(f);
+    advance(f);
+    await cycle(f);
+    f.chain.tickFor = (tokenId) => tokenId === BUY_TOKEN_ID ? T_IN : T_X;
+    advance(f);
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 3);
+    delete f.chain.tickFor;
+    f.chain.tick = T_IN;
+    advance(f);
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 0);
+    await noShift(f);
+    f.chain.tick = T_X;
+    advance(f);
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 1);
+    await noShift(f);
+    const beforeSecondCross = await matchingTokenObservation(f);
+    assert.equal(beforeSecondCross.gridCrossConsecutive, 1);
+    advance(f);
+    await cycle(f);
+    assert.equal((await matchingTokenObservation(f)).gridCrossConsecutive, 2);
+    await noShift(f);
+    const beforeDispatch = await matchingTokenObservation(f);
+    assert.equal(beforeDispatch.gridCrossConsecutive, 2);
+    advance(f);
+    assert.equal(outcome(await cycle(f), BUY_ID).kind, "grid-shift");
+  });
+
+  it("BW-2 mismatched tokenId holds without a recheckable sibling range", async () => {
+    for (const rowOrder of ["buy-first", "sell-first"] as const) {
+      const observations = new FailingPuts();
+      const f = await fixture({ grid: RECHECK_GRID, rowOrder, priceStop: false, observations, sellTokenId: "9203" });
+      await seedSellObservation(f, { tokenId: "9200" });
+      assert.equal((await f.observations.get(ownerAccount.address, AGENT_ID, SELL_ID))?.tokenId, "9200");
+      observations.failFor.add(SELL_ID);
+      const buy = outcome(await cycle(f), BUY_ID);
+      assert.equal(buy.action, "hold");
+      assert.match(buy.reason, /cannot be re-checked/u);
+      await noShift(f);
+    }
+  });
+
+  it("BW-3 either missing range bound holds without a recheckable sibling range", async () => {
+    for (const missing of ["lower", "upper"] as const) {
+      const observations = new FailingPuts();
+      const f = await fixture({ grid: RECHECK_GRID, rowOrder: "sell-first", priceStop: false, observations });
+      await seedSellObservation(f, { tokenId: SELL_TOKEN_ID, ...(missing === "lower" ? { lower: false } : { upper: false }) });
+      observations.failFor.add(SELL_ID);
+      const buy = outcome(await cycle(f), BUY_ID);
+      assert.equal(buy.action, "hold");
+      assert.match(buy.reason, /cannot be re-checked/u);
+      await noShift(f);
+    }
+  });
+
+  it("BW-4 closed sibling with stale evidence is ignored by the survivor", async () => {
+    const observations = new FailingPuts();
+    const f = await fixture({ grid: RECHECK_GRID, rowOrder: "sell-first", priceStop: false, observations });
+    await seedSellObservation(f, { tokenId: SELL_TOKEN_ID });
+    await f.store.setPositionState(ownerAccount.address, AGENT_ID, SELL_ID, "closed");
+    const buy = outcome(await cycle(f), BUY_ID);
+    assert.equal(buy.action, "hold");
+    assert.doesNotMatch(buy.reason, /Shift cross evidence/u);
+    await noShift(f);
+  });
+
+  it("BW-5 recovery after a successful matching-token write clears the hold, but a failed write does not", async () => {
+    const recoveredStore = new FailingPuts();
+    const recovered = await fixture({ grid: RECHECK_GRID, rowOrder: "sell-first", priceStop: false, observations: recoveredStore, sellTokenId: "9203" });
+    await seedSellObservation(recovered, { tokenId: "9200" });
+    recoveredStore.failFor.add(SELL_ID);
+    assert.match(outcome(await cycle(recovered), BUY_ID).reason, /cannot be re-checked/u);
+    recoveredStore.failFor.delete(SELL_ID);
+    recovered.chain.tick = T_X;
+    const first = outcome(await cycle(recovered), BUY_ID);
+    assert.notEqual(first.kind, "grid-shift");
+    assert.equal((await matchingTokenObservation(recovered)).tokenId, "9203");
+    assert.equal((await matchingTokenObservation(recovered)).gridCrossConsecutive, 1);
+    advance(recovered);
+    assert.equal(outcome(await cycle(recovered), BUY_ID).kind, "grid-shift");
+
+    const heldStore = new FailingPuts();
+    const held = await fixture({ grid: RECHECK_GRID, rowOrder: "sell-first", priceStop: false, observations: heldStore, sellTokenId: "9203" });
+    await seedSellObservation(held, { tokenId: "9200" });
+    heldStore.failFor.add(SELL_ID);
+    await cycle(held);
+    advance(held);
+    assert.match(outcome(await cycle(held), BUY_ID).reason, /cannot be re-checked/u);
+    await noShift(held);
+  });
+
+  it("BW-6 the snapshot fields survive for every mode", async () => {
+    const fixed: LpGridSettings = {
+      pool: SHIFT_GRID.pool,
+      wbnbIsToken0: SHIFT_GRID.wbnbIsToken0,
+      tickSpacing: SHIFT_GRID.tickSpacing,
+      buyRange: SHIFT_GRID.buyRange,
+      sellRange: SHIFT_GRID.sellRange,
+      maxFlipsPerDay: 12,
+      minNetEdgeBps: 0,
+    };
+    const f = await fixture({ grid: fixed, priceStop: false });
+    await cycle(f);
+    const buy = await f.observations.get(ownerAccount.address, AGENT_ID, BUY_ID);
+    const sell = await f.observations.get(ownerAccount.address, AGENT_ID, SELL_ID);
+    assert.deepEqual(buy && { tickLower: buy.tickLower, tickUpper: buy.tickUpper }, DERIVED.buyRange);
+    assert.deepEqual(sell && { tickLower: sell.tickLower, tickUpper: sell.tickUpper }, DERIVED.sellRange);
+  });
+
+  it("BW-7 a failed sibling observation read produces no shift-cross hold", async () => {
+    const observations = new FailingPuts();
+    const f = await fixture({ grid: RECHECK_GRID, rowOrder: "sell-first", priceStop: false, observations });
+    observations.failGetFor.add(SELL_ID);
+    const buy = outcome(await cycle(f), BUY_ID);
+    assert.doesNotMatch(buy.reason, /Shift cross evidence/u);
+    await noShift(f);
   });
 });

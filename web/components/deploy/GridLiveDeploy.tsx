@@ -518,7 +518,7 @@ export async function armGridAgent(input: {
   input.onNote?.(
     `Grid derived at tick ${currentTick} (block ${blockNumber}): buy [${derived.buyRange.tickLower}, ${derived.buyRange.tickUpper}), `
     + `sell [${derived.sellRange.tickLower}, ${derived.sellRange.tickUpper}), gap ${derived.gapTicks} / width ${derived.widthTicks} ticks`
-    + `${derived.gapClamped || derived.widthClamped ? " (quantized up to the pool's tick spacing)" : ""}. `
+    + `${derived.gapClamped ? " (quantized up to the pool's tick spacing)" : ""}. `
     + "Confirm the signature in your wallet…",
   );
   const envelope = await input.signEnvelope("gridArm", agentId, {

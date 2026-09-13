@@ -5,7 +5,7 @@ import { lpWithdrawOutcome } from "@/lib/lp/withdraw";
 import { formatEther, isHex, size } from "viem";
 import { ActivityRow, Button, Category, ChartFrame, Icon, MetricTile, Num, SegmentedToggle, Skeleton, StatusBadge } from "@/design-system";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
-import { CHART_INTERVALS, displaySide, emptyRungPairs, gridSideLabel, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult } from "@/lib/exec/agent-detail";
+import { CHART_INTERVALS, displaySide, emptyRungPairs, gridSideLabel, liveRungSides, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult, type LiveRungGap } from "@/lib/exec/agent-detail";
 import { REVIEWED_MAJORS_56, formatAtomic, midpointWbnbUsdtPrice, pairQuoting, rangePrices, reviewedPair, type ReviewedPair, priceAtTick } from "@/lib/exec/pairs";
 import { LiquidityChart, type LiquidityGeometry } from "@/components/lp/LiquidityChart";
 import { gridModelLabel } from "@/lib/grid/economics";
@@ -171,20 +171,51 @@ function pairContext(view: AgentDetailView | null | undefined): { readonly pair:
  * The price a rung fills at: an ask completes at the TOP of its range, a bid at
  * the BOTTOM — the two numbers PancakeSwap shows for the same position.
  */
+function displayRungSource(view: AgentDetailView, role: "bid" | "ask"): "live" | "signed" | "none" {
+  const planeBuyIsBid = !view.grid.sideInverted;
+  const planeRole = (role === "bid") === planeBuyIsBid ? "buy" : "sell";
+  return planeRole === "buy" ? view.grid.buyRungSource : view.grid.sellRungSource;
+}
+
 function rangePrice(view: AgentDetailView | null, role: "bid" | "ask"): string | null {
   if (view === null) return null;
   // `buyPrices` is the PLANE's buy rung; on a grid whose display base is
   // WBNB that rung is the reader's ASK (`sideInverted`).
   const planeBuyIsBid = !view.grid.sideInverted;
-  const prices = (role === "bid") === planeBuyIsBid ? view.grid.buyPrices : view.grid.sellPrices;
+  const planeRole = (role === "bid") === planeBuyIsBid ? "buy" : "sell";
+  if (displayRungSource(view, role) === "none") return null;
+  const prices = planeRole === "buy" ? view.grid.buyPrices : view.grid.sellPrices;
   if (prices === null) return null;
   return role === "bid" ? prices.low : prices.high;
 }
 
-/** The plane's signed range for a DISPLAY side, through the same seam. */
-function displayRange(view: AgentDetailView, role: "bid" | "ask"): { readonly tickLower: number; readonly tickUpper: number } {
+/** The live or signed range for a DISPLAY side, through the same seam. */
+function displayRange(view: AgentDetailView, role: "bid" | "ask"): { readonly tickLower: number; readonly tickUpper: number } | null {
   const planeBuyIsBid = !view.grid.sideInverted;
+  const planeRole = (role === "bid") === planeBuyIsBid ? "buy" : "sell";
+  if (displayRungSource(view, role) === "none") return null;
   return (role === "bid") === planeBuyIsBid ? view.grid.buyRange : view.grid.sellRange;
+}
+
+function rungQuote(view: AgentDetailView | null, role: "bid" | "ask"): string {
+  if (view === null) return "—";
+  const price = rangePrice(view, role);
+  if (price !== null) return price;
+  const planeBuyIsBid = !view.grid.sideInverted;
+  const planeRole = (role === "bid") === planeBuyIsBid ? "buy" : "sell";
+  const source = displayRungSource(view, role);
+  if (source === "live" || source === "signed") return "— price metadata unavailable";
+  const gap: LiveRungGap | null = planeRole === "buy" ? view.grid.buyRungGap : view.grid.sellRungGap;
+  switch (gap) {
+    case "reading": return `— reading the ${role} rung from chain`;
+    case "unreadable": return `— ${role} rung unreadable on chain`;
+    case "emptied": return `— ${role} rung emptied, awaiting the shift`;
+    case "no-token": return "— rung not minted";
+    case "role-unavailable": return "— live rung role unavailable";
+    case "closed": return `— ${role} rung closed`;
+    case "no-row": return `— no live ${role} rung (one-sided)`;
+    default: return "—";
+  }
 }
 
 /**
@@ -436,8 +467,6 @@ function GridLiquidity({ view }: { readonly view: AgentDetailView | null }) {
   React.useEffect(() => { setInvert(false); }, [view?.grid.pool]);
   const context = pairContext(view);
   const observedTick = view?.grid.observedTick ?? null;
-  const buyPrice = rangePrice(view, "bid");
-  const sellPrice = rangePrice(view, "ask");
   const geometry: LiquidityGeometry | null = view !== null && context !== null && observedTick !== null && view.grid.tickSpacing > 0
     ? {
       spacing: view.grid.tickSpacing,
@@ -454,7 +483,14 @@ function GridLiquidity({ view }: { readonly view: AgentDetailView | null }) {
   // (operator, 2026-09-11) — the QUOTES line below already names the rungs.
   const range: React.ComponentProps<typeof LiquidityChart>["range"] = view === null
     ? { mode: "unavailable", reason: "— no owner view yet" }
-    : { mode: "rungs", rungs: [{ ...displayRange(view, "bid"), tone: "bid" }, { ...displayRange(view, "ask"), tone: "ask" }] };
+    : {
+        mode: "rungs",
+        rungs: (["bid", "ask"] as const).flatMap((side) => {
+          const rung = displayRange(view, side);
+          return rung === null ? [] : [{ ...rung, tone: side }];
+        }),
+      };
+  const signed = view !== null && view.grid.buyRungSource === "signed" && view.grid.sellRungSource === "signed";
   return (
     <div style={{ display: "grid", gap: 12, padding: 16 }}>
       <LiquidityChart
@@ -467,7 +503,7 @@ function GridLiquidity({ view }: { readonly view: AgentDetailView | null }) {
       />
       <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", paddingTop: 10, borderTop: "1px solid var(--line-1)", font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" }}>
         <span style={{ marginLeft: "auto", display: "flex", gap: 18, flexWrap: "wrap" }}>
-          <span title={view?.grid.tickSource === "live" ? "Read straight from the pool by this page, independent of the worker" : view?.grid.tickSource === "worker" ? "The worker's last finalized observation" : undefined}>ACTIVE TICK {observedTick ?? "—"}{view?.grid.tickSource === "live" ? " · LIVE" : ""}</span><span>TICK SPACING {view?.grid.tickSpacing || "—"}</span><span>QUOTES {buyPrice ?? "—"} – {sellPrice ?? "—"} {context?.quote ?? "—"}</span><span>—</span><span>{view?.grid.liveRows ?? "—"} LIVE ORDERS</span>
+          <span title={view?.grid.tickSource === "live" ? "Read straight from the pool by this page, independent of the worker" : view?.grid.tickSource === "worker" ? "The worker's last finalized observation" : undefined}>ACTIVE TICK {observedTick ?? "—"}{view?.grid.tickSource === "live" ? " · LIVE" : ""}</span><span>TICK SPACING {view?.grid.tickSpacing || "—"}</span><span>QUOTES {rungQuote(view, "bid")} – {rungQuote(view, "ask")} {context?.quote ?? "—"}{signed ? " · SIGNED, not yet armed" : ""}</span><span>—</span><span>{view?.grid.liveRows ?? "—"} LIVE ORDERS</span>
         </span>
       </div>
     </div>
@@ -540,7 +576,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
                 {detail.marketReason ?? "—"}
               </div>
             ) : (
-            <MarketChart kind="pool" address={view.grid.pool} title={view.grid.pair} candles={detail.market === null && detail.chartCandles === null ? undefined : chartSeries} markers={markers} priceLines={[{ price: rungOnChart(view, "bid", detail.chartUnit), color: TICK_BID, title: "BID" }, { price: rungOnChart(view, "ask", detail.chartUnit), color: TICK_ASK, title: "ASK" }].flatMap((line) => line.price === null ? [] : [{ price: line.price, color: line.color, title: line.title }])} embedded height={200} />
+            <MarketChart kind="pool" address={view.grid.pool} title={view.grid.pair} candles={detail.market === null && detail.chartCandles === null ? undefined : chartSeries} markers={markers} priceLines={[{ price: rungOnChart(view, "bid", detail.chartUnit), color: TICK_BID, title: displayRungSource(view, "bid") === "signed" ? "BID · SIGNED" : "BID" }, { price: rungOnChart(view, "ask", detail.chartUnit), color: TICK_ASK, title: displayRungSource(view, "ask") === "signed" ? "ASK · SIGNED" : "ASK" }].flatMap((line) => line.price === null ? [] : [{ price: line.price, color: line.color, title: line.title }])} embedded height={200} />
             )}
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>
               {chartAxis(chartSeries).map((time, index) => <span key={index}>{time}</span>)}
@@ -975,39 +1011,46 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     return () => { clearInterval(timer); chainGeneration.current++; };
   }, [readOnChainPositions, chainIdentity]);
 
-  // LIVE RUNGS: every NFT on this pool with liquidity right now (the plane's
-  // rows read from chain, plus the ones the plane has not recorded yet),
-  // classified by side against the page's current tick — a range above the
-  // tick holds token0. When the chain names a side, its range REPLACES the
-  // plane's recorded range in the view the panels draw from, so a re-quote is
-  // visible the moment its batch lands rather than when the relay confirms it.
+  // LIVE RUNGS: current positive-liquidity NFTs are numeric only when the
+  // plane's open row binds a buy/sell role to that tokenId. Discovery can name
+  // an orphan for a dash, never a side; a live row's range replaces signed
+  // geometry the moment its chain read is current.
   const liveView = useMemo<AgentDetailView | null>(() => {
     if (view === null || view.hireSizingName === "lp-v1" || view.hireSizingName === "trade-v1") return view;
-    if (view === null || view.grid.observedTick === null) return view;
+    const currentChain = chainReadIdentity === chainIdentity;
     const context = pairContext(view);
-    if (context === null) return view;
-    const tick = view.grid.observedTick;
-    const live = [...onChain.values(), ...discovered].filter((nft) =>
-      nft.liquidity > 0n
-      && nft.token0.toLowerCase() === view.grid.token0.toLowerCase()
-      && nft.token1.toLowerCase() === view.grid.token1.toLowerCase()
-      && nft.fee === view.grid.fee);
-    if (live.length === 0) return view;
-    // Highest tokenId per side wins: the newest mint is the current rung.
-    let buy: OnChainPosition | undefined;
-    let sell: OnChainPosition | undefined;
-    for (const nft of live) {
-      const holdsWbnb = rungHoldsWbnb({ tickLower: nft.tickLower, tickUpper: nft.tickUpper, amount0: nft.amounts.amount0, amount1: nft.amounts.amount1, tick, wbnbIsToken0: view.grid.wbnbIsToken0 });
-      if (holdsWbnb) { if (buy === undefined || nft.tokenId > buy.tokenId) buy = nft; }
-      else if (sell === undefined || nft.tokenId > sell.tokenId) sell = nft;
-    }
+    const sides = liveRungSides({
+      positions: view.positions,
+      onChain: currentChain ? onChain : new Map(),
+      chainReads: currentChain ? chainReads : new Map(),
+      discovered: currentChain ? discovered : [],
+      pool: {
+        token0: view.grid.token0,
+        token1: view.grid.token1,
+        fee: view.grid.fee,
+        wbnbIsToken0: view.grid.wbnbIsToken0,
+      },
+    });
+    const buy = sides.buy;
+    const sell = sides.sell;
     const grid = {
       ...view.grid,
-      ...(buy === undefined ? {} : { buyRange: { tickLower: buy.tickLower, tickUpper: buy.tickUpper }, buyPrices: rangePrices(buy.tickLower, buy.tickUpper, context.pair) }),
-      ...(sell === undefined ? {} : { sellRange: { tickLower: sell.tickLower, tickUpper: sell.tickUpper }, sellPrices: rangePrices(sell.tickLower, sell.tickUpper, context.pair) }),
+      buyRungSource: buy === null ? sides.placement === "placed" ? "none" as const : "signed" as const : "live" as const,
+      sellRungSource: sell === null ? sides.placement === "placed" ? "none" as const : "signed" as const : "live" as const,
+      buyRungGap: buy === null && sides.placement === "placed" ? sides.gaps.buy : null,
+      sellRungGap: sell === null && sides.placement === "placed" ? sides.gaps.sell : null,
+      placement: sides.placement,
+      ...(buy === null ? {} : {
+        buyRange: { tickLower: buy.tickLower, tickUpper: buy.tickUpper },
+        buyPrices: context === null ? null : rangePrices(buy.tickLower, buy.tickUpper, context.pair),
+      }),
+      ...(sell === null ? {} : {
+        sellRange: { tickLower: sell.tickLower, tickUpper: sell.tickUpper },
+        sellPrices: context === null ? null : rangePrices(sell.tickLower, sell.tickUpper, context.pair),
+      }),
     };
     return { ...view, grid };
-  }, [discovered, onChain, view]);
+  }, [chainIdentity, chainReadIdentity, chainReads, discovered, onChain, view]);
 
   const snapshot = useMemo(
     () => removeSnapshotOf(view, registration, finalizedRevocation),
@@ -1398,7 +1441,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   // only honest label is the one this gap/width reproduces at this spacing.
   const model = view === null
     ? "—"
-    : gridModelLabel({ gapTicks: view.grid.gapTicks, widthTicks: view.grid.widthTicks, tickSpacing: view.grid.tickSpacing }) ?? "—";
+    : gridModelLabel({ gapTicks: view.grid.gapTicks, tickSpacing: view.grid.tickSpacing }) ?? "—";
   const statusMessage = message || detail.message;
   const removeCallsId = progress.revokeAttempt?.callsId;
   const removeTransactionHash = progress.revokeAttempt?.receipt?.transactionHash ?? progress.revokeAttempt?.transactionHash;

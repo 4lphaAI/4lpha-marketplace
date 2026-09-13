@@ -7,17 +7,22 @@ import { formatFloorBnb, gridCapitalFloor, gridCapitalFloorBnb, gridGrossEdgeBps
  * against the same inputs, not by re-deriving the formula. That is the point of
  * the file: this port exists to refuse before the plane does, so it is worth
  * nothing unless it answers the plane's numbers to the wei.
+ * Regeneration inputs: `gridShiftEconomics({ budgetWei: 0n,
+ * relayFeePerSubmitWei: 100_000_000_000_000n })` with `minNetEdgeBps: 0`,
+ * `deployPctBps: 3000`, `spreadFactor: 1`, width equal to tick spacing, and
+ * the maximum fundable floor over ticks `0..tickSpacing-1` for each fee tier;
+ * the resulting wei was rounded UP to four BNB decimals.
  */
 const cases = [
   {
     presetId: "standard", tickSpacing: 10, currentTick: 0,
-    gross: 100n, minRung: 20_000_000_000_000_000n,
-    minBudget: 133_333_333_333_333_334n, minFundable: 190_480_000_000_000_001n,
+    gross: 80n, minRung: 25_000_000_000_000_000n,
+    minBudget: 166_666_666_666_666_668n, minFundable: 238_100_000_000_000_002n,
   },
   {
     presetId: "tight", tickSpacing: 10, currentTick: 7,
-    gross: 70n, minRung: 28_571_428_571_428_572n,
-    minBudget: 190_476_190_476_190_480n, minFundable: 272_114_285_714_285_720n,
+    gross: 60n, minRung: 33_333_333_333_333_334n,
+    minBudget: 222_222_222_222_222_228n, minFundable: 317_466_666_666_666_675n,
   },
   {
     presetId: "wide", tickSpacing: 50, currentTick: -23_012,
@@ -55,14 +60,14 @@ describe("gridCapitalFloor", () => {
       presetId: "standard", spreadFactor: 1, currentTick: 0, tickSpacing: 10,
       wbnbIsToken0: true, profile: "grid-v1",
     });
-    expect(fixed.minBudgetWei).toBe(20_000_000_000_000_000n);
+    expect(fixed.minBudgetWei).toBe(25_000_000_000_000_000n);
     expect(fixed.minFundableBudgetWei).toBe(fixed.minBudgetWei);
   });
 
   it("scales with the relay fee, because the floor is a gas floor", () => {
     const base = { presetId: "standard", spreadFactor: 1, currentTick: 0, tickSpacing: 10, wbnbIsToken0: true, profile: "grid-v1" } as const;
     const cheap = gridCapitalFloor({ ...base, relayFeePerSubmitWei: 50_000_000_000_000n });
-    expect(cheap.minBudgetWei).toBe(10_000_000_000_000_000n);
+    expect(cheap.minBudgetWei).toBe(12_500_000_000_000_000n);
   });
 
   it("refuses every size when the owner's own minimum exceeds the spread", () => {
@@ -89,6 +94,12 @@ describe("gridCapitalFloor", () => {
 
 describe("GRID_CAPITAL_FLOOR_BNB", () => {
   const spacings: Record<number, number> = { 100: 1, 500: 10, 2500: 50, 10000: 200 };
+  const oldTable: Record<string, Record<number, string>> = {
+    tight: { 100: "0.4141", 500: "0.2722", 2500: "0.0943", 10000: "0.0229" },
+    standard: { 100: "0.2094", 500: "0.1905", 2500: "0.0943", 10000: "0.0229" },
+    wide: { 100: "0.0939", 500: "0.0859", 2500: "0.0627", 10000: "0.0229" },
+    "very-wide": { 100: "0.0466", 500: "0.0456", 2500: "0.0415", 10000: "0.0229" },
+  };
 
   // The table is what the UI enforces; this re-derives every cell from the
   // live calculation at the WORST tick of its tier. A cell that drifts below
@@ -113,8 +124,22 @@ describe("GRID_CAPITAL_FLOOR_BNB", () => {
   }
 
   it("falls back to the widest floor when the fee tier is unknown", () => {
-    expect(gridCapitalFloorBnb("standard", null)).toBe("0.2094");
-    expect(gridCapitalFloorBnb("standard", 3_000)).toBe("0.2094");
+    expect(gridCapitalFloorBnb("standard", null)).toBe("0.3073");
+    expect(gridCapitalFloorBnb("standard", 3_000)).toBe("0.3073");
+  });
+
+  it("the floor table: spacing-50 Tight/Balanced/Wide and every spacing-200 cell are unchanged; every other cell moved in the direction the gross edge moved", () => {
+    for (const presetId of ["tight", "standard", "wide", "very-wide"] as const) {
+      for (const fee of [100, 500, 2500, 10_000]) {
+        const next = gridCapitalFloorBnb(presetId, fee);
+        if ((fee === 2_500 && presetId !== "very-wide") || fee === 10_000) {
+          expect(next).toBe(oldTable[presetId]![fee]);
+        } else {
+          expect(Number(next)).toBeGreaterThan(Number(oldTable[presetId]![fee]));
+        }
+      }
+    }
+    expect(Number(gridCapitalFloorBnb("very-wide", 2_500))).toBeGreaterThan(Number(oldTable["very-wide"]![2_500]));
   });
 });
 
@@ -129,21 +154,29 @@ describe("formatFloorBnb", () => {
 describe("gridModelLabel", () => {
   it("names the model from the SIGNED geometry, at this pool's spacing", () => {
     // The live agent: 150/100 ticks on a 0.25% pool (spacing 50).
-    expect(gridModelLabel({ gapTicks: 150, widthTicks: 100, tickSpacing: 50 })).toBe("High Volatility");
-    expect(gridModelLabel({ gapTicks: 30, widthTicks: 30, tickSpacing: 10 })).toBe("Balanced");
-    expect(gridModelLabel({ gapTicks: 20, widthTicks: 20, tickSpacing: 10 })).toBe("Tight Scalp");
+    expect(gridModelLabel({ gapTicks: 150, tickSpacing: 50 })).toBe("High Volatility");
+    expect(gridModelLabel({ gapTicks: 30, tickSpacing: 10 })).toBe("Balanced");
+    expect(gridModelLabel({ gapTicks: 20, tickSpacing: 10 })).toBe("Tight Scalp");
   });
 
   it("says Custom for a geometry no preset produces", () => {
-    expect(gridModelLabel({ gapTicks: 70, widthTicks: 70, tickSpacing: 10 })).toBe("Custom");
+    expect(gridModelLabel({ gapTicks: 70, tickSpacing: 10 })).toBe("Custom");
   });
 
   it("returns null when the grid signed no gap/width at all (a fixed grid)", () => {
-    expect(gridModelLabel({ gapTicks: null, widthTicks: null, tickSpacing: 50 })).toBeNull();
+    expect(gridModelLabel({ gapTicks: null, tickSpacing: 50 })).toBeNull();
   });
 
   it("reports the FIRST preset a coarse spacing collapses onto, and that is the honest answer", () => {
     // At spacing 50 tight and standard quantize to the same 50/50 geometry.
-    expect(gridModelLabel({ gapTicks: 50, widthTicks: 50, tickSpacing: 50 })).toBe("Tight Scalp");
+    expect(gridModelLabel({ gapTicks: 50, tickSpacing: 50 })).toBe("Tight Scalp");
+  });
+
+  it("a pre-ruling grid keeps its model name: gap 75 at spacing 1 is Wide Band whatever width it signed", () => {
+    expect(gridModelLabel({ gapTicks: 75, tickSpacing: 1 })).toBe("Wide Band");
+  });
+
+  it("gap 70 at spacing 10 is Custom", () => {
+    expect(gridModelLabel({ gapTicks: 70, tickSpacing: 10 })).toBe("Custom");
   });
 });

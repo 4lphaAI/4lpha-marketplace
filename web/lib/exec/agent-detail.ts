@@ -1,4 +1,5 @@
 import { parseFeeEvidence, feeMetric, type FeeEvidence } from "@/lib/lp/fees";
+import type { OnChainPosition, OnChainPositionRead } from "@/lib/altana/position-reader";
 import { parseErc8004Identity, type Erc8004Identity } from "./erc8004-identity";
 import {
   USDT_56,
@@ -73,6 +74,105 @@ export type DetailPosition = {
   /** "ASK BTCB" for a rung selling the base, "BID WBNB" for one bidding the quote. */
   readonly sideLabel: string | null;
 };
+
+export type LiveRungGap = "reading" | "unreadable" | "emptied" | "no-token" | "role-unavailable" | "closed" | "no-row";
+
+export type LiveRung = {
+  readonly tickLower: number;
+  readonly tickUpper: number;
+  readonly tokenId: bigint;
+  readonly positionId: string;
+};
+
+export type LiveRungSides = {
+  readonly buy: LiveRung | null;
+  readonly sell: LiveRung | null;
+  readonly placement: "unplaced" | "placed";
+  readonly gaps: { readonly buy: LiveRungGap | null; readonly sell: LiveRungGap | null };
+};
+
+export function liveRungSides(input: {
+  readonly positions: readonly DetailPosition[];
+  readonly onChain: ReadonlyMap<string, OnChainPosition>;
+  readonly chainReads: ReadonlyMap<string, OnChainPositionRead>;
+  readonly discovered: readonly OnChainPosition[];
+  readonly pool: {
+    readonly token0: string;
+    readonly token1: string;
+    readonly fee: number;
+    readonly wbnbIsToken0: boolean;
+  };
+}): LiveRungSides {
+  const samePool = (nft: OnChainPosition): boolean =>
+    nft.token0.toLowerCase() === input.pool.token0.toLowerCase()
+    && nft.token1.toLowerCase() === input.pool.token1.toLowerCase()
+    && nft.fee === input.pool.fee;
+  const chainReads = input.chainReads;
+  const usable = (tokenId: string): OnChainPosition | null => {
+    const nft = input.onChain.get(tokenId);
+    return nft !== undefined
+      && nft.tokenId.toString(10) === tokenId
+      && samePool(nft)
+      ? nft
+      : null;
+  };
+  const funded = new Map<string, OnChainPosition>();
+  for (const [key, nft] of input.onChain) {
+    if (nft.tokenId.toString(10) === key && samePool(nft) && nft.liquidity > 0n) funded.set(key, nft);
+  }
+  for (const nft of input.discovered) {
+    const key = nft.tokenId.toString(10);
+    if (!input.onChain.has(key) && samePool(nft) && nft.liquidity > 0n) funded.set(key, nft);
+  }
+  // R2-C1/R4-C4: only an open plane row can supply numeric role evidence.
+  const bound = (role: "buy" | "sell"): LiveRung | null => {
+    let result: LiveRung | null = null;
+    for (const position of input.positions) {
+      if (position.state === "closed" || position.role !== role || position.tokenId === null) continue;
+      const nft = usable(position.tokenId);
+      if (nft === null || nft.liquidity <= 0n) continue;
+      const candidate: LiveRung = {
+        tickLower: nft.tickLower,
+        tickUpper: nft.tickUpper,
+        tokenId: nft.tokenId,
+        positionId: position.positionId,
+      };
+      if (result === null || candidate.tokenId > result.tokenId) result = candidate;
+    }
+    return result;
+  };
+  const buy = bound("buy");
+  const sell = bound("sell");
+  const boundIds = new Set([buy?.tokenId.toString(10), sell?.tokenId.toString(10)].filter((id): id is string => id !== undefined));
+  const orphanFunded = [...funded.keys()].some((tokenId) => !boundIds.has(tokenId));
+  // R4-C0/C1: signed fallback is a view of the plane rows, not discovery.
+  const placement = input.positions.length > 0 ? "placed" as const : "unplaced" as const;
+  const gap = (role: "buy" | "sell", rung: LiveRung | null): LiveRungGap | null => {
+    if (rung !== null || placement === "unplaced") return null;
+    const rows = input.positions.filter((position) => position.role === role);
+    const openRows = rows.filter((position) => position.state !== "closed");
+    if (openRows.some((position) => position.tokenId !== null && !input.onChain.has(position.tokenId) && !chainReads.has(position.tokenId))) return "reading";
+    if (openRows.some((position) => {
+      if (position.tokenId === null) return false;
+      const nft = input.onChain.get(position.tokenId);
+      const read = chainReads.get(position.tokenId);
+      return read?.kind === "unreadable" || read?.kind === "burned"
+        || (read?.kind === "position" && nft === undefined)
+        || (nft !== undefined && usable(position.tokenId) === null);
+    })) return "unreadable";
+    if (openRows.some((position) => position.tokenId !== null && usable(position.tokenId)?.liquidity === 0n)) return "emptied";
+    if (openRows.some((position) => position.tokenId === null)) return "no-token";
+    if (orphanFunded) return "role-unavailable";
+    if (rows.length > 0 && openRows.length === 0) return "closed";
+    return rows.length === 0 ? "no-row" : "unreadable";
+  };
+  return {
+    buy,
+    sell,
+    placement,
+    gaps: { buy: gap("buy", buy), sell: gap("sell", sell) },
+  };
+}
 
 /**
  * AGENT-GAS-ATTENTION §3.2 — the agent's gas standing as the page reads it.
@@ -329,6 +429,11 @@ export type AgentDetailView = {
     readonly driftPctOfGap: number | null;
     readonly buyRange: { readonly tickLower: number; readonly tickUpper: number };
     readonly sellRange: { readonly tickLower: number; readonly tickUpper: number };
+    readonly buyRungSource: "live" | "signed" | "none";
+    readonly sellRungSource: "live" | "signed" | "none";
+    readonly buyRungGap: LiveRungGap | null;
+    readonly sellRungGap: LiveRungGap | null;
+    readonly placement: "unplaced" | "placed";
     readonly observedTick: number | null;
     readonly observationAgeMs: number | null;
     readonly observationStale: boolean;
@@ -855,6 +960,11 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
       tickSpacing: 0,
       buyRange: { tickLower: 0, tickUpper: 0 },
       sellRange: { tickLower: 0, tickUpper: 0 },
+      buyRungSource: "none",
+      sellRungSource: "none",
+      buyRungGap: null,
+      sellRungGap: null,
+      placement: "unplaced",
       observedTick: null,
       observationAgeMs: null,
       observationStale: true,
@@ -1179,6 +1289,11 @@ function mapLpAgentDetail(
       tickSpacing: 0,
       buyRange: { tickLower: 0, tickUpper: 0 },
       sellRange: { tickLower: 0, tickUpper: 0 },
+      buyRungSource: "none",
+      sellRungSource: "none",
+      buyRungGap: null,
+      sellRungGap: null,
+      placement: "unplaced",
       observedTick: null,
       observationAgeMs: null,
       observationStale: true,
@@ -1536,6 +1651,11 @@ export function mapAgentDetail(
       widthTicks: safeInteger(geometryBlock?.["widthTicks"]) ? Number(geometryBlock?.["widthTicks"]) : null,
       buyRange: gridBuyRange,
       sellRange: gridSellRange,
+      buyRungSource: positions.length === 0 ? "signed" : "none",
+      sellRungSource: positions.length === 0 ? "signed" : "none",
+      buyRungGap: positions.length === 0 ? null : "reading",
+      sellRungGap: positions.length === 0 ? null : "reading",
+      placement: positions.length === 0 ? "unplaced" : "placed",
       observedTick: observed?.observedTick ?? null,
       observationAgeMs: observed?.observationAgeMs ?? null,
       observationStale: observed?.observationAgeMs === null || observed === undefined || observed.observationAgeMs > 120_000,

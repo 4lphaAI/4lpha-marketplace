@@ -7,6 +7,7 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentDetailView, OhlcvResult } from "@/lib/exec/agent-detail";
+import { rangePrices, reviewedPair } from "@/lib/exec/pairs";
 
 const hook = vi.hoisted(() => ({
   detail: null as unknown,
@@ -39,6 +40,11 @@ vi.mock("@/lib/altana/position-reader", () => ({
 // row and the chain disagreed once (2026-09-03, NFT 7316794). No client in a
 // static render: the reads are skipped and every assertion below is unchanged.
 vi.mock("wagmi", () => ({ usePublicClient: () => hook.publicClient }));
+vi.mock("@/components/MarketChart", () => ({
+  MarketChart: ({ priceLines = [] }: { readonly priceLines?: readonly { readonly price: number; readonly color: string; readonly title: string }[] }) => (
+    <div data-testid="market-chart" data-price-lines={JSON.stringify(priceLines)} />
+  ),
+}));
 
 import { HiredAgentScreen } from "./HiredAgentScreen";
 
@@ -65,7 +71,7 @@ const view: AgentDetailView = {
   sequences: [{ sequenceId: "sequence-real", positionId: "real-position-7", kind: "grid-flip", state: "completed", recoveryState: "none", note: "settled", outcomeUnavailable: false, txHashes: [`0x${"44".repeat(32)}`], steps: [{ index: 0, kind: "zap-out", decisionId: "lp:sequence-real:0", state: "COMMITTED" }], updatedAt: 2_000, createdAt: 1_500, shiftCause: null, targetBuyRange: null, targetSellRange: null }],
   positions: [{ positionId: "real-position-7", state: "open", tokenId: "9007199254740993", pair: "WBNB / USDT", role: "buy", sideLabel: "BID USDT", rung: { tickLower: -9, tickUpper: 1, priceLow: "640.00000000", priceHigh: "645.00000000", fillPrice: "640.00000000" }, age: "2h ago", ageTitle: "2026-09-02T00:00:00.000Z", value: metric("0.081 WBNB"), unrealised: metric("-0.004 WBNB"), fees: { value: null, reason: "— fees are counted in unrealised" }, nftUrl: "https://bscscan.com/nft/0x46a15b0b27311cedf172ab29e4f4766fbe7f4364/9007199254740993" }],
   lp: null,
-  grid: { pool: "0x5555555555555555555555555555555555555555", pair: "WBNB / USDT", base: "WBNB" as const, quote: "USDT" as const, symbol0: "USDT", symbol1: "WBNB", decimals0: 18, decimals1: 18, token0: "0x55d398326f99059ff775485246999027b3197955", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", fee: 100, wbnbIsToken0: false, sideInverted: true, observedPrice: "645.00000000", quoteUsd: 1, baseAddress: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", quoteAddress: "0x55d398326f99059ff775485246999027b3197955", buyPrices: { low: "640.00000000", high: "645.00000000" }, sellPrices: { low: "646.00000000", high: "650.00000000" }, tickSpacing: 10, mode: "shift", gapTicks: 150, widthTicks: 100, driftPctOfGap: 0, buyRange: { tickLower: -9, tickUpper: 1 }, sellRange: { tickLower: 1, tickUpper: 11 }, observedTick: -3, observationAgeMs: 2_000, observationStale: false, tickSource: "worker", rangeUnavailableBecause: null, liveRows: 1 },
+  grid: { pool: "0x5555555555555555555555555555555555555555", pair: "WBNB / USDT", base: "WBNB" as const, quote: "USDT" as const, symbol0: "USDT", symbol1: "WBNB", decimals0: 18, decimals1: 18, token0: "0x55d398326f99059ff775485246999027b3197955", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", fee: 100, wbnbIsToken0: false, sideInverted: true, observedPrice: "645.00000000", quoteUsd: 1, baseAddress: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", quoteAddress: "0x55d398326f99059ff775485246999027b3197955", buyPrices: { low: "640.00000000", high: "645.00000000" }, sellPrices: { low: "646.00000000", high: "650.00000000" }, tickSpacing: 10, mode: "shift", gapTicks: 150, widthTicks: 100, driftPctOfGap: 0, buyRange: { tickLower: -9, tickUpper: 1 }, sellRange: { tickLower: 1, tickUpper: 11 }, buyRungSource: "live", sellRungSource: "live", buyRungGap: null, sellRungGap: null, placement: "placed", observedTick: -3, observationAgeMs: 2_000, observationStale: false, tickSource: "worker", rangeUnavailableBecause: null, liveRows: 1 },
 };
 function lpFixture(): NonNullable<AgentDetailView["lp"]> {
   return {model:"custom",pool:{...view.grid,poolAddress:view.grid.pool},openingRange:{source:"explicit",tickLower:-9,tickUpper:1},
@@ -547,5 +553,165 @@ describe("Hired agent detail provenance", () => {
     expect(source).toContain("max={10_080}");
     expect(source).toContain("disabled={model.id === draft.fallbackModel}");
     expect(source).toContain("disabled={model.id === draft.primaryModel}");
+  });
+});
+
+describe("GRID-ONE-TICK-SHIFT-RECHECK C: live rung quotes", () => {
+  const S = 7_415_162n;
+  const B = 7_415_163n;
+  const D = 7_405_787n;
+  const sRange = { tickLower: -65_965, tickUpper: -65_915 } as const;
+  const bRange = { tickLower: -66_166, tickUpper: -66_116 } as const;
+  const dRange = { tickLower: -66_600, tickUpper: -66_550 } as const;
+
+  function quoteText(host: HTMLElement): string {
+    return [...host.querySelectorAll("span")].find((element) => element.textContent?.startsWith("QUOTES "))?.textContent ?? "";
+  }
+
+  function row(positionId: string, role: string, tokenId: string | null, state = "open") {
+    return { ...view.positions[0]!, positionId, role, tokenId, state };
+  }
+
+  function chainPosition(tokenId: bigint, range: { readonly tickLower: number; readonly tickUpper: number }, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      kind: "position",
+      blockNumber: 1n,
+      readAtMs: 1,
+      sqrtPriceX96: 1n << 96n,
+      amountsAvailable: true,
+      tokenId,
+      liquidity: 1n,
+      token0: view.grid.token0,
+      token1: view.grid.token1,
+      fee: view.grid.fee,
+      tickLower: range.tickLower,
+      tickUpper: range.tickUpper,
+      amounts: { amount0: 1n, amount1: 10n ** 18n },
+      minimums: { amount0: 1n, amount1: 1n },
+      owed: { amount0: 0n, amount1: 0n },
+      ...overrides,
+    };
+  }
+
+  async function mount(nextView: AgentDetailView, options: { readonly deferReads?: boolean; readonly nft?: (tokenId: bigint) => Record<string, unknown> } = {}) {
+    hook.owner.ownerAddress = "0x1111111111111111111111111111111111111111";
+    hook.owner.passkey = null;
+    hook.publicClient = {};
+    hook.readOnChainPosition.mockReset();
+    const pending: (() => void)[] = [];
+    hook.readOnChainPosition.mockImplementation(async (_client: unknown, _nfpm: unknown, tokenId: bigint) => {
+      if (options.deferReads === true) await new Promise<void>((resolve) => pending.push(resolve));
+      return options.nft?.(tokenId) ?? chainPosition(tokenId, tokenId === S ? sRange : tokenId === B ? bRange : dRange);
+    });
+    hook.listWalletPositionIds.mockReset();
+    hook.listWalletPositionIds.mockResolvedValue([]);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { bins: [], currentTick: -65_923, blockNumber: "1" } }), { status: 200 })));
+    hook.detail = { state: "ready", view: nextView, market, trade: null, asOfMs: 2_000, message: "", readHeaders: {}, signIn: vi.fn(), refresh: vi.fn() };
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const settle = async () => {
+      for (let i = 0; i < 4; i += 1) await Promise.resolve();
+      for (let i = 0; i < 3; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+    await act(async () => {
+      root.render(<HiredAgentScreen agentId="owner-exact-agent-92" go={() => undefined} />);
+      await settle();
+    });
+    const charts = [...host.querySelectorAll("button")].find((button) => button.textContent === "Show charts");
+    await act(async () => {
+      charts?.click();
+      await settle();
+    });
+    return {
+      host,
+      pending,
+      async cleanup() {
+        await act(async () => { root.unmount(); await Promise.resolve(); });
+        host.remove();
+        vi.unstubAllGlobals();
+      },
+    };
+  }
+
+  it("QUOTES and the BID/ASK lines print the live rungs, not the signed ranges", async () => {
+    const nextView = { ...view, positions: [row("p-sell", "sell", S.toString()), row("p-buy", "buy", B.toString())] };
+    const mounted = await mount(nextView);
+    try {
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      const pair = reviewedPair(56, view.grid.token0, view.grid.token1, view.grid.wbnbIsToken0);
+      expect(pair).not.toBeNull();
+      if (pair === null) return;
+      const bid = rangePrices(sRange.tickLower, sRange.tickUpper, pair).low;
+      const ask = rangePrices(bRange.tickLower, bRange.tickUpper, pair).high;
+      expect(quoteText(mounted.host)).toContain(bid);
+      expect(quoteText(mounted.host)).toContain(ask);
+      expect(quoteText(mounted.host)).not.toContain("640.00000000");
+      expect(quoteText(mounted.host)).not.toContain("650.00000000");
+      expect(quoteText(mounted.host)).not.toContain("SIGNED");
+    } finally { await mounted.cleanup(); }
+  });
+
+  it("before the chain answers, a placed grid shows a dash with its reason, never a signed number", async () => {
+    const nextView = { ...view, positions: [row("p-sell", "sell", S.toString()), row("p-buy", "buy", B.toString())] };
+    const mounted = await mount(nextView, { deferReads: true });
+    try {
+      expect(quoteText(mounted.host)).toContain("— reading the bid rung from chain");
+      expect(quoteText(mounted.host)).toContain("— reading the ask rung from chain");
+      expect(quoteText(mounted.host)).not.toContain("640.00000000");
+      mounted.pending.splice(0).forEach((resolve) => resolve());
+    } finally { await mounted.cleanup(); }
+  });
+
+  it("an armed grid with nothing minted shows the signed rungs and says so", async () => {
+    const mounted = await mount({ ...view, positions: [] });
+    try {
+      expect(quoteText(mounted.host)).toContain("645.00000000");
+      expect(quoteText(mounted.host)).toContain("646.00000000");
+      expect(quoteText(mounted.host)).toContain("· SIGNED, not yet armed");
+    } finally { await mounted.cleanup(); }
+  });
+
+  it("rows with null tokenIds show rung-not-minted dashes, never signed numbers", async () => {
+    const mounted = await mount({ ...view, positions: [row("p-sell", "sell", null), row("p-buy", "buy", null)] });
+    try {
+      expect((quoteText(mounted.host).match(/— rung not minted/gu) ?? []).length).toBe(2);
+      expect(quoteText(mounted.host)).not.toContain("640.00000000");
+      expect(quoteText(mounted.host)).not.toContain("SIGNED");
+    } finally { await mounted.cleanup(); }
+  });
+
+  it("a funded NFT under a closed row shows role-unavailable dashes", async () => {
+    const mounted = await mount({ ...view, positions: [row("p-closed", "sell", D.toString(), "closed")] }, { nft: () => chainPosition(D, dRange) });
+    try {
+      expect((quoteText(mounted.host).match(/— live rung role unavailable/gu) ?? []).length).toBe(2);
+      expect(quoteText(mounted.host)).not.toContain("640.00000000");
+    } finally { await mounted.cleanup(); }
+  });
+
+  it("an unresolved pair keeps live tick ranges on the chart and dashes price metadata", async () => {
+    const unknownToken = "0x00000000000000000000000000000000000000aa";
+    const nextView = {
+      ...view,
+      positions: [row("p-sell", "sell", S.toString()), row("p-buy", "buy", B.toString())],
+      grid: { ...view.grid, token0: unknownToken, pair: "unknown / WBNB", symbol0: "unknown", base: null, quote: null },
+    };
+    const mounted = await mount(nextView, { nft: (tokenId) => chainPosition(tokenId, tokenId === S ? sRange : bRange, { token0: unknownToken }) });
+    try {
+      expect((quoteText(mounted.host).match(/— price metadata unavailable/gu) ?? []).length).toBe(2);
+      expect(mounted.host.innerHTML).toContain('data-lower="-66166"');
+      expect(mounted.host.innerHTML).toContain('data-upper="-65915"');
+    } finally { await mounted.cleanup(); }
+  });
+
+  it("a one-sided pair prints the live bid and a no-live-ask reason", async () => {
+    const mounted = await mount({ ...view, positions: [row("p-sell", "sell", S.toString())] });
+    try {
+      const pair = reviewedPair(56, view.grid.token0, view.grid.token1, view.grid.wbnbIsToken0);
+      expect(pair).not.toBeNull();
+      if (pair === null) return;
+      expect(quoteText(mounted.host)).toContain(rangePrices(sRange.tickLower, sRange.tickUpper, pair).low);
+      expect(quoteText(mounted.host)).toContain("— no live ask rung (one-sided)");
+    } finally { await mounted.cleanup(); }
   });
 });

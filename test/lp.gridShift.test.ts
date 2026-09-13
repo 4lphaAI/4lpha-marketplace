@@ -77,6 +77,7 @@ import {
   gridShiftGasGate,
   lpGridShiftGasHoldReason,
   lpGridShiftQuotaHoldReason,
+  lpGridShiftCrossRecheckHoldReason,
   lpGridShiftRefusal,
 } from "../src/lp/gridTriggers.js";
 import { MAX_TICK, MIN_TICK, getSqrtRatioAtTick } from "../src/lp/tickMath.js";
@@ -2020,6 +2021,7 @@ describe("PHASE3.22 §13.1: the round-trip journey", () => {
       readonly gridCrossConsecutive: number;
       readonly gridDriftConsecutive: number;
       readonly gridRangeRelation?: "inside" | "outside";
+      readonly range?: { readonly tickLower: number; readonly tickUpper: number };
     };
   }): ReturnType<typeof evaluateGridTriggers> {
     return evaluateGridTriggers({
@@ -2373,8 +2375,26 @@ describe("PHASE3.22 §13.1: the round-trip journey", () => {
         role: "sell",
         gridCrossConsecutive: sellSecond.nextObservation.gridCrossConsecutive ?? 0,
         gridDriftConsecutive: 0,
+        range: grid.sellRange,
       },
     });
+    const noRangeGrid = shiftGrid({ wbnbIsToken0: false, shift: { ...SHIFT, driftPctOfGap: 0 } });
+    const noRange = turn({
+      grid: noRangeGrid,
+      role: "buy",
+      range: noRangeGrid.buyRange,
+      tick: upTick,
+      blockNumber: 101n,
+      nowMs: START + INTERVAL_MS,
+      previousObservation: first.nextObservation,
+      sibling: {
+        role: "sell",
+        gridCrossConsecutive: sellSecond.nextObservation.gridCrossConsecutive ?? 0,
+        gridDriftConsecutive: 0,
+      },
+    });
+    assert.equal(noRange.decision, "hold");
+    assert.match(noRange.triggerReason.reason, /cannot be re-checked/u);
     assert.equal(
       second.decision,
       "grid-shift",
@@ -2732,6 +2752,296 @@ describe("PHASE3.22 §8: the client's shift width default", () => {
 /* -------------------------------------------------------------------------- */
 /* GRID-GAS-RESERVE P2 — the shift lane's gas gate                            */
 /* -------------------------------------------------------------------------- */
+
+describe("GRID-ONE-TICK-SHIFT-RECHECK B: the sibling's cross is re-read at the dispatcher's own tick", () => {
+  const INTERVAL_MS = 30_000;
+  const POOL = getAddress("0x00000000000000000000000000000000000000EE");
+  const RAILS = {
+    maxPriceImpactBps: 10_000,
+    maxSpotTwapDeviationBps: 10_000,
+    minObservationCardinality: 1,
+    minPoolLiquidity: 0n,
+    twapWindowSec: 60,
+    twapWindowSeconds: 60,
+    maxSagaSlippageBps: 50,
+  };
+  const grid = (driftPctOfGap = 0): LpGridSettings => {
+    const shift: LpGridShift = {
+      gapTicks: 75,
+      widthTicks: 50,
+      deployPctBps: 3_000,
+      driftPctOfGap,
+      shiftsPerDay: DEFAULT_GRID_SHIFT_SHIFTS_PER_DAY,
+      driftGasBudgetWei: 8n,
+      driftPerMotionWei: 1n,
+    };
+    const ranges = gridDeriveRanges({
+      currentTick: -66_041,
+      tickSpacing: 1,
+      gapTicks: shift.gapTicks,
+      widthTicks: shift.widthTicks,
+      wbnbIsToken0: false,
+      minTick: MIN_TICK,
+      maxTick: MAX_TICK,
+    });
+    return {
+      pool: { token0: TOKEN_LO, token1: WBNB, fee: 100 },
+      wbnbIsToken0: false,
+      tickSpacing: 1,
+      buyRange: ranges.buyRange,
+      sellRange: ranges.sellRange,
+      maxFlipsPerDay: 1,
+      minNetEdgeBps: 0,
+      mode: "shift",
+      shift,
+    };
+  };
+  const turn = (input: {
+    readonly grid: LpGridSettings;
+    readonly tick: number;
+    readonly role?: "buy" | "sell";
+    readonly range?: { readonly tickLower: number; readonly tickUpper: number };
+    readonly blockNumber?: bigint;
+    readonly nowMs?: number;
+    readonly previousObservation?: ReturnType<typeof evaluateGridTriggers>["nextObservation"];
+    readonly liveRoles?: readonly ("buy" | "sell")[];
+    readonly sibling?: {
+      readonly role: "buy" | "sell";
+      readonly gridCrossConsecutive: number;
+      readonly gridDriftConsecutive: number;
+      readonly gridRangeRelation?: "inside" | "outside";
+      readonly range?: { readonly tickLower: number; readonly tickUpper: number };
+    };
+  }) => {
+    const role = input.role ?? "buy";
+    const range = input.range ?? (role === "buy" ? input.grid.buyRange : input.grid.sellRange);
+    return evaluateGridTriggers({
+    settingsDigest: "0xshift" as `0x${string}`,
+    intervalMs: INTERVAL_MS,
+    market: {
+      blockNumber: input.blockNumber ?? 100n,
+      finalizedBlockNumber: input.blockNumber ?? 100n,
+      observationCardinality: 500,
+      poolLiquidity: 10n ** 18n,
+      priceImpactBps: 0n,
+      spotSqrtPriceX96: getSqrtRatioAtTick(input.tick),
+      twapSqrtPriceX96: getSqrtRatioAtTick(input.tick),
+    },
+    nowMs: input.nowMs ?? START,
+    position: {
+      basisWei: 0n,
+      basisSource: "minted",
+      collectibleFee0: 0n,
+      collectibleFee1: 0n,
+      currentTick: input.tick,
+      exitValueWei: 10n ** 18n,
+      freshFeesValueWei: 0n,
+      poolAddress: POOL,
+      token0: input.grid.pool.token0,
+      token1: input.grid.pool.token1,
+      fee: input.grid.pool.fee,
+      tickLower: range.tickLower,
+      tickUpper: range.tickUpper,
+      tokenId: role === "buy" ? "111" : "222",
+      gridLevel: 1,
+      gridRole: role,
+      bufferQuoteWei: 10n ** 21n,
+      bufferBaseWei: 10n ** 21n,
+      bufferNativeWei: 10n ** 18n,
+    },
+    rails: RAILS,
+    settings: { ...DEFAULT_LP_SETTINGS, minMinutesBetweenExits: 5, grid: input.grid },
+    relayFeePerSubmitWei: RELAY_FEE,
+    ...(input.previousObservation === undefined ? {} : { previousObservation: input.previousObservation }),
+    shiftGroupLiveRoles: { role, liveRoles: input.liveRoles ?? ["buy", "sell"] },
+    ...(input.sibling === undefined ? {} : { shiftSibling: input.sibling }),
+    shiftQuotaUsage: {
+      shiftLiveCount: 0,
+      shiftSettleLiveCount: 0,
+      shiftDriftLiveCount: 0,
+      latestReservedAtMs: null,
+    },
+    });
+  };
+
+  it("the incident: sibling crossed twice at -65911, dispatcher at -65923 ⇒ HOLD, not grid-shift", () => {
+    const incident = grid();
+    const result = turn({
+      grid: incident,
+      tick: -65_923,
+      sibling: {
+        role: "sell",
+        gridCrossConsecutive: 2,
+        gridDriftConsecutive: 0,
+        gridRangeRelation: "outside",
+        range: incident.sellRange,
+      },
+    });
+    assert.equal(result.decision, "hold");
+    assert.equal(result.gridShiftTargets, undefined);
+    assert.equal(result.gridShiftCause, undefined);
+    assert.match(result.triggerReason.reason, /Shift cross evidence is stale/u);
+    assert.match(result.triggerReason.reason, /\[-65965, -65915\)/u);
+    assert.match(result.triggerReason.reason, /-65923/u);
+    assert.match(result.triggerReason.reason, /INSIDE/u);
+  });
+
+  it("same fixture, dispatcher at -65911 ⇒ grid-shift on cross, both targets", () => {
+    const incident = grid();
+    const result = turn({
+      grid: incident,
+      tick: -65_911,
+      sibling: {
+        role: "sell",
+        gridCrossConsecutive: 2,
+        gridDriftConsecutive: 0,
+        range: incident.sellRange,
+      },
+    });
+    assert.equal(result.decision, "grid-shift");
+    assert.equal(result.gridShiftCause, "cross");
+    assert.deepEqual(result.gridShiftTargets, {
+      buyRange: { tickLower: -66_036, tickUpper: -65_986 },
+      sellRange: { tickLower: -65_835, tickUpper: -65_785 },
+    });
+  });
+
+  it("dispatcher at -65970 (sibling back on its armed side) ⇒ HOLD naming the reversal", () => {
+    const incident = grid();
+    const result = turn({
+      grid: incident,
+      tick: -65_970,
+      sibling: {
+        role: "sell",
+        gridCrossConsecutive: 2,
+        gridDriftConsecutive: 0,
+        range: incident.sellRange,
+      },
+    });
+    assert.equal(result.decision, "hold");
+    assert.match(result.triggerReason.reason, /back on its armed side/u);
+  });
+
+  it("a sibling without a range cannot arm the pair even at -65911", () => {
+    const incident = grid();
+    const result = turn({
+      grid: incident,
+      tick: -65_911,
+      sibling: { role: "sell", gridCrossConsecutive: 2, gridDriftConsecutive: 0 },
+    });
+    assert.equal(result.decision, "hold");
+    assert.match(result.triggerReason.reason, /cannot be re-checked/u);
+  });
+
+  it("own-row cross evidence is same-cycle and dispatches over a stale sibling", () => {
+    const incident = grid();
+    const first = turn({ grid: incident, tick: -66_170 });
+    const second = turn({
+      grid: incident,
+      tick: -66_170,
+      blockNumber: 101n,
+      nowMs: START + INTERVAL_MS,
+      previousObservation: first.nextObservation,
+      sibling: {
+        role: "sell",
+        gridCrossConsecutive: 2,
+        gridDriftConsecutive: 0,
+        range: incident.sellRange,
+      },
+    });
+    assert.equal(second.decision, "grid-shift");
+    assert.equal(second.gridShiftCause, "cross");
+  });
+
+  it("a stale sibling cross does not gate drift: cause = drift, clean rung only", () => {
+    const incident = grid(100);
+    const first = turn({
+      grid: incident,
+      tick: -65_923,
+      sibling: { role: "sell", gridCrossConsecutive: 0, gridDriftConsecutive: 0, range: incident.sellRange },
+    });
+    const second = turn({
+      grid: incident,
+      tick: -65_923,
+      blockNumber: 101n,
+      nowMs: START + INTERVAL_MS,
+      previousObservation: first.nextObservation,
+      sibling: {
+        role: "sell",
+        gridCrossConsecutive: 2,
+        gridDriftConsecutive: 0,
+        gridRangeRelation: "inside",
+        range: incident.sellRange,
+      },
+    });
+    assert.equal(second.gridShiftCause, "drift");
+    assert.ok(second.gridShiftTargets?.buyRange);
+    assert.equal(second.gridShiftTargets?.sellRange, undefined);
+  });
+
+  it("the observation carries the range the recheck needs, in both loop orderings", () => {
+    const incident = grid();
+    const sellFirst = turn({ grid: incident, role: "sell", tick: -65_898, range: incident.sellRange });
+    const sellSecond = turn({
+      grid: incident,
+      role: "sell",
+      tick: -65_911,
+      range: incident.sellRange,
+      blockNumber: 101n,
+      nowMs: START + INTERVAL_MS,
+      previousObservation: sellFirst.nextObservation,
+    });
+    assert.equal(sellSecond.nextObservation.gridCrossConsecutive, 2);
+    const sibling = {
+      role: "sell" as const,
+      gridCrossConsecutive: sellSecond.nextObservation.gridCrossConsecutive ?? 0,
+      gridDriftConsecutive: 0,
+      range: incident.sellRange,
+    };
+    for (const nowMs of [START + INTERVAL_MS, START + 2 * INTERVAL_MS]) {
+      const held = turn({ grid: incident, tick: -65_923, nowMs, sibling });
+      assert.equal(held.decision, "hold");
+      assert.match(held.triggerReason.reason, /INSIDE/u);
+      const shifted = turn({ grid: incident, tick: -65_911, nowMs, sibling });
+      assert.equal(shifted.decision, "grid-shift");
+    }
+  });
+
+  it("the hold resets nothing", () => {
+    const incident = grid();
+    const sibling = {
+      role: "sell" as const,
+      gridCrossConsecutive: 2,
+      gridDriftConsecutive: 0,
+      range: incident.sellRange,
+    };
+    const held = turn({ grid: incident, tick: -65_923, sibling });
+    // The sibling observation is input evidence, never an evaluator output;
+    // the dispatcher's next observation must be independent of the hold.
+    const withoutSibling = turn({ grid: incident, tick: -65_923 });
+    assert.deepEqual(held.nextObservation, withoutSibling.nextObservation);
+  });
+
+  it("the worker binds the sibling's range to its tokenId", () => {
+    const source = readFileSync(new URL("../src/lp/worker.ts", import.meta.url), "utf8");
+    assert.match(source, /theirs\.tokenId === other\.tokenId/u);
+    assert.match(source, /range: \{ tickLower: theirs\.tickLower, tickUpper: theirs\.tickUpper \}/u);
+    assert.doesNotMatch(source, /range: undefined/u);
+  });
+
+  it("three sentences, one builder, each under the 280-char cap", () => {
+    const incident = grid();
+    const texts = [
+      lpGridShiftCrossRecheckHoldReason({ siblingRole: "sell", siblingRange: incident.sellRange, siblingCrossConsecutive: 2, currentTick: -65_923, verdict: "inside" }),
+      lpGridShiftCrossRecheckHoldReason({ siblingRole: "sell", siblingRange: incident.sellRange, siblingCrossConsecutive: 2, currentTick: -65_970, verdict: "armed-side" }),
+      lpGridShiftCrossRecheckHoldReason({ siblingRole: "sell", siblingCrossConsecutive: 2, currentTick: -65_911, verdict: "range-unknown" }),
+    ];
+    for (const text of texts) {
+      assert.equal(sanitizeMessage(text), text);
+      assert.equal(text.length <= 280, true);
+    }
+  });
+});
 
 describe("GRID-GAS-RESERVE P2: gridShiftGasGate holds a shift the relay could not be paid for", () => {
   const FEE = 38_800_000_000_000n; // the live .env unit, 0.0000388 BNB

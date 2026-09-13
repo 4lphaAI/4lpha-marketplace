@@ -25,10 +25,10 @@ export const FEE_TO_TICK_SPACING: Record<number, number> = {
 
 /** Nominal preset table (1 tick ≈ 1 bps), same numbers as `live-grid`. */
 export const GRID_PRESETS = {
-  tight: { gapBps: 15, widthBps: 15, label: "Tight Scalp" },
-  standard: { gapBps: 30, widthBps: 30, label: "Balanced" },
-  wide: { gapBps: 75, widthBps: 50, label: "Wide Band" },
-  "very-wide": { gapBps: 150, widthBps: 100, label: "High Volatility" },
+  tight: { gapBps: 15, label: "Tight Scalp" },
+  standard: { gapBps: 30, label: "Balanced" },
+  wide: { gapBps: 75, label: "Wide Band" },
+  "very-wide": { gapBps: 150, label: "High Volatility" },
 } as const;
 
 export type GridPresetId = keyof typeof GRID_PRESETS;
@@ -102,7 +102,6 @@ export function deriveGridFromPreset(input: {
   readonly gapTicks: number;
   readonly widthTicks: number;
   readonly gapClamped: boolean;
-  readonly widthClamped: boolean;
   readonly buyRange: GridRange;
   readonly sellRange: GridRange;
 } {
@@ -111,19 +110,17 @@ export function deriveGridFromPreset(input: {
   }
   const preset = GRID_PRESETS[input.presetId];
   const gap = gridQuantizeUpToSpacing(preset.gapBps * input.spreadFactor, input.tickSpacing);
-  const width = gridQuantizeUpToSpacing(preset.widthBps * input.spreadFactor, input.tickSpacing);
   const ranges = gridDeriveRanges({
     currentTick: input.currentTick,
     tickSpacing: input.tickSpacing,
     gapTicks: gap.ticks,
-    widthTicks: width.ticks,
+    widthTicks: input.tickSpacing,
     wbnbIsToken0: input.wbnbIsToken0,
   });
   return {
     gapTicks: gap.ticks,
-    widthTicks: width.ticks,
+    widthTicks: input.tickSpacing,
     gapClamped: gap.clamped,
-    widthClamped: width.clamped,
     ...ranges,
   };
 }

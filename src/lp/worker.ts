@@ -151,6 +151,7 @@ import {
   LP_NO_TOKEN_ID_REASON,
   type LpAutomationSettings,
   type LpBrainSettings,
+  type LpGridRange,
   gridModeOf,
   ladderMotionCounts,
   type LpManagementDecision,
@@ -2958,6 +2959,7 @@ async function evaluatePosition(
         readonly gridDriftConsecutive: number;
         readonly crossSide?: SwaplessRotationSide;
         readonly driftSide?: SwaplessRotationSide;
+        readonly range?: LpGridRange;
         readonly gridRangeRelation?: "inside" | "outside";
       }
     | undefined;
@@ -3013,6 +3015,15 @@ async function evaluatePosition(
         if (other.positionId === position.positionId) continue;
         const theirs = await readObservation(deps, state, other);
         if (theirs !== undefined) {
+          // GRID-ONE-TICK-SHIFT-RECHECK R2-B2: only a matching-token snapshot
+          // may authorize the sibling range; the trigger adds no chain read.
+          const range =
+            theirs.tickLower !== undefined
+            && theirs.tickUpper !== undefined
+            && other.tokenId !== null
+            && theirs.tokenId === other.tokenId
+              ? { range: { tickLower: theirs.tickLower, tickUpper: theirs.tickUpper } }
+              : {};
           shiftSibling = {
             role: other.gridRole,
             gridCrossConsecutive: theirs.gridCrossConsecutive ?? 0,
@@ -3026,6 +3037,7 @@ async function evaluatePosition(
             ...(theirs.gridRangeRelation === undefined
               ? {}
               : { gridRangeRelation: theirs.gridRangeRelation }),
+            ...range,
           };
         }
       }

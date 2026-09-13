@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { USDT_56, WBNB_56 } from "./pairs";
-import { displaySide, emptyRungPairs, gridSideInverted, gridSideLabel, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, reduceTokenKlines, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, stickyArmBenchmark, tokenKlinesPath } from "./agent-detail";
+import { displaySide, emptyRungPairs, gridSideInverted, gridSideLabel, liveRungSides, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, reduceTokenKlines, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, stickyArmBenchmark, tokenKlinesPath, type DetailPosition } from "./agent-detail";
+import type { OnChainPosition, OnChainPositionRead } from "@/lib/altana/position-reader";
 import { priceAtTick as priceAtTickRef } from "./pairs";
 
 const NOW = 2_000_000_000_000;
@@ -697,5 +698,144 @@ describe("stickyArmBenchmark (GRID-BENCHMARK-LATENCY)", () => {
     expect(view.grossPnl.loading).toBe(true);
     expect(view.grossPnlPercent.loading).toBe(true);
     expect(view.hodl?.loading).toBe(true);
+  });
+});
+
+describe("liveRungSides", () => {
+  const pool = { token0: USDT_56, token1: WBNB_56, fee: 100, wbnbIsToken0: false } as const;
+  const S = 7_415_162n;
+  const B = 7_415_163n;
+  const D = 7_405_787n;
+  const sRange = { tickLower: -65_965, tickUpper: -65_915 } as const;
+  const bRange = { tickLower: -66_166, tickUpper: -66_116 } as const;
+  const dRange = { tickLower: -66_600, tickUpper: -66_550 } as const;
+  const metric = { value: null, reason: null } as const;
+
+  function position(positionId: string, role: string, tokenId: string | null, state = "open"): DetailPosition {
+    return {
+      positionId,
+      state,
+      tokenId,
+      pair: "USDT / WBNB",
+      role,
+      age: "now",
+      ageTitle: "now",
+      value: metric,
+      unrealised: metric,
+      fees: metric,
+      nftUrl: null,
+      rung: null,
+      sideLabel: null,
+    };
+  }
+
+  function nft(tokenId: bigint, range: { readonly tickLower: number; readonly tickUpper: number }, overrides: Partial<OnChainPosition> = {}): OnChainPosition {
+    return {
+      kind: "position",
+      blockNumber: 1n,
+      readAtMs: 1,
+      sqrtPriceX96: 1n << 96n,
+      amountsAvailable: true,
+      tokenId,
+      liquidity: 1n,
+      token0: USDT_56,
+      token1: WBNB_56,
+      fee: 100,
+      tickLower: range.tickLower,
+      tickUpper: range.tickUpper,
+      amounts: { amount0: 1n, amount1: 10n ** 18n },
+      minimums: { amount0: 1n, amount1: 1n },
+      owed: { amount0: 0n, amount1: 0n },
+      ...overrides,
+    };
+  }
+
+  function byId(...nfts: readonly OnChainPosition[]): ReadonlyMap<string, OnChainPosition> {
+    return new Map(nfts.map((value) => [value.tokenId.toString(10), value] as const));
+  }
+
+  function classify(
+    positions: readonly DetailPosition[],
+    onChain: ReadonlyMap<string, OnChainPosition>,
+    discovered: readonly OnChainPosition[] = [],
+    chainReads: ReadonlyMap<string, OnChainPositionRead> = new Map<string, OnChainPositionRead>(),
+  ) {
+    return liveRungSides({ positions, onChain, chainReads, discovered, pool });
+  }
+
+  it("assigns a mid-fill rung by its plane role, not by the asset it holds", () => {
+    const sides = classify([position("p-sell", "sell", S.toString()), position("p-buy", "buy", B.toString())], byId(nft(S, sRange), nft(B, bRange)));
+    expect({ buy: sides.buy?.tokenId, sell: sides.sell?.tokenId, placement: sides.placement, gaps: sides.gaps }).toEqual({ buy: B, sell: S, placement: "placed", gaps: { buy: null, sell: null } });
+  });
+
+  it("a dead NFT in discovered never displaces a row's rung", () => {
+    const base = classify([position("p-sell", "sell", S.toString()), position("p-buy", "buy", B.toString())], byId(nft(S, sRange), nft(B, bRange)));
+    const withOrphan = classify([position("p-sell", "sell", S.toString()), position("p-buy", "buy", B.toString())], byId(nft(S, sRange), nft(B, bRange)), [nft(D, dRange)]);
+    expect(withOrphan).toEqual(base);
+  });
+
+  it("rows without chain reads yet: placed, both sides reading", () => {
+    const sides = classify([position("p-sell", "sell", S.toString()), position("p-buy", "buy", B.toString())], byId());
+    expect(sides).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "reading", sell: "reading" } });
+  });
+
+  it("nothing minted yet: placed with no-token gaps", () => {
+    const rows = [position("p-sell", "sell", null), position("p-buy", "buy", null)];
+    expect(classify(rows, byId())).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "no-token", sell: "no-token" } });
+    expect(classify(rows, byId(), [nft(D, dRange)])).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "no-token", sell: "no-token" } });
+  });
+
+  it("a one-sided pair reports no-row for the missing role", () => {
+    const sides = classify([position("p-sell", "sell", S.toString())], byId(nft(S, sRange)));
+    expect({ buy: sides.buy, sell: sides.sell?.tokenId, gaps: sides.gaps }).toEqual({ buy: null, sell: S, gaps: { buy: "no-row", sell: null } });
+  });
+
+  it("a discovered NFT is placement evidence only, whatever its geometry", () => {
+    const sides = classify([position("p-closed", "sell", D.toString(), "closed")], byId(nft(D, dRange, { liquidity: 0n })), [nft(S, sRange)]);
+    const swapped = classify([position("p-closed", "sell", D.toString(), "closed")], byId(nft(D, dRange, { liquidity: 0n })), [nft(S, sRange, { amounts: { amount0: 10n ** 18n, amount1: 1n } })]);
+    expect(sides).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "role-unavailable", sell: "role-unavailable" } });
+    expect(swapped).toEqual(sides);
+  });
+
+  it("an emptied rung reports emptied", () => {
+    const sides = classify([position("p-sell", "sell", S.toString()), position("p-buy", "buy", B.toString())], byId(nft(S, sRange, { liquidity: 0n }), nft(B, bRange)));
+    expect({ buy: sides.buy?.tokenId ?? null, sell: sides.sell, gaps: sides.gaps }).toEqual({ buy: B, sell: null, gaps: { buy: null, sell: "emptied" } });
+  });
+
+  it("a funded NFT under a closed row is placement evidence only", () => {
+    expect(classify([position("p-closed", "sell", D.toString(), "closed")], byId(nft(D, dRange)))).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "role-unavailable", sell: "role-unavailable" } });
+  });
+
+  it("an unassigned row's NFT is placement evidence only", () => {
+    expect(classify([position("p-unassigned", "unassigned", "42")], byId(nft(42n, dRange)))).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "role-unavailable", sell: "role-unavailable" } });
+  });
+
+  it("totality: case-insensitive tokens, exact fee, key/tokenId agreement, dedupe", () => {
+    const upper = nft(S, sRange, { token0: USDT_56.toUpperCase() as typeof USDT_56 });
+    expect(classify([position("p-sell", "sell", S.toString())], byId(upper)).sell?.tokenId).toBe(S);
+    expect(classify([position("p-buy", "buy", "1")], byId(nft(1n, bRange, { fee: 500 })))).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "unreadable", sell: "no-row" } });
+    expect(classify([position("p-buy", "buy", "1")], new Map([["1", nft(2n, bRange)]]))).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "unreadable", sell: "no-row" } });
+    expect(classify([position("p-sell", "sell", S.toString())], byId(nft(S, sRange)), [nft(S, sRange)])).toEqual({ buy: null, sell: expect.objectContaining({ tokenId: S }), placement: "placed", gaps: { buy: "no-row", sell: null } });
+  });
+
+  it("closed rows with empty NFTs are closed, not unplaced", () => {
+    expect(classify([position("p-sell", "sell", S.toString(), "closed"), position("p-buy", "buy", B.toString(), "closed")], byId(nft(S, sRange, { liquidity: 0n }), nft(B, bRange, { liquidity: 0n })))).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "closed", sell: "closed" } });
+  });
+
+  it("an open row without a tokenId is no-token before a pending read", () => {
+    expect(classify([position("p-buy", "buy", null), position("p-sell", "sell", S.toString())], byId())).toEqual({ buy: null, sell: null, placement: "placed", gaps: { buy: "no-token", sell: "reading" } });
+  });
+
+  it("a second funded NFT under an open role row that loses the tokenId tie is an orphan", () => {
+    const sides = classify([position("p10", "buy", "10"), position("p11", "buy", "11")], byId(nft(10n, bRange), nft(11n, sRange)));
+    expect({ buy: sides.buy?.tokenId, sell: sides.sell, placement: sides.placement, gaps: sides.gaps }).toEqual({ buy: 11n, sell: null, placement: "placed", gaps: { buy: null, sell: "role-unavailable" } });
+  });
+
+  it("zero rows are unplaced even when discovery has not been used", () => {
+    expect(classify([], byId(nft(S, sRange)))).toEqual({ buy: null, sell: null, placement: "unplaced", gaps: { buy: null, sell: null } });
+  });
+
+  it("a pre-arm discovered NFT does not suppress signed placement", () => {
+    expect(classify([], byId(), [nft(S, sRange)])).toEqual({ buy: null, sell: null, placement: "unplaced", gaps: { buy: null, sell: null } });
   });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  GRID_PRESETS,
   deriveGridFromPreset,
   formatWeiAsBnb,
   gridDeriveRanges,
@@ -51,30 +52,59 @@ describe("gridDeriveRanges", () => {
 });
 
 describe("deriveGridFromPreset", () => {
-  it("standard preset on a 0.01% pool (spacing 1) keeps 30/30", () => {
-    const derived = deriveGridFromPreset({
-      presetId: "standard",
-      spreadFactor: 1,
-      currentTick: -23015,
-      tickSpacing: 1,
-      wbnbIsToken0: true,
-    });
-    expect(derived.gapTicks).toBe(30);
-    expect(derived.widthTicks).toBe(30);
-    expect(derived.gapClamped).toBe(false);
+  it("deriveGridFromPreset: width is exactly one tick spacing for every preset, spacing and spread factor", () => {
+    for (const presetId of ["tight", "standard", "wide", "very-wide"] as const) {
+      for (const tickSpacing of [1, 10, 50, 200]) {
+        for (const spreadFactor of [0.25, 1, 3]) {
+          const derived = deriveGridFromPreset({
+            presetId,
+            spreadFactor,
+            currentTick: -23015,
+            tickSpacing,
+            wbnbIsToken0: true,
+          });
+          expect(derived.widthTicks).toBe(tickSpacing);
+          expect(derived.gapTicks).toBe(
+            gridQuantizeUpToSpacing(
+              GRID_PRESETS[presetId].gapBps * spreadFactor,
+              tickSpacing,
+            ).ticks,
+          );
+          expect("widthClamped" in derived).toBe(false);
+        }
+      }
+    }
   });
-  it("tight preset on a 0.25% pool (spacing 50) clamps both to 50", () => {
-    const derived = deriveGridFromPreset({
-      presetId: "tight",
-      spreadFactor: 1,
-      currentTick: 100,
-      tickSpacing: 50,
-      wbnbIsToken0: true,
-    });
-    expect(derived.gapTicks).toBe(50);
-    expect(derived.widthTicks).toBe(50);
-    expect(derived.gapClamped).toBe(true);
-    expect(derived.widthClamped).toBe(true);
+  it("mid-to-mid distance of a preset pair is 2g + 2s on every pool", () => {
+    const expected: Record<string, readonly number[]> = {
+      tight: [32, 60, 200, 800],
+      standard: [62, 80, 200, 800],
+      wide: [152, 180, 300, 800],
+      "very-wide": [302, 320, 400, 800],
+    };
+    const presets = { tight: 15, standard: 30, wide: 75, "very-wide": 150 } as const;
+    for (const presetId of Object.keys(presets) as Array<keyof typeof presets>) {
+      for (const [index, tickSpacing] of [1, 10, 50, 200].entries()) {
+        for (const tick of [0, 1, tickSpacing - 1, -1, -tickSpacing]) {
+          const derived = deriveGridFromPreset({
+            presetId,
+            spreadFactor: 1,
+            currentTick: tick,
+            tickSpacing,
+            wbnbIsToken0: index % 2 === 0,
+          });
+          const buyMid = Math.floor((derived.buyRange.tickLower + derived.buyRange.tickUpper) / 2);
+          const sellMid = Math.floor((derived.sellRange.tickLower + derived.sellRange.tickUpper) / 2);
+          expect(Math.abs(sellMid - buyMid)).toBe(expected[presetId]![index]);
+        }
+      }
+    }
+  });
+  it("GRID_PRESETS carries no bps width", () => {
+    expect(Object.keys(GRID_PRESETS.tight)).toEqual(["gapBps", "label"]);
+    expect(Object.keys(GRID_PRESETS.standard)).toEqual(["gapBps", "label"]);
+    expect(Object.keys(GRID_PRESETS.wide)).toEqual(["gapBps", "label"]);
+    expect(Object.keys(GRID_PRESETS["very-wide"])).toEqual(["gapBps", "label"]);
   });
   it("refuses an out-of-bounds spread factor", () => {
     expect(() =>
