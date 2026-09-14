@@ -323,6 +323,8 @@ export function mockAgentDetailView(agentId: string): AgentDetailView {
       gapTicks: 100,
       widthTicks: 50,
       driftPctOfGap: 0,
+      deployPctBps: 3_000,
+      shiftLane: { used: 1, perDay: 16 },
       buyRange: BUY_RANGE,
       sellRange: SELL_RANGE,
       buyRungSource: "live",
