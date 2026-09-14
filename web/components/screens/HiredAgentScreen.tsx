@@ -125,6 +125,19 @@ export function modeLabel(view: AgentDetailView | null | undefined): string {
   return ` · ${grid.mode}`;
 }
 
+/** The signed deployment fraction, for the Execution model tile's second line. */
+export function utilizationNote(view: AgentDetailView | null | undefined): string | undefined {
+  const bps = view?.grid.deployPctBps;
+  return typeof bps === "number" ? `Capital utilization ${bps / 100}%` : undefined;
+}
+
+/** The cross lane's daily count as the plane reports it: `used/perDay`, a dash for `used` until it does. */
+export function requotesLabel(view: AgentDetailView | null | undefined): string | null {
+  const lane = view?.grid.shiftLane;
+  if (lane === null || lane === undefined) return null;
+  return `REQUOTES ${lane.used ?? "—"}/${lane.perDay} TODAY`;
+}
+
 function metricTone(value: string): "profit" | "loss" | "flat" {
   if (value.startsWith("-")) return "loss";
   if (value === "—" || /^0(?:\.0+)?(?:\s|%|$)/u.test(value)) return "flat";
@@ -503,7 +516,7 @@ function GridLiquidity({ view }: { readonly view: AgentDetailView | null }) {
       />
       <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", paddingTop: 10, borderTop: "1px solid var(--line-1)", font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" }}>
         <span style={{ marginLeft: "auto", display: "flex", gap: 18, flexWrap: "wrap" }}>
-          <span title={view?.grid.tickSource === "live" ? "Read straight from the pool by this page, independent of the worker" : view?.grid.tickSource === "worker" ? "The worker's last finalized observation" : undefined}>ACTIVE TICK {observedTick ?? "—"}{view?.grid.tickSource === "live" ? " · LIVE" : ""}</span><span>TICK SPACING {view?.grid.tickSpacing || "—"}</span><span>QUOTES {rungQuote(view, "bid")} – {rungQuote(view, "ask")} {context?.quote ?? "—"}{signed ? " · SIGNED, not yet armed" : ""}</span><span>—</span><span>{view?.grid.liveRows ?? "—"} LIVE ORDERS</span>
+          <span title={view?.grid.tickSource === "live" ? "Read straight from the pool by this page, independent of the worker" : view?.grid.tickSource === "worker" ? "The worker's last finalized observation" : undefined}>ACTIVE TICK {observedTick ?? "—"}{view?.grid.tickSource === "live" ? " · LIVE" : ""}</span><span>TICK SPACING {view?.grid.tickSpacing || "—"}</span><span>QUOTES {rungQuote(view, "bid")} – {rungQuote(view, "ask")} {context?.quote ?? "—"}{signed ? " · SIGNED, not yet armed" : ""}</span><span>—</span><span>{view?.grid.liveRows ?? "—"} LIVE ORDERS</span>{requotesLabel(view) === null ? null : <span title="Re-placements of the ladder after a fill, counted by the plane against the signed daily allowance">{requotesLabel(view)}</span>}
         </span>
       </div>
     </div>
@@ -1600,7 +1613,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
             <SegmentedToggle options={[{ value: "USD", label: "USD" }, { value: "BNB", label: "BNB" }]} value={delegatedUnit} onChange={(next: string) => setDelegatedUnit(next === "BNB" ? "BNB" : "USD")} />
           </span>
         </span>
-        <MetricTile size="sm" label={`Execution model${modeLabel(view)}`} value={model} style={{ height: "100%", whiteSpace: "nowrap" }} />
+        <MetricTile size="sm" label={`Execution model${modeLabel(view)}`} value={model} note={utilizationNote(view)} style={{ height: "100%", whiteSpace: "nowrap" }} />
         {/* A dash still needs its reason — "why is this empty" is the question
             an empty tile provokes — but a tile that HAS a number says it with
             the number alone. */}

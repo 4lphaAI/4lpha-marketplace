@@ -46,7 +46,7 @@ vi.mock("@/components/MarketChart", () => ({
   ),
 }));
 
-import { HiredAgentScreen } from "./HiredAgentScreen";
+import { HiredAgentScreen, requotesLabel } from "./HiredAgentScreen";
 
 const metric = (value: string) => ({ value, reason: null });
 const view: AgentDetailView = {
@@ -71,7 +71,7 @@ const view: AgentDetailView = {
   sequences: [{ sequenceId: "sequence-real", positionId: "real-position-7", kind: "grid-flip", state: "completed", recoveryState: "none", note: "settled", outcomeUnavailable: false, txHashes: [`0x${"44".repeat(32)}`], steps: [{ index: 0, kind: "zap-out", decisionId: "lp:sequence-real:0", state: "COMMITTED" }], updatedAt: 2_000, createdAt: 1_500, shiftCause: null, targetBuyRange: null, targetSellRange: null }],
   positions: [{ positionId: "real-position-7", state: "open", tokenId: "9007199254740993", pair: "WBNB / USDT", role: "buy", sideLabel: "BID USDT", rung: { tickLower: -9, tickUpper: 1, priceLow: "640.00000000", priceHigh: "645.00000000", fillPrice: "640.00000000" }, age: "2h ago", ageTitle: "2026-09-02T00:00:00.000Z", value: metric("0.081 WBNB"), unrealised: metric("-0.004 WBNB"), fees: { value: null, reason: "— fees are counted in unrealised" }, nftUrl: "https://bscscan.com/nft/0x46a15b0b27311cedf172ab29e4f4766fbe7f4364/9007199254740993" }],
   lp: null,
-  grid: { pool: "0x5555555555555555555555555555555555555555", pair: "WBNB / USDT", base: "WBNB" as const, quote: "USDT" as const, symbol0: "USDT", symbol1: "WBNB", decimals0: 18, decimals1: 18, token0: "0x55d398326f99059ff775485246999027b3197955", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", fee: 100, wbnbIsToken0: false, sideInverted: true, observedPrice: "645.00000000", quoteUsd: 1, baseAddress: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", quoteAddress: "0x55d398326f99059ff775485246999027b3197955", buyPrices: { low: "640.00000000", high: "645.00000000" }, sellPrices: { low: "646.00000000", high: "650.00000000" }, tickSpacing: 10, mode: "shift", gapTicks: 150, widthTicks: 100, driftPctOfGap: 0, buyRange: { tickLower: -9, tickUpper: 1 }, sellRange: { tickLower: 1, tickUpper: 11 }, buyRungSource: "live", sellRungSource: "live", buyRungGap: null, sellRungGap: null, placement: "placed", observedTick: -3, observationAgeMs: 2_000, observationStale: false, tickSource: "worker", rangeUnavailableBecause: null, liveRows: 1 },
+  grid: { pool: "0x5555555555555555555555555555555555555555", pair: "WBNB / USDT", base: "WBNB" as const, quote: "USDT" as const, symbol0: "USDT", symbol1: "WBNB", decimals0: 18, decimals1: 18, token0: "0x55d398326f99059ff775485246999027b3197955", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", fee: 100, wbnbIsToken0: false, sideInverted: true, observedPrice: "645.00000000", quoteUsd: 1, baseAddress: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", quoteAddress: "0x55d398326f99059ff775485246999027b3197955", buyPrices: { low: "640.00000000", high: "645.00000000" }, sellPrices: { low: "646.00000000", high: "650.00000000" }, tickSpacing: 10, mode: "shift", gapTicks: 150, widthTicks: 100, driftPctOfGap: 0, deployPctBps: 3_000, shiftLane: { used: 1, perDay: 16 }, buyRange: { tickLower: -9, tickUpper: 1 }, sellRange: { tickLower: 1, tickUpper: 11 }, buyRungSource: "live", sellRungSource: "live", buyRungGap: null, sellRungGap: null, placement: "placed", observedTick: -3, observationAgeMs: 2_000, observationStale: false, tickSource: "worker", rangeUnavailableBecause: null, liveRows: 1 },
 };
 function lpFixture(): NonNullable<AgentDetailView["lp"]> {
   return {model:"custom",pool:{...view.grid,poolAddress:view.grid.pool},openingRange:{source:"explicit",tickLower:-9,tickUpper:1},
@@ -116,6 +116,16 @@ describe("Hired agent detail provenance", () => {
     expect(html).toContain("0.081 WBNB");
     expect(html).toContain("-0.004 WBNB");
     expect(html).toContain("https://bscscan.com/nft/0x46a15b0b27311cedf172ab29e4f4766fbe7f4364/9007199254740993");
+  });
+
+  it("shows the signed capital utilization under the model and the plane's requote count in the liquidity footer (hotfix 2026-09-14)", () => {
+    const html = render();
+    expect(html).toContain("Capital utilization 30%");
+    // The liquidity footer sits behind "Show charts" in a static render, so its label is checked directly.
+    expect(requotesLabel(view)).toBe("REQUOTES 1/16 TODAY");
+    expect(requotesLabel({ ...view, grid: { ...view.grid, shiftLane: { used: null, perDay: 16 } } })).toBe("REQUOTES —/16 TODAY");
+    expect(requotesLabel({ ...view, grid: { ...view.grid, shiftLane: null, deployPctBps: null } })).toBeNull();
+    expect(render({ ...view, grid: { ...view.grid, deployPctBps: null } })).not.toContain("Capital utilization");
   });
 
   it("renders only the on-chain HODL percentage, without amount, description or receipt link", () => {

@@ -427,6 +427,10 @@ export type AgentDetailView = {
     readonly widthTicks: number | null;
     /** Shift mode's drift lane; 0 = disabled, so the grid moves only on a fill (PHASE3.25 cross). */
     readonly driftPctOfGap: number | null;
+    /** Shift mode's signed deployment fraction, in bps (3000 = 30% of the budget in live rungs). */
+    readonly deployPctBps: number | null;
+    /** The cross lane as the plane counts it today: motions used (null until the plane reports) against the signed daily allowance. */
+    readonly shiftLane: { readonly used: number | null; readonly perDay: number } | null;
     readonly buyRange: { readonly tickLower: number; readonly tickUpper: number };
     readonly sellRange: { readonly tickLower: number; readonly tickUpper: number };
     readonly buyRungSource: "live" | "signed" | "none";
@@ -939,6 +943,8 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
       gapTicks: null,
       widthTicks: null,
       driftPctOfGap: null,
+      deployPctBps: null,
+      shiftLane: null,
       pair: "—",
       base: null,
       quote: null,
@@ -1268,6 +1274,8 @@ function mapLpAgentDetail(
       gapTicks: null,
       widthTicks: null,
       driftPctOfGap: null,
+      deployPctBps: null,
+      shiftLane: null,
       pair: "—",
       base: null,
       quote: null,
@@ -1505,6 +1513,8 @@ export function mapAgentDetail(
   // from their valuations. Everything is WBNB wei, so the subtraction is exact.
   // Shift, ladder and policy all carry their gap/width in their own block.
   const geometryBlock = row(grid["shift"]) ?? row(grid["ladder"]) ?? row(grid["policy"]);
+  // PHASE3.25 shiftState.lanes — the plane's own live count of the cross lane.
+  const shiftLanes = row(row(grid["shiftState"])?.["lanes"]);
   const buffer = row(grid["buffer"]);
   const holdings = grossHoldingsWei({
     positions: data["positions"] as readonly Row[],
@@ -1649,6 +1659,9 @@ export function mapAgentDetail(
       gapTicks: safeInteger(geometryBlock?.["gapTicks"]) ? Number(geometryBlock?.["gapTicks"]) : null,
       driftPctOfGap: safeInteger(geometryBlock?.["driftPctOfGap"]) ? Number(geometryBlock?.["driftPctOfGap"]) : null,
       widthTicks: safeInteger(geometryBlock?.["widthTicks"]) ? Number(geometryBlock?.["widthTicks"]) : null,
+      deployPctBps: safeInteger(geometryBlock?.["deployPctBps"]) ? Number(geometryBlock?.["deployPctBps"]) : null,
+      shiftLane: shiftLanes === null || !safeInteger(shiftLanes["shiftsPerDay"]) ? null
+        : { used: safeInteger(shiftLanes["shiftsUsed"]) ? Number(shiftLanes["shiftsUsed"]) : null, perDay: Number(shiftLanes["shiftsPerDay"]) },
       buyRange: gridBuyRange,
       sellRange: gridSellRange,
       buyRungSource: positions.length === 0 ? "signed" : "none",

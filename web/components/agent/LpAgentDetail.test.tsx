@@ -92,6 +92,8 @@ function baseView(): AgentDetailView {
       gapTicks: null,
       widthTicks: null,
       driftPctOfGap: null,
+      deployPctBps: null,
+      shiftLane: null,
       buyRange: { tickLower: 0, tickUpper: 0 },
       sellRange: { tickLower: 0, tickUpper: 0 },
       buyRungSource: "none",
