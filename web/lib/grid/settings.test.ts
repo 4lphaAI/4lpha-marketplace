@@ -70,6 +70,17 @@ describe("buildShiftGridSettings", () => {
     expect(grid["maxFlipsPerDay"]).toBe(1);
     expect(settings["minMinutesBetweenExits"]).toBe(5);
     expect(shiftBlock(settings)["deployPctBps"]).toBe(3_000);
+    expect(settings).not.toHaveProperty("grid.requote");
+  });
+
+  it("signs the live utilization and requote choices, while defaulting both when absent", () => {
+    const chosen = shiftBlock(buildShiftGridSettings({ ...base, deployPctBps: 5_000, shiftsPerDay: 4 }));
+    expect(chosen["deployPctBps"]).toBe(5_000);
+    expect(chosen["shiftsPerDay"]).toBe(4);
+    const defaults = shiftBlock(buildShiftGridSettings({ ...base }));
+    expect(defaults["deployPctBps"]).toBe(3_000);
+    expect(defaults["shiftsPerDay"]).toBe(16);
+    expect(buildShiftGridSettings({ ...base })).not.toHaveProperty("grid.requote");
   });
 
   it("leaves the fixed-grid builder untouched", () => {

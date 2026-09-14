@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const suggestion = vi.hoisted(() => ({ report: null as ((value: string | null) => void) | null }));
 
+vi.mock("@/lib/exec/use-owner-actions", () => ({ useOwnerActions: () => ({ walletAddress: undefined }) }));
 vi.mock("@/components/deploy/HireGridDeploy", () => ({ HireGridDeploy: ({ mode }: { mode: string }) => <span data-mode={mode} /> }));
 vi.mock("@/components/deploy/HireLpDeploy", () => ({ HireLpDeploy: ({ mode }: { mode: string }) => <span data-mode={mode} /> }));
 vi.mock("@/components/deploy/HireTradeDeploy", () => ({ HireTradeDeploy: () => <span data-mode="Live" /> }));

@@ -2,7 +2,19 @@ import type { OwnerActionEnvelope } from "../exec/owner-action";
 import type { HireSessionView } from "./hire-state";
 
 export const GRID_HIRE_STORAGE_KEY = "4lpha:grid-hire:v1";
+export const GRID_HIRE_CHOICES_STORAGE_KEY = "4lpha:grid-hire-choices:v1";
 type HireStorage = Pick<Storage, "getItem" | "removeItem">;
+
+export type GridHireChoices = {
+  readonly version: 1;
+  readonly agentId: string;
+  readonly uiPresetId: string;
+  readonly capitalBnb: string;
+  readonly utilizationPct: number;
+  readonly maxRequotesDaily: number;
+  readonly takeProfitPct: number;
+  readonly stopLossPct: number;
+};
 
 export function cancellationRecorded(view: HireSessionView | null): boolean {
   return view?.status === "retired" || (view?.status === "provisioning" && view.cancelRequested === true);
@@ -15,7 +27,11 @@ export function forgetHire(
   storageKey: string = GRID_HIRE_STORAGE_KEY,
 ): void {
   const saved = storage.getItem(storageKey);
-  if (saved === agentId) { storage.removeItem(storageKey); return; }
+  if (saved === agentId) {
+    storage.removeItem(storageKey);
+    if (storageKey === GRID_HIRE_STORAGE_KEY) storage.removeItem(GRID_HIRE_CHOICES_STORAGE_KEY);
+    return;
+  }
   if (storageKey !== "4lpha:trade-hire:v2" || saved === null) return;
   try {
     const record: unknown = JSON.parse(saved);
@@ -49,7 +65,9 @@ export async function cancelGridHire(input: {
   if (payload.data === undefined || !cancellationRecorded(payload.data)) {
     throw new Error("Cancellation is not confirmed. Refresh this hire and try again.");
   }
-  forgetHire(input.storage, input.agentId, input.storageKey);
+  const storageKey = input.storageKey ?? GRID_HIRE_STORAGE_KEY;
+  if (storageKey === GRID_HIRE_STORAGE_KEY) forgetGridHire(input.storage, input.agentId);
+  else forgetHire(input.storage, input.agentId, storageKey);
   return payload.data;
 }
 

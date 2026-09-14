@@ -16,6 +16,7 @@ vi.mock("./GridLiveDeploy", () => ({ armGridAgent: mocks.arm, GridDeployActions:
 
 import { HireGridDeploy } from "./HireGridDeploy";
 import { HireRecoveryActions } from "./HireRecoveryActions";
+import { GRID_HIRE_CHOICES_STORAGE_KEY } from "@/lib/altana/grid-hire-recovery";
 
 const key = "4lpha:grid-hire:v1";
 const id = "grid-agent-01-3";
@@ -42,6 +43,7 @@ let nextFunding: Promise<Response> | null;
 let nextSession: Promise<Response> | null;
 let nextProvision: Promise<Response> | null;
 let cancelResponse: () => Response;
+const gridPool = { pool: "0x4444444444444444444444444444444444444444", token0: "0x5555555555555555555555555555555555555555", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", wbnbIsToken0: false } as React.ComponentProps<typeof HireGridDeploy>["pool"];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -77,10 +79,10 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
-async function deploy() {
+async function deploy(input: { readonly pool?: React.ComponentProps<typeof HireGridDeploy>["pool"]; readonly onRestoreChoices?: NonNullable<React.ComponentProps<typeof HireGridDeploy>["onRestoreChoices"]> } = {}) {
   await act(async () => { root!.render(<HireGridDeploy mode="Live" agentName="Grid agent 01 3" uiPresetId="balanced"
-    pool={{ pool: "0x4444444444444444444444444444444444444444", token0: "0x5555555555555555555555555555555555555555", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", wbnbIsToken0: false } as React.ComponentProps<typeof HireGridDeploy>["pool"]}
-    capitalBnb="0.03" takeProfitPct={0} stopLossPct={0} go={vi.fn()} />); });
+    pool={input.pool === undefined ? gridPool : input.pool}
+    capitalBnb="0.03" utilizationPct={30} maxRequotesDaily={16} takeProfitPct={0} stopLossPct={0} onRestoreChoices={input.onRestoreChoices} go={vi.fn()} />); });
 }
 function button(label: string): HTMLButtonElement {
   const found = [...host.querySelectorAll("button")].find((entry) => entry.textContent === label);
@@ -140,7 +142,7 @@ describe("grid hire interruption in the rendered UI", () => {
     localStorage.setItem(key, id);
     currentSession = {
       status: "armed",
-      hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "100" },
+      hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "30000000000000000" },
     };
     const signature = deferred<unknown>();
     const submitArm = vi.fn();
@@ -276,6 +278,11 @@ it("does not reinterpret unrelated 409 errors as an existing agent", async () =>
 
 it("increments the suffix when another owner holds the global agent id", async () => {
   let provisionCalls = 0;
+  let choicesAtArm: string | null = null;
+  mocks.arm.mockImplementation(async () => {
+    choicesAtArm = localStorage.getItem(GRID_HIRE_CHOICES_STORAGE_KEY);
+    return {};
+  });
   fetchMock.mockImplementation(async (input, init) => {
     const url = String(input);
     if (url.includes("/hire/preview")) return json(preview("100"));
@@ -284,7 +291,7 @@ it("increments the suffix when another owner holds the global agent id", async (
       provisionCalls += 1;
       return provisionCalls === 1
         ? new Response(JSON.stringify({ error: { code: "agent_exists" } }), { status: 409 })
-        : json({ ...session, status: "armed", hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "100" } });
+        : json({ ...session, status: "armed", hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "30000000000000000" } });
     }
     if (url.endsWith("/session")) {
       return new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
@@ -295,8 +302,47 @@ it("increments the suffix when another owner holds the global agent id", async (
   await click("Deploy grid agent");
   expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "provisionAgent").map(([, agentId]) => agentId))
     .toEqual(["grid-agent-01-3", "grid-agent-01-3-2"]);
+  expect(JSON.parse(choicesAtArm ?? "null")).toEqual({
+    version: 1, agentId: "grid-agent-01-3-2", uiPresetId: "balanced", capitalBnb: "0.03",
+    utilizationPct: 30, maxRequotesDaily: 16, takeProfitPct: 0, stopLossPct: 0,
+  });
   expect(mocks.arm).toHaveBeenCalledTimes(1);
   expect(host.textContent).not.toContain("not_found");
+});
+
+it("restores a matching choice snapshot before polling and does not auto-continue without a pool", async () => {
+  localStorage.setItem(key, id);
+  const choices = { version: 1, agentId: id, uiPresetId: "balanced", capitalBnb: "0.0971", utilizationPct: 50, maxRequotesDaily: 4, takeProfitPct: 0, stopLossPct: 0 };
+  localStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify(choices));
+  currentSession = { status: "armed", hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "97100000000000000" } };
+  const restored = vi.fn();
+  await deploy({ pool: null, onRestoreChoices: restored });
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  expect(restored).toHaveBeenCalledWith(choices);
+  expect(mocks.arm).not.toHaveBeenCalled();
+});
+
+it("does not restore or auto-continue a snapshot for another agent", async () => {
+  localStorage.setItem(key, id);
+  localStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({
+    version: 1, agentId: "another-agent", uiPresetId: "balanced", capitalBnb: "0.0971", utilizationPct: 50, maxRequotesDaily: 4, takeProfitPct: 0, stopLossPct: 0,
+  }));
+  currentSession = { status: "armed", hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "97100000000000000" } };
+  const restored = vi.fn();
+  await deploy({ onRestoreChoices: restored });
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  expect(restored).not.toHaveBeenCalled();
+  expect(mocks.arm).not.toHaveBeenCalled();
+});
+
+it("refuses capital above the immutable hire budget before armGridAgent", async () => {
+  localStorage.setItem(key, id);
+  currentSession = { status: "armed", hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "20000000000000000" } };
+  await deploy();
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  await click("Arm the grid");
+  expect(mocks.arm).not.toHaveBeenCalled();
+  expect(host.textContent).toContain("Total capital 0.03 BNB exceeds this hire's budget of 0.02 BNB. Lower it to that amount, or cancel this hire and start again.");
 });
 
 it("cancels a scoped Trading draft, clears only its JSON pointer and returns to Trading", async () => {

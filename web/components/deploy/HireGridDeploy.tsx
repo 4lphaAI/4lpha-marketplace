@@ -10,7 +10,7 @@ import { FundsModal, type FundsWallet } from "@/components/FundsModal";
 import { grantAgentSession, GrantAgentSessionError } from "@/lib/altana/client";
 import { freshFundingGate, hireResumeStep, type HireFunding, type HireSessionView } from "@/lib/altana/hire-state";
 import { credentialUsable, ensureHireReadCredential, HireReadRefused, pollStatusText, readHireSession, rememberedHireReadCredential, type HireReadCredential } from "@/lib/altana/hire-read-session";
-import { cancelGridHire, cancellationMessage, cancellationRecorded, forgetGridHire, GridDeployRun, GridDeployStopped } from "@/lib/altana/grid-hire-recovery";
+import { cancelGridHire, cancellationMessage, cancellationRecorded, forgetGridHire, GRID_HIRE_CHOICES_STORAGE_KEY, GridDeployRun, GridDeployStopped, type GridHireChoices } from "@/lib/altana/grid-hire-recovery";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
 import { parseBnbToWei } from "@/lib/grid/geometry";
 import { depositAmountBnb, depositAmountWei, requiredDepositWei, walletSharedWithLiveAgents } from "@/lib/altana/hire-funding";
@@ -157,9 +157,14 @@ const IDLE_STEPS: Record<DeployStepKey, DeployStep> = {
  * run aborted — the moment the toggle moves.
  */
 export function HireGridDeploy(props: React.ComponentProps<typeof HireGridDeployLive>) {
-  if (props.mode === "Demo") return <GridDeployActions {...props} />;
+  if (props.mode === "Demo") {
+    const { utilizationPct, maxRequotesDaily, onRestoreChoices, ...demoProps } = props;
+    return <GridDeployActions {...demoProps} />;
+  }
   return <HireGridDeployLive {...props} />;
 }
+
+type GridDeployChoiceSnapshot = Pick<GridHireChoices, "capitalBnb" | "uiPresetId" | "utilizationPct" | "maxRequotesDaily" | "takeProfitPct" | "stopLossPct">;
 
 function HireGridDeployLive(props: {
   readonly mode: "Demo" | "Live";
@@ -167,12 +172,15 @@ function HireGridDeployLive(props: {
   readonly uiPresetId: string;
   readonly pool: LivePool | null;
   readonly capitalBnb: string;
+  readonly utilizationPct: number;
+  readonly maxRequotesDaily: number;
   readonly takeProfitPct: number;
   readonly stopLossPct: number;
   /** In-app router from KitApp. Routing is React state, not the URL, so a location change would 404. */
   readonly go?: (route: string) => void;
   /** Set when the form itself is invalid (capital under the pool's floor): the hire cannot start. */
   readonly blockedReason?: string | null;
+  readonly onRestoreChoices?: (choices: GridHireChoices) => void;
 }) {
   const owner = useOwnerActions();
   const hireStorage = React.useMemo(() => accountHireStorage(typeof window === "undefined" ? undefined : window.localStorage, owner.ownerAddress), [owner.ownerAddress]);
@@ -284,6 +292,23 @@ function HireGridDeployLive(props: {
     if (saved === null) return;
     setAgentId(saved);
     setWorking("Checking the durable hire state before offering another grant…");
+    let restoredChoices: GridHireChoices | null = null;
+    const rawChoices = hireStorage.getItem(GRID_HIRE_CHOICES_STORAGE_KEY);
+    if (rawChoices !== null) {
+      try {
+        const parsed: unknown = JSON.parse(rawChoices);
+        if (parsed !== null && typeof parsed === "object") {
+          const candidate = parsed as Partial<GridHireChoices>;
+          if (candidate.version === 1 && candidate.agentId === saved
+            && typeof candidate.uiPresetId === "string" && typeof candidate.capitalBnb === "string"
+            && typeof candidate.utilizationPct === "number" && typeof candidate.maxRequotesDaily === "number"
+            && typeof candidate.takeProfitPct === "number" && typeof candidate.stopLossPct === "number") {
+            restoredChoices = candidate as GridHireChoices;
+            props.onRestoreChoices?.(restoredChoices);
+          }
+        }
+      } catch { /* A malformed snapshot cannot authorize a resumed arm. */ }
+    }
     void beginPolling(saved).then((resumedView) => {
       if (!mounted.current) return;
       // A FINISHED session is not a broken hire: `revoked`/`retired` is the
@@ -293,9 +318,10 @@ function HireGridDeployLive(props: {
       // filled in. Every other terminal state (permissions-differ, expired,
       // wallet-owner-mismatch) still needs the owner to act on THAT agent, so
       // it is left exactly where it is.
-      if (!accountSwitchRequiresContinue(hireStorage) && resumedView !== undefined && hireResumeStep(resumedView) === "arm" && !cancellationRecorded(resumedView) && !autoContinued.current) {
+      if (!accountSwitchRequiresContinue(hireStorage) && restoredChoices !== null && props.pool !== null
+        && resumedView !== undefined && hireResumeStep(resumedView) === "arm" && !cancellationRecorded(resumedView) && !autoContinued.current) {
         autoContinued.current = true;
-        void deployAll({ id: saved, view: resumedView });
+        void deployAll({ id: saved, view: resumedView, choices: restoredChoices });
       }
       if (resumedView !== undefined && (resumedView.status === "revoked" || resumedView.status === "retired")) {
         forgetGridHire(hireStorage, saved);
@@ -309,20 +335,20 @@ function HireGridDeployLive(props: {
       if (!mounted.current || error instanceof GridDeployStopped) return;
       setMessage(error instanceof Error ? error.message : "Hire status is unavailable.");
     }).finally(() => { if (mounted.current) setWorking(null); });
-  }, [beginPolling, owner.passkey]);
+  }, [beginPolling, owner.passkey, props.onRestoreChoices, props.pool]);
 
   React.useEffect(() => {
     if (view?.status !== "armed" || preview !== null || props.pool === null || owner.walletAddress === undefined) return;
     let current = true;
-    void loadPreview().then((result) => { if (current) setPreview(result); }).catch(() => undefined);
+    void loadPreview(props.capitalBnb).then((result) => { if (current) setPreview(result); }).catch(() => undefined);
     return () => { current = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view?.status, preview, props.pool, owner.walletAddress]);
 
-  const loadPreview = async (): Promise<Preview> => {
+  const loadPreview = async (capitalBnb: string): Promise<Preview> => {
     if (owner.passkey === null || owner.walletAddress === undefined) throw new Error("Create or recover your passkey wallet first.");
     if (props.pool === null) throw new Error("Select a pool first.");
-    const openNativeBudgetWei = parseBnbToWei(props.capitalBnb);
+    const openNativeBudgetWei = parseBnbToWei(capitalBnb);
     if (openNativeBudgetWei <= 0n) throw new Error("Total capital must be positive.");
     const query = new URLSearchParams({ walletAddress: owner.walletAddress, openNativeBudgetWei: openNativeBudgetWei.toString(10), sizingPreset: HIRE_PROFILE });
     const response = await fetch(`/api/agents/hire/preview?${query}`, { cache: "no-store" });
@@ -334,17 +360,17 @@ function HireGridDeployLive(props: {
     return payload.data;
   };
 
-  const startHire = async (run: GridDeployRun): Promise<{ readonly id: string; readonly view: HireSessionView } | null> => {
+  const startHire = async (run: GridDeployRun, chosen: GridDeployChoiceSnapshot, pool: LivePool, agentName: string): Promise<{ readonly id: string; readonly view: HireSessionView } | null> => {
     setMessage(null);
     setWorking("Reading the live cap and funding estimate…");
     try {
-      const fresh = await run.guarded(loadPreview);
+      const fresh = await run.guarded(() => loadPreview(chosen.capitalBnb));
       setPreview(fresh);
       // ONE owner-signed list read decides the number: `grid-agent-01`, then
       // `-2`, `-3`. The list includes revoked and retired rows, which is what
       // makes re-hiring under the same name work. A list that cannot be read
       // falls back to the bare slug — the 409 branch below is the backstop.
-      const base = agentIdFromName(props.agentName);
+      const base = agentIdFromName(agentName);
       const taken: string[] = [];
       try {
         setWorking("Checking which agent names you already hold…");
@@ -368,7 +394,7 @@ function HireGridDeployLive(props: {
       }
       const params = {
         walletAddress: owner.walletAddress!,
-        token: poolToken(props.pool!),
+        token: poolToken(pool),
         capDayWei: fresh.capDayWei,
         openNativeBudgetWei: fresh.sizing.openNativeBudgetWei,
         ttlSec: 604_800,
@@ -393,7 +419,10 @@ function HireGridDeployLive(props: {
         // the request was in flight; never continue from it into a grant.
         if (response.ok && payload.data !== undefined) {
           const saved = hireStorage.getItem("4lpha:grid-hire:v1");
-          if (!run.stopped || saved === null || saved === id) hireStorage.setItem("4lpha:grid-hire:v1", id);
+          if (!run.stopped || saved === null || saved === id) {
+            hireStorage.setItem("4lpha:grid-hire:v1", id);
+            hireStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({ version: 1, agentId: id, ...chosen } satisfies GridHireChoices));
+          }
         }
         run.check();
         if (response.status === 409 && payload.error?.code === "agent_exists") {
@@ -419,6 +448,9 @@ function HireGridDeployLive(props: {
           run.check();
           if (existing.status !== "revoked" && existing.status !== "retired") {
             hireStorage.setItem("4lpha:grid-hire:v1", id);
+            // The resumed row is armed with THIS run's choices, so a refresh
+            // must restore these and not the defaults (R7.1).
+            hireStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({ version: 1, agentId: id, ...chosen } satisfies GridHireChoices));
             setAgentId(id);
             return { id, view: existing };
           }
@@ -490,8 +522,27 @@ function HireGridDeployLive(props: {
    * pressing deploy again after a failure continues rather than restarts, and
    * a submitted-but-unconfirmed grant is never re-signed.
    */
-  const deployAll = async (seed?: { readonly id: string; readonly view: HireSessionView }): Promise<void> => {
+  const deployAll = async (seed?: { readonly id: string; readonly view: HireSessionView; readonly choices?: GridHireChoices }): Promise<void> => {
     if (activeRun.current !== null || cancelling.current || (working !== null && seed === undefined)) return;
+    const chosen: GridDeployChoiceSnapshot = seed?.choices === undefined
+      ? {
+          capitalBnb: props.capitalBnb,
+          uiPresetId: props.uiPresetId,
+          utilizationPct: props.utilizationPct,
+          maxRequotesDaily: props.maxRequotesDaily,
+          takeProfitPct: props.takeProfitPct,
+          stopLossPct: props.stopLossPct,
+        }
+      : {
+          capitalBnb: seed.choices.capitalBnb,
+          uiPresetId: seed.choices.uiPresetId,
+          utilizationPct: seed.choices.utilizationPct,
+          maxRequotesDaily: seed.choices.maxRequotesDaily,
+          takeProfitPct: seed.choices.takeProfitPct,
+          stopLossPct: seed.choices.stopLossPct,
+        };
+    const pool = props.pool;
+    const agentName = props.agentName;
     const run = new GridDeployRun();
     activeRun.current = run;
     stopPolling();
@@ -502,14 +553,14 @@ function HireGridDeployLive(props: {
       if (owner.passkey === null || owner.walletAddress === undefined) {
         throw new Error("Create or recover your passkey wallet first.");
       }
-      if (props.pool === null) throw new Error("Select a pool first.");
+      if (pool === null) throw new Error("Select a pool first.");
 
       // ── 1. The hire ───────────────────────────────────────────────────────
       let id = seed?.id ?? agentId;
       let current = seed?.view ?? view;
       if (id === null || current === null) {
         mark("hire", "active", "Confirm the hire signature with your passkey…");
-        const hired = await run.guarded(() => startHire(run));
+        const hired = await run.guarded(() => startHire(run, chosen, pool, agentName));
         if (hired === null) throw new Error("The hire could not be prepared.");
         id = hired.id;
         current = hired.view;
@@ -536,7 +587,7 @@ function HireGridDeployLive(props: {
 
       // ── 2. Funding, and 3. the grant ──────────────────────────────────────
       if (hireResumeStep(current) === "fund-and-grant") {
-        let fresh = await run.guarded(loadPreview);
+        let fresh = await run.guarded(() => loadPreview(chosen.capitalBnb));
         setPreview(fresh);
         let gate = freshFundingGate(fresh.funding, Math.floor(Date.now() / 1_000));
         // The amount is COMPUTED, not asked for: budget + registration +
@@ -564,7 +615,7 @@ function HireGridDeployLive(props: {
           const deadline = Date.now() + 15 * 60_000;
           while (Date.now() < deadline) {
             await run.wait(6_000);
-            fresh = await run.guarded(loadPreview);
+            fresh = await run.guarded(() => loadPreview(chosen.capitalBnb));
             setPreview(fresh);
             gate = freshFundingGate(fresh.funding, Math.floor(Date.now() / 1_000));
             if (gate.ok && landed(fresh)) break;
@@ -648,17 +699,25 @@ function HireGridDeployLive(props: {
       // ── 5. The arm — the step that actually places the money ──────────────
       mark("arm", "active", "Deriving the grid from the live tick…");
       run.check();
-      const hireProfile = current.hireSizing?.name;
-      if (hireProfile !== "grid-v1" && hireProfile !== "grid-shift-v1") {
+      const hireSizing = current.hireSizing;
+      const hireProfile = hireSizing?.name;
+      if ((hireProfile !== "grid-v1" && hireProfile !== "grid-shift-v1") || hireSizing == null) {
         throw new Error(`This hire has an unexpected non-grid profile (${hireProfile ?? "missing"}).`);
+      }
+      const chosenBudgetWei = parseBnbToWei(chosen.capitalBnb);
+      const hiredBudgetWei = BigInt(hireSizing.openNativeBudgetWei);
+      if (chosenBudgetWei > hiredBudgetWei) {
+        throw new Error(`Total capital ${chosen.capitalBnb} BNB exceeds this hire's budget of ${formatEther(hiredBudgetWei)} BNB. Lower it to that amount, or cancel this hire and start again.`);
       }
       const armed = await run.guarded(() => armGridAgent({
         agentId: id!,
-        pool: props.pool!,
-        uiPresetId: props.uiPresetId,
-        capitalBnb: props.capitalBnb,
-        stopLossPct: props.stopLossPct,
-        takeProfitPct: props.takeProfitPct,
+        pool,
+        uiPresetId: chosen.uiPresetId,
+        capitalBnb: chosen.capitalBnb,
+        stopLossPct: chosen.stopLossPct,
+        takeProfitPct: chosen.takeProfitPct,
+        deployPctBps: chosen.utilizationPct * 100,
+        shiftsPerDay: chosen.maxRequotesDaily,
         signEnvelope: (action, targetId, params) => run.guarded(() => owner.signEnvelope(action, targetId, params)),
         hireProfile,
         ...(preview?.sizing.relayFeePerSubmitWei === undefined ? {} : { relayFeePerSubmitWei: preview.sizing.relayFeePerSubmitWei }),

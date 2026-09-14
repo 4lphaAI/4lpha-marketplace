@@ -19,7 +19,7 @@
  * grant the plane would not have made.
  */
 import { getSqrtRatioAtTick } from "@/lib/exec/pairs";
-import { deriveGridFromPreset, GRID_PRESETS, gridQuantizeUpToSpacing, type GridPresetId, type GridRange } from "./geometry";
+import { deriveGridFromPreset, FEE_TO_TICK_SPACING, GRID_PRESETS, gridQuantizeUpToSpacing, type GridPresetId, type GridRange } from "./geometry";
 import { GRID_DEFAULT_MIN_NET_EDGE_BPS, GRID_SHIFT_DEPLOY_PCT_BPS } from "./settings";
 
 /**
@@ -197,6 +197,33 @@ export const GRID_FLOOR_FALLBACK_FEE = 100;
 export function gridCapitalFloorBnb(presetId: GridPresetId, fee: number | null): string {
   const row = GRID_CAPITAL_FLOOR_BNB[presetId];
   return (fee === null ? undefined : row[fee]) ?? row[GRID_FLOOR_FALLBACK_FEE] as string;
+}
+
+/** The worst fundable floor across every tick residue in a pool's fee tier. */
+export function gridCapitalFloorBnbAtFee(input: {
+  readonly presetId: GridPresetId;
+  readonly fee: number | null;
+  readonly relayFeePerSubmitWei: bigint;
+  readonly deployPctBps: number;
+}): string {
+  const tickSpacing = (input.fee === null ? undefined : FEE_TO_TICK_SPACING[input.fee])
+    ?? FEE_TO_TICK_SPACING[GRID_FLOOR_FALLBACK_FEE];
+  let max: bigint | null = null;
+  for (let tick = 0; tick < tickSpacing; tick += 1) {
+    const floor = gridCapitalFloor({
+      presetId: input.presetId,
+      spreadFactor: 1,
+      currentTick: tick,
+      tickSpacing,
+      wbnbIsToken0: true,
+      profile: "grid-shift-v1",
+      relayFeePerSubmitWei: input.relayFeePerSubmitWei,
+      deployPctBps: input.deployPctBps,
+    }).minFundableBudgetWei;
+    if (floor === null) return gridCapitalFloorBnb(input.presetId, input.fee);
+    if (max === null || floor > max) max = floor;
+  }
+  return formatFloorBnb(max ?? 0n);
 }
 
 /**

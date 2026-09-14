@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cancellationMessage, cancellationRecorded, forgetHire } from "./grid-hire-recovery";
+import { cancellationMessage, cancellationRecorded, forgetGridHire, forgetHire, GRID_HIRE_CHOICES_STORAGE_KEY, GRID_HIRE_STORAGE_KEY } from "./grid-hire-recovery";
 import type { HireSessionView } from "./hire-state";
 
 describe("canceled hire recovery copy", () => {
@@ -23,4 +23,11 @@ it("does not clear an unrelated or malformed Trading JSON pointer", () => {
     forgetHire({ getItem: () => saved, removeItem: key => { removed.push(key); } }, "target", "4lpha:trade-hire:v2");
     expect(removed).toEqual([]);
   }
+});
+
+it("forgets the grid pointer and its matching choice snapshot together", () => {
+  const values = new Map([[GRID_HIRE_STORAGE_KEY, "target"], [GRID_HIRE_CHOICES_STORAGE_KEY, "choices"]]);
+  const storage = { getItem: (key: string) => values.get(key) ?? null, removeItem: (key: string) => { values.delete(key); } };
+  forgetGridHire(storage, "target");
+  expect(values.size).toBe(0);
 });

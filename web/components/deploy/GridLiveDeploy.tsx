@@ -25,7 +25,7 @@ import {
   parseBnbToWei,
   type GridPresetId,
 } from "@/lib/grid/geometry";
-import { buildFixedGridSettings, buildShiftGridSettings } from "@/lib/grid/settings";
+import { buildFixedGridSettings, buildShiftGridSettings, GRID_SHIFT_DEPLOY_PCT_BPS, GRID_SHIFT_MAX_SHIFTS_PER_DAY, GRID_SHIFT_SHIFTS_PER_DAY } from "@/lib/grid/settings";
 import { WBNB_56 } from "@/lib/exec/pairs";
 import { PairIcons as SharedPairIcons } from "@/components/TokenIcon";
 import { DEMO_GRID_OMISSIONS } from "@/lib/demo/omissions";
@@ -454,10 +454,26 @@ export async function armGridAgent(input: {
   readonly signEnvelope: (action: string, agentId: string, params: Record<string, unknown>) => Promise<unknown>;
   readonly hireProfile?: "grid-v1" | "grid-shift-v1";
   readonly relayFeePerSubmitWei?: string;
+  readonly deployPctBps?: number;
+  readonly shiftsPerDay?: number;
   readonly onNote?: (note: string) => void;
 }): Promise<Record<string, unknown>> {
   const { agentId, pool, capitalBnb } = input;
   const geometryPreset = UI_PRESET_TO_GEOMETRY[input.uiPresetId] ?? "standard";
+  const shift = input.hireProfile === "grid-shift-v1";
+  if (shift) {
+    const deployPctBps = input.deployPctBps ?? GRID_SHIFT_DEPLOY_PCT_BPS;
+    if (!Number.isInteger(deployPctBps) || deployPctBps < 3_000 || deployPctBps > 5_000 || deployPctBps % 500 !== 0) {
+      throw new Error("Capital utilization must be a whole 5% step between 30% and 50%.");
+    }
+    const shiftsPerDay = input.shiftsPerDay ?? GRID_SHIFT_SHIFTS_PER_DAY;
+    if (!Number.isInteger(shiftsPerDay) || shiftsPerDay < 1 || shiftsPerDay > GRID_SHIFT_MAX_SHIFTS_PER_DAY) {
+      throw new Error("Max requotes daily must be a whole number between 1 and 16.");
+    }
+    if (input.stopLossPct !== 0 || input.takeProfitPct !== 0) {
+      throw new Error("This grid model closes rungs on price crossings, not on a % target. Turn Take profit and Stop loss off to deploy.");
+    }
+  }
   const budgetWei = parseBnbToWei(capitalBnb);
   if (budgetWei <= 0n) throw new Error("Total capital must be positive.");
 
@@ -494,7 +510,6 @@ export async function armGridAgent(input: {
     tickSpacing,
     wbnbIsToken0: pool.wbnbIsToken0,
   });
-  const shift = input.hireProfile === "grid-shift-v1";
   const base = {
     pool: { token0: pool.token0, token1: pool.token1, fee: pool.fee },
     wbnbIsToken0: pool.wbnbIsToken0,
@@ -511,6 +526,8 @@ export async function armGridAgent(input: {
         ...base,
         gapTicks: derived.gapTicks,
         widthTicks: derived.widthTicks,
+        ...(input.deployPctBps === undefined ? {} : { deployPctBps: input.deployPctBps }),
+        ...(input.shiftsPerDay === undefined ? {} : { shiftsPerDay: input.shiftsPerDay }),
         ...(input.relayFeePerSubmitWei === undefined ? {} : { relayFeePerSubmitWei: input.relayFeePerSubmitWei }),
       })
     : buildFixedGridSettings(base);
@@ -519,7 +536,10 @@ export async function armGridAgent(input: {
     `Grid derived at tick ${currentTick} (block ${blockNumber}): buy [${derived.buyRange.tickLower}, ${derived.buyRange.tickUpper}), `
     + `sell [${derived.sellRange.tickLower}, ${derived.sellRange.tickUpper}), gap ${derived.gapTicks} / width ${derived.widthTicks} ticks`
     + `${derived.gapClamped ? " (quantized up to the pool's tick spacing)" : ""}. `
-    + "Confirm the signature in your wallet…",
+    + (shift
+      ? ` Capital ${capitalBnb} BNB, utilization ${(input.deployPctBps ?? GRID_SHIFT_DEPLOY_PCT_BPS) / 100}%, up to ${input.shiftsPerDay ?? GRID_SHIFT_SHIFTS_PER_DAY} requotes/day.`
+      : "")
+    + " Confirm the signature in your wallet…",
   );
   const envelope = await input.signEnvelope("gridArm", agentId, {
     settings,

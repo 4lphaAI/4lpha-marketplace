@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatFloorBnb, gridCapitalFloor, gridCapitalFloorBnb, gridGrossEdgeBps, gridModelLabel } from "./economics";
+import { DEFAULT_RELAY_FEE_PER_SUBMIT_WEI, formatFloorBnb, GRID_CAPITAL_FLOOR_BNB, gridCapitalFloor, gridCapitalFloorBnb, gridCapitalFloorBnbAtFee, gridGrossEdgeBps, gridModelLabel } from "./economics";
 
 /**
  * Every expectation here was produced by RUNNING the execution plane's own
@@ -140,6 +140,33 @@ describe("GRID_CAPITAL_FLOOR_BNB", () => {
       }
     }
     expect(Number(gridCapitalFloorBnb("very-wide", 2_500))).toBeGreaterThan(Number(oldTable["very-wide"]![2_500]));
+  });
+});
+
+describe("gridCapitalFloorBnbAtFee", () => {
+  const presets = ["tight", "standard", "wide", "very-wide"] as const;
+  const fees = [100, 500, 2_500, 10_000] as const;
+  const expected = {
+    tight: ["0.2239", "0.1880"],
+    standard: ["0.1156", "0.0971"],
+    wide: ["0.0469", "0.0394"],
+    "very-wide": ["0.0235", "0.0197"],
+  } as const;
+
+  it("is equivalent to every static table cell at the padded fee and default utilization", () => {
+    for (const presetId of presets) for (const fee of fees) {
+      expect(gridCapitalFloorBnbAtFee({ presetId, fee, relayFeePerSubmitWei: DEFAULT_RELAY_FEE_PER_SUBMIT_WEI, deployPctBps: 3_000 }))
+        .toBe(GRID_CAPITAL_FLOOR_BNB[presetId][fee]);
+    }
+  });
+
+  it("pins the eight live-fee floors", () => {
+    for (const presetId of presets) {
+      expect(gridCapitalFloorBnbAtFee({ presetId, fee: 100, relayFeePerSubmitWei: 37_600_000_000_000n, deployPctBps: 3_000 })).toBe(expected[presetId][0]);
+      expect(gridCapitalFloorBnbAtFee({ presetId, fee: 100, relayFeePerSubmitWei: 37_600_000_000_000n, deployPctBps: 5_000 })).toBe(expected[presetId][1]);
+      expect(Number(expected[presetId][1]) / Number(expected[presetId][0])).toBeGreaterThanOrEqual(0.80);
+      expect(Number(expected[presetId][1]) / Number(expected[presetId][0])).toBeLessThanOrEqual(0.90);
+    }
   });
 });
 

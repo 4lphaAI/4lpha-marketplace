@@ -35,6 +35,7 @@ export type ShiftGridInput = FixedGridInput & {
   readonly widthTicks: number;
   /** The plane's configured relay fee per submission (wei, decimal) — required only when drift is enabled. */
   readonly relayFeePerSubmitWei?: string;
+  readonly deployPctBps?: number;
   readonly shiftsPerDay?: number;
   /** 0 disables drift (the default): the grid then moves only on a FILL. */
   readonly driftPctOfGap?: number;
@@ -68,6 +69,8 @@ export const GRID_SHIFT_DRIFT_PCT_OF_GAP = 0;
  * split the budget with a lane that earns nothing.
  */
 export const GRID_SHIFT_SHIFTS_PER_DAY = 16;
+// `grid-shift-v1` permits at most 16 shift motions per day.
+export const GRID_SHIFT_MAX_SHIFTS_PER_DAY = 16;
 export const GRID_SHIFT_DRIFT_MOTIONS_PER_DAY = 8;
 export const GRID_SHIFT_SUBMISSIONS_PER_MOTION = 2n;
 export const GRID_SHIFT_MIN_MINUTES_BETWEEN_EXITS = 5;
@@ -76,8 +79,9 @@ export const GRID_SHIFT_MIN_MINUTES_BETWEEN_EXITS = 5;
  * Builds the byte-stable settings for a SHIFT-grid gridArm (grid.mode "shift",
  * the PHASE3.22 atomic pair with PHASE3.25's split cadence). Mirrors
  * `scripts/live-grid.ts` `shiftBlockFrom`: gap/width from the preset geometry,
- * deploy 30% per side, drift at 60% of the gap, 8 settlements a day, and the
- * owner-signed drift lane = 8 motions x (2 submissions x relay fee). Both wei
+ * the selected utilization (30% by default), drift disabled, and 16 cross motions
+ * a day by default. When drift is enabled, its lane is 8 motions x (2 submissions
+ * x relay fee). Both wei
  * fields are signed together, as the plane requires. Sizing stays inside the
  * `grid-shift-v1` hire profile (<= 16 motions a day at 5-minute spacing).
  */
@@ -102,7 +106,7 @@ export function buildShiftGridSettings(input: ShiftGridInput): Record<string, un
       shift: {
         gapTicks: input.gapTicks,
         widthTicks: input.widthTicks,
-        deployPctBps: GRID_SHIFT_DEPLOY_PCT_BPS,
+        deployPctBps: input.deployPctBps ?? GRID_SHIFT_DEPLOY_PCT_BPS,
         driftPctOfGap,
         shiftsPerDay: input.shiftsPerDay ?? GRID_SHIFT_SHIFTS_PER_DAY,
         // Signed together or not at all (`triggers.ts`: "a budget without its

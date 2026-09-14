@@ -16,13 +16,15 @@ import { Button, Checkbox, Icon, Input, SegmentedToggle, Select } from "@/design
 import { RESOURCES } from "@/lib/design-resources";
 import { TUTORIAL_LINKS } from "@/lib/tutorials";
 import { LivePoolSection, UI_PRESET_TO_GEOMETRY } from "@/components/deploy/GridLiveDeploy";
-import { gridCapitalFloorBnb } from "@/lib/grid/economics";
+import { DEFAULT_RELAY_FEE_PER_SUBMIT_WEI, gridCapitalFloorBnb, gridCapitalFloorBnbAtFee } from "@/lib/grid/economics";
 import { HireGridDeploy } from "@/components/deploy/HireGridDeploy";
 import { HireLpDeploy } from "@/components/deploy/HireLpDeploy";
 import { HireTradeDeploy } from "@/components/deploy/HireTradeDeploy";
 import { DemoTradeDeploy } from "@/components/deploy/DemoTradeDeploy";
 import { DemoAgentPanel } from "@/components/demo/DemoAgentPanel";
 import { HireLendingDeploy } from "@/components/deploy/HireLendingDeploy";
+import { useOwnerActions } from "@/lib/exec/use-owner-actions";
+import type { GridHireChoices } from "@/lib/altana/grid-hire-recovery";
 import { GuardedAccountSection } from "@/components/deploy/GuardedAccountSection";
 import { lendingControlNumber } from "@/lib/lending/form";
 import { TradeModelSelect } from "@/components/deploy/TradeModelSelect";
@@ -132,6 +134,8 @@ const CONFIG = {
     { title: "Agent", fields: [
       { k: "agentName", label: "Agent name", type: "text", v: "Grid Agent 01" },
       { k: "capital", label: "Total capital", type: "stepper", v: "0.02", step: 0.01, min: 0.02, suffix: "BNB" },
+      { k: "utilizationPct", label: "Capital utilization", type: "stepper", v: "30", step: 5, min: 30, max: 50, floor: 30, suffix: "%", tooltip: "Share of total capital held in live grid orders. Between 30% and 50%; the rest stays as idle inventory.", liveOnly: true },
+      { k: "maxRequotesDaily", label: "Max requotes daily", type: "stepper", v: "16", step: 1, min: 1, max: 16, floor: 1, tooltip: "How many times per day the agent may re-place the ladder after a fill.", liveOnly: true },
     ] },
     { title: "Pool", fields: [
       { k: "pool", label: "Pool", type: "pool", v: "WBNB-USDT-001" },
@@ -295,9 +299,13 @@ const CONFIG = {
   ],
 };
 
-function sectionsFor(kind, presetId) {
+function sectionsFor(kind, presetId, mode = "Live") {
   if (kind === "lp") return presetId === "blue" ? CONFIG.lpCustom : CONFIG.lp;
-  return CONFIG[kind];
+  const sections = CONFIG[kind];
+  return mode === "Live" ? sections : sections.map((section) => ({
+    ...section,
+    fields: section.fields.filter((field) => !field.liveOnly),
+  }));
 }
 
 function defaults(kind, presetId) {
@@ -313,6 +321,20 @@ function decimalOrNull(value) {
   if (normalized === "") return null;
   const parsed = Number(normalized);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function parseUtilization(value) {
+  const raw = String(value ?? "").trim();
+  if (raw === "") return null;
+  const percent = Number(raw);
+  return Number.isInteger(percent) && percent >= 30 && percent <= 50 && percent % 5 === 0 ? percent * 100 : null;
+}
+
+function parseRequotes(value) {
+  const raw = String(value ?? "").trim();
+  if (raw === "") return null;
+  const count = Number(raw);
+  return Number.isInteger(count) && count >= 1 && count <= 16 ? count : null;
 }
 
 function weiToBnb(value) {
@@ -858,7 +880,7 @@ function Field({ f, value, onChange, values, set, preset }) {
     const below = f.floor != null && typed != null && typed < f.min;
     return (
       <div className="fl-field">
-        <label className="fl-field__label">{f.label}</label>
+        <label className="fl-field__label">{f.label}{typeof f.tooltip === "string" ? <span aria-label={f.tooltip} title={f.tooltip} tabIndex={0} style={{ display: "inline-grid", placeItems: "center", width: 13, height: 13, marginLeft: 6, border: "1px solid var(--line-1)", borderRadius: "50%", color: "var(--text-subtle)", cursor: "help", font: "var(--weight-medium) 9px/1 var(--font-mono)" }}>i</span> : null}</label>
         <NumStepper value={value} onChange={onChange} step={f.step || 1} min={f.min} max={f.max} prefix={f.prefix} suffix={f.suffix} noClamp={f.floor != null} preciseStep={f.preciseStep} disabled={f.lockedByPreset && f.lockedByPreset.includes(preset)} />
         {below ? <span role="alert" style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--loss)" }}>Minimum {f.floor} {f.suffix ?? ""}</span>
           : f.hint ? <span className="fl-field__hint">{f.hint}</span> : null}
@@ -1024,6 +1046,7 @@ function DeployAgentScreen({ kind, go }) {
   const active = KINDS.find((k) => k.id === kind) || KINDS[0];
   const id = active.id;
   const presets = PRESETS[id];
+  const owner = useOwnerActions();
   const [selectedMode, setMode] = React.useState("Live");
   const mode = id === "lp" || id === "health" ? "Live" : selectedMode;
   const [preset, setPreset] = React.useState(DEFAULT_PRESET[id]);
@@ -1037,6 +1060,7 @@ function DeployAgentScreen({ kind, go }) {
   // machinery below; an untouched one snaps to the floor as pools and presets
   // change, so the field is always already valid.
   const capitalTouched = React.useRef(false);
+  const restoredCapital = React.useRef(false);
   const repayTouched = React.useRef(false);
   const activeKind = React.useRef(id);
   activeKind.current = id;
@@ -1048,16 +1072,41 @@ function DeployAgentScreen({ kind, go }) {
       ? current : { ...current, maxRepay: amount ?? "" });
   }, []);
   const set = (k, v) => {
-    if (k === "capital") capitalTouched.current = true;
+    if (k === "capital") { capitalTouched.current = true; restoredCapital.current = false; }
     if (k === "maxRepay") repayTouched.current = true;
     setValues((s) => ({ ...s, [k]: v }));
   };
+  // A restore arrives from HireGridDeploy's mount-time resume effect, which
+  // React runs BEFORE this screen's own `[id]` reset effect below — so the
+  // record is also parked in a ref and the reset re-applies it instead of
+  // the defaults (audit finding A1).
+  const pendingRestore = React.useRef(null);
+  const withChoices = (current, record) => ({ ...current,
+    capital: record.capitalBnb,
+    utilizationPct: String(record.utilizationPct),
+    maxRequotesDaily: String(record.maxRequotesDaily),
+    tpOn: record.takeProfitPct !== 0,
+    takeProfit: String(record.takeProfitPct),
+    slOn: record.stopLossPct !== 0,
+    stopLoss: String(record.stopLossPct),
+  });
+  const restoreGridChoices = React.useCallback((record: GridHireChoices) => {
+    if (id !== "grid" || mode !== "Live") return;
+    pendingRestore.current = record;
+    capitalTouched.current = true;
+    restoredCapital.current = true;
+    setPreset(record.uiPresetId);
+    setValues((current) => withChoices(current, record));
+  }, [id, mode]);
   // Live-wired grid deploy (spec: MD here/MARKETPLACE-GRID-DEPLOY-SPEC.md):
   // a REAL pool object from /api/pools replaces the design export's static
   // POOLS list for the grid kind only.
   const [livePool, setLivePool] = React.useState(null);
   const [lpRoutingPool, setLpRoutingPool] = React.useState(null);
   const [lpRoutingError, setLpRoutingError] = React.useState(null);
+  const [relayFeePerSubmitWei, setRelayFeePerSubmitWei] = React.useState(null);
+  const relayFeeCache = React.useRef(new Map());
+  const relayFeeAttempted = React.useRef(new Set());
   const selectLivePool = (next) => {
     if (id === "lp") {
       // The selection and its readiness invalidation land in the same event
@@ -1078,15 +1127,62 @@ function DeployAgentScreen({ kind, go }) {
   // depends only on the execution model and the pool's fee tier, both of which
   // this screen already holds, so it is known the instant the screen renders.
   React.useEffect(() => {
-    setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setMode("Live"); setShowAdv(false); setSim(null);
-    capitalTouched.current = false;
+    const record = id === "grid" ? pendingRestore.current : null;
+    pendingRestore.current = null;
+    const presetId = record === null ? DEFAULT_PRESET[id] : record.uiPresetId;
+    setPreset(presetId); setValues(record === null ? defaults(id, presetId) : withChoices(defaults(id, presetId), record)); setMode("Live"); setShowAdv(false); setSim(null);
+    capitalTouched.current = record !== null;
+    restoredCapital.current = record !== null;
     repayTouched.current = false;
     setRepaySuggestion(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  React.useEffect(() => {
+    if (id !== "grid" || mode !== "Live" || owner.walletAddress === undefined) return;
+    const walletAddress = owner.walletAddress;
+    const cached = relayFeeCache.current.get(walletAddress);
+    if (cached !== undefined || relayFeeAttempted.current.has(walletAddress)) {
+      setRelayFeePerSubmitWei(cached ?? null);
+      return;
+    }
+    relayFeeAttempted.current.add(walletAddress);
+    setRelayFeePerSubmitWei(null);
+    let cancelled = false;
+    const query = new URLSearchParams({ walletAddress, openNativeBudgetWei: "1", sizingPreset: "grid-shift-v1" });
+    void fetch(`/api/agents/hire/preview?${query}`, { cache: "no-store" })
+      .then(async (response) => {
+        const payload = await response.json() as { data?: { sizing?: { relayFeePerSubmitWei?: unknown } } };
+        if (!response.ok) return;
+        const fee = payload.data?.sizing?.relayFeePerSubmitWei;
+        if (typeof fee !== "string" || !/^\d+$/u.test(fee) || BigInt(fee) <= 0n) return;
+        // Cache even after a cancel (mode/kind flipped mid-flight): the fetch
+        // is one per wallet, so a dropped result would otherwise never return.
+        relayFeeCache.current.set(walletAddress, fee);
+        if (!cancelled) setRelayFeePerSubmitWei(fee);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [id, mode, owner.walletAddress]);
+
+  const utilizationBps = id === "grid" ? parseUtilization(values.utilizationPct) : null;
+  const shiftsPerDay = id === "grid" ? parseRequotes(values.maxRequotesDaily) : null;
+  const geometryPreset = UI_PRESET_TO_GEOMETRY[preset] ?? "standard";
   const capitalFloorText = id !== "grid"
     ? null
-    : gridCapitalFloorBnb(UI_PRESET_TO_GEOMETRY[preset] ?? "standard", livePool === null ? null : livePool.fee);
+    : mode !== "Live"
+      ? gridCapitalFloorBnb(geometryPreset, livePool === null ? null : livePool.fee)
+      : gridCapitalFloorBnbAtFee({
+        presetId: geometryPreset,
+        fee: livePool === null ? null : livePool.fee,
+        relayFeePerSubmitWei: relayFeePerSubmitWei === null ? DEFAULT_RELAY_FEE_PER_SUBMIT_WEI : BigInt(relayFeePerSubmitWei),
+        deployPctBps: utilizationBps ?? 3_000,
+      });
+  const capitalFloorHint = id === "grid" && mode === "Live"
+    ? relayFeePerSubmitWei === null
+      ? "Estimated minimum for this pool and model, priced on a padded relay fee. The figure is refined once your wallet's hire preview loads."
+      : "Minimum for this pool and model at the plane's current relay fee."
+    : null;
   const capitalFloorBnb = capitalFloorText === null ? null : Number(capitalFloorText);
   React.useEffect(() => {
     if (capitalFloorText === null) return;
@@ -1094,7 +1190,7 @@ function DeployAgentScreen({ kind, go }) {
       const now = Number(String(current.capital ?? "").replace(/,/gu, ""));
       // Fill it for them; only a capital they typed themselves survives, and
       // only while it still clears the floor.
-      if (capitalTouched.current && Number.isFinite(now) && now >= Number(capitalFloorText)) return current;
+      if (capitalTouched.current && Number.isFinite(now) && (restoredCapital.current || now >= Number(capitalFloorText))) return current;
       return { ...current, capital: capitalFloorText };
     });
   }, [capitalFloorText]);
@@ -1247,7 +1343,7 @@ function DeployAgentScreen({ kind, go }) {
   const presetIdx = Math.max(0, presets.findIndex((p) => p.id === preset));
   const runSim = () => setSim(SIM[id][presetIdx] || SIM[id][0]);
 
-  const sections = sectionsFor(id, preset);
+  const sections = sectionsFor(id, preset, mode);
   const primary = sections.filter((s) => !s.adv);
   const advanced = sections.filter((s) => s.adv);
   // Per-field overrides the CONFIG table cannot carry, because they depend on
@@ -1264,11 +1360,16 @@ function DeployAgentScreen({ kind, go }) {
     if (id !== "grid" || capitalFloorText === null || capitalFloorBnb === null) return null;
     // `floor` turns the stepper strict: the − button stops here and a smaller
     // typed number goes red instead of being silently rewritten.
-    return { capital: { min: capitalFloorBnb, floor: capitalFloorText, hint: null } };
-  }, [id, capitalFloorText, capitalFloorBnb, repaySuggestion]);
+    return { capital: { min: capitalFloorBnb, floor: capitalFloorText, hint: capitalFloorHint } };
+  }, [id, capitalFloorText, capitalFloorBnb, capitalFloorHint, repaySuggestion]);
 
   const capitalBelowFloor = capitalFloorBnb !== null
     && Number(String(values.capital ?? "").replace(/,/gu, "")) < capitalFloorBnb;
+  const gridBlockedReason = id !== "grid" ? null
+    : mode === "Live" && utilizationBps === null ? "Capital utilization must be a whole 5% step between 30% and 50%."
+      : mode === "Live" && shiftsPerDay === null ? "Max requotes daily must be a whole number between 1 and 16."
+        : mode === "Live" && (values.tpOn || values.slOn) ? "This grid model closes rungs on price crossings, not on a % target. Turn Take profit and Stop loss off to deploy."
+          : capitalBelowFloor ? `Total capital is below this pool's minimum of ${capitalFloorText} BNB.` : null;
   const tradePreset = id === "trading" ? presets.find((entry) => entry.id === preset) : null;
   const tradeSettings = id === "trading" ? ({
     name: String(values.agentName ?? "Trading Agent 01"), executionModel: tradePreset?.executionModel ?? "sigma",
@@ -1447,7 +1548,12 @@ function DeployAgentScreen({ kind, go }) {
             takeProfitPct={values.tpOn ? Number(values.takeProfit) || 0 : 0}
             stopLossPct={values.slOn ? Number(values.stopLoss) || 0 : 0}
             go={go}
-            blockedReason={capitalBelowFloor ? `Total capital is below this pool's minimum of ${capitalFloorText} BNB.` : null}
+            {...(mode === "Live" ? {
+              utilizationPct: utilizationBps === null ? 30 : utilizationBps / 100,
+              maxRequotesDaily: shiftsPerDay ?? 16,
+              onRestoreChoices: restoreGridChoices,
+            } : {})}
+            blockedReason={gridBlockedReason}
           />
         ) : id === "trading" && tradeSettings !== null ? (
           // Demo and Live are two components, never one with a flag: the live

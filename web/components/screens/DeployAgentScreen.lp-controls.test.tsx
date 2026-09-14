@@ -5,7 +5,11 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("@/components/deploy/HireGridDeploy", () => ({ HireGridDeploy: () => null }));
+const gridHarness = vi.hoisted(() => ({ walletAddress: undefined as string | undefined }));
+vi.mock("@/lib/exec/use-owner-actions", () => ({ useOwnerActions: () => ({ walletAddress: gridHarness.walletAddress }) }));
+vi.mock("@/components/deploy/HireGridDeploy", () => ({
+  HireGridDeploy: (props: Record<string, unknown>) => <div data-testid="grid-deploy-props" data-mode={String(props.mode)} data-blocked={String(props.blockedReason ?? "")} />,
+}));
 vi.mock("@/components/deploy/HireLpDeploy", () => ({
   HireLpDeploy: ({ explicitPrices, blockedReason }: { blockedReason?: string | null; explicitPrices?: {
     minPrice: number;
@@ -609,6 +613,101 @@ describe("LP deploy controls", () => {
       // …the plane's rails reason is shown, and Deploy is blocked with exactly that reason.
       expect(host.querySelector('[data-testid="lp-rails-warning"]')?.textContent).toContain("manipulation rails");
       expect(host.querySelector<HTMLButtonElement>('[data-testid="lp-deploy-props"]')?.dataset.blocked).toContain("manipulation rails");
+    } finally {
+      await act(async () => { root.unmount(); });
+      host.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("shows live-only grid controls and the padded floor hint without a wallet", async () => {
+    gridHarness.walletAddress = undefined;
+    vi.stubGlobal("fetch", vi.fn(async (request: RequestInfo | URL) => {
+      if (String(request) === "/api/pools") return new Response(JSON.stringify({ data: [] }), { headers: { "content-type": "application/json" } });
+      throw new Error(`Unexpected fetch ${String(request)}`);
+    }));
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    try {
+      await act(async () => { root.render(<DeployAgentScreen kind="grid" go={() => undefined} />); await Promise.resolve(); await Promise.resolve(); });
+      expect(host.textContent).toContain("Capital utilization");
+      expect(host.textContent).toContain("Max requotes daily");
+      const utilization = [...host.querySelectorAll(".fl-field")].find((entry) => entry.querySelector("label")?.textContent?.startsWith("Capital utilization"));
+      const requotes = [...host.querySelectorAll(".fl-field")].find((entry) => entry.querySelector("label")?.textContent?.startsWith("Max requotes daily"));
+      expect(utilization?.querySelector<HTMLInputElement>("input")?.value).toBe("30");
+      expect(requotes?.querySelector<HTMLInputElement>("input")?.value).toBe("16");
+      expect(host.textContent).toContain("Estimated minimum for this pool and model, priced on a padded relay fee. The figure is refined once your wallet's hire preview loads.");
+      await act(async () => { host.querySelector<HTMLButtonElement>('[data-seg="Demo"]')?.click(); });
+      expect(host.textContent).not.toContain("Capital utilization");
+      expect(host.textContent).not.toContain("Max requotes daily");
+    } finally {
+      await act(async () => { root.unmount(); });
+      host.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("prices the loaded fee, follows 50% utilization, and restores the choice after Demo", async () => {
+    gridHarness.walletAddress = "0x1111111111111111111111111111111111111111";
+    const pool = {
+      pool: "0x3333333333333333333333333333333333333333", token0: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", token1: "0x55d398326f99059ff775485246999027b3197955",
+      token0Symbol: "WBNB", token1Symbol: "USDT", fee: 100, tick: 0, tvlUsd: 1_000_000, volume24hUsd: 100_000,
+      token0Icon: null, token1Icon: null, wbnbIsToken0: true, staleness: null,
+    };
+    vi.stubGlobal("fetch", vi.fn(async (request: RequestInfo | URL) => {
+      const url = String(request);
+      if (url === "/api/pools") return new Response(JSON.stringify({ data: [pool] }), { headers: { "content-type": "application/json" } });
+      if (url.startsWith("/api/agents/hire/preview?")) return new Response(JSON.stringify({ data: { sizing: { relayFeePerSubmitWei: "37600000000000" } } }), { headers: { "content-type": "application/json" } });
+      throw new Error(`Unexpected fetch ${url}`);
+    }));
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const settle = async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); };
+    const field = (label: string) => [...host.querySelectorAll(".fl-field")].find((entry) => entry.querySelector("label")?.textContent?.startsWith(label));
+    try {
+      await act(async () => { root.render(<DeployAgentScreen kind="grid" go={() => undefined} />); await settle(); });
+      const capital = () => field("Total capital")?.querySelector<HTMLInputElement>("input")?.value;
+      expect(capital()).toBe("0.1156");
+      expect(host.textContent).toContain("Minimum for this pool and model at the plane's current relay fee.");
+      await act(async () => { [...host.querySelectorAll("button")].find((button) => button.textContent?.includes("WBNB / USDT"))?.click(); await settle(); });
+      expect(capital()).toBe("0.1156");
+      const input = field("Capital utilization")?.querySelector<HTMLInputElement>("input");
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      await act(async () => { setter?.call(input, "50"); input?.dispatchEvent(new Event("input", { bubbles: true })); await settle(); });
+      expect(input?.value).toBe("50");
+      expect(capital()).toBe("0.0971");
+      await act(async () => { host.querySelector<HTMLButtonElement>('[data-seg="Demo"]')?.click(); });
+      expect(capital()).toBe("0.3073");
+      expect(host.textContent).not.toContain("Minimum for this pool and model at the plane's current relay fee.");
+      await act(async () => { host.querySelector<HTMLButtonElement>('[data-seg="Live"]')?.click(); await settle(); });
+      expect(field("Capital utilization")?.querySelector<HTMLInputElement>("input")?.value).toBe("50");
+      expect(capital()).toBe("0.0971");
+      expect(host.querySelector("[data-testid=grid-deploy-props]")?.getAttribute("data-blocked")).toBe("");
+    } finally {
+      await act(async () => { root.unmount(); });
+      host.remove();
+      vi.unstubAllGlobals();
+      gridHarness.walletAddress = undefined;
+    }
+  });
+
+  it("blocks value-based TP/SL on a live shift grid before deploy", async () => {
+    gridHarness.walletAddress = undefined;
+    vi.stubGlobal("fetch", vi.fn(async (request: RequestInfo | URL) => {
+      if (String(request) === "/api/pools") return new Response(JSON.stringify({ data: [] }), { headers: { "content-type": "application/json" } });
+      throw new Error(`Unexpected fetch ${String(request)}`);
+    }));
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    try {
+      await act(async () => { root.render(<DeployAgentScreen kind="grid" go={() => undefined} />); await Promise.resolve(); await Promise.resolve(); });
+      const tp = [...host.querySelectorAll<HTMLInputElement>("input[type=checkbox]")]
+        .find((input) => input.closest("label")?.textContent?.includes("Take profit"));
+      await act(async () => { tp?.click(); });
+      expect(host.querySelector("[data-testid=grid-deploy-props]")?.getAttribute("data-blocked")).toBe("This grid model closes rungs on price crossings, not on a % target. Turn Take profit and Stop loss off to deploy.");
     } finally {
       await act(async () => { root.unmount(); });
       host.remove();

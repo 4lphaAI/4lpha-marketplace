@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { armGridAgent } from "./GridLiveDeploy";
 import { nextFreeAgentId } from "./HireGridDeploy";
 
 /**
@@ -30,5 +31,72 @@ describe("nextFreeAgentId", () => {
   it("refuses rather than looping when a thousand names collide", () => {
     const taken = ["g", ...Array.from({ length: 998 }, (_, index) => `g-${index + 2}`)];
     expect(() => nextFreeAgentId("g", taken)).toThrow(/rename/iu);
+  });
+});
+
+const armBase = {
+  agentId: "grid-agent-01",
+  pool: {
+    pool: "0x4444444444444444444444444444444444444444",
+    token0: "0x5555555555555555555555555555555555555555",
+    token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    token0Symbol: "USDT",
+    token1Symbol: "WBNB",
+    fee: 100,
+    tick: 0,
+    tvlUsd: null,
+    volume24hUsd: null,
+    token0Icon: null,
+    token1Icon: null,
+    wbnbIsToken0: false,
+    staleness: null,
+  },
+  uiPresetId: "balanced",
+  capitalBnb: "1",
+  stopLossPct: 0,
+  takeProfitPct: 0,
+  hireProfile: "grid-shift-v1" as const,
+  signEnvelope: vi.fn(async () => ({})),
+};
+
+describe("armGridAgent shift guards", () => {
+  for (const deployPctBps of [2_500, 3_250, 5_500]) {
+    it(`refuses utilization ${deployPctBps} before fetch or signature`, async () => {
+      const fetchMock = vi.fn<typeof fetch>();
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        await expect(armGridAgent({ ...armBase, deployPctBps })).rejects.toThrow("Capital utilization must be a whole 5% step between 30% and 50%.");
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(armBase.signEnvelope).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+  }
+
+  for (const shiftsPerDay of [0, 17, 8.5]) {
+    it(`refuses ${shiftsPerDay} requotes daily before fetch or signature`, async () => {
+      const fetchMock = vi.fn<typeof fetch>();
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        await expect(armGridAgent({ ...armBase, shiftsPerDay })).rejects.toThrow("Max requotes daily must be a whole number between 1 and 16.");
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(armBase.signEnvelope).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+  }
+
+  it("refuses value-based exits before fetch or signature", async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(armGridAgent({ ...armBase, takeProfitPct: 6 })).rejects.toThrow("This grid model closes rungs on price crossings, not on a % target. Turn Take profit and Stop loss off to deploy.");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(armBase.signEnvelope).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
