@@ -174,4 +174,131 @@ describe("session renewal agent store", () => {
       }
     } finally { await fixture.close(); }
   });
+
+  it("[F10a/F10c/F10d/F10f] isolates retry admission, cancelled latching, and action-bound ledger CAS", async () => {
+    const fixture = await stores();
+    let sequence = 0;
+    try {
+      for (const store of fixture.stores) {
+        const label = store.durable ? "postgres" : "memory";
+        const create = async (overrides: Partial<PendingRenewal> = {}) => {
+          sequence += 1;
+          const oldFacts = facts(privateKeyToAccount(OLD_KEY).publicKey, NOW_SEC - 1);
+          const agent = await store.createAgent({ id: `renew-f10-${label}-${sequence}`,
+            ownerAddress: OWNER, walletAddress: getAddress(`0x${(0x1000 + sequence).toString(16).padStart(40, "0")}`), custodyModel: "self-eoa",
+            sessionFacts: oldFacts, status: "armed" });
+          await store.putAgentSessionKey(OWNER, agent.id, OLD_KEY);
+          const base = pending(oldFacts);
+          const expiresAt = overrides.expiresAt ?? base.expiresAt;
+          const renewal: PendingRenewal = {
+            ...base, ...overrides, expiresAt,
+            sessionSpec: { ...base.sessionSpec, ...(overrides.sessionSpec ?? {}), expiresAt },
+          };
+          const current = await store.getAgent(OWNER, agent.id);
+          const created = await store.createPendingRenewalCas({ ownerAddress: OWNER, agentId: agent.id,
+            expectedRowVersion: current!.rowVersion, nowSec: NOW_SEC, pendingRenewal: renewal, sessionKey: NEW_KEY });
+          assert.equal(created.kind, "updated", `${label}: fixture pending renewal`);
+          return { id: agent.id, renewal, agent: created.agent };
+        };
+
+        const latched = await create({ authorityObserved: true });
+        const latchResult = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: latched.id,
+          expectedRowVersion: latched.agent.rowVersion, expectedGrantDigest: latched.renewal.grantDigest,
+          renewActionId: `0x${"71".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(latchResult.kind, "conflict", `${label}: an observed descriptor cannot reopen`);
+
+        const wrongPhase = await create({ phase: "observed" });
+        const phaseResult = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: wrongPhase.id,
+          expectedRowVersion: wrongPhase.agent.rowVersion, expectedGrantDigest: wrongPhase.renewal.grantDigest,
+          renewActionId: `0x${"72".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(phaseResult.kind, "conflict", `${label}: phase is an independent retry predicate`);
+
+        const short = await create({ expiresAt: NOW_SEC + 3_599 });
+        const shortResult = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: short.id,
+          expectedRowVersion: short.agent.rowVersion, expectedGrantDigest: short.renewal.grantDigest,
+          renewActionId: `0x${"73".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(shortResult.kind, "conflict", `${label}: the 3599-second floor refuses`);
+
+        const exact = await create({ expiresAt: NOW_SEC + 3_600 });
+        const exactResult = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: exact.id,
+          expectedRowVersion: exact.agent.rowVersion, expectedGrantDigest: exact.renewal.grantDigest,
+          renewActionId: `0x${"74".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(exactResult.kind, "updated", `${label}: the 3600-second floor admits`);
+
+        const expired = await create({ cancelRequestedAtSec: NOW_SEC - 1, cancelActionId: `0x${"75".repeat(32)}` as Hex, cancelReason: "expired" });
+        const expiredResult = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: expired.id,
+          expectedRowVersion: expired.agent.rowVersion, expectedGrantDigest: expired.renewal.grantDigest,
+          renewActionId: `0x${"76".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(expiredResult.kind, "conflict", `${label}: plane-expired cancellation refuses`);
+
+        const coverage = await create({ cancelRequestedAtSec: NOW_SEC - 1, cancelActionId: `0x${"77".repeat(32)}` as Hex, cancelReason: "renewal_coverage_lost" });
+        const coverageResult = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: coverage.id,
+          expectedRowVersion: coverage.agent.rowVersion, expectedGrantDigest: coverage.renewal.grantDigest,
+          renewActionId: `0x${"78".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(coverageResult.kind, "conflict", `${label}: coverage-loss cancellation refuses`);
+
+        const cancelled = await create();
+        const cancelledResult = await store.cancelPendingRenewalCas({ ownerAddress: OWNER, agentId: cancelled.id,
+          expectedRowVersion: cancelled.agent.rowVersion, expectedGrantDigest: cancelled.renewal.grantDigest,
+          nowSec: NOW_SEC, cancelActionId: `0x${"79".repeat(32)}` as Hex, outcome: "cancelled", reason: "owner" });
+        assert.equal(cancelledResult.kind, "updated");
+        const cancelledRow = cancelledResult.kind === "updated" ? cancelledResult.agent : cancelled.agent;
+        const late = await store.markPendingRenewalPhaseCas({ ownerAddress: OWNER, agentId: cancelled.id,
+          expectedRowVersion: cancelledRow.rowVersion, expectedGrantDigest: cancelled.renewal.grantDigest,
+          phase: "granting", authorityObserved: true });
+        assert.equal(late.kind, "updated", `${label}: cancelled descriptors latch a late observation`);
+        assert.equal(late.agent.pendingRenewal?.phase, "granting");
+        assert.equal(late.agent.pendingRenewal?.cancelReason, "owner");
+        assert.equal(late.agent.pendingRenewal?.cancelActionId, `0x${"79".repeat(32)}`);
+        assert.equal(late.agent.pendingRenewal?.authorityObserved, true);
+        const changedPhase = await store.markPendingRenewalPhaseCas({ ownerAddress: OWNER, agentId: cancelled.id,
+          expectedRowVersion: late.agent.rowVersion, expectedGrantDigest: cancelled.renewal.grantDigest,
+          phase: "observed", authorityObserved: true });
+        assert.equal(changedPhase.kind, "conflict", `${label}: cancellation still rejects phase changes`);
+        const latchedRetry = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: cancelled.id,
+          expectedRowVersion: late.agent.rowVersion, expectedGrantDigest: cancelled.renewal.grantDigest,
+          renewActionId: `0x${"7a".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(latchedRetry.kind, "conflict", `${label}: a cancelled late observation blocks retry`);
+
+        const ledger = await create();
+        const oldAttemptId = `0x${"7b".repeat(32)}` as Hex;
+        const started = await store.startRenewalGrantAttemptCas({ ownerAddress: OWNER, agentId: ledger.id,
+          expectedGrantDigest: ledger.renewal.grantDigest, expectedRenewActionId: ledger.renewal.renewActionId,
+          attemptId: oldAttemptId, startedAtSec: NOW_SEC });
+        assert.equal(started.kind, "created", `${label}: old attempt starts`);
+        const wrongAction = await store.startRenewalGrantAttemptCas({ ownerAddress: OWNER, agentId: ledger.id,
+          expectedGrantDigest: ledger.renewal.grantDigest, expectedRenewActionId: `0x${"7c".repeat(32)}` as Hex,
+          attemptId: `0x${"7d".repeat(32)}` as Hex, startedAtSec: NOW_SEC });
+        assert.equal(wrongAction.kind, "conflict", `${label}: the ledger checks the action id inside the fence`);
+        const immutable = {
+          grantDigest: ledger.renewal.grantDigest, sessionAddress: ledger.renewal.sessionAddress,
+          sessionPublicKey: ledger.renewal.sessionPublicKey, expiresAt: ledger.renewal.expiresAt,
+          sessionSpec: ledger.renewal.sessionSpec, permissions: ledger.renewal.permissions,
+          previous: ledger.renewal.previous, createdAtSec: ledger.renewal.createdAtSec,
+          keyStoreVerdictAtS1: ledger.renewal.keyStoreVerdictAtS1,
+        };
+        const reopened = await store.reopenPendingRenewalCas({ ownerAddress: OWNER, agentId: ledger.id,
+          expectedRowVersion: started.kind === "created" ? started.agent.rowVersion : 0,
+          expectedGrantDigest: ledger.renewal.grantDigest, renewActionId: `0x${"7e".repeat(32)}` as Hex, nowSec: NOW_SEC });
+        assert.equal(reopened.kind, "updated", `${label}: un-cancelled retry reopens`);
+        assert.deepEqual({
+          grantDigest: reopened.agent.pendingRenewal!.grantDigest, sessionAddress: reopened.agent.pendingRenewal!.sessionAddress,
+          sessionPublicKey: reopened.agent.pendingRenewal!.sessionPublicKey, expiresAt: reopened.agent.pendingRenewal!.expiresAt,
+          sessionSpec: reopened.agent.pendingRenewal!.sessionSpec, permissions: reopened.agent.pendingRenewal!.permissions,
+          previous: reopened.agent.pendingRenewal!.previous, createdAtSec: reopened.agent.pendingRenewal!.createdAtSec,
+          keyStoreVerdictAtS1: reopened.agent.pendingRenewal!.keyStoreVerdictAtS1,
+        }, immutable, `${label}: retry keeps the authority tuple byte-identical`);
+        assert.equal(reopened.agent.pendingRenewal?.grantAttempt, undefined);
+        assert.equal(reopened.agent.renewalOutcomes?.at(-1)?.outcome, "superseded");
+        const oldAfterReopen = await store.startRenewalGrantAttemptCas({ ownerAddress: OWNER, agentId: ledger.id,
+          expectedGrantDigest: ledger.renewal.grantDigest, expectedRenewActionId: ledger.renewal.renewActionId,
+          attemptId: `0x${"7f".repeat(32)}` as Hex, startedAtSec: NOW_SEC });
+        assert.equal(oldAfterReopen.kind, "conflict", `${label}: old-tab attempt conflicts after reopen`);
+        const newAfterReopen = await store.startRenewalGrantAttemptCas({ ownerAddress: OWNER, agentId: ledger.id,
+          expectedGrantDigest: ledger.renewal.grantDigest, expectedRenewActionId: `0x${"7e".repeat(32)}` as Hex,
+          attemptId: `0x${"80".repeat(32)}` as Hex, startedAtSec: NOW_SEC });
+        assert.equal(newAfterReopen.kind, "created", `${label}: new-tab attempt may invoke after reopen`);
+      }
+    } finally { await fixture.close(); }
+  });
 });

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { classifyRevokeCallsStatus, revokeAgentSession } from "./client";
+import { GrantAgentSessionError, classifyRevokeCallsStatus, revokeAgentSession } from "./client";
 import type { StoredPasskey } from "@/lib/exec/passkey";
 
 const record: StoredPasskey = {
@@ -12,6 +12,13 @@ const record: StoredPasskey = {
 };
 
 describe("dedicated Altana session revoke", () => {
+  it("[F12] keeps the original grant cause for the wizard without rendering it here", () => {
+    const cause = { name: "Error", message: "Session grant did not confirm: status=PENDING" };
+    const error = new GrantAgentSessionError("grant_pending", cause);
+    expect(error.cause).toBe(cause);
+    expect(error.code).toBe("grant_pending");
+  });
+
   it("refuses a missing or mismatched stored owner wallet before SDK work", async () => {
     await expect(revokeAgentSession({
       record,

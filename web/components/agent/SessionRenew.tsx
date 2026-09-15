@@ -4,7 +4,7 @@ import React from "react";
 import type { SessionPermissions } from "@altananetwork/sdk";
 import type { Address, Hex } from "viem";
 import { Button } from "@/design-system";
-import { grantAgentSession, revokeAgentSession } from "@/lib/altana/client";
+import { GrantAgentSessionError, grantAgentSession, revokeAgentSession } from "@/lib/altana/client";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
 
 type WirePermissions = {
@@ -16,6 +16,7 @@ type RenewalData = {
   readonly grantDigest: Hex;
   readonly permissions: WirePermissions;
   readonly expiry: number;
+  readonly expiresAt?: number;
   readonly sessionPublicKey: Hex;
   readonly sessionAddress: Address;
   readonly funding?: { readonly requiredWei?: string; readonly balanceWei?: string | null };
@@ -23,6 +24,7 @@ type RenewalData = {
   readonly universe?: { readonly tokens?: readonly string[]; readonly held?: number; readonly pinned?: number; readonly dropped?: readonly string[] };
   readonly renewActionId?: Hex;
   readonly phase?: string;
+  readonly cancelReason?: "owner" | "expired" | "renewal_coverage_lost";
   readonly authorityObserved?: boolean;
   readonly onChainRevoke?: unknown;
   readonly coverageLossToken?: string;
@@ -64,9 +66,56 @@ function responseData(payload: unknown): RenewalData | null {
   const data = (payload as { readonly data?: unknown }).data;
   if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
   const value = data as Record<string, unknown>;
-  return typeof value["grantDigest"] === "string" && typeof value["expiry"] === "number"
+  const expiry = typeof value["expiry"] === "number" ? value["expiry"] : value["expiresAt"];
+  return typeof value["grantDigest"] === "string" && typeof expiry === "number"
     && typeof value["sessionPublicKey"] === "string" && typeof value["sessionAddress"] === "string"
-    ? value as unknown as RenewalData : null;
+    ? { ...value, expiry } as unknown as RenewalData : null;
+}
+
+function dateText(expiresAt: number): string {
+  return new Date(expiresAt * 1_000).toISOString();
+}
+
+function remainingText(expiresAt: number): string {
+  const remaining = Math.max(0, expiresAt - Math.floor(Date.now() / 1_000));
+  const hours = Math.floor(remaining / 3_600);
+  const minutes = Math.floor((remaining % 3_600) / 60);
+  return hours > 0 ? `${hours}h ${minutes}m remaining` : `${minutes}m remaining`;
+}
+
+export function diagnostic(cause: unknown): string | null {
+  if (typeof cause !== "object" || cause === null || Array.isArray(cause)) return null;
+  const value = cause as { readonly name?: unknown; readonly message?: unknown };
+  const name = typeof value.name === "string" ? value.name : null;
+  const message = typeof value.message === "string" ? value.message : null;
+  if (message === "Session grant did not confirm: status=PENDING") return "relay did not confirm";
+  if (message === "Session grant did not confirm: status=FAILED" || message === "Session grant did not confirm: status=REVERTED") return "grant failed on chain";
+  if (name === "NotAllowedError" || name === "AbortError" || name === "TimeoutError"
+    || name === "SecurityError" || name === "InvalidStateError") return "passkey prompt cancelled or timed out";
+  if (name === "HttpRequestError") return "relay unreachable";
+  return null;
+}
+
+function ownerExpiry(value: unknown): number | null | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const row = value as { readonly id?: unknown; readonly status?: unknown; readonly walletAddress?: unknown; readonly sessionExpiresAt?: unknown };
+  if (typeof row.id !== "string" || typeof row.status !== "string" || typeof row.walletAddress !== "string"
+    || !Object.prototype.hasOwnProperty.call(row, "sessionExpiresAt")) return undefined;
+  if (row.sessionExpiresAt === null) return null;
+  return typeof row.sessionExpiresAt === "number" && Number.isSafeInteger(row.sessionExpiresAt) && row.sessionExpiresAt >= 0
+    ? row.sessionExpiresAt : undefined;
+}
+
+function grantErrorMessage(error: GrantAgentSessionError): string {
+  const base = error.code === "grant_pending"
+    ? "The relay did not confirm the new key in time. Retry — the same key is reused."
+    : error.code === "grant_rejected"
+      ? "The passkey prompt was cancelled or timed out. Retry — the same key is reused."
+      : error.code === "grant_underfunded"
+        ? "The wallet cannot pay the grant fee."
+        : "The grant failed. Retry — the same key is reused.";
+  const detail = diagnostic(error.cause);
+  return detail === null ? base : `${base} (${detail})`;
 }
 
 async function jsonResponse(response: Response): Promise<unknown> {
@@ -107,26 +156,84 @@ export function SessionRenew(props: SessionRenewProps): React.ReactElement | nul
   const owner = useOwnerActions();
   const [preview, setPreview] = React.useState<SessionPayload["data"] | null>(null);
   const [pending, setPending] = React.useState<RenewalData | null>(null);
-  const [step, setStep] = React.useState<"idle" | "preview" | "signing" | "granting" | "converging" | "done" | "cancelled">("idle");
+  const [completedExpiresAt, setCompletedExpiresAt] = React.useState<number | null>(null);
+  const [step, setStep] = React.useState<"idle" | "preview" | "signing" | "granting" | "retry" | "retryExpired" | "converging" | "done" | "cancelled">("idle");
   const [busy, setBusy] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
 
-  const readSession = React.useCallback(async (): Promise<SessionPayload["data"] | null> => {
-    const response = await fetch(`/api/agents/${encodeURIComponent(props.agentId)}/session`, { headers: props.readHeaders, cache: "no-store" });
-    const payload = await jsonResponse(response) as SessionPayload;
-    if (!response.ok) return null;
-    setPreview(payload.data ?? null);
-    if (payload.data?.pendingRenewal !== undefined) {
-      const renewal = payload.data.onChainRevoke === undefined
-        ? payload.data.pendingRenewal
-        : { ...payload.data.pendingRenewal, onChainRevoke: payload.data.onChainRevoke };
-      setPending(renewal);
-      setStep(payload.data.renewalPhase === "cancelled" || payload.data.pendingRenewal.phase === "cancelled" ? "cancelled" : "converging");
+  const selectPending = React.useCallback((data: NonNullable<SessionPayload["data"]>): void => {
+    const value = data?.pendingRenewal;
+    if (value === undefined) {
+      setPending(null);
+      return;
     }
-    return payload.data ?? null;
-  }, [props.agentId, props.readHeaders]);
+    const renewal = data?.onChainRevoke === undefined
+      ? value
+      : { ...value, onChainRevoke: data.onChainRevoke };
+    setPending(renewal);
+    const phase = data?.renewalPhase ?? renewal.phase;
+    const hasRevoke = renewal.onChainRevoke !== undefined
+      || (renewal.authorityObserved === true && renewal.phase === "cancelled");
+    if (hasRevoke) setStep("cancelled");
+    else if (phase === "observed" || phase === "quiescing" || phase === "ready") setStep("converging");
+    else if (phase === "cancelled") setStep("cancelled");
+    else if (phase === "granting") setStep("retry");
+    else setStep("converging");
+  }, []);
+
+  const readSession = React.useCallback(async (): Promise<NonNullable<SessionPayload["data"]> | null> => {
+    try {
+      const response = await fetch(`/api/agents/${encodeURIComponent(props.agentId)}/session`, { headers: props.readHeaders, cache: "no-store" });
+      const payload = await jsonResponse(response) as SessionPayload;
+      if (!response.ok || payload.data === undefined) return null;
+      setPreview(payload.data);
+      selectPending(payload.data);
+      return payload.data;
+    } catch {
+      return null;
+    }
+  }, [props.agentId, props.readHeaders, selectPending]);
 
   React.useEffect(() => { if (expired(props.sessionExpiresAt)) void readSession(); }, [props.sessionExpiresAt, readSession]);
+
+  const completeFromOwnerRead = React.useCallback(async (): Promise<boolean> => {
+    if (props.refresh === undefined) return false;
+    let fresh: unknown;
+    try { fresh = await props.refresh(); } catch { return false; }
+    const expiry = ownerExpiry(fresh);
+    if (expiry === undefined) return false;
+    setPending(null);
+    if (expiry !== null && !expired(expiry)) {
+      setCompletedExpiresAt(expiry);
+      setStep("done");
+    } else {
+      setStep("idle");
+    }
+    return true;
+  }, [props.refresh]);
+
+  const reconcileAfterError = React.useCallback(async (fallback: string, retryExpired: boolean): Promise<void> => {
+    const current = await readSession();
+    if (current === null) {
+      setMessage("Could not read the renewal state — refresh.");
+      return;
+    }
+    if (current.pendingRenewal !== undefined) {
+      if (retryExpired) {
+        const value = current.pendingRenewal;
+        const expiry = typeof value.expiry === "number" ? value.expiry : value.expiresAt;
+        if (typeof expiry === "number") {
+          setStep("retryExpired");
+          setMessage(`Retry closed: the reserved key expires ${dateText(expiry)}; a fresh renewal opens after that.`);
+        } else {
+          setMessage("Could not read the renewal state — refresh.");
+        }
+      } else setMessage(fallback);
+      return;
+    }
+    if (!await completeFromOwnerRead()) setMessage("Could not read the renewal state — refresh.");
+    else setMessage(fallback);
+  }, [completeFromOwnerRead, readSession]);
 
   const start = React.useCallback(async () => {
     setBusy(true); setMessage(null); setStep("signing");
@@ -135,7 +242,13 @@ export function SessionRenew(props: SessionRenewProps): React.ReactElement | nul
       const envelope = await owner.signEnvelope("renewSession", props.agentId, params);
       const response = await fetch(`/api/agents/${encodeURIComponent(props.agentId)}/session/renew`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope) });
       const payload = await jsonResponse(response);
-      if (!response.ok) throw new Error(typeof payload === "object" && payload !== null && typeof (payload as { error?: { message?: unknown } }).error?.message === "string" ? (payload as { error: { message: string } }).error.message : "Renewal could not be started.");
+      if (!response.ok) {
+        const row = typeof payload === "object" && payload !== null ? payload as { readonly error?: { readonly code?: unknown; readonly message?: unknown } } : {};
+        const code = row.error?.code === "renewal_retry_expired";
+        const fallback = typeof row.error?.message === "string" ? row.error.message : "Renewal could not be started.";
+        await reconcileAfterError(fallback, code);
+        return;
+      }
       const data = responseData(payload);
       if (data === null || owner.passkey === null || owner.walletAddress === undefined) throw new Error("The renewal response is incomplete.");
       setPending(data); setStep("granting");
@@ -146,15 +259,23 @@ export function SessionRenew(props: SessionRenewProps): React.ReactElement | nul
       setStep("converging");
       for (let count = 0; count < 40; count += 1) {
         const current = await readSession();
-        if (current?.pendingRenewal === undefined) { setStep("done"); await props.refresh?.(); return; }
+        if (current === null) {
+          setMessage("Could not read the renewal state — refresh.");
+        } else if (current.pendingRenewal === undefined) {
+          if (await completeFromOwnerRead()) return;
+          setMessage("Could not read the renewal state — refresh.");
+          return;
+        }
         await new Promise((resolve) => setTimeout(resolve, 1_500));
       }
       setMessage("The grant landed, but the plane is still converging. Keep this page open or refresh to resume.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Renewal failed.");
-      setStep("preview");
+      const fallback = error instanceof GrantAgentSessionError
+        ? grantErrorMessage(error)
+        : error instanceof Error ? error.message : "Renewal failed.";
+      await reconcileAfterError(fallback, false);
     } finally { setBusy(false); }
-  }, [owner, props.agentId, props.refresh, readSession]);
+  }, [completeFromOwnerRead, owner, props.agentId, readSession, reconcileAfterError]);
 
   const cancel = React.useCallback(async () => {
     if (pending === null) return;
@@ -198,9 +319,11 @@ export function SessionRenew(props: SessionRenewProps): React.ReactElement | nul
     {step === "preview" ? <div style={{ marginTop: 12 }}><p>Funding required: {preview?.funding?.requiredWei ?? "unavailable"} wei. Preview the trade universe, then sign the renewal.</p><Button size="sm" disabled={busy} onClick={() => void start()}>Sign renewal</Button></div> : null}
     {step === "signing" ? <p role="status" style={{ marginTop: 12 }}>Waiting for the renewal signature…</p> : null}
     {step === "granting" ? <p role="status" style={{ marginTop: 12 }}>Granting the new session key…</p> : null}
-    {step === "converging" ? <div style={{ marginTop: 12 }}><p role="status">Converging: {preview?.renewalPhase ?? pending?.phase ?? "granting"}{preview?.quiescing ? ` · ${preview.quiescing}` : ""}</p><Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>Cancel</Button></div> : null}
-    {step === "done" ? <p role="status" style={{ marginTop: 12 }}>Session renewed for seven days.</p> : null}
-    {step === "cancelled" ? <div style={{ marginTop: 12 }}><p role="status">Renewal cancelled. The agent remains on its expired session.</p>{pending?.coverageLossToken === undefined ? null : <p>Coverage changed; retry after resolving {pending.coverageLossToken}.</p>}{pending?.authorityObserved === true || revokeInstructions(pending?.onChainRevoke) !== null ? <><p>Revoke the new key to retire the cancelled renewal.</p>{(() => { const instructions = revokeInstructions(pending?.onChainRevoke); return instructions === null ? null : <ol>{instructions.calls.map((call, index) => <li key={`${call.to}-${index}`}><span>{call.note}</span><br /><code>{call.to}</code><br /><code>{call.data}</code></li>)}</ol>; })()}<Button size="sm" disabled={busy} onClick={() => void revokeNewKey()}>Revoke new key</Button></> : null}</div> : null}
+    {step === "retry" ? <div style={{ marginTop: 12 }}><p role="status">Retrying the pending renewal — the reserved key expires {pending?.expiry === undefined ? "on an unavailable date" : `${dateText(pending.expiry)} (${remainingText(pending.expiry)})`}. Each retry signs one more grant of the same key.</p><Button size="sm" disabled={busy} onClick={() => void start()}>Retry grant</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>Cancel renewal</Button></div> : null}
+    {step === "retryExpired" ? <p role="status" style={{ marginTop: 12 }}>{message ?? (pending?.expiry === undefined ? "Retry closed." : `Retry closed: the reserved key expires ${dateText(pending.expiry)}; a fresh renewal opens after that.`)}</p> : null}
+    {step === "converging" ? <div style={{ marginTop: 12 }}><p role="status">Converging: {preview?.renewalPhase ?? pending?.phase ?? "granting"}{preview?.quiescing ? ` · ${preview.quiescing}` : ""}</p><Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>Cancel renewal</Button></div> : null}
+    {step === "done" ? <p role="status" style={{ marginTop: 12 }}>Session renewed until {completedExpiresAt === null ? "the recorded expiry" : dateText(completedExpiresAt)}.</p> : null}
+    {step === "cancelled" ? <div style={{ marginTop: 12 }}><p role="status">Renewal cancelled. The agent remains on its expired session.</p>{pending?.coverageLossToken === undefined ? null : <p>Coverage changed; retry after resolving {pending.coverageLossToken}.</p>}{pending?.authorityObserved === true || revokeInstructions(pending?.onChainRevoke) !== null ? <><p>Revoke the new key to retire the cancelled renewal.</p>{(() => { const instructions = revokeInstructions(pending?.onChainRevoke); return instructions === null ? null : <ol>{instructions.calls.map((call, index) => <li key={`${call.to}-${index}`}><span>{call.note}</span><br /><code>{call.to}</code><br /><code>{call.data}</code></li>)}</ol>; })()}<Button size="sm" disabled={busy} onClick={() => void revokeNewKey()}>Revoke new key</Button></> : pending?.cancelReason === "owner" ? <Button size="sm" disabled={busy} onClick={() => void start()}>Retry renewal</Button> : null}</div> : null}
     {message ? <p role="alert" style={{ color: "var(--loss)", marginTop: 10 }}>{message}</p> : null}
   </section>;
 }

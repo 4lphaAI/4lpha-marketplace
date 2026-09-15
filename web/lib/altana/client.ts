@@ -86,10 +86,12 @@ export type GrantAgentSessionErrorCode =
 
 export class GrantAgentSessionError extends Error {
   readonly code: GrantAgentSessionErrorCode;
-  constructor(code: GrantAgentSessionErrorCode) {
+  readonly cause: unknown;
+  constructor(code: GrantAgentSessionErrorCode, cause?: unknown) {
     super(code);
     this.name = "GrantAgentSessionError";
     this.code = code;
+    this.cause = cause;
   }
 }
 
@@ -142,7 +144,7 @@ export async function grantAgentSession(input: {
     return { publicKey: session.publicKey, expiry: session.expiry };
   } catch (error) {
     if (error instanceof GrantAgentSessionError) throw error;
-    throw new GrantAgentSessionError(grantErrorCode(error));
+    throw new GrantAgentSessionError(grantErrorCode(error), error);
   }
 }
 

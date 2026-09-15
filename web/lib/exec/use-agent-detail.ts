@@ -268,12 +268,12 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
   const requestHeaders = useCallback((window: AuthWindow): HeadersInit =>
     window.signedHeader === undefined ? {} : { "x-owner-action": window.signedHeader }, []);
 
-  const pollOwner = useCallback(async (window: AuthWindow): Promise<void> => {
+  const pollOwner = useCallback(async (window: AuthWindow): Promise<boolean> => {
     const nowMs = Date.now();
     if (!mayPoll(nowMs, window.expiryMs)) {
       setState("auth-expired");
       setAuth(null);
-      return;
+      return false;
     }
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -289,7 +289,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
         fetch(`/api/agents/${encodeURIComponent(agentId)}`, { headers, cache: "no-store", signal: controller.signal }),
         fetch(`/api/agents/${encodeURIComponent(agentId)}/lp`, { headers, cache: "no-store", signal: controller.signal }),
       ]);
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) return false;
       const failed = [ownerResponse, lpResponse].find((response) => !response.ok);
       if (failed !== undefined) {
         const next = pollStateForStatus(failed.status);
@@ -298,7 +298,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
           setAuth(null);
           forgetReadExpiry(readSessionStorage());
         }
-        return;
+        return false;
       }
       ownerPayload.current = await ownerResponse.json() as unknown;
       // GRID-BENCHMARK-LATENCY: reuse the immutable arm receipt across a
@@ -326,7 +326,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
             setAuth(null);
             forgetReadExpiry(readSessionStorage());
           }
-          return;
+          return false;
         }
         setTrade(parseTradeViewEnvelope(await tradeResponse.json() as unknown));
       } else setTrade(null);
@@ -344,7 +344,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
               setAuth(null);
               forgetReadExpiry(readSessionStorage());
             }
-            return;
+            return false;
           }
         } else {
           setLending(parseLendingAgentView(await lendingResponse.json() as unknown));
@@ -352,7 +352,7 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
       } else setLending(null);
     } catch (error) {
       if (!controller.signal.aborted) setState(error instanceof Error ? "execution-unavailable" : "invalid-response");
-      return;
+      return false;
     } finally {
       clearTimeout(deadline);
       if (abortRef.current === controller) abortRef.current = null;
@@ -367,7 +367,9 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
     } catch (error) {
       setMapperError(error instanceof Error ? error.message : String(error));
       setState("invalid-response");
+      return false;
     }
+    return true;
   }, [agentId, publishView, requestHeaders]);
 
   const pollMarket = useCallback(async (window: AuthWindow): Promise<void> => {
@@ -540,9 +542,9 @@ export function useAgentDetail(agentId: string): UseAgentDetailResult {
   }, [agentId, pollMarket, pollOwner, signEnvelope]);
 
   const refresh = useCallback(async (): Promise<AgentDetailView | null> => {
-    if (auth === null) return viewRef.current;
-    await pollOwner(auth);
-    return viewRef.current;
+    if (auth === null) return null;
+    const fresh = await pollOwner(auth);
+    return fresh ? viewRef.current : null;
   }, [auth, pollOwner]);
 
   const refreshTrade = useCallback(async (): Promise<TradeView | null> => {

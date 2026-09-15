@@ -38,7 +38,7 @@ const TREASURY = getAddress("0x7000000000000000000000000000000000000007");
 const KEYSTORE = getAddress("0x8000000000000000000000000000000000000008");
 const RENEWAL_OLD_KEY = `0x${"99".repeat(32)}` as Hex;
 
-type EvidenceMode = "absent" | "exact" | "unreadable";
+type EvidenceMode = "absent" | "exact" | "unreadable" | "unreadable-snapshot";
 
 function exactEvidence(pending: PendingGrant): GrantEvidenceSnapshot {
   return {
@@ -124,6 +124,7 @@ async function fixture(options: {
     },
   }) as ExecutionJournal;
   let mode: EvidenceMode = "absent";
+  let fundingOverride: Awaited<ReturnType<GrantEvidenceReader["readFunding"]>> | null = null;
   let grantReads = 0;
   let sessionReadMode: "missing" | "invalid" | "unreadable" = "missing";
   let keyStoreReads = 0;
@@ -137,6 +138,11 @@ async function fixture(options: {
   const evidence: GrantEvidenceReader = {
     async readFunding(_wallet, relayGasHeadroomWei, observedAtSec) {
       if (mode === "unreadable") throw new Error("rpc failed");
+      if (fundingOverride !== null) return {
+        ...fundingOverride,
+        observedAtSec,
+        relayGasHeadroomWei: relayGasHeadroomWei.toString(10),
+      };
       return {
         version: 1, observedAtSec, registrationFeeWei: "2", registrations: 2,
         relayGasHeadroomWei: relayGasHeadroomWei.toString(10),
@@ -147,6 +153,10 @@ async function fixture(options: {
       grantReads += 1;
       if (mode === "unreadable") throw new Error("rpc failed");
       if (mode === "exact") return exactEvidence(pending);
+      if (mode === "unreadable-snapshot") return {
+        relayKeys: [], accountKey: null, accountSpend: [], canExecute: [],
+        keyStore: { kind: "unreadable" }, ownerVerdict: "verified",
+      };
       return {
         relayKeys: [], accountKey: null, accountSpend: [], canExecute: [],
         keyStore: { kind: "missing" }, ownerVerdict: "verified",
@@ -215,6 +225,7 @@ async function fixture(options: {
     store,
     setForcedSessionKeyPresent(next: boolean) { forceSessionKeyPresent = next; },
     setMode(next: EvidenceMode) { mode = next; },
+    setFunding(next: Awaited<ReturnType<GrantEvidenceReader["readFunding"]>> | null) { fundingOverride = next; },
     setSessionReadMode(next: "missing" | "invalid" | "unreadable") { sessionReadMode = next; },
     setFinalizedSession(
       mode: "invalid" | "registered" | "missing" | "unreadable" | "hash-change",
@@ -359,6 +370,7 @@ describe("marketplace hire routes", () => {
     assert.equal((pendingReplay.body["meta"] as { replayed?: boolean }).replayed, true);
     assert.equal((pendingReplay.body["data"] as { grantDigest: Hex }).grantDigest, grantDigest);
 
+    f.setMode("exact");
     const different = await signed("renewSession", id, { ttlSec: 3_600 });
     const pendingConflict = await post(f.harness, `/agents/${id}/session/renew`, different);
     assert.equal(pendingConflict.status, 409, pendingConflict.text);
@@ -373,7 +385,6 @@ describe("marketplace hire routes", () => {
     const wrongAttempt = await post(f.harness, `/agents/${id}/session/renew/grant-attempt`, different);
     assert.equal(wrongAttempt.status, 409, wrongAttempt.text);
 
-    f.setMode("exact");
     const cancel = await signed("cancelRenewal", id, { grantDigest });
     const canceled = await post(f.harness, `/agents/${id}/session/renew/cancel`, cancel);
     assert.equal(canceled.status, 200, canceled.text);
@@ -413,6 +424,148 @@ describe("marketplace hire routes", () => {
     const historyReplay = await post(f.harness, `/agents/${id}/session/renew`, second);
     assert.equal(historyReplay.status, 200, historyReplay.text);
     assert.equal((historyReplay.body["meta"] as { replayed?: boolean }).replayed, true);
+  });
+
+  it("[F10b/F10c/F10d/F10e/F11] retries with fresh funding, clears the bound ledger, and converges under the new id", async () => {
+    const f = await fixture({ lp: { store: { listSequences: async () => [] }, readers: {} } as unknown as NonNullable<Parameters<typeof createHarness>[0]["lp"]> });
+    const id = "renew-f10-retry";
+    const expiry = NOW_SEC - 1;
+    const oldFacts = {
+      spec: { allowedCalls: [{ to: NFPM }], spendCaps: [{ limit: 1_000n, period: "day" as const }], expiresAt: expiry },
+      permissions: { calls: [], spend: [] }, publicKey: privateKeyToAccount(RENEWAL_OLD_KEY).publicKey, expiry,
+      hireSizing: { name: "lp-v1" as const, version: 1 as const, openNativeBudgetWei: "0" },
+    };
+    await f.store.createAgent({ id, ownerAddress: ownerAccount.address, walletAddress: WALLET,
+      custodyModel: "self-eoa", sessionFacts: oldFacts, status: "armed", httpRuntimeProfile: "lp-v1" });
+    const first = await signed("renewSession", id, { ttlSec: 3_600 });
+    const created = await post(f.harness, `/agents/${id}/session/renew`, first);
+    assert.equal(created.status, 200, created.text);
+    const firstData = created.body["data"] as { grantDigest: Hex; sessionAddress: string; sessionPublicKey: Hex; expiry: number; renewActionId: Hex };
+    const storedBefore = (await f.store.getAgent(ownerAccount.address, id))?.pendingRenewal;
+    assert.notEqual(storedBefore, null);
+    assert.notEqual(storedBefore, undefined);
+    const firstAttempt = await post(f.harness, `/agents/${id}/session/renew/grant-attempt`, first);
+    assert.equal(firstAttempt.status, 200, firstAttempt.text);
+    assert.equal((firstAttempt.body["data"] as { mayInvoke: boolean }).mayInvoke, true);
+
+    f.setFunding({ version: 1, observedAtSec: NOW_SEC, registrationFeeWei: "2", registrations: 1,
+      relayGasHeadroomWei: "3", requiredWei: "1000001", balanceWei: "1000000" });
+    const underfundedAction = await signed("renewSession", id, { ttlSec: 604_800 });
+    const underfunded = await post(f.harness, `/agents/${id}/session/renew`, underfundedAction);
+    assert.equal(underfunded.status, 402, underfunded.text);
+    assert.equal((underfunded.body as { error: { code: string } }).error.code, "renewal_underfunded");
+    assert.equal((underfunded.body as { data: { funding: { requiredWei: string; balanceWei: string } } }).data.funding.requiredWei, "1000001");
+    assert.equal((await f.store.getAgent(ownerAccount.address, id))?.pendingRenewal?.renewActionId, firstData.renewActionId);
+
+    f.setFunding({ version: 1, observedAtSec: NOW_SEC, registrationFeeWei: "2", registrations: 1,
+      relayGasHeadroomWei: "3", requiredWei: "1", balanceWei: "1000000" });
+    const retry = await signed("renewSession", id, { ttlSec: 604_800 });
+    const retried = await post(f.harness, `/agents/${id}/session/renew`, retry);
+    assert.equal(retried.status, 200, retried.text);
+    const retryData = retried.body["data"] as { grantDigest: Hex; sessionAddress: string; sessionPublicKey: Hex; expiry: number; renewActionId: Hex; funding: { requiredWei: string } };
+    assert.equal((retried.body["meta"] as { retried?: boolean }).retried, true);
+    assert.equal(retryData.grantDigest, firstData.grantDigest);
+    assert.equal(retryData.sessionAddress, firstData.sessionAddress);
+    assert.equal(retryData.sessionPublicKey, firstData.sessionPublicKey);
+    assert.equal(retryData.expiry, firstData.expiry);
+    assert.notEqual(retryData.renewActionId, firstData.renewActionId);
+    assert.equal(retryData.funding.requiredWei, "1");
+    const reopened = (await f.store.getAgent(ownerAccount.address, id))?.pendingRenewal;
+    assert.equal(reopened?.funding.requiredWei, storedBefore!.funding.requiredWei);
+    assert.equal(reopened?.grantAttempt, undefined);
+    assert.equal(reopened?.cancelRequestedAtSec, undefined);
+    assert.equal((await f.store.getAgent(ownerAccount.address, id))?.renewalOutcomes?.find((row) => row.renewActionId === firstData.renewActionId)?.outcome, "superseded");
+
+    const oldAttempt = await post(f.harness, `/agents/${id}/session/renew/grant-attempt`, first);
+    assert.equal(oldAttempt.status, 409, oldAttempt.text);
+    const newAttempt = await post(f.harness, `/agents/${id}/session/renew/grant-attempt`, retry);
+    assert.equal(newAttempt.status, 200, newAttempt.text);
+    assert.equal((newAttempt.body["data"] as { mayInvoke: boolean }).mayInvoke, true);
+    const oldReplayWhilePending = await post(f.harness, `/agents/${id}/session/renew`, first);
+    assert.equal(oldReplayWhilePending.status, 409, oldReplayWhilePending.text);
+    assert.equal((oldReplayWhilePending.body as { error: { code: string } }).error.code, "renewal_pending");
+
+    f.setMode("exact");
+    const read = await signed("read", id);
+    const converged = await f.harness.app.request(`/agents/${id}/session`, {
+      headers: { "x-exec-token": EXEC_TOKEN, "x-owner-action": toReadHeader(read) },
+    });
+    assert.equal(converged.status, 200, await converged.text());
+    const current = await f.store.getAgent(ownerAccount.address, id);
+    assert.equal(current?.pendingRenewal, null);
+    assert.equal(current?.sessionFacts?.renewActionId, retryData.renewActionId);
+    assert.equal(current?.sessionFacts?.expiry, firstData.expiry);
+    assert.equal(current?.sessionFacts?.grantedAtSec, NOW_SEC);
+    const executing = await f.store.readExecutingSession(ownerAccount.address, id);
+    assert.equal(executing?.facts.renewActionId, retryData.renewActionId);
+    const oldReplayAfterDone = await post(f.harness, `/agents/${id}/session/renew`, first);
+    assert.equal(oldReplayAfterDone.status, 410, oldReplayAfterDone.text);
+  });
+
+  it("[F10] reopens an owner-cancelled unobserved descriptor and keeps its cancellation receipt", async () => {
+    const f = await fixture({ lp: { store: { listSequences: async () => [] }, readers: {} } as unknown as NonNullable<Parameters<typeof createHarness>[0]["lp"]> });
+    const id = "renew-f10-cancelled-retry";
+    const expiry = NOW_SEC - 1;
+    const oldFacts = {
+      spec: { allowedCalls: [{ to: NFPM }], spendCaps: [{ limit: 1_000n, period: "day" as const }], expiresAt: expiry },
+      permissions: { calls: [], spend: [] }, publicKey: privateKeyToAccount(RENEWAL_OLD_KEY).publicKey, expiry,
+      hireSizing: { name: "lp-v1" as const, version: 1 as const, openNativeBudgetWei: "0" },
+    };
+    await f.store.createAgent({ id, ownerAddress: ownerAccount.address, walletAddress: getAddress("0x2100000000000000000000000000000000000021"),
+      custodyModel: "self-eoa", sessionFacts: oldFacts, status: "armed", httpRuntimeProfile: "lp-v1" });
+    const first = await signed("renewSession", id, { ttlSec: 3_600 });
+    const created = await post(f.harness, `/agents/${id}/session/renew`, first);
+    assert.equal(created.status, 200, created.text);
+    const grantDigest = (created.body["data"] as { grantDigest: Hex }).grantDigest;
+    const cancel = await signed("cancelRenewal", id, { grantDigest });
+    const canceled = await post(f.harness, `/agents/${id}/session/renew/cancel`, cancel);
+    assert.equal(canceled.status, 200, canceled.text);
+    const retry = await signed("renewSession", id, { ttlSec: 604_800 });
+    const retried = await post(f.harness, `/agents/${id}/session/renew`, retry);
+    assert.equal(retried.status, 200, retried.text);
+    const outcomes = (await f.store.getAgent(ownerAccount.address, id))?.renewalOutcomes ?? [];
+    assert.deepEqual(outcomes.map((row) => row.outcome), ["cancelled"]);
+    const oldReplay = await post(f.harness, `/agents/${id}/session/renew`, first);
+    assert.equal(oldReplay.status, 409, oldReplay.text);
+    assert.equal((oldReplay.body as { error: { code: string } }).error.code, "renewal_cancelled");
+  });
+
+  it("[F10g] performs one fail-closed pre-reopen evidence read", async () => {
+    const make = async (id: string) => {
+      const f = await fixture({ lp: { store: { listSequences: async () => [] }, readers: {} } as unknown as NonNullable<Parameters<typeof createHarness>[0]["lp"]> });
+      const expiry = NOW_SEC - 1;
+      const oldFacts = {
+        spec: { allowedCalls: [{ to: NFPM }], spendCaps: [{ limit: 1_000n, period: "day" as const }], expiresAt: expiry },
+        permissions: { calls: [], spend: [] }, publicKey: privateKeyToAccount(RENEWAL_OLD_KEY).publicKey, expiry,
+        hireSizing: { name: "lp-v1" as const, version: 1 as const, openNativeBudgetWei: "0" },
+      };
+      await f.store.createAgent({ id, ownerAddress: ownerAccount.address, walletAddress: getAddress(`0x${(0x220 + id.length).toString(16).padStart(40, "0")}`),
+        custodyModel: "self-eoa", sessionFacts: oldFacts, status: "armed", httpRuntimeProfile: "lp-v1" });
+      const first = await signed("renewSession", id, { ttlSec: 3_600 });
+      const created = await post(f.harness, `/agents/${id}/session/renew`, first);
+      assert.equal(created.status, 200, created.text);
+      return { f, first };
+    };
+
+    const observed = await make("renew-f10g-observed");
+    observed.f.setMode("exact");
+    const observedRetry = await post(observed.f.harness, "/agents/renew-f10g-observed/session/renew", await signed("renewSession", "renew-f10g-observed", { ttlSec: 3_600 }));
+    assert.equal(observedRetry.status, 409, observedRetry.text);
+    assert.equal((observedRetry.body as { error: { code: string } }).error.code, "renewal_pending");
+    assert.equal(observed.f.grantReads(), 1);
+    assert.equal((await observed.f.store.getAgent(ownerAccount.address, "renew-f10g-observed"))?.pendingRenewal?.authorityObserved, true);
+
+    const unreadable = await make("renew-f10g-unreadable");
+    unreadable.f.setMode("unreadable");
+    const unreadableRetry = await post(unreadable.f.harness, "/agents/renew-f10g-unreadable/session/renew", await signed("renewSession", "renew-f10g-unreadable", { ttlSec: 3_600 }));
+    assert.equal(unreadableRetry.status, 503, unreadableRetry.text);
+    assert.equal((await unreadable.f.store.getAgent(ownerAccount.address, "renew-f10g-unreadable"))?.pendingRenewal?.authorityObserved, undefined);
+
+    const resolvedUnreadable = await make("renew-f10g-resolved-unreadable");
+    resolvedUnreadable.f.setMode("unreadable-snapshot");
+    const resolved = await post(resolvedUnreadable.f.harness, "/agents/renew-f10g-resolved-unreadable/session/renew", await signed("renewSession", "renew-f10g-resolved-unreadable", { ttlSec: 3_600 }));
+    assert.equal(resolved.status, 503, resolved.text);
+    assert.equal((await resolvedUnreadable.f.store.getAgent(ownerAccount.address, "renew-f10g-resolved-unreadable"))?.pendingRenewal?.authorityObserved, undefined);
   });
 
   it("requires a durable chain-56 passkey composition at server construction", async () => {

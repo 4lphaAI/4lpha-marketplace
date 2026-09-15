@@ -290,7 +290,7 @@ import type { TradeReadiness } from "./trade/readiness.js";
 import { pinnedTokens, positionView, runView, tradeSummary } from "./trade/view.js";
 import { validateSessionSpec } from "./core/session.js";
 import type { GrantEvidenceReader } from "./wallet/grantEvidence.js";
-import { grantDigest } from "./wallet/grantEvidence.js";
+import { assessGrantEvidence, grantDigest } from "./wallet/grantEvidence.js";
 import { assessRenewalQuiescence, authorityObserved, buildPendingOnChainRevoke, convergeProvisioning, convergeRenewal } from "./wallet/provisioning.js";
 import type { VenusSettingsStore } from "./store/venusSettings.js";
 import type { VenusObservationStore } from "./store/venusObservations.js";
@@ -1052,6 +1052,7 @@ export type ErrorCode =
   | "renewal_unsupported_kind"
   | "renewal_universe_unavailable"
   | "renewal_underfunded"
+  | "renewal_retry_expired"
   | "paused"
   | "halted"
   | "revoked"
@@ -3104,6 +3105,13 @@ export function createServer(deps: ServerDeps): Hono {
       ...(draft.universe === undefined ? {} : { universe: draft.universe }),
     });
 
+    const renewalRetryResponse = (pending: PendingRenewal, funding: import("./store/agents.js").FundingRequirement, renewActionId: Hex): Record<string, unknown> => ({
+      permissions: permissionView(pending.permissions), expiry: pending.expiresAt, sessionPublicKey: pending.sessionPublicKey,
+      sessionAddress: pending.sessionAddress, grantDigest: pending.grantDigest, funding,
+      previous: { publicKey: pending.previous.publicKey, expiry: pending.previous.expiry, expired: pending.previous.expiry <= nowSec() },
+      renewActionId,
+    });
+
     const convergeRenewalFor = (agent: AgentRecord, signal?: AbortSignal) => convergeRenewal({
       store: deps.agentStore, evidence: hire!.evidence, ownerAddress: agent.ownerAddress, agentId: agent.id,
       keyStore: config.keyStore, nowSec: nowSec(), checkQuiescent: async () => {
@@ -3166,14 +3174,112 @@ export function createServer(deps: ServerDeps): Hono {
         }
         return c.json({ data: { ...renewalPendingView(priorPending, nowSec()), renewActionId: actionId }, meta: { replayed: true } });
       }
-      if (priorPending !== null && priorPending !== undefined) {
-        const code = priorPending.cancelRequestedAtSec === undefined ? "renewal_pending" : "renewal_cancelled_unresolved";
-        return c.json({ error: { code }, data: { grantDigest: priorPending.grantDigest, ...(priorPending.authorityObserved === true ? { onChainRevoke: buildPendingOnChainRevoke(priorPending, config.keyStore) } : {}) } }, 409);
+      if (priorHistory !== undefined) {
+        const verified = await verifyOwnerAction(envelope.value, verifyOptions()).catch(() => null);
+        if (verified === null) return fail(c, 401, "owner_auth_failed");
+        return c.json({ data: { agent: agentOwnerView(initial), renewActionId: actionId }, meta: { replayed: true } });
       }
-      if (priorHistory !== undefined) return c.json({ data: { agent: agentOwnerView(initial), renewActionId: actionId }, meta: { replayed: true } });
       const outcome = (initial.renewalOutcomes ?? []).find((row) => row.renewActionId.toLowerCase() === actionId.toLowerCase());
-      if (outcome !== undefined && outcome.outcome !== "completed") return fail(c, 410, "renewal_gone");
-      if (outcome?.outcome === "completed") return c.json({ data: { agent: agentOwnerView(initial), renewActionId: actionId }, meta: { replayed: true } });
+      if (outcome !== undefined) {
+        const verified = await verifyOwnerAction(envelope.value, verifyOptions()).catch(() => null);
+        if (verified === null) return fail(c, 401, "owner_auth_failed");
+        const samePending = priorPending !== null && priorPending !== undefined
+          && priorPending.grantDigest.toLowerCase() === outcome.grantDigest.toLowerCase();
+        if (outcome.outcome === "completed") return c.json({ data: { agent: agentOwnerView(initial), renewActionId: actionId }, meta: { replayed: true } });
+        if (outcome.outcome === "superseded" && samePending) {
+          return c.json({ error: { code: "renewal_pending" }, data: { grantDigest: outcome.grantDigest } }, 409);
+        }
+        if ((outcome.outcome === "cancelled" || outcome.outcome === "expired") && samePending) {
+          return c.json({ error: { code: "renewal_cancelled" }, data: {
+            grantDigest: outcome.grantDigest,
+            ...(priorPending.authorityObserved === true ? { onChainRevoke: buildPendingOnChainRevoke(priorPending, config.keyStore) } : {}),
+          } }, 409);
+        }
+        return fail(c, 410, "renewal_gone");
+      }
+      if (priorPending !== null && priorPending !== undefined) {
+        const remaining = priorPending.expiresAt - nowSec();
+        if (priorPending.authorityObserved === true) {
+          if (priorPending.cancelRequestedAtSec !== undefined) {
+            return c.json({ error: { code: "renewal_cancelled" }, data: {
+              ...renewalPendingView(priorPending, nowSec()),
+              onChainRevoke: buildPendingOnChainRevoke(priorPending, config.keyStore),
+            } }, 409);
+          }
+          return c.json({ error: { code: "renewal_pending" }, data: { grantDigest: priorPending.grantDigest } }, 409);
+        }
+        if (priorPending.cancelRequestedAtSec !== undefined && priorPending.cancelReason !== "owner") {
+          return c.json({ error: { code: "renewal_cancelled_unresolved" }, data: {
+            grantDigest: priorPending.grantDigest,
+            ...(priorPending.authorityObserved === true ? { onChainRevoke: buildPendingOnChainRevoke(priorPending, config.keyStore) } : {}),
+          } }, 409);
+        }
+        if (priorPending.phase !== "granting") {
+          return c.json({ error: { code: "renewal_pending" }, data: { grantDigest: priorPending.grantDigest } }, 409);
+        }
+        if (remaining < 3_600) {
+          return c.json({ error: { code: "renewal_retry_expired" }, data: {
+            grantDigest: priorPending.grantDigest, expiresAt: priorPending.expiresAt, retryAfterSec: remaining,
+          } }, 409);
+        }
+        let owner: OwnerAuthResult;
+        try { owner = await authorizeOwnerAction(envelope.value, { ...verifyOptions(), nonceStore: deps.nonceStore }); }
+        catch (error) { return error instanceof OwnerAuthError ? fail(c, 401, "owner_auth_failed") : fail(c, 500, "internal_error"); }
+        const params = parseRenewSessionParams(envelope.value.params);
+        if (!params.ok) return fail(c, 400, "invalid_request", params.message);
+        void params.value.ttlSec;
+        let snapshot: Awaited<ReturnType<GrantEvidenceReader["readGrant"]>>;
+        try {
+          snapshot = await hire!.evidence.readGrant(priorPending as unknown as PendingGrant, c.req.raw.signal);
+        } catch {
+          return fail(c, 503, "evidence_unreadable");
+        }
+        const observed = authorityObserved(priorPending, snapshot);
+        if (observed) {
+          const marked = await deps.agentStore.markPendingRenewalPhaseCas({
+            ownerAddress: owner.ownerAddress, agentId: id, expectedRowVersion: initial.rowVersion,
+            expectedGrantDigest: priorPending.grantDigest, phase: priorPending.phase, authorityObserved: true,
+          });
+          const markedPending = marked.kind === "not_found" ? priorPending : marked.agent?.pendingRenewal ?? priorPending;
+          if (markedPending.cancelRequestedAtSec !== undefined) {
+            return c.json({ error: { code: "renewal_cancelled" }, data: {
+              ...renewalPendingView(markedPending, nowSec()),
+              onChainRevoke: buildPendingOnChainRevoke(markedPending, config.keyStore),
+            } }, 409);
+          }
+          return c.json({ error: { code: "renewal_pending" }, data: { grantDigest: markedPending.grantDigest } }, 409);
+        }
+        if (snapshot.keyStore.kind === "unreadable" || snapshot.ownerVerdict === "unreadable"
+          || assessGrantEvidence(priorPending, snapshot, nowSec()).includes("evidence-unreadable")) {
+          return fail(c, 503, "evidence_unreadable");
+        }
+        let funding: import("./store/agents.js").FundingRequirement;
+        try {
+          funding = await hire!.evidence.readFunding(priorPending.walletAddress, hire!.grantGasHeadroomWei, nowSec(), c.req.raw.signal);
+          if (funding.balanceWei === null) throw new Error("Funding balance is unreadable.");
+          if (BigInt(funding.balanceWei) < BigInt(funding.requiredWei)) {
+            return c.json({ error: { code: "renewal_underfunded" }, data: { funding } }, 402);
+          }
+        } catch (error) {
+          if (error instanceof Error && error.message === "Funding balance is unreadable.") return fail(c, 503, "evidence_unreadable");
+          return fail(c, 503, "evidence_unreadable");
+        }
+        const reopened = await deps.agentStore.reopenPendingRenewalCas({
+          ownerAddress: owner.ownerAddress, agentId: id, expectedRowVersion: initial.rowVersion,
+          expectedGrantDigest: priorPending.grantDigest, renewActionId: actionId, nowSec: nowSec(),
+        });
+        if (reopened.kind === "updated" || reopened.kind === "same") {
+          const pending = reopened.agent.pendingRenewal;
+          if (pending === null || pending === undefined) return fail(c, 409, "renewal_pending");
+          return c.json({ data: renewalRetryResponse(pending, funding, actionId), meta: { retried: true } });
+        }
+        const currentPending = reopened.kind === "not_found" ? undefined : reopened.agent?.pendingRenewal;
+        if (currentPending !== null && currentPending !== undefined) {
+          const code = currentPending.cancelRequestedAtSec === undefined ? "renewal_pending" : "renewal_cancelled_unresolved";
+          return c.json({ error: { code }, data: { grantDigest: currentPending.grantDigest } }, 409);
+        }
+        return fail(c, reopened.kind === "not_found" ? 404 : 409, reopened.kind === "not_found" ? "not_found" : "renewal_pending");
+      }
       let owner: OwnerAuthResult;
       try { owner = await authorizeOwnerAction(envelope.value, { ...verifyOptions(), nonceStore: deps.nonceStore }); }
       catch (error) { return error instanceof OwnerAuthError ? fail(c, 401, "owner_auth_failed") : fail(c, 500, "internal_error"); }
@@ -3230,7 +3336,7 @@ export function createServer(deps: ServerDeps): Hono {
       if (agent === null || pending === null || pending === undefined || agent.ownerAddress.toLowerCase() !== envelope.value.signed.owner.toLowerCase()
         || pending.renewActionId.toLowerCase() !== ownerActionIdempotencyKey(envelope.value.signed).toLowerCase()) return fail(c, 409, "conflict");
       const attemptId = keccak256(stringToBytes(canonicalEncode({ purpose: "renewalGrantAttempt/v1", renewActionId: pending.renewActionId, ...(pending.lastGrantAttemptReset === undefined ? {} : { resetActionId: pending.lastGrantAttemptReset.resetActionId }) })));
-      const started = await deps.agentStore.startRenewalGrantAttemptCas({ ownerAddress: agent.ownerAddress, agentId: agent.id, expectedGrantDigest: pending.grantDigest, attemptId, startedAtSec: nowSec() });
+      const started = await deps.agentStore.startRenewalGrantAttemptCas({ ownerAddress: agent.ownerAddress, agentId: agent.id, expectedGrantDigest: pending.grantDigest, expectedRenewActionId: ownerActionIdempotencyKey(envelope.value.signed) as Hex, attemptId, startedAtSec: nowSec() });
       if (started.kind === "conflict" || started.kind === "not_found") return fail(c, 409, "conflict");
       return c.json({ data: { ...renewalPendingView(started.agent.pendingRenewal!, nowSec()), attemptId, mayInvoke: started.kind === "created" } });
     });
