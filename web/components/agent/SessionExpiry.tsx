@@ -140,6 +140,9 @@ const COPY: Record<SessionExpiryKind, {
  * remedy. Revoked / retired / provisioning agents are past or before the
  * session and get nothing here.
  */
+/** Bounded so a page whose hero is a flex row (LP, grid, lending title columns) wraps its actions instead of stretching. */
+const NOTICE_STYLE = { maxWidth: "88ch" } as const;
+
 export function SessionExpiryNotice({ kind, expiresAt, nowMs, status, open }: {
   readonly kind: SessionExpiryKind;
   readonly expiresAt: number | null | undefined;
@@ -154,17 +157,17 @@ export function SessionExpiryNotice({ kind, expiresAt, nowMs, status, open }: {
   const copy = COPY[kind];
   const remaining = view.label.replace(/^Expires in /u, "");
   if (view.state === "expired") {
-    return <div className="fl-trade-message fl-trade-message--warning" role="alert" data-session-notice="expired">
+    return <div className="fl-trade-message fl-trade-message--warning" style={NOTICE_STYLE} role="alert" data-session-notice="expired">
       Session expired. The agent can no longer {copy.stops(open)}; {copy.expiredRecovery}
     </div>;
   }
   if (open <= 0) return null;
   if (status === "paused") {
-    return <div className="fl-trade-message fl-trade-message--warning" role="alert" data-session-notice="paused-soon">
+    return <div className="fl-trade-message fl-trade-message--warning" style={NOTICE_STYLE} role="alert" data-session-notice="paused-soon">
       Paused — the session ends in {remaining}. {copy.pausedAdvice}
     </div>;
   }
-  return <div className="fl-trade-message fl-trade-message--warning" role="alert" data-session-notice="soon">
+  return <div className="fl-trade-message fl-trade-message--warning" style={NOTICE_STYLE} role="alert" data-session-notice="soon">
     Session ends in {remaining}. {copy.soonAdvice}
   </div>;
 }

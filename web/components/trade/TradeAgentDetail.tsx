@@ -301,7 +301,6 @@ export function TradeAgentDetail(props: Props) {
     <div className="fl-trade-hero">
       <div className="fl-trade-title"><span className="fl-card__glyph"><Icon name="yield" size={22} /></span><h1>{settings?.name ?? view?.id ?? agentId}</h1><StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} /><SessionExpiryChip expiresAt={view?.sessionExpiresAt} nowMs={nowMs} /><AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." /></div>
       <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
-      <SessionExpiryNotice kind="trade" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={trade?.open.length ?? 0} />
       <div className="fl-hired-actions">
         {signedOut ? <Button variant="primary" onClick={() => void props.signIn()}>Sign in to view</Button> : null}
         <Button variant={editing ? "primary" : "secondary"} icon={<Icon name="settings" size={15} />} disabled={busy || settings === null || draining || unresolved.length > 0} onClick={() => setEditing((value) => !value)}>{editing ? "Editing" : "Edit"}</Button>
@@ -309,6 +308,8 @@ export function TradeAgentDetail(props: Props) {
         <Button variant="danger" icon={<Icon name="revoke" size={15} />} disabled={busy || view === null || props.removed} onClick={props.remove}>{props.removed ? "Removed" : view?.status === "revoked" ? "Finish removal" : draining ? "Removing" : "Remove"}</Button>
       </div>
     </div>
+    {/* Below the hero, not inside its flex row: in the row it squeezed the title to "Tra…" (seen live 2026-09-15). */}
+    <SessionExpiryNotice kind="trade" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={trade?.open.length ?? 0} />
     {message ? <div className="fl-trade-message" role="status">{message}</div> : null}
     {props.identityStatus}
     {recoveryRequired ? <div className="fl-trade-message fl-trade-message--warning" role="alert">
