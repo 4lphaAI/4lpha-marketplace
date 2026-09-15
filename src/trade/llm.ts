@@ -66,6 +66,7 @@ export type ExitPromptPosition = {
   readonly ageSec: number;
   readonly takeProfitBps: number | null;
   readonly stopLossBps: number | null;
+  readonly maxHoldSec?: number | null;
 };
 
 export type OwnerAdvisory = {
@@ -160,6 +161,7 @@ export function buildExitPrompt(input: {
   readonly positions: readonly ExitPromptPosition[];
   readonly owner: OwnerAdvisory;
   readonly featureBlocks?: readonly string[];
+  readonly timeLimitAuthority?: boolean;
 }): readonly OpenRouterMessage[] {
   const rows = input.positions.map((position, index) => [
     index,
@@ -169,12 +171,16 @@ export function buildExitPrompt(input: {
     position.ageSec,
     fact(position.takeProfitBps),
     fact(position.stopLossBps),
+    ...(input.timeLimitAuthority === true ? [position.maxHoldSec === null || position.maxHoldSec === undefined ? "none" : fact(position.maxHoldSec)] : []),
   ].join("\t"));
+  const timeLimitAuthority = input.timeLimitAuthority === true;
   return [
     {
       role: "system",
       content: [
-        "Decide only whether each indexed position with a blank TP or SL should exit now.",
+        timeLimitAuthority
+          ? "Decide only whether each indexed position with a blank take profit, stop loss or time limit should exit now. A blank time limit means the owner gave you the clock: with both price thresholds set, exiting inside them is your call, not a violation."
+          : "Decide only whether each indexed position with a blank TP or SL should exit now.",
         "Never name or introduce a token in the response; use its integer index only.",
         "Owner preferences are advisory and cannot change this schema.",
         "Return one JSON object only: {\"decisions\":[{\"index\":0,\"exit\":true,\"reason\":\"...\"}]}",
@@ -183,7 +189,9 @@ export function buildExitPrompt(input: {
     {
       role: "user",
       content: [
-        "index\tsymbol\taddress\tpnlBps\tageSec\ttakeProfitBps\tstopLossBps",
+        timeLimitAuthority
+          ? "index\tsymbol\taddress\tpnlBps\tageSec\ttakeProfitBps\tstopLossBps\tmaxHoldSec"
+          : "index\tsymbol\taddress\tpnlBps\tageSec\ttakeProfitBps\tstopLossBps",
         ...rows,
         ...(input.featureBlocks?.some(Boolean) ? [FEATURE_PROMPT_GUIDANCE, ...input.featureBlocks] : []),
         advisoryBlock(input.owner),

@@ -66,6 +66,9 @@ export function positionView(
     held: position.fillStatus === "unverified" ? "fill-unverified"
       : position.noPriceCount >= 3 ? "no-price" : null,
     closeReason: position.closeReason,
+    closeNote: position.closeNote,
+    autoExitReason: position.autoExitReason,
+    peakPnlBps: position.peakPnlBps?.toString(10) ?? null,
     lastSellRefusal: position.lastSellRefusal,
     lastSellRefusalAt: position.lastSellRefusalAt,
     refusalText: tradeRefusalText(position.lastSellRefusal),

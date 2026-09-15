@@ -967,3 +967,195 @@ describe("trade worker gas cache across a shared wallet (review 3/4)", () => {
     );
   });
 });
+
+describe("trade exit doctrine worker boundaries", () => {
+  it("writes session-expired before readiness and gas, while projection still runs", async () => {
+    const now = Date.now();
+    const h = await harness({ now });
+    const agent = await h.agents.getAgentById("agent-a");
+    assert.ok(agent?.sessionFacts);
+    await h.agents.updateAgentSessionFacts(OWNER, "agent-a", { ...agent.sessionFacts, expiry: Math.floor(now / 1_000) - 1 });
+    let projected = 0;
+    let gasReads = 0;
+    const report = await runTradeWorkerOnce({
+      ...h.deps,
+      reconcile: async () => { projected += 1; },
+      readiness: { ...h.deps.readiness, ready: false },
+      walletNativeBalance: async () => { gasReads += 1; return 0n; },
+    });
+    const [run] = await h.positions.listRuns(OWNER, "agent-a", 1);
+    assert.equal(projected, 1);
+    assert.equal(gasReads, 0);
+    assert.equal(report.outcomes[0]?.reason, "session-expired");
+    assert.equal(run?.reason, "session-expired");
+    assert.equal(run?.events?.[0]?.code, "session-expired");
+  });
+
+  it("stops entries at the clamped session cutoff before any market or model read", async () => {
+    const base = Date.now();
+    const h = await harness({ now: base + 70_000 });
+    const agent = await h.agents.getAgentById("agent-a");
+    assert.ok(agent?.sessionFacts);
+    await h.agents.updateAgentSessionFacts(OWNER, "agent-a", { ...agent.sessionFacts, expiry: Math.floor((base + 130_000) / 1_000) });
+    let balanceReads = 0;
+    let modelCalls = 0;
+    const report = await runTradeWorkerOnce({
+      ...h.deps,
+      provider: { getTokenBalance: async () => { balanceReads += 1; return 100n; } },
+      llmFor: () => ({ complete: async () => { modelCalls += 1; return { model: "fixture", content: JSON.stringify({ decisions: [] }) }; } }),
+    });
+    assert.equal(report.outcomes[0]?.reason, "session-expiring");
+    assert.equal(balanceReads, 0);
+    assert.equal(modelCalls, 0);
+  });
+
+  it("paces time-limit-only model calls and leaves blank price thresholds on the cycle cadence", async () => {
+    const base = Date.now();
+    const counter = { calls: 0 };
+    let now = base;
+    const h = await harness({ now: base, settings: settings({ maxOpenPositions: 1, takeProfitBps: 1_000, stopLossBps: 1_000, maxHoldSec: null }),
+      llm: { complete: async () => { counter.calls += 1; return { model: "fixture", content: JSON.stringify({ decisions: [{ index: 0, exit: false, reason: "hold" }] }) }; } },
+      routeReader: quoteReader(async (_path, amount) => amount),
+    });
+    await openPosition(h, address(950), "paced", base - 1_000);
+    const deps = { ...h.deps, now: () => now, exitLlmIntervalMs: 300_000 };
+    await runTradeWorkerOnce(deps);
+    now += 120_000;
+    await runTradeWorkerOnce(deps);
+    assert.equal(counter.calls, 1);
+    const runs = await h.positions.listRuns(OWNER, "agent-a", 10);
+    assert.ok(runs.some((run) => run.events?.some((event) => event.code === "deferred")));
+    now += 180_000;
+    await runTradeWorkerOnce(deps);
+    assert.equal(counter.calls, 2);
+  });
+
+  it("keeps a crash marker through refusal and closes with its persisted note on retry", async () => {
+    const base = Date.now();
+    let now = base;
+    let quote = 100n;
+    let balance = 100n;
+    let sells = 0;
+    const h = await harness({ now: base, settings: settings({ maxOpenPositions: 1, takeProfitBps: 9_000, stopLossBps: 9_000, maxHoldSec: 86_400 }),
+      tokenBalance: async () => balance,
+      routeReader: quoteReader(async (_path, amount) => amount * quote / 100n),
+      executor: { async execute(input) {
+        if (input.request.side === "sell") {
+          sells += 1;
+          if (sells === 1) return { kind: "rolled-back", code: "REFUSED", meta: {} };
+          balance = 0n;
+        }
+        return { kind: "committed" as const, receipt: { status: "CONFIRMED" as const, transactionHash: HASH },
+          fill: input.request.side === "sell"
+            ? { side: "sell" as const, exitWei: input.request.quotedOutWei, fillStatus: "verified" as const }
+            : { side: "buy" as const, entryWei: input.request.amountWei, tokenAmount: input.request.quotedOutWei, fillStatus: "verified" as const, receiptAttributable: true }, meta: {} };
+      } },
+    });
+    await h.positions.open({ positionId: "crash", agentId: "agent-a", ownerAddress: OWNER, token: address(951),
+      route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 100n, fillStatus: "verified", openedAt: base - 10_000,
+      crashBasisVerified: true });
+    const deps = { ...h.deps, now: () => now };
+    await runTradeWorkerOnce(deps);
+    quote = 40n;
+    now += 120_000;
+    await runTradeWorkerOnce(deps);
+    now += 120_000;
+    await runTradeWorkerOnce(deps);
+    const marked = await h.positions.get(OWNER, "agent-a", "crash");
+    assert.equal(sells, 1);
+    assert.equal(marked?.status, "open");
+    assert.equal(marked?.autoExitReason, "crash-stop");
+    assert.ok(marked?.autoExitNote);
+    now += 120_000;
+    await runTradeWorkerOnce(deps);
+    const closed = await h.positions.get(OWNER, "agent-a", "crash");
+    assert.equal(sells, 2);
+    assert.equal(closed?.status, "closed");
+    assert.equal(closed?.closeReason, "crash-stop");
+    assert.equal(closed?.closeNote, marked?.autoExitNote);
+  });
+
+  // AUDIT (Fable, 2026-09-15) — two mutations survived the builder's suite:
+  // (m2) removing the fence's re-read of `crashProtection` before a crash
+  // intent, and (m3) selling although the marker CAS failed. Both rules are
+  // R3.2 / R4.2 of the spec; both are now pinned here.
+  it("R4.2: a crash marker whose owner has since turned protection OFF creates no sell intent", async () => {
+    const base = Date.now();
+    let sells = 0;
+    const h = await harness({ now: base, settings: settings({ maxOpenPositions: 1, takeProfitBps: 9_000, stopLossBps: 9_000, maxHoldSec: 86_400 }),
+      // A flat quote: neither price threshold can fire, so only the marker could sell.
+      routeReader: quoteReader(async (_path, amount) => amount),
+      executor: { async execute(input) {
+        if (input.request.side === "sell") sells += 1;
+        return { kind: "committed" as const, receipt: { status: "CONFIRMED" as const, transactionHash: HASH },
+          fill: { side: "sell" as const, exitWei: input.request.quotedOutWei, fillStatus: "verified" as const }, meta: {} };
+      } },
+    });
+    await h.positions.open({ positionId: "marked", agentId: "agent-a", ownerAddress: OWNER, token: address(952),
+      route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 100n, fillStatus: "verified", openedAt: base - 10_000,
+      crashBasisVerified: true });
+    // The marker is durable evidence from an earlier cycle; the OFF Save's
+    // cleanup is simulated as having failed, so the row still carries it.
+    const marked = await h.positions.recordCrashEvidence({ ownerAddress: OWNER, agentId: "agent-a", positionId: "marked",
+      expected: { lastQuoteWei: null, lastQuoteBalance: null, lastQuoteRoute: null, lastQuoteAtMs: null,
+        crashPendingSinceMs: null, crashPendingKind: null, crashRefQuoteWei: null, crashRefBalance: null,
+        crashRefAtMs: null, crashRefRoute: null, autoExitReason: null, autoExitAtMs: null, autoExitNote: null },
+      action: { kind: "marker", reason: "crash-stop", atMs: base - 5_000, note: "quote -60% vs last reading" } });
+    assert.equal(marked?.autoExitReason, "crash-stop");
+    // The cycle's settings snapshot (the worker page) still says ON; the owner's
+    // OFF Save lands before the sell reaches the fence, whose re-read says OFF.
+    const off = settings({ maxOpenPositions: 1, takeProfitBps: 9_000, stopLossBps: 9_000, maxHoldSec: 86_400, crashProtection: false });
+    const offRow = { agentId: "agent-a", ownerAddress: OWNER, params: off, digest: tradeSettingsDigest(off), updatedAt: base, drainingAt: null };
+    const settingsStore = new Proxy(h.settingsStore, {
+      get(target, property, receiver) {
+        if (property === "get") return async () => offRow;
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as typeof h.settingsStore;
+    await runTradeWorkerOnce({ ...h.deps, settingsStore, now: () => base + 120_000 });
+    assert.equal(sells, 0, "protection OFF at the fence must refuse the marker-driven sell");
+    assert.equal((await h.intents.listUnsettled(OWNER, "agent-a")).length, 0);
+    assert.equal((await h.positions.get(OWNER, "agent-a", "marked"))?.status, "open");
+  });
+
+  it("R3.2: a marker transition the store refuses cannot authorize that automatic sell", async () => {
+    const base = Date.now();
+    let sells = 0;
+    let quote = 100n;
+    const h = await harness({ now: base, settings: settings({ maxOpenPositions: 1, takeProfitBps: 9_000, stopLossBps: 9_000, maxHoldSec: 86_400 }),
+      routeReader: quoteReader(async (_path, amount) => amount * quote / 100n),
+      executor: { async execute(input) {
+        if (input.request.side === "sell") sells += 1;
+        return { kind: "committed" as const, receipt: { status: "CONFIRMED" as const, transactionHash: HASH },
+          fill: { side: "sell" as const, exitWei: input.request.quotedOutWei, fillStatus: "verified" as const }, meta: {} };
+      } },
+    });
+    await h.positions.open({ positionId: "refused", agentId: "agent-a", ownerAddress: OWNER, token: address(953),
+      route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 100n, fillStatus: "verified", openedAt: base - 10_000,
+      crashBasisVerified: true });
+    // A store whose evidence CAS always loses (a concurrent writer moved the row).
+    const positions = new Proxy(h.positions, {
+      get(target, property, receiver) {
+        if (property === "recordCrashEvidence") {
+          return async (input: Parameters<typeof target.recordCrashEvidence>[0]) =>
+            input.action.kind === "marker" ? null : target.recordCrashEvidence(input);
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as typeof h.positions;
+    const deps = { ...h.deps, positions };
+    let now = base;
+    await runTradeWorkerOnce({ ...deps, now: () => now });
+    quote = 40n;
+    now += 120_000;
+    await runTradeWorkerOnce({ ...deps, now: () => now });
+    now += 120_000;
+    await runTradeWorkerOnce({ ...deps, now: () => now });
+    assert.equal(sells, 0, "the marker could not be written durably, so no crash sell may be submitted");
+    const row = await h.positions.get(OWNER, "agent-a", "refused");
+    assert.equal(row?.autoExitReason, null);
+    assert.equal(row?.crashPendingKind, "collapse", "the arm persisted; only the marker transition was refused");
+  });
+});

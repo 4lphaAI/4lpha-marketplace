@@ -35,15 +35,15 @@ export type TradeWorkerSettingsPage = {
 };
 
 export interface TradeSettingsStore {
-  get(ownerAddress: Address, agentId: string): Promise<TradeSettingsRecord | null>;
+  get(ownerAddress: Address, agentId: string, sql?: SqlClient): Promise<TradeSettingsRecord | null>;
   /** First-wins activation write used by Trading hire convergence. */
   putInitialIfAbsentOrSameDigest(input: PutTradeSettingsInput): Promise<PutInitialTradeSettingsResult>;
-  put(input: PutTradeSettingsInput): Promise<TradeSettingsRecord>;
+  put(input: PutTradeSettingsInput, sql?: SqlClient): Promise<TradeSettingsRecord>;
   requestDrain(ownerAddress: Address, agentId: string): Promise<TradeSettingsRecord | null>;
   withEntryFence<T>(
     ownerAddress: Address,
     agentId: string,
-    work: () => Promise<T>,
+    work: (sql: SqlClient | undefined) => Promise<T>,
   ): Promise<{ readonly kind: "allowed"; readonly value: T } | { readonly kind: "draining" }>;
   listTradeAgentsForWorker(input: {
     readonly limit: number;
@@ -144,12 +144,12 @@ export class MemoryTradeSettingsStore implements TradeSettingsStore {
     });
   }
 
-  async withEntryFence<T>(ownerAddress: Address, agentId: string, work: () => Promise<T>): Promise<{ readonly kind: "allowed"; readonly value: T } | { readonly kind: "draining" }> {
+  async withEntryFence<T>(ownerAddress: Address, agentId: string, work: (sql: SqlClient | undefined) => Promise<T>): Promise<{ readonly kind: "allowed"; readonly value: T } | { readonly kind: "draining" }> {
     return this.#withFence(agentId, async () => {
       const row = this.#rows.get(agentId);
       if (row === undefined || row.ownerAddress !== ownerKey(ownerAddress)) throw new Error("Trade settings are unavailable.");
       if (row.drainingAt !== null) return { kind: "draining" } as const;
-      return { kind: "allowed", value: await work() } as const;
+      return { kind: "allowed", value: await work(undefined) } as const;
     });
   }
 
@@ -251,8 +251,8 @@ export class PostgresTradeSettingsStore implements TradeSettingsStore {
     return new PostgresTradeSettingsStore(sql, now);
   }
 
-  async get(ownerAddress: Address, agentId: string): Promise<TradeSettingsRecord | null> {
-    const result = await this.#sql.query<SettingsRow>(
+  async get(ownerAddress: Address, agentId: string, sql: SqlClient = this.#sql): Promise<TradeSettingsRecord | null> {
+    const result = await sql.query<SettingsRow>(
       `/* tradeSettings.get */
        select ${SETTINGS_COLUMNS}
        from trade_settings ts
@@ -263,9 +263,9 @@ export class PostgresTradeSettingsStore implements TradeSettingsStore {
     return row === undefined ? null : rowToRecord(row);
   }
 
-  async put(input: PutTradeSettingsInput): Promise<TradeSettingsRecord> {
+  async put(input: PutTradeSettingsInput, sql: SqlClient = this.#sql): Promise<TradeSettingsRecord> {
     // TRADING-AGENT R5: the owner predicate is inside the one upsert statement.
-    const result = await this.#sql.query<SettingsRow>(
+    const result = await sql.query<SettingsRow>(
       `/* tradeSettings.put */
        insert into trade_settings (agent_id, owner_address, params, digest, updated_at)
        values ($1, $2, $3::jsonb, $4, $5)
@@ -332,7 +332,7 @@ export class PostgresTradeSettingsStore implements TradeSettingsStore {
     });
   }
 
-  async withEntryFence<T>(ownerAddress: Address, agentId: string, work: () => Promise<T>): Promise<{ readonly kind: "allowed"; readonly value: T } | { readonly kind: "draining" }> {
+  async withEntryFence<T>(ownerAddress: Address, agentId: string, work: (sql: SqlClient | undefined) => Promise<T>): Promise<{ readonly kind: "allowed"; readonly value: T } | { readonly kind: "draining" }> {
     return this.#sql.transaction(async (tx) => {
       await tx.query(`/* tradeSettings.fence */ select pg_advisory_xact_lock(hashtext($1))`, [agentId]);
       const result = await tx.query<SettingsRow>(
@@ -343,7 +343,7 @@ export class PostgresTradeSettingsStore implements TradeSettingsStore {
       const row = result.rows[0];
       if (row === undefined) throw new Error("Trade settings are unavailable.");
       if (row.draining_at !== null) return { kind: "draining" } as const;
-      return { kind: "allowed", value: await work() } as const;
+      return { kind: "allowed", value: await work(tx) } as const;
     });
   }
 

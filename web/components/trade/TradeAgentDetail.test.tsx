@@ -14,9 +14,9 @@ function view(over: Partial<AgentDetailView> = {}): AgentDetailView {
     id: "trading-agent-01", status: "armed", httpRuntimeProfile: "trade-v1", hireSizingName: "trade-v1",
     walletAddress: "0x2222222222222222222222222222222222222222", sessionPublicKey: `0x${"33".repeat(64)}`, sessionExpiresAt: null,
     provisioning: false, actionDisabledReason: null, armMs: 1_000,
-    dailyNativeLimit: metric("— session limit unavailable"), recordedCycleDelta: metric("— not a grid agent"),
-    grossPnl: metric("— not a grid agent"), grossPnlPercent: metric("— not a grid agent"), recordedCycles: metric("— not a grid agent"),
-    levels: [], cycleHistoryAvailable: false, cycleNote: "— not a grid agent", gas: null, motions: [], sequences: [], positions: [],
+    dailyNativeLimit: metric("â€” session limit unavailable"), recordedCycleDelta: metric("â€” not a grid agent"),
+    grossPnl: metric("â€” not a grid agent"), grossPnlPercent: metric("â€” not a grid agent"), recordedCycles: metric("â€” not a grid agent"),
+    levels: [], cycleHistoryAvailable: false, cycleNote: "â€” not a grid agent", gas: null, motions: [], sequences: [], positions: [],
     ...over,
   } as AgentDetailView;
 }
@@ -54,10 +54,10 @@ function props(v: AgentDetailView, t: TradeView) {
 
 describe("the Edit panel tells the truth about \"no time limit\" (2026-09-15)", () => {
   it("phrases the consequence from the thresholds the way the worker behaves", () => {
-    expect(noLimitNote({ takeProfitBps: 2_000, stopLossBps: 2_500 })).toBe("No time limit — positions exit only on take profit or stop loss.");
-    expect(noLimitNote({ takeProfitBps: 2_000, stopLossBps: null })).toBe("No time limit — positions exit only on take profit, or when the model says so.");
-    expect(noLimitNote({ takeProfitBps: null, stopLossBps: 2_500 })).toBe("No time limit — positions exit only on stop loss, or when the model says so.");
-    expect(noLimitNote({ takeProfitBps: null, stopLossBps: null })).toBe("No time limit — positions exit only when the model says so.");
+    expect(noLimitNote({ takeProfitBps: 2_000, stopLossBps: 2_500 })).toBe("No time limit — the model decides when to exit; take profit or stop loss still apply.");
+    expect(noLimitNote({ takeProfitBps: 2_000, stopLossBps: null })).toBe("No time limit — the model decides when to exit; take profit still apply.");
+    expect(noLimitNote({ takeProfitBps: null, stopLossBps: 2_500 })).toBe("No time limit — the model decides when to exit; stop loss still apply.");
+    expect(noLimitNote({ takeProfitBps: null, stopLossBps: null })).toBe("No time limit — the model decides when to exit.");
   });
 
   it("shows an unticked box and the note for a null hold, and a stepper once ticked — never \"120 min\" over no limit", async () => {
@@ -68,11 +68,40 @@ describe("the Edit panel tells the truth about \"no time limit\" (2026-09-15)", 
       await act(async () => { [...host.querySelectorAll("button")].find((button) => button.textContent === "Edit")!.click(); });
       const hold = [...host.querySelectorAll("label")].find((label) => label.textContent?.includes("Max holding time"))!;
       expect(hold.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked).toBe(false);
-      expect(hold.textContent).toContain("No time limit — positions exit only on take profit or stop loss.");
+      expect(hold.textContent).toContain("No time limit — the model decides when to exit; take profit or stop loss still apply.");
       expect(hold.querySelector('input[type="number"]')).toBeNull();
       await act(async () => { hold.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click(); });
       expect(hold.querySelector<HTMLInputElement>('input[type="number"]')!.value).toBe("120");
       expect(hold.textContent).not.toContain("No time limit");
+    } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+  });
+
+  it("round-trips crash protection in the edit panel and renders the automatic labels", async () => {
+    const host = document.createElement("div"), root = createRoot(host);
+    let saved: TradeSettings | null = null;
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ data: {} }) })));
+    try {
+      const t = trade(0, { settings: settings({ crashProtection: true }), closed: [{
+        positionId: "closed", token: "0x0000000000000000000000000000000000000001", route: { hops: [], fees: [] },
+        entryWei: "100", tokenAmount: "100", fillStatus: "verified", openedAt: NOW - 1_000, entryTxHash: null,
+        status: "closed", pnlBps: null, exitRequestedAt: null, orphanedAt: null, closedAt: NOW, exitWei: null,
+        exitTxHash: null, soldTokenAmount: null, exitFillStatus: "unverified", closeReason: "crash-stop",
+        closeNote: "quote -60% vs last reading", refusalText: null, observation: null,
+      }] });
+      const p = { ...props(view(), t), saveSettings: async (next: TradeSettings) => { saved = next; } };
+      await act(async () => root.render(<TradeAgentDetail {...p} />));
+      await act(async () => { [...host.querySelectorAll("button")].find((button) => button.textContent === "Edit")!.click(); });
+      const crash = [...host.querySelectorAll("label")].find((label) => label.textContent?.includes("Crash protection"))!;
+      const checkbox = crash.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+      expect(checkbox.checked).toBe(true);
+      await act(async () => { checkbox.click(); });
+      await act(async () => { [...host.querySelectorAll("button")].find((button) => button.textContent === "Save")!.click(); });
+      expect((saved as TradeSettings | null)?.crashProtection).toBe(false);
+      await act(async () => root.render(<TradeAgentDetail {...p} />));
+      await act(async () => { [...host.querySelectorAll("button")].find((button) => button.textContent === "Closed Positions")!.click(); });
+      expect(host.textContent).toContain("crash stop");
+      expect(host.textContent).not.toContain("crash-stop");
+      expect(host.textContent).toContain("quote -60% vs last reading");
     } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
   });
 });
@@ -116,6 +145,7 @@ describe("the session clock on the trade page (2026-09-15)", () => {
       expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
       expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
       expect(host.querySelector('[role="alert"]')?.textContent).toBe("Session expired — the agent can't trade or sell. Withdraw tokens from Account, or hire again.");
+      expect(host.textContent).toContain("Hard revoke");
     } finally { await done(); }
   });
 

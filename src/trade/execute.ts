@@ -66,7 +66,7 @@ export type ExecuteTradeDeps = {
 };
 
 export type TradeReceiptFill =
-  | { readonly side: "buy"; readonly entryWei: bigint; readonly tokenAmount: bigint | null; readonly fillStatus: "verified" | "unverified" }
+  | { readonly side: "buy"; readonly entryWei: bigint; readonly tokenAmount: bigint | null; readonly fillStatus: "verified" | "unverified"; readonly receiptAttributable?: boolean }
   | { readonly side: "sell"; readonly exitWei: bigint | null; readonly fillStatus: "verified" | "unverified" };
 
 const TRANSFER_TOPIC = keccak256(stringToBytes("Transfer(address,address,uint256)"));
@@ -118,7 +118,7 @@ export async function tradeReceiptFill(input: {
   if (input.request.side === "buy") {
     const delta = tokenDelta(logs, input.request.token, input.walletAddress);
     return { side: "buy", entryWei: input.nativeInWei, tokenAmount: delta > 0n ? delta : null,
-      fillStatus: delta > 0n ? "verified" : "unverified" };
+      fillStatus: delta > 0n ? "verified" : "unverified", receiptAttributable: delta > 0n };
   }
   const exitWei = nativeWithdrawal(logs, input.wbnb);
   return { side: "sell", exitWei: exitWei > 0n ? exitWei : null,

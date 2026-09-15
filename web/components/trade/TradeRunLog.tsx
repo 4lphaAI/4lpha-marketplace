@@ -88,6 +88,8 @@ export function runLabel(reason: string): string {
     "no-candidates": "No candidates passed screening", "llm-invalid": "LLM response rejected",
     "llm-unavailable": "LLM unavailable", "draining": "Closing positions",
     "entry-budget-too-small": "Entry budget cannot cover fees", "dry-run": "Simulation completed",
+    "session-expired": "Session expired — nothing can execute",
+    "session-expiring": "No new entries — session ends soon",
   };
   return labels[code] ?? code.replace(/[-_]/gu, " ");
 }

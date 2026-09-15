@@ -209,20 +209,23 @@ export function HireTradeDeploy(props: {
   const activeRun = React.useRef<GridDeployRun | null>(null);
   const mounted = React.useRef(true);
   const resumed = React.useRef(false);
+  const hireSettings = React.useMemo(() => props.settings.crashProtection === undefined
+    ? { ...props.settings, crashProtection: true }
+    : props.settings, [props.settings]);
 
   const capDayWei = parseBnbToWei(props.capitalBnb);
   const conservativeSizing = checkTradeSizing({
     capDayWei,
-    entryWei: BigInt(props.settings.entryWei),
-    maxOpenPositions: props.settings.maxOpenPositions,
+    entryWei: BigInt(hireSettings.entryWei),
+    maxOpenPositions: hireSettings.maxOpenPositions,
     grantedTokenCount: maxGrantedTokens(props.executionModel),
     platformFeeBps: MAX_PLATFORM_FEE_BPS,
   });
   const previewMatches = preview !== null
     && preview.capDayWei === capDayWei.toString(10)
     && preview.sizing.executionModel === props.executionModel
-    && preview.sizing.entryWei === props.settings.entryWei
-    && preview.sizing.maxOpenPositions === props.settings.maxOpenPositions;
+    && preview.sizing.entryWei === hireSettings.entryWei
+    && preview.sizing.maxOpenPositions === hireSettings.maxOpenPositions;
   const sizingOk = previewMatches ? preview.sizing.ok : conservativeSizing.ok;
   const minimumWei = previewMatches ? previewMinimumWei(preview) : conservativeSizing.minimumCapWei;
   const sizingMessage = sizingOk ? null
@@ -299,7 +302,7 @@ export function HireTradeDeploy(props: {
       walletAddress: owner.walletAddress,
       capDayWei: capDayWei.toString(10),
       executionModel: props.executionModel,
-      settings: props.settings,
+      settings: hireSettings,
     }).then((result) => {
       if (current) {
         setPreview(result);
@@ -312,7 +315,7 @@ export function HireTradeDeploy(props: {
       }
     });
     return () => { current = false; };
-  }, [capDayWei, fetchPreview, owner.walletAddress, props.blockedReason, props.executionModel, props.settings]);
+  }, [capDayWei, fetchPreview, hireSettings, owner.walletAddress, props.blockedReason, props.executionModel]);
 
   const readContinuation = React.useCallback(async (current: TradeHireRecord): Promise<HireSessionView> => {
     if (current.provisionEnvelope === null) throw new Error("The hire signature was not completed; press Sign hire again.");
@@ -362,7 +365,7 @@ export function HireTradeDeploy(props: {
       executionModel: props.executionModel,
       hireRunId,
       autoGrant: true,
-      settings: props.settings,
+      settings: hireSettings,
     };
     if (getAddress(params.walletAddress) !== getAddress(owner.walletAddress)) {
       throw new Error("The saved hire belongs to a different passkey wallet.");
@@ -407,8 +410,8 @@ export function HireTradeDeploy(props: {
       }
     }
     throw new Error(`Every candidate name around "${base}" is already claimed. Rename the agent and try again.`);
-  }, [assertRunActive, blocked, capDayWei, loadPreview, owner.passkey, owner.signEnvelope, owner.walletAddress,
-    props.agentName, props.executionModel, props.settings, readContinuation, submitSignedHire]);
+  }, [assertRunActive, blocked, capDayWei, hireSettings, loadPreview, owner.passkey, owner.signEnvelope, owner.walletAddress,
+    props.agentName, props.executionModel, readContinuation, submitSignedHire]);
 
   const deployAll = React.useCallback(async (seed?: TradeHireRecord | null): Promise<void> => {
     if (activeRun.current !== null) return;
@@ -673,6 +676,7 @@ export function HireTradeDeploy(props: {
 
   return <div style={{ display: "grid", gap: 14, marginTop: 26, paddingTop: 20, borderTop: "1px solid var(--line-1)" }}>
     <span className="fl-eyebrow">Hire the scoped agent session</span>
+    <p>Crash protection: {hireSettings.crashProtection === true ? "ON" : "OFF"}.</p>
     {preview ? <div style={{ display: "grid", gap: 6, color: "var(--text-muted)", font: "var(--type-body-sm)" }}>
       <p>Capital floor: {formatEther(previewMinimumWei(preview))} BNB, including entry fees and exit gas reserves.</p>
     </div> : null}

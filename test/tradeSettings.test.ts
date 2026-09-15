@@ -8,7 +8,9 @@ import {
   MAX_INSTRUCTIONS_ENCODED_BYTES,
   MAX_SKILL_MARKDOWN_ENCODED_BYTES,
   encodedJsonStringBytes,
+  immutableTradeSettingChange,
   parseTradeSettings,
+  tradeSettingsDigest,
 } from "../src/trade/settings.js";
 
 describe("trade settings codec", () => {
@@ -70,5 +72,22 @@ describe("trade settings codec", () => {
     for (const [key, value] of cases) {
       assert.equal(parseTradeSettings({ ...DEFAULT_TRADE_SETTINGS, [key]: value }).ok, false, key);
     }
+  });
+
+  it("keeps raw and effective settings separate, with absent crash protection off", () => {
+    const { crashProtection: _removed, ...legacy } = DEFAULT_TRADE_SETTINGS;
+    const parsed = parseTradeSettings(legacy);
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    assert.equal(Object.hasOwn(parsed.value.raw, "crashProtection"), false);
+    assert.equal(parsed.value.effective.crashProtection, false);
+    assert.equal(tradeSettingsDigest(parsed.value.raw), "0xb34733da23bd5e68c2254b4a2657c502d620d8cdbf3dfe52e62548841e57b007");
+    assert.equal(tradeSettingsDigest(DEFAULT_TRADE_SETTINGS), "0x74ea4a3c9914e6acdc7416ca5baeda0955d2f79db74e6407e05d8d196ffdf91e");
+    assert.notEqual(tradeSettingsDigest(parsed.value.raw), tradeSettingsDigest(DEFAULT_TRADE_SETTINGS));
+    assert.equal(immutableTradeSettingChange(parsed.value.effective, { ...parsed.value.effective, crashProtection: true }), null);
+  });
+
+  it("rejects a present non-boolean crash protection field", () => {
+    assert.equal(parseTradeSettings({ ...DEFAULT_TRADE_SETTINGS, crashProtection: "on" }).ok, false);
   });
 });

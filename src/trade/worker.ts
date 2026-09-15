@@ -1,17 +1,17 @@
 /** One bounded autonomous trading pass (TRADING-AGENT R3.8 / C31). */
 import { randomUUID } from "node:crypto";
-import type { Address, Hex } from "viem";
+import { keccak256, stringToBytes, type Address, type Hex } from "viem";
 import type { ExecutionReceipt, WalletProvider } from "../core/types.js";
 import { sanitizeMessage } from "../core/errors.js";
 import type { TradeRequest } from "../http/wire.js";
 import type { ScanGate } from "../rules/scanGate.js";
 import type { AgentRecord, AgentStore } from "../store/agents.js";
 import type { ExecutionJournal } from "../store/journal.js";
-import type { TradeCloseReason, TradePositionRecord, TradePositionStore } from "../store/tradePositions.js";
+import type { TradeCloseReason, TradeCrashEvidenceAction, TradeEvidenceExpected, TradePositionRecord, TradePositionStore } from "../store/tradePositions.js";
 import type { TradeIntentRecord, TradeIntentStore } from "../store/tradeIntents.js";
 import type { TradeSettingsRecord, TradeSettingsStore } from "../store/tradeSettings.js";
 import { grantsTokenSell } from "../ops/policy.js";
-import { applySlippageFloorWei, decideExit, pnlBps } from "./exits.js";
+import { applySlippageFloorWei, decideExit, hasBlankThreshold, pnlBps, RUG_QUOTE_WINDOW_MS, SESSION_ENTRY_CUTOFF_MS, SESSION_EXIT_LEAD_MS, type ExitEvidence } from "./exits.js";
 import {
   buildEntryPrompt,
   buildExitPrompt,
@@ -29,7 +29,9 @@ import {
   type BestBuyRoute,
   type RouteQuoteReader,
 } from "./route.js";
-import { parseTradeSettings, type TradeSettings } from "./settings.js";
+import { parseTradeSettings, type EffectiveTradeSettings } from "./settings.js";
+import { canonicalEncode } from "../auth/canonical.js";
+import { MAX_TRADE_SESSION_SECONDS } from "../ops/policy.js";
 import {
   createTradeVerdictCache,
   selectEntryCandidates,
@@ -47,7 +49,7 @@ import { enrichFeatures, featurePrompt, assessMomentum, featureModel } from "./f
 
 export type TradeExecutionMeta = Readonly<Record<string, unknown>>;
 export type TradeExecutorFill =
-  | { readonly side: "buy"; readonly entryWei: bigint; readonly tokenAmount: bigint | null; readonly fillStatus: "verified" | "unverified" }
+  | { readonly side: "buy"; readonly entryWei: bigint; readonly tokenAmount: bigint | null; readonly fillStatus: "verified" | "unverified"; readonly receiptAttributable?: boolean }
   | { readonly side: "sell"; readonly exitWei: bigint | null; readonly fillStatus: "verified" | "unverified" };
 
 export type TradeExecutorResult =
@@ -91,9 +93,9 @@ export type TradeWorkerReport = {
 
 export type TradeWorkerDeps = {
   readonly agentStore: Pick<AgentStore, "getAgentById">;
-  readonly settingsStore: Pick<TradeSettingsStore, "listTradeAgentsForWorker" | "listTradeAgentsForProjection" | "withEntryFence">;
+  readonly settingsStore: Pick<TradeSettingsStore, "get" | "listTradeAgentsForWorker" | "listTradeAgentsForProjection" | "withEntryFence">;
   readonly positions: Pick<TradePositionStore,
-    "get" | "list" | "listOpen" | "open" | "closePosition" | "recordSellRefusal" | "resolveFill" | "incrementNoPrice" | "resetNoPrice" | "markOrphaned" | "insertRun">;
+    "get" | "list" | "listOpen" | "open" | "closePosition" | "recordSellRefusal" | "resolveFill" | "recordQuote" | "recordCrashEvidence" | "incrementNoPrice" | "resetNoPrice" | "markOrphaned" | "insertRun">;
   readonly intents: Pick<TradeIntentStore, "create" | "listUnsettled" | "markSubmitted" | "markProjected" | "markRolledBack">;
   readonly journal: Pick<ExecutionJournal, "get">;
   readonly dataPlane: TradeDataPlaneReads;
@@ -141,6 +143,8 @@ export type TradeWorkerDeps = {
   readonly gasBackoff?: TradeGasBackoff;
   /** The daemon's cycle interval, for the backoff ladder. Defaults to 60 s. */
   readonly intervalMs?: number;
+  /** Minimum process-local interval for time-limit-only exit-model calls. */
+  readonly exitLlmIntervalMs?: number;
   readonly log?: (message: string) => void;
 };
 
@@ -163,6 +167,15 @@ export type RunTradeWorkerOptions = {
 };
 
 type MutableCounts = { events?: TradeRunEvent[]; startedAt?: number; candidates: number; refusals: number; entries: number; exits: number; heldNoPrice: number };
+
+export const TRADE_EXIT_LLM_INTERVAL_MS = 300_000;
+const exitLlmAttemptAt = new Map<string, number>();
+
+function exitLlmIntervalMs(deps: TradeWorkerDeps): number {
+  const configured = deps.exitLlmIntervalMs
+    ?? Number.parseInt(process.env["TRADE_EXIT_LLM_INTERVAL_MS"] ?? "", 10);
+  return Number.isFinite(configured) && configured >= 0 ? configured : TRADE_EXIT_LLM_INTERVAL_MS;
+}
 
 function observe(counts: MutableCounts, event: Omit<TradeRunEvent, "elapsedMs">): void {
   if (counts.events === undefined || counts.events.length >= 100) return;
@@ -200,10 +213,41 @@ export function prefilterEvent(prefilter: PinnedPrefilterSummary): Omit<TradeRun
   };
 }
 
-function settingsFrom(value: unknown): TradeSettings {
+function settingsFrom(value: unknown): EffectiveTradeSettings {
   const parsed = parseTradeSettings(value);
   if (!parsed.ok) throw new Error("Stored trade settings are invalid.");
-  return parsed.value;
+  return parsed.value.effective;
+}
+
+function routeKey(venue: PricedPosition["venue"], route: TradePositionRecord["route"]): string {
+  return `${venue}:${keccak256(stringToBytes(canonicalEncode(route)))}`;
+}
+
+function evidenceExpected(position: TradePositionRecord): TradeEvidenceExpected {
+  return {
+    lastQuoteWei: position.lastQuoteWei,
+    lastQuoteBalance: position.lastQuoteBalance,
+    lastQuoteRoute: position.lastQuoteRoute,
+    lastQuoteAtMs: position.lastQuoteAtMs,
+    crashPendingSinceMs: position.crashPendingSinceMs,
+    crashPendingKind: position.crashPendingKind,
+    crashRefQuoteWei: position.crashRefQuoteWei,
+    crashRefBalance: position.crashRefBalance,
+    crashRefAtMs: position.crashRefAtMs,
+    crashRefRoute: position.crashRefRoute,
+    autoExitReason: position.autoExitReason,
+    autoExitAtMs: position.autoExitAtMs,
+    autoExitNote: position.autoExitNote,
+  };
+}
+
+function evidenceAction(evidence: ExitEvidence): TradeCrashEvidenceAction {
+  if (evidence.kind === "clear") return evidence;
+  if (evidence.kind === "arm") return {
+    kind: "arm", pendingKind: evidence.pendingKind, pendingSinceMs: evidence.pendingSinceMs,
+    reference: evidence.reference,
+  };
+  return evidence;
 }
 
 function venueForRoute(route: TradePositionRecord["route"]): "pancake_v2" | "pancake_v3" {
@@ -249,6 +293,7 @@ type PricedPosition = {
   readonly quoteOutWei: bigint;
   readonly route: TradePositionRecord["route"];
   readonly venue: "pancake_v2" | "pancake_v3";
+  readonly routeKey: string;
 };
 
 async function repairSellRoute(
@@ -256,14 +301,14 @@ async function repairSellRoute(
   position: TradePositionRecord,
   balance: bigint,
   signal?: AbortSignal,
-): Promise<Omit<PricedPosition, "position" | "balance"> | null> {
+): Promise<Omit<PricedPosition, "position" | "balance" | "routeKey"> | null> {
   const probes = [
     { venue: "pancake_v2" as const, route: { hops: [], fees: [] } },
     ...([100, 500, 2_500, 10_000] as const).map((fee) => ({ venue: "pancake_v3" as const, route: { hops: [], fees: [fee] } })),
     { venue: "pancake_v3" as const, route: { hops: [USDT_56], fees: [100, 100] as const } },
     { venue: "pancake_v3" as const, route: { hops: [USDT_56], fees: [500, 100] as const } },
   ];
-  let best: Omit<PricedPosition, "position" | "balance"> | null = null;
+  let best: Omit<PricedPosition, "position" | "balance" | "routeKey"> | null = null;
   for (const probe of probes) {
     try {
       const quoteOutWei = await quoteSellAlongRoute({
@@ -325,14 +370,14 @@ async function pricePositions(
         ...(deps.routeReader === undefined ? {} : { reader: deps.routeReader }),
       });
       await deps.positions.resetNoPrice(agent.ownerAddress, agent.id, position.positionId);
-      priced.push({ position, balance, quoteOutWei, venue, route: position.route });
+      priced.push({ position, balance, quoteOutWei, venue, route: position.route, routeKey: routeKey(venue, position.route) });
     } catch {
       signal?.throwIfAborted();
       const repair = repaired ? null : await repairSellRoute(deps, position, balance, signal);
       repaired = true;
       if (repair !== null) {
         await deps.positions.resetNoPrice(agent.ownerAddress, agent.id, position.positionId);
-        priced.push({ position, balance, ...repair });
+        priced.push({ position, balance, ...repair, routeKey: routeKey(repair.venue, repair.route) });
         continue;
       }
       const row = await deps.positions.incrementNoPrice(agent.ownerAddress, agent.id, position.positionId);
@@ -349,6 +394,7 @@ async function projectIntent(
   txHash: Hex,
   fill: TradeExecutorFill,
   signal?: AbortSignal,
+  useIntentNote = false,
 ): Promise<boolean> {
   if (intent.side === "buy") {
     if (fill.side !== "buy") return false;
@@ -368,6 +414,7 @@ async function projectIntent(
         fillStatus: fill.fillStatus,
         openedAt: intent.createdAt,
         entryTxHash: txHash,
+        crashBasisVerified: fill.receiptAttributable === true,
       });
     }
     await deps.intents.markProjected(agent.ownerAddress, agent.id, intent.decisionId);
@@ -394,6 +441,7 @@ async function projectIntent(
       soldTokenAmount: intent.amountWei,
       exitFillStatus: fill.fillStatus,
       reason: intent.closeReason ?? "owner-request",
+      note: useIntentNote ? intent.note : null,
     });
   }
   await deps.intents.markProjected(agent.ownerAddress, agent.id, intent.decisionId);
@@ -431,15 +479,13 @@ async function reconcileTradeIntents(
 async function sellPosition(
   deps: TradeWorkerDeps,
   agent: AgentRecord,
-  settings: TradeSettings,
+  settings: EffectiveTradeSettings,
   priced: PricedPosition,
   closeReason: Exclude<TradeCloseReason, "balance-gone">,
   counts: MutableCounts,
   signal?: AbortSignal,
+  decisionNote: string | null = null,
 ): Promise<void> {
-  const prior = (await deps.intents.listUnsettled(agent.ownerAddress, agent.id))
-    .find((intent) => intent.side === "sell" && intent.positionId === priced.position.positionId);
-  if (prior !== undefined) return;
   const request: TradeRequest = {
     decisionId: randomUUID(),
     venue: tradeVenue(priced.venue),
@@ -451,19 +497,46 @@ async function sellPosition(
     route: priced.route,
   };
   const identity = deps.executionIdentity(agent, request);
-  const intent = await deps.intents.create({
+  const createInput = {
     decisionId: request.decisionId,
     idempotencyKey: identity.idempotencyKey,
     agentId: agent.id,
     ownerAddress: agent.ownerAddress,
-    side: "sell",
+    side: "sell" as const,
     token: request.token,
     route: priced.route,
     amountWei: priced.balance,
     entryWei: priced.position.entryWei,
     positionId: priced.position.positionId,
     closeReason,
-  });
+    ...(decisionNote === null ? {} : { note: decisionNote }),
+  };
+  let intent: TradeIntentRecord | null = null;
+  const markerDriven = closeReason === "crash-stop" || closeReason === "session-expiring";
+  if (markerDriven) {
+    const fenced = await deps.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async (sql) => {
+      const currentSettingsRow = await deps.settingsStore.get(agent.ownerAddress, agent.id, sql);
+      if (currentSettingsRow === null) return null;
+      const currentSettings = settingsFrom(currentSettingsRow.params);
+      if (closeReason === "crash-stop" && currentSettings.crashProtection !== true) return null;
+      const current = await deps.positions.get(agent.ownerAddress, agent.id, priced.position.positionId, sql);
+      if (current === null || current.status !== "open" || current.autoExitReason !== closeReason) return null;
+      const prior = (await deps.intents.listUnsettled(agent.ownerAddress, agent.id, sql))
+        .find((row) => row.side === "sell" && row.positionId === priced.position.positionId);
+      if (prior !== undefined) return null;
+      return deps.intents.create({ ...createInput,
+        ...(current.autoExitNote === null ? {} : { note: current.autoExitNote }),
+      }, sql);
+    });
+    if (fenced.kind === "draining" || fenced.value === null) return;
+    intent = fenced.value;
+  } else {
+    const prior = (await deps.intents.listUnsettled(agent.ownerAddress, agent.id))
+      .find((row) => row.side === "sell" && row.positionId === priced.position.positionId);
+    if (prior !== undefined) return;
+    intent = await deps.intents.create(createInput);
+  }
+  if (intent === null) return;
   const result = await execute(deps, agent, request, {
     async evaluate() { return { verdict: "allow", reasons: [] }; },
   }, signal);
@@ -474,7 +547,7 @@ async function sellPosition(
       await deps.intents.markSubmitted(agent.ownerAddress, agent.id, intent.decisionId, txHash);
       const fill = result.fill?.side === "sell" ? result.fill
         : { side: "sell" as const, exitWei: null, fillStatus: "unverified" as const };
-      if (await projectIntent(deps, agent, intent, txHash, fill, signal)) counts.exits += 1;
+      if (await projectIntent(deps, agent, intent, txHash, fill, signal, true)) counts.exits += 1;
     }
   } else {
     if (result.kind === "denied" || result.kind === "rolled-back") {
@@ -487,10 +560,69 @@ async function sellPosition(
   }
 }
 
+async function persistExitEvidence(
+  deps: TradeWorkerDeps,
+  agent: AgentRecord,
+  position: TradePositionRecord,
+  evidence: ExitEvidence,
+): Promise<boolean> {
+  const fenced = await deps.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async (sql) => {
+    const currentSettingsRow = await deps.settingsStore.get(agent.ownerAddress, agent.id, sql);
+    if (currentSettingsRow === null) return false;
+    const currentSettings = settingsFrom(currentSettingsRow.params);
+    if (evidence.kind !== "marker" || evidence.reason === "crash-stop") {
+      if (currentSettings.crashProtection !== true) return false;
+    }
+    const current = await deps.positions.get(agent.ownerAddress, agent.id, position.positionId, sql);
+    if (current === null || current.status !== "open") return false;
+    return (await deps.positions.recordCrashEvidence({
+      ownerAddress: agent.ownerAddress,
+      agentId: agent.id,
+      positionId: position.positionId,
+      expected: evidenceExpected(position),
+      action: evidenceAction(evidence),
+    }, sql)) !== null;
+  });
+  return fenced.kind === "allowed" && fenced.value;
+}
+
+async function persistQuoteTelemetry(
+  deps: TradeWorkerDeps,
+  agent: AgentRecord,
+  item: PricedPosition,
+  decisionPnlBps: bigint | null,
+  atMs: number,
+  counts: MutableCounts,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    const recorded = await deps.positions.recordQuote({
+      ownerAddress: agent.ownerAddress,
+      agentId: agent.id,
+      positionId: item.position.positionId,
+      quoteOutWei: item.quoteOutWei,
+      balance: item.balance,
+      routeKey: item.routeKey,
+      pnlBps: decisionPnlBps,
+      atMs,
+      expected: {
+        lastQuoteWei: item.position.lastQuoteWei,
+        lastQuoteBalance: item.position.lastQuoteBalance,
+        lastQuoteRoute: item.position.lastQuoteRoute,
+        lastQuoteAtMs: item.position.lastQuoteAtMs,
+      },
+    });
+    if (recorded === null) observe(counts, { stage: "sell", code: "telemetry-unavailable", token: item.position.token });
+  } catch {
+    signal?.throwIfAborted();
+    observe(counts, { stage: "sell", code: "telemetry-unavailable", token: item.position.token });
+  }
+}
+
 async function runExits(
   deps: TradeWorkerDeps,
   agent: AgentRecord,
-  settings: TradeSettings,
+  settings: EffectiveTradeSettings,
   counts: MutableCounts,
   nowMs: number,
   draining: boolean,
@@ -502,23 +634,53 @@ async function runExits(
     || left.openedAt - right.openedAt);
   const priced = await pricePositions(deps, agent, ordered, counts, signal);
   const llmCandidates: PricedPosition[] = [];
+  const unsettledSellPositions = new Set((await deps.intents.listUnsettled(agent.ownerAddress, agent.id))
+    .filter((intent) => intent.side === "sell")
+    .map((intent) => intent.positionId));
+  const sessionExpiresAtMs = agent.sessionFacts?.expiry === undefined || agent.sessionFacts === null
+    ? null : agent.sessionFacts.expiry * 1_000;
+  const remaining = sessionExpiresAtMs === null ? null : sessionExpiresAtMs - agent.createdAt;
+  const safeRemaining = remaining !== null && Number.isFinite(remaining) && remaining > 0
+    ? remaining : MAX_TRADE_SESSION_SECONDS * 1_000;
+  const sessionExitLeadMs = Math.min(SESSION_EXIT_LEAD_MS, safeRemaining / 4);
   for (const item of priced) {
+    // R3.3: an unsettled disposition owns this position until projection;
+    // neither crash evidence nor another automatic decision may advance it.
+    if (unsettledSellPositions.has(item.position.positionId)) continue;
     const decision = decideExit({
       quoteOutWei: item.quoteOutWei, entryWei: item.position.entryWei,
       openedAtMs: item.position.openedAt, nowMs,
       stopLossBps: settings.stopLossBps, takeProfitBps: settings.takeProfitBps,
       maxHoldSec: settings.maxHoldSec,
       exitRequestedAt: draining ? (item.position.exitRequestedAt ?? nowMs) : item.position.exitRequestedAt,
+      sessionExpiresAtMs, sessionExitLeadMs, crashProtection: settings.crashProtection,
+      balance: item.balance, routeKey: item.routeKey,
+      lastQuoteWei: item.position.lastQuoteWei, lastQuoteBalance: item.position.lastQuoteBalance,
+      lastQuoteRoute: item.position.lastQuoteRoute, lastQuoteAtMs: item.position.lastQuoteAtMs,
+      peakPnlBps: item.position.peakPnlBps,
+      crashPendingSinceMs: item.position.crashPendingSinceMs,
+      crashPendingKind: item.position.crashPendingKind,
+      crashRefQuoteWei: item.position.crashRefQuoteWei, crashRefBalance: item.position.crashRefBalance,
+      crashRefAtMs: item.position.crashRefAtMs, crashRefRoute: item.position.crashRefRoute,
+      crashBasisVerified: item.position.crashBasisVerified, tokenAmount: item.position.tokenAmount,
+      fillStatus: item.position.fillStatus, autoExitReason: item.position.autoExitReason,
+      autoExitNote: item.position.autoExitNote, rugQuoteWindowMs: RUG_QUOTE_WINDOW_MS,
+      timeLimitAuthority: settings.maxHoldSec === null,
     });
+    const evidenceOkay = decision.evidence === undefined
+      ? true : await persistExitEvidence(deps, agent, item.position, decision.evidence);
+    const decisionPnlBps = decision.exit ? decision.pnlBps : pnlBps(item.quoteOutWei, item.position.entryWei);
+    await persistQuoteTelemetry(deps, agent, item, decisionPnlBps, nowMs, counts, signal);
     // The exit side follows the entry side (see universe.ts): a shut underlying
     // market is a fact about the asset, and the sell quote itself is the price.
     // Refusing to exit on a calendar would strand a position the pool can close.
-    if (decision.exit) {
-      await sellPosition(deps, agent, settings, item, decision.reason, counts, signal);
-    } else if (
-      (settings.takeProfitBps === null || settings.stopLossBps === null)
-      && !decision.exit
-    ) {
+    if (decision.exit && evidenceOkay) {
+      await sellPosition(deps, agent, settings, item, decision.reason, counts, signal, decision.note ?? null);
+    } else if (!decision.exit && hasBlankThreshold({
+      takeProfitBps: settings.takeProfitBps,
+      stopLossBps: settings.stopLossBps,
+      timeLimitAuthority: settings.maxHoldSec === null,
+    })) {
       llmCandidates.push(item);
     }
   }
@@ -533,9 +695,17 @@ async function runExits(
         ageSec: Math.max(0, Math.floor((nowMs - item.position.openedAt) / 1_000)),
         takeProfitBps: settings.takeProfitBps,
         stopLossBps: settings.stopLossBps,
+        ...(settings.maxHoldSec === null ? { maxHoldSec: null } : {}),
       }];
     });
     if (llmPositions.length !== llmCandidates.length) return;
+    const timeLimitOnly = settings.takeProfitBps !== null
+      && settings.stopLossBps !== null && settings.maxHoldSec === null;
+    const attemptedAt = exitLlmAttemptAt.get(agent.id);
+    if (timeLimitOnly && attemptedAt !== undefined && nowMs - attemptedAt < exitLlmIntervalMs(deps)) {
+      observe(counts, { stage: "exit-llm", code: "deferred" });
+      return;
+    }
     const features = await enrichFeatures(deps.dataPlane, settings.executionModel,
       llmCandidates.map(item => item.position.token), deps.now?.() ?? Date.now(), signal);
     const featureNow = deps.now?.() ?? Date.now();
@@ -545,6 +715,7 @@ async function runExits(
       observe(counts, { stage: "exit-llm", code: !evidence ? "feature-missing" : momentum.status === "unavailable" ? "feature-partial" : "feature-ready",
         token: item.position.token, reason: `momentum:${momentum.status}; snapshot:${evidence?.["15m"]?.snapshotId ?? evidence?.["1h"]?.snapshotId ?? "none"}` });
     }
+    if (timeLimitOnly) exitLlmAttemptAt.set(agent.id, nowMs);
     const answer = await completeWithFallback(deps, settings, buildExitPrompt({
       featureBlocks: llmCandidates.map((item, index) => {
         const block = featurePrompt(features.get(item.position.token.toLowerCase()), featureNow);
@@ -552,13 +723,14 @@ async function runExits(
       }),
       positions: llmPositions,
       owner: settings,
+      ...(timeLimitOnly ? { timeLimitAuthority: true } : {}),
     }), signal, (event) => observe(counts, { ...event, stage: "exit-llm" }));
     const decisions = validateExitResponse(answer.content, llmCandidates.length);
     if (!decisions.ok) { observe(counts, { stage: "exit-llm", code: "invalid-response" }); return; }
     for (const decision of decisions.decisions) {
       const item = llmCandidates[decision.index];
       observe(counts, { stage: "exit-llm", code: decision.exit ? "exit" : "hold", model: answer.model, reason: decision.reason, ...(item === undefined ? {} : { token: item.position.token }) });
-      if (decision.exit && item !== undefined) await sellPosition(deps, agent, settings, item, "llm", counts, signal);
+      if (decision.exit && item !== undefined) await sellPosition(deps, agent, settings, item, "llm", counts, signal, decision.reason);
     }
   } catch {
     observe(counts, { stage: "exit-llm", code: "unavailable-hold" });
@@ -569,7 +741,7 @@ async function runExits(
 async function runEntry(
   deps: TradeWorkerDeps,
   agent: AgentRecord,
-  settings: TradeSettings,
+  settings: EffectiveTradeSettings,
   counts: MutableCounts,
   nowMs: number,
   dryRun: boolean,
@@ -577,6 +749,12 @@ async function runEntry(
 ): Promise<string> {
   const facts = agent.sessionFacts;
   if (facts === null) throw new Error("Agent session facts are unavailable.");
+  const expiryMs = facts.expiry * 1_000;
+  const remaining = expiryMs - agent.createdAt;
+  const safeRemaining = Number.isFinite(remaining) && remaining > 0
+    ? remaining : MAX_TRADE_SESSION_SECONDS * 1_000;
+  const entryCutoffMs = Math.min(SESSION_ENTRY_CUTOFF_MS, safeRemaining / 2);
+  if (nowMs >= expiryMs - entryCutoffMs) return "session-expiring";
   const open = await deps.positions.listOpen(agent.ownerAddress, agent.id);
   if (open.length >= settings.maxOpenPositions) return "at-capacity";
   const buySize = sizeTradeBuy({ entryWei: BigInt(settings.entryWei),
@@ -861,22 +1039,44 @@ export async function runTradeWorkerOnce(
       projectionCursor = page.cursor;
     }
   }
+  const outcomes: TradeWorkerAgentOutcome[] = [];
+  const workerRows: TradeSettingsRecord[] = [];
+  let workerCursor: string | null = null;
+  for (;;) {
+    const page = await deps.settingsStore.listTradeAgentsForWorker({ limit: 32, cursor: workerCursor });
+    workerRows.push(...page.rows);
+    if (!page.hasMore || page.cursor === null) break;
+    workerCursor = page.cursor;
+  }
+  const expiredAgentIds = new Set<string>();
+  if (options.dryRun !== true) {
+    const atMs = deps.now?.() ?? Date.now();
+    for (const row of workerRows) {
+      const agent = await deps.agentStore.getAgentById(row.agentId);
+      if (agent?.status !== "armed" || agent.sessionFacts === null) continue;
+      const expiryMs = agent.sessionFacts.expiry * 1_000;
+      if (atMs < expiryMs) continue;
+      expiredAgentIds.add(agent.id);
+      const counts: MutableCounts = { events: [], startedAt: atMs, candidates: 0, refusals: 0, entries: 0, exits: 0, heldNoPrice: 0 };
+      observe(counts, { stage: "cycle", code: "session-expired", reason: new Date(expiryMs).toISOString() });
+      await deps.positions.insertRun({ agentId: agent.id, ownerAddress: agent.ownerAddress, dryRun: false,
+        reason: "session-expired", events: counts.events ?? [] });
+      outcomes.push({ agentId: agent.id, dryRun: false, reason: "session-expired", ...counts });
+    }
+  }
   if (!deps.readiness.ready) {
     deps.log?.("[trade-worker] data plane is not ready; skipping cycle");
-    return { skippedNotReady: true, outcomes: [] };
+    return { skippedNotReady: true, outcomes };
   }
-  const outcomes: TradeWorkerAgentOutcome[] = [];
   // AGENT-GAS-ATTENTION §2.2 — one `eth_getBalance` per WALLET per cycle.
   // Rebuilt per cycle: a balance from a previous cycle is not a reading.
   const gasCache = new Map<string, bigint | undefined>();
-  let cursor: string | null = null;
-  for (;;) {
-    const page = await deps.settingsStore.listTradeAgentsForWorker({ limit: 32, cursor });
-    for (const row of page.rows) {
+  for (const row of workerRows) {
       const agent = await deps.agentStore.getAgentById(row.agentId);
       if (agent === null) continue;
       // AUDIT L9 / TRADING-AGENT R5/R9: pause deliberately stops entries AND exits, matching Venus D4.
       if (agent.status !== "armed") continue;
+      if (expiredAgentIds.has(agent.id)) continue;
       // AGENT-GAS-ATTENTION §2.2 — the gas gate, before `processAgent` reaches
       // the data plane, the LLM or the router. It sits BELOW the projection
       // sweep above on purpose: custody convergence must run for a broke agent
@@ -915,9 +1115,6 @@ export async function runTradeWorkerOnce(
       } finally {
         gasCache.delete(agent.walletAddress.toLowerCase());
       }
-    }
-    if (!page.hasMore || page.cursor === null) break;
-    cursor = page.cursor;
   }
   return { skippedNotReady: false, outcomes };
 }

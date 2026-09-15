@@ -151,15 +151,21 @@ function Stepper({ value, suffix, onChange, min = 0, max = Number.MAX_SAFE_INTEG
 
 /**
  * What "no time limit" means for THIS draft, stated the way the worker
- * actually behaves: the model is asked about an exit only when the owner left
- * take profit or stop loss blank (`runExits`); with both set, the rules alone
- * decide and an untouched position simply stays open.
+ * actually behaves: a blank time limit gives the model the clock, while a
+ * blank price threshold gives it the corresponding price authority (`runExits`).
  */
 export function noLimitNote(draft: Pick<TradeSettings, "takeProfitBps" | "stopLossBps">): string {
   const rules = [draft.takeProfitBps === null ? null : "take profit", draft.stopLossBps === null ? null : "stop loss"].filter((rule): rule is string => rule !== null);
+  if (rules.length === 0) return "No time limit \u2014 the model decides when to exit.";
+  return `No time limit \u2014 the model decides when to exit; ${rules.join(" or ")} still apply.`;
   const model = draft.takeProfitBps === null || draft.stopLossBps === null;
   if (rules.length === 0) return "No time limit — positions exit only when the model says so.";
   return `No time limit — positions exit only on ${rules.join(" or ")}${model ? ", or when the model says so" : ""}.`;
+}
+
+/** The wire code as words: "crash-stop" → "crash stop", as the open-position plan already renders reasons (AUDIT A1). */
+export function closeReasonLabel(reason: TradePositionView["closeReason"]): string {
+  return reason === null ? "—" : reason.replace(/-/gu, " ");
 }
 
 function EditPanel({ initial, onCancel, onSave, busy }: {
@@ -178,7 +184,7 @@ function EditPanel({ initial, onCancel, onSave, busy }: {
   return <section className="fl-trade-edit">
     <div className="fl-trade-edit__intro">
       <div><span className="fl-trade-kicker">Execution model</span><p>Live deployment settings. Only the controls enabled below can change.</p></div>
-      <button type="button" className="fl-trade-reset" onClick={() => setDraft({ ...draft, noReentry: true, takeProfitBps: 10_000, stopLossBps: 5_000, maxHoldSec: 7_200, slippageBps: 300, primaryModel: "0gm-1.0-35b-a3b", fallbackModel: "glm-5.3-flash" })}>Reset parameters to defaults</button>
+      <button type="button" className="fl-trade-reset" onClick={() => setDraft({ ...draft, noReentry: true, takeProfitBps: 10_000, stopLossBps: 5_000, maxHoldSec: 7_200, crashProtection: true, slippageBps: 300, primaryModel: "0gm-1.0-35b-a3b", fallbackModel: "glm-5.3-flash" })}>Reset parameters to defaults</button>
     </div>
     <div className="fl-trade-edit__check"><input id="trade-no-reentry" type="checkbox" checked={draft.noReentry} onChange={(event) => setDraft({ ...draft, noReentry: event.target.checked })} /><label htmlFor="trade-no-reentry">No re-entry</label></div>
     <div className="fl-trade-kicker">Exit</div>
@@ -194,6 +200,7 @@ function EditPanel({ initial, onCancel, onSave, busy }: {
           ? <small className="fl-trade-edit__no-limit">{noLimitNote(draft)}</small>
           : <Stepper value={Math.round(draft.maxHoldSec / 60)} suffix="min" min={1} max={10_080} onChange={(value) => setDraft({ ...draft, maxHoldSec: value * 60 })} />}
       </label>
+      <label><span><input type="checkbox" checked={draft.crashProtection === true} onChange={(event) => setDraft({ ...draft, crashProtection: event.target.checked })} /> Crash protection</span><small>Two comparable price observations confirm a protective exit.</small></label>
     </div>
     <div className="fl-trade-kicker">Risk and execution</div>
     <div className="fl-trade-edit__grid fl-trade-edit__grid--three">
@@ -263,7 +270,7 @@ function ClosedPositionRow({ position, icon, usdRate }: {
   const tone = !complete || position.pnlBps === null ? "flat" : BigInt(position.pnlBps) < 0n ? "loss" : "profit";
   return <div className="fl-trade-position fl-trade-position--closed">
     <div className="fl-trade-position__token"><TokenIcon src={icon} symbol={symbol} size={26} /><span><strong>{symbol} / BNB</strong><small>{compactAddress(position.token)}</small></span></div>
-    <div>{position.closeReason?.replace(/-/gu, " ") ?? "—"}</div>
+    <div><span>{closeReasonLabel(position.closeReason)}</span>{position.closeNote ? <small>{position.closeNote}</small> : null}</div>
     <div>{position.closedAt === null ? "—" : relativeTime(position.openedAt, position.closedAt).text.replace(/^about /u, "")}</div>
     <div>{tokenAmount(position)} {symbol}</div>
     <div><strong>{bnb(position.entryWei)}</strong><span className="fl-trade-position__closed-sub"> → {complete ? bnb(position.exitWei) : "—"}</span></div>
@@ -295,7 +302,9 @@ export function TradeAgentDetail(props: Props) {
   const status = pill?.status ?? (view?.status === "armed" ? "live" : "paused");
   const statusLabel = view === null ? "—" : draining ? "draining" : pill?.label ?? (["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined);
   const unresolved = trade?.pendingIntents ?? [];
-  const recoveryRequired = unresolved.length > 0 || (trade?.open ?? []).some((position) => position.status === "orphaned");
+  const sessionExpired = sessionExpiry(view?.sessionExpiresAt, nowMs).state === "expired"
+    && (view?.status === "armed" || view?.status === "paused");
+  const recoveryRequired = sessionExpired || unresolved.length > 0 || (trade?.open ?? []).some((position) => position.status === "orphaned");
   return <div className="fl-shell fl-hired-agent-page fl-trade-detail-page">
     <Button variant="ghost" size="sm" icon={<Icon name="chevron-right" size={14} style={{ transform: "rotate(180deg)" }} />} onClick={() => props.go("/account")}>My agents</Button>
     <div className="fl-trade-hero">
@@ -313,7 +322,7 @@ export function TradeAgentDetail(props: Props) {
     {message ? <div className="fl-trade-message" role="status">{message}</div> : null}
     {props.identityStatus}
     {recoveryRequired ? <div className="fl-trade-message fl-trade-message--warning" role="alert">
-      <span>Removal is blocked by unresolved execution {unresolved.map((intent) => intent.decisionId).join(", ") || "or an orphaned token"}. Hard revoke stops future authority but does not complete conversion to BNB.</span>
+      <span>{sessionExpired ? "Session expired. Withdraw tokens from Account → Withdraw, then use Hard revoke before finishing removal." : `Removal is blocked by unresolved execution ${unresolved.map((intent) => intent.decisionId).join(", ") || "or an orphaned token"}. Hard revoke stops future authority but does not complete conversion to BNB.`}</span>
       <span className="fl-trade-message__actions"><Button variant="danger" size="sm" disabled={busy || view?.sessionPublicKey === null} onClick={props.hardRevoke}>Hard revoke</Button><Button variant="secondary" size="sm" onClick={() => props.go("/account")}>Account recovery</Button></span>
     </div> : null}
     <div className="fl-trade-metrics">

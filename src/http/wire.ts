@@ -32,7 +32,7 @@ import type { OwnerActionRequest, OwnerActionStruct, OwnerActionType } from "../
 import { validProvisioningCancellation, type AgentCaps, type AgentRecord, type SessionArmPlan } from "../store/agents.js";
 import { identityOwnerView } from "../identity/types.js";
 import type { WalletCall } from "../core/types.js";
-import { parseTradeSettings, type TradeSettings } from "../trade/settings.js";
+import { parseTradeSettings, type TradeSettings, type EffectiveTradeSettings } from "../trade/settings.js";
 import { parseLendingSettingsParams, type LendingSettings } from "./lendingWire.js";
 import { LENDING_RESERVE_BPS_MAX, LENDING_RESERVE_BPS_MIN } from "../ops/policy.js";
 
@@ -133,7 +133,9 @@ export type TradeHireParams = {
   readonly executionModel: import("../trade/settings.js").TradeExecutionModel;
   readonly hireRunId: string;
   readonly autoGrant: true;
-  readonly settings: TradeSettings;
+  readonly settings: EffectiveTradeSettings;
+  /** The exact optional-key object signed by the owner. */
+  readonly settingsParams: TradeSettings;
 };
 
 /**
@@ -144,7 +146,7 @@ export type TradeHireParams = {
  * needs `supplyNativeWei` and therefore `reserveBps`. None of those exist on
  * the grid envelope, so S1 could not have applied either gating condition. One
  * signed hire carries every input the floors need, exactly as
- * `parseTradeHireParams` already carries `settings`.
+ * `parseTradeHireParams` carries effective settings plus the signed raw bytes.
  *
  * `previewReceipt` is REQUIRED and is verified at S1 against
  * `LENDING_PREVIEW_SECRET` (R3.8): it binds the guarded account, the finalized
@@ -331,13 +333,13 @@ export function parseTradeHireParams(value: unknown): ParseResult<TradeHireParam
   if (value["autoGrant"] !== true) return fail('"autoGrant" must be true.');
   const settings = parseTradeSettings(value["settings"]);
   if (!settings.ok) return fail(`"settings" is invalid: ${settings.message}`);
-  if (settings.value.executionModel !== executionModel) {
+  if (settings.value.effective.executionModel !== executionModel) {
     return fail('"settings.executionModel" must equal "executionModel".');
   }
   return { ok: true, value: {
     walletAddress: walletAddress.value, capDayWei: capDayWei.value,
     ttlSec: ttlSec as number, sizingPreset: "trade-v1", executionModel,
-    hireRunId, autoGrant: true, settings: settings.value,
+    hireRunId, autoGrant: true, settings: settings.value.effective, settingsParams: settings.value.raw,
   } };
 }
 

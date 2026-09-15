@@ -29,7 +29,7 @@ import {
   loadMasterKey,
 } from "./crypto.js";
 import { createPgSqlClient, type SqlClient } from "./sql.js";
-import type { TradeSettings } from "../trade/settings.js";
+import type { TradeSettingsRaw } from "../trade/settings.js";
 import type { SessionRevocationEvidenceV1 } from "../account/keyStoreReader.js";
 import { categoryForPreset, decodeIdentity, fail as identityFail, newIdentity, type StoredIdentity, type IdentityCategory, type IdentitySource, type Erc8004IdentitySummary, type IdentityFence } from "../identity/types.js";
 import { IDENTITY_AGENT_MIGRATION, IDENTITY_AGENT_INDEX, projectionAllowed, sourceFromRecord } from "./erc8004Sources.js";
@@ -157,7 +157,7 @@ export type PendingGrant = {
   readonly hireRunId?: string;
   readonly autoGrant?: true;
   readonly initialTradeSettings?: {
-    readonly params: TradeSettings;
+    readonly params: TradeSettingsRaw;
     readonly digest: Hex;
   };
   readonly initialArmPlan?: {

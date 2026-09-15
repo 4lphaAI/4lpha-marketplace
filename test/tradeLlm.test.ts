@@ -167,6 +167,16 @@ describe("TRADING-AGENT prompts and transport", () => {
     assert.match(prompt[1]?.content ?? "", /\t100\t60\t-/u);
   });
 
+  it("gives the model explicit time-limit authority only for the live time-only class", () => {
+    const prompt = buildExitPrompt({
+      positions: [{ ...position, takeProfitBps: 1_000, stopLossBps: 2_000, maxHoldSec: null }],
+      owner: { instructions: null, skillMarkdown: null }, timeLimitAuthority: true,
+    });
+    assert.match(prompt[0]?.content ?? "", /blank take profit, stop loss or time limit/u);
+    assert.match(prompt[1]?.content ?? "", /stopLossBps\tmaxHoldSec/u);
+    assert.match(prompt[1]?.content ?? "", /\tnone\n/u);
+  });
+
   it("copies every secret-like regex class and trims input", () => {
     const sanitized = sanitizeSecretLikeText(
       " 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sk-or-v1-abc dg-abcdefghijklmnop Bearer xyz https://u:p@example.test/x token=abc /path/abcdefghijklmnopqrstuvwx ",

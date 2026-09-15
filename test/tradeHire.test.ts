@@ -22,7 +22,20 @@ describe("TRADING-AGENT R5/C29 hire wire", () => {
       settings: DEFAULT_TRADE_SETTINGS };
     assert.equal(parseHireParams(value).ok, true);
     assert.equal(paramsHash("provisionAgent", value),
-      "0x99e963959b261dca90088cec859e2000d72b6e6908ae0b81a759da98aa64d736");
+      "0x89c17e2504a4af32bdb4e24e2299e5c48d966793a5d4b75289e82b6ce5c81839");
     assert.equal(parseHireParams({ ...value, template: "trade" }).ok, false);
+  });
+
+  it("carries effective settings and the exact optional-key object separately", () => {
+    const { crashProtection: _removed, ...legacySettings } = DEFAULT_TRADE_SETTINGS;
+    const value = { walletAddress: WALLET, capDayWei: "30000000000000000", ttlSec: 604800,
+      sizingPreset: "trade-v1" as const, executionModel: "sigma" as const,
+      hireRunId: "11111111-1111-4111-8111-111111111111", autoGrant: true,
+      settings: legacySettings };
+    const parsed = parseHireParams(value);
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok || parsed.value.sizingPreset !== "trade-v1") return;
+    assert.equal(parsed.value.settings.crashProtection, false);
+    assert.equal(Object.hasOwn(parsed.value.settingsParams, "crashProtection"), false);
   });
 });

@@ -6,8 +6,8 @@ import { isTradeLlmModelId, type TradeLlmModelId } from "./llm.js";
 export type TradeExecutionModel = "blue-chip" | "mid-cap" | "degen" | "sigma";
 export type TradeGasPriority = "low" | "standard" | "high";
 
-/** The exact JSON object signed by the owner; every key is mandatory. */
-export type TradeSettings = {
+/** The exact JSON object signed by the owner; crashProtection is optional for old hires. */
+type TradeSettingsFields = {
   readonly name: string;
   readonly executionModel: TradeExecutionModel;
   readonly entryWei: string;
@@ -28,6 +28,18 @@ export type TradeSettings = {
   /** Used only when the primary throws or answers off-schema; never equal to it. */
   readonly fallbackModel: TradeLlmModelId;
 };
+
+/** The owner-signed object. The revision-2 field is optional for old hires. */
+export type TradeSettings = TradeSettingsFields & {
+  readonly crashProtection?: boolean;
+};
+
+/** Behavioural settings after the compatibility default has been applied. */
+export type EffectiveTradeSettings = TradeSettingsFields & {
+  readonly crashProtection: boolean;
+};
+
+export type TradeSettingsRaw = TradeSettings;
 
 export const MIN_TRADE_ENTRY_WEI = 2_000_000_000_000_000n;
 export const MAX_INSTRUCTIONS_ENCODED_BYTES = 2_048;
@@ -51,14 +63,15 @@ export const DEFAULT_TRADE_SETTINGS: TradeSettings = {
   skillMarkdown: null,
   primaryModel: "0gm-1.0-35b-a3b",
   fallbackModel: "qwen3-vl-30b",
+  crashProtection: true,
 };
 
 // TRADING-AGENT R5: a literal, not a self-computed constant, catches default drift.
 export const DEFAULT_TRADE_SETTINGS_DIGEST: Hex =
-  "0xb34733da23bd5e68c2254b4a2657c502d620d8cdbf3dfe52e62548841e57b007";
+  "0x74ea4a3c9914e6acdc7416ca5baeda0955d2f79db74e6407e05d8d196ffdf91e";
 
 export type TradeSettingsParseResult =
-  | { readonly ok: true; readonly value: TradeSettings }
+  | { readonly ok: true; readonly value: { readonly raw: TradeSettingsRaw; readonly effective: EffectiveTradeSettings } }
   | { readonly ok: false; readonly message: string };
 
 const SETTINGS_KEYS = [
@@ -79,6 +92,7 @@ const SETTINGS_KEYS = [
   "skillMarkdown",
   "primaryModel",
   "fallbackModel",
+  "crashProtection",
 ] as const satisfies readonly (keyof TradeSettings)[];
 
 const SETTINGS_KEY_SET: ReadonlySet<string> = new Set(SETTINGS_KEYS);
@@ -144,7 +158,7 @@ export function parseTradeSettings(value: unknown): TradeSettingsParseResult {
   if (!isRecord(value)) return fail("Trade settings must be a JSON object.");
   const unknown = Object.keys(value).find((key) => !SETTINGS_KEY_SET.has(key));
   if (unknown !== undefined) return fail(`Trade settings has unknown key "${unknown}".`);
-  const missing = SETTINGS_KEYS.find((key) => !Object.hasOwn(value, key));
+  const missing = SETTINGS_KEYS.find((key) => key !== "crashProtection" && !Object.hasOwn(value, key));
   if (missing !== undefined) return fail(`Trade settings is missing key "${missing}"; unset values must be null.`);
 
   const name = value["name"];
@@ -209,45 +223,53 @@ export function parseTradeSettings(value: unknown): TradeSettingsParseResult {
   if (!isTradeLlmModelId(fallbackModel)) return fail("fallbackModel is not an offered model.");
   if (primaryModel === fallbackModel) return fail("fallbackModel must differ from primaryModel.");
 
+  const hasCrashProtection = Object.hasOwn(value, "crashProtection");
+  const crashProtection = value["crashProtection"];
+  if (hasCrashProtection && typeof crashProtection !== "boolean") {
+    return fail("crashProtection must be a boolean.");
+  }
+  const raw: TradeSettingsRaw = {
+    name,
+    executionModel,
+    entryWei,
+    maxOpenPositions,
+    minMarketCapUsd,
+    maxMarketCapUsd,
+    noReentry,
+    takeProfitBps,
+    stopLossBps,
+    maxHoldSec,
+    breakEvenAfterTp,
+    slippageBps,
+    gasPriority,
+    instructions,
+    skillMarkdown,
+    primaryModel,
+    fallbackModel,
+    ...(hasCrashProtection ? { crashProtection: crashProtection as boolean } : {}),
+  };
+
   return {
     ok: true,
-    value: {
-      name,
-      executionModel,
-      entryWei,
-      maxOpenPositions,
-      minMarketCapUsd,
-      maxMarketCapUsd,
-      noReentry,
-      takeProfitBps,
-      stopLossBps,
-      maxHoldSec,
-      breakEvenAfterTp,
-      slippageBps,
-      gasPriority,
-      instructions,
-      skillMarkdown,
-      primaryModel,
-      fallbackModel,
-    },
+    value: { raw, effective: { ...raw, crashProtection: hasCrashProtection ? crashProtection as boolean : false } },
   };
 }
 
 /** Recompute the one owner-action digest over the complete wire object. */
-export function tradeSettingsDigest(settings: TradeSettings): Hex {
+export function tradeSettingsDigest(settings: TradeSettingsRaw): Hex {
   return paramsHash("tradeSettings", settings);
 }
 
-const EDITABLE_TRADE_SETTINGS = new Set<keyof TradeSettings>([
+const EDITABLE_TRADE_SETTINGS = new Set<keyof EffectiveTradeSettings>([
   "noReentry", "takeProfitBps", "stopLossBps", "maxHoldSec", "slippageBps",
-  "primaryModel", "fallbackModel",
+  "primaryModel", "fallbackModel", "crashProtection",
 ]);
 
 /** Server authority for the detail editor; hidden browser controls are not a boundary. */
 export function immutableTradeSettingChange(
-  current: TradeSettings,
-  next: TradeSettings,
-): keyof TradeSettings | null {
+  current: EffectiveTradeSettings,
+  next: EffectiveTradeSettings,
+): keyof EffectiveTradeSettings | null {
   for (const key of SETTINGS_KEYS) {
     if (!EDITABLE_TRADE_SETTINGS.has(key) && current[key] !== next[key]) return key;
   }

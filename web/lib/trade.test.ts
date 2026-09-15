@@ -15,7 +15,7 @@ import {
 
 describe("trading UI wire constants", () => {
   it("matches the plane preset fixture byte-for-byte", () => {
-    const fixture = readFileSync(new URL("./fixtures/trade-model-presets.json", import.meta.url), "utf8");
+    const fixture = readFileSync(new URL("./fixtures/trade-model-presets.json", import.meta.url), "utf8").replace(/\r\n/gu, "\n");
     expect(`${JSON.stringify(TRADE_MODEL_PRESETS, null, 2)}\n`).toBe(fixture);
   });
 

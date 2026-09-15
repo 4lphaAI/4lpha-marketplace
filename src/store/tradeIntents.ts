@@ -1,6 +1,7 @@
 /** Durable pre-submit trade identities and exactly-once position projection. */
 import { isDeepStrictEqual } from "node:util";
 import { getAddress, isHex, type Address, type Hex } from "viem";
+import { sanitizeMessage } from "../core/errors.js";
 import type { TradeRoute } from "../ops/route.js";
 import type { TradeCloseReason } from "./tradePositions.js";
 import { decodeJsonb, encodeJsonbParam } from "./codec.js";
@@ -29,12 +30,12 @@ export type TradeIntentRecord = {
 
 export type CreateTradeIntentInput = Pick<TradeIntentRecord,
   "decisionId" | "idempotencyKey" | "agentId" | "ownerAddress" | "side" | "token" |
-  "route" | "amountWei" | "entryWei" | "positionId" | "closeReason">;
+  "route" | "amountWei" | "entryWei" | "positionId" | "closeReason"> & { readonly note?: string | null };
 
 export interface TradeIntentStore {
-  create(input: CreateTradeIntentInput): Promise<TradeIntentRecord>;
-  get(ownerAddress: Address, agentId: string, decisionId: string): Promise<TradeIntentRecord | null>;
-  listUnsettled(ownerAddress: Address, agentId: string): Promise<readonly TradeIntentRecord[]>;
+  create(input: CreateTradeIntentInput, sql?: SqlClient): Promise<TradeIntentRecord>;
+  get(ownerAddress: Address, agentId: string, decisionId: string, sql?: SqlClient): Promise<TradeIntentRecord | null>;
+  listUnsettled(ownerAddress: Address, agentId: string, sql?: SqlClient): Promise<readonly TradeIntentRecord[]>;
   markSubmitted(ownerAddress: Address, agentId: string, decisionId: string, txHash: Hex | null): Promise<TradeIntentRecord | null>;
   markProjected(ownerAddress: Address, agentId: string, decisionId: string): Promise<TradeIntentRecord | null>;
   markRolledBack(ownerAddress: Address, agentId: string, decisionId: string, note: string | null): Promise<TradeIntentRecord | null>;
@@ -82,7 +83,7 @@ export class MemoryTradeIntentStore implements TradeIntentStore {
       route: structuredClone(input.route),
       state: "pending",
       txHash: null,
-      note: null,
+      note: input.note === null || input.note === undefined ? null : sanitizeMessage(input.note).slice(0, 200),
       createdAt: at,
       updatedAt: at,
     };
@@ -163,17 +164,17 @@ export class PostgresTradeIntentStore implements TradeIntentStore {
     return new PostgresTradeIntentStore(sql, now);
   }
 
-  async create(input: CreateTradeIntentInput): Promise<TradeIntentRecord> {
+  async create(input: CreateTradeIntentInput, sql: SqlClient = this.sql): Promise<TradeIntentRecord> {
     const at = new Date(this.now());
-    const inserted = await this.sql.query<IntentRow>(
+    const inserted = await sql.query<IntentRow>(
       `/* tradeIntents.create */ insert into trade_intents (${COLUMNS})
-       values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::numeric,$9::numeric,$10,$11,'pending',null,null,$12,$12)
+       values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::numeric,$9::numeric,$10,$11,'pending',null,$12,$13,$13)
        on conflict (decision_id) do nothing returning ${COLUMNS}`,
       [input.decisionId, input.idempotencyKey, input.agentId, ownerKey(input.ownerAddress), input.side,
         getAddress(input.token), encodeJsonbParam(input.route), input.amountWei.toString(10), input.entryWei.toString(10),
-        input.positionId, input.closeReason, at],
+        input.positionId, input.closeReason, input.note === null || input.note === undefined ? null : sanitizeMessage(input.note).slice(0, 200), at],
     );
-    const row = inserted.rows[0] ?? (await this.sql.query<IntentRow>(
+    const row = inserted.rows[0] ?? (await sql.query<IntentRow>(
       `/* tradeIntents.getByDecision */ select ${COLUMNS} from trade_intents where decision_id = $1`, [input.decisionId],
     )).rows[0];
     if (row === undefined) throw new Error("Trade intent could not be stored.");
@@ -182,16 +183,16 @@ export class PostgresTradeIntentStore implements TradeIntentStore {
     return record;
   }
 
-  async get(ownerAddress: Address, agentId: string, decisionId: string): Promise<TradeIntentRecord | null> {
-    const row = (await this.sql.query<IntentRow>(
+  async get(ownerAddress: Address, agentId: string, decisionId: string, sql: SqlClient = this.sql): Promise<TradeIntentRecord | null> {
+    const row = (await sql.query<IntentRow>(
       `/* tradeIntents.get */ select ${COLUMNS} from trade_intents where decision_id=$1 and agent_id=$2 and owner_address=$3`,
       [decisionId, agentId, ownerKey(ownerAddress)],
     )).rows[0];
     return row === undefined ? null : rowToIntent(row);
   }
 
-  async listUnsettled(ownerAddress: Address, agentId: string): Promise<readonly TradeIntentRecord[]> {
-    const rows = await this.sql.query<IntentRow>(
+  async listUnsettled(ownerAddress: Address, agentId: string, sql: SqlClient = this.sql): Promise<readonly TradeIntentRecord[]> {
+    const rows = await sql.query<IntentRow>(
       `/* tradeIntents.listUnsettled */ select ${COLUMNS} from trade_intents
        where owner_address=$1 and agent_id=$2 and state='pending' order by created_at asc, decision_id asc`,
       [ownerKey(ownerAddress), agentId],
@@ -224,7 +225,7 @@ function rowToIntent(row: IntentRow): TradeIntentRecord {
   if (row.side !== "buy" && row.side !== "sell") throw new Error("Stored trade intent side is invalid.");
   if (row.state !== "pending" && row.state !== "projected" && row.state !== "rolled-back") throw new Error("Stored trade intent state is invalid.");
   const closeReason = row.close_reason;
-  if (closeReason !== null && !["owner-request", "stop-loss", "take-profit", "max-hold", "llm"].includes(closeReason)) {
+  if (closeReason !== null && !["owner-request", "stop-loss", "take-profit", "max-hold", "llm", "crash-stop", "session-expiring"].includes(closeReason)) {
     throw new Error("Stored trade intent close reason is invalid.");
   }
   return {

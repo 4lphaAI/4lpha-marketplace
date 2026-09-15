@@ -170,6 +170,7 @@ const CONFIG = {
       { k: "stopLossOn", type: "hidden", v: true },
       { k: "stopLoss", label: "Stop loss", type: "numToggle", on: "stopLossOn", v: "50", suffix: "%", step: 5, min: 0, max: 100 },
       { k: "holdTime", label: "Max holding time", type: "num", v: "480", suffix: "min", alignAsCheckbox: true, step: 60, noLimitAtMin: true },
+      { k: "crashProtection", label: "Crash protection", type: "check", v: true, text: "Crash protection" },
       { k: "moonbag", label: "check", type: "check", v: true, text: "Move the stop to break-even after the last take-profit target fills." },
     ] },
     { title: "Risk and execution", poweredBy: "0g", fields: [
@@ -178,7 +179,7 @@ const CONFIG = {
       { k: "primary", label: "Primary model", type: "select", v: MODELS[0], options: MODELS, excludeValueOf: "fallback", showDisabledOption: true },
       { k: "fallback", label: "Fallback model", type: "select", v: MODELS[1], options: FALLBACKS, excludeValueOf: "primary", showDisabledOption: true },
     ] },
-    { title: "Advanced settings", adv: true, note: "Pay-per-call data feeds and optional trading guidance. These never override wallet controls, slippage, stop-loss, or rug protection.", fields: [
+    { title: "Advanced settings", adv: true, note: "Pay-per-call data feeds and optional trading guidance. These never override wallet controls, slippage, stop-loss, or crash protection.", fields: [
       { k: "quicknode", label: "QuickNode RPC x402", type: "toggle", v: false, text: "Pay per request for faster reads", exclusiveWith: "customRpc" },
       { k: "customRpc", label: "Custom RPC", type: "toggle", v: false, text: "Use your own RPC endpoint", exclusiveWith: "quicknode", inputKey: "customRpcUrl", inputPlaceholder: "https://your-rpc-endpoint.com" },
       { k: "cmcHub", label: "CMC Agent Hub x402", type: "toggle", v: false, text: "Pay per request for CoinMarketCap agent data" },
@@ -1211,6 +1212,7 @@ function DeployAgentScreen({ kind, go }) {
         noReentry: settings.noReentry, tp1On: settings.takeProfitBps !== null, tp1: settings.takeProfitBps === null ? "0" : String(settings.takeProfitBps / 100),
         stopLossOn: settings.stopLossBps !== null, stopLoss: settings.stopLossBps === null ? "50" : String(Math.abs(stopLossPercentFromBps(settings.stopLossBps))),
         holdTime: settings.maxHoldSec === null ? "0" : String(settings.maxHoldSec / 60),
+        crashProtection: settings.crashProtection !== false,
         slippage: String(settings.slippageBps / 100), gas: settings.gasPriority[0].toUpperCase() + settings.gasPriority.slice(1),
         instructions: settings.instructions ?? "", skillFile: settings.skillMarkdown === null ? null : { name: "Previous skill.md", text: settings.skillMarkdown },
       }));
@@ -1377,6 +1379,7 @@ function DeployAgentScreen({ kind, go }) {
     minMarketCapUsd: decimalOrNull(values.minMcap), maxMarketCapUsd: decimalOrNull(values.maxMcap), noReentry: !!values.noReentry,
     takeProfitBps: values.tp1On ? Math.round(Number(values.tp1) * 100) : null, stopLossBps: stopLossBpsWhenEnabled(!!values.stopLossOn, Number(values.stopLoss)),
     maxHoldSec: Number(values.holdTime) > 0 ? Math.round(Number(values.holdTime) * 60) : null, breakEvenAfterTp: false,
+    crashProtection: values.crashProtection !== false,
     slippageBps: Math.round(Number(values.slippage) * 100), gasPriority: String(values.gas ?? "Standard").toLowerCase(),
     primaryModel: tradeModelId(String(values.primary ?? MODELS[0])),
     fallbackModel: tradeModelId(String(values.fallback ?? MODELS[1])),

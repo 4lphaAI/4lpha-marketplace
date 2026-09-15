@@ -295,7 +295,7 @@ describe("trade position and run stores", () => {
       assert.equal((await store.listRuns(OWNER_A, "a1", 200)).length, 200);
       assert.equal((await store.listRuns(OWNER_B, "a1", 200)).length, 0);
     }
-    assert.equal(sql.transactions, 201);
+    assert.equal(sql.transactions, 202);
     const prune = sql.texts.find((text) => text.includes("/* tradeRuns.prune */")) ?? "";
     assert.match(prune, /order by created_at desc, id desc limit 200/u);
   });

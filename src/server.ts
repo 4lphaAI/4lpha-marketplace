@@ -1979,7 +1979,7 @@ export function createServer(deps: ServerDeps): Hono {
         if (durableRunId !== params.value.hireRunId
           || (pending !== null && (pending.autoGrant !== true
             || pending.initialTradeSettings?.digest.toLowerCase()
-              !== tradeSettingsDigest(params.value.settings).toLowerCase()))) {
+              !== tradeSettingsDigest(params.value.settingsParams).toLowerCase()))) {
           return { kind: "error", code: "conflict" };
         }
       } else if (params.value.sizingPreset === "lending-v1") {
@@ -2143,7 +2143,7 @@ export function createServer(deps: ServerDeps): Hono {
           return durableAction?.toLowerCase() === actionId && durableRun === tradeParams.hireRunId
             && (row.pendingGrant === null || (row.pendingGrant.autoGrant === true
               && row.pendingGrant.initialTradeSettings?.digest.toLowerCase()
-                === tradeSettingsDigest(tradeParams.settings).toLowerCase()));
+                === tradeSettingsDigest(tradeParams.settingsParams).toLowerCase()));
         };
 
         try {
@@ -2328,7 +2328,7 @@ export function createServer(deps: ServerDeps): Hono {
               sizingPreset: "trade-v1", sizingPresetVersion: 1 }, funding,
             createdAtSec: Math.floor(acceptedAtMs / 1_000), keyStoreVerdictAtS1: ownerVerdict,
             provisionActionId, hireRunId: tradeParams.hireRunId, autoGrant: true,
-            initialTradeSettings: { params: tradeParams.settings, digest: tradeSettingsDigest(tradeParams.settings) },
+            initialTradeSettings: { params: tradeParams.settingsParams, digest: tradeSettingsDigest(tradeParams.settingsParams) },
           };
           let row: AgentRecord;
           try {
@@ -2494,8 +2494,8 @@ export function createServer(deps: ServerDeps): Hono {
                 keyStoreVerdictAtS1: ownerVerdict, provisionActionId,
                 hireRunId: tradeParams.hireRunId, autoGrant: true,
                 initialTradeSettings: {
-                  params: tradeParams.settings,
-                  digest: tradeSettingsDigest(tradeParams.settings),
+                  params: tradeParams.settingsParams,
+                  digest: tradeSettingsDigest(tradeParams.settingsParams),
                 },
               };
               prepared = { pending, sessionKey, params: tradeParams };
@@ -3932,36 +3932,44 @@ export function createServer(deps: ServerDeps): Hono {
       return ownerMutation(c, c.req.param("id"), "tradeSettings", "tradeSettings", async ({ agent, params, idempotencyKey }) => {
         const parsed = parseTradeSettings(params);
         if (!parsed.ok) throw new BadRequestError(parsed.message);
-        const existing = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
-        if (existing !== null) {
-          const current = parseTradeSettings(existing.params);
-          if (!current.ok) throw new ConflictError("Stored trading settings are invalid.");
-          const immutable = immutableTradeSettingChange(current.value, parsed.value);
-          if (immutable !== null) throw new BadRequestError(`${immutable} cannot be changed after deploy.`);
-          if (existing.drainingAt !== null) throw new ConflictError("Trade settings cannot change while the agent is draining.");
-        }
         if (await deps.journal.hasPendingForAgent(agent.id, idempotencyKey)) {
           throw new ConflictError("Trade settings cannot change while an execution is pending.");
         }
         if (agent.sessionFacts === null) throw new TradeNotExecutableError();
         const capDayWei = nativeDayCapWei(agent.sessionFacts);
         if (capDayWei === null) throw new TradeNotExecutableError();
-        const sized = checkTradeSizing({ capDayWei, entryWei: BigInt(parsed.value.entryWei),
-          maxOpenPositions: parsed.value.maxOpenPositions,
+        const effective = parsed.value.effective;
+        const sized = checkTradeSizing({ capDayWei, entryWei: BigInt(effective.entryWei),
+          maxOpenPositions: effective.maxOpenPositions,
           grantedTokenCount: pinnedTokens(agent.sessionFacts).length,
           platformFeeBps: tradeAgent.feeBps });
         if (!sized.ok) throw new TradeCapitalTooSmallError(sized.minimumCapWei);
-        let stored;
-        try {
-          stored = await tradeAgent.settingsStore.put({ agentId: agent.id,
-            ownerAddress: agent.ownerAddress, params: parsed.value, digest: tradeSettingsDigest(parsed.value) });
-        } catch (error) {
-          if (error instanceof Error && error.message.includes("draining")) {
-            throw new ConflictError("Trade settings cannot change while the agent is draining.");
+        const existingBeforeFence = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+        if (existingBeforeFence === null) {
+          const stored = await tradeAgent.settingsStore.put({ agentId: agent.id,
+            ownerAddress: agent.ownerAddress, params: parsed.value.raw, digest: tradeSettingsDigest(parsed.value.raw) });
+          if (effective.crashProtection === false) {
+            await tradeAgent.positions.clearCrashEvidenceForAgent(agent.ownerAddress, agent.id);
           }
-          throw error;
+          return { settings: stored.params, digest: stored.digest, updatedAt: stored.updatedAt };
         }
-        return { settings: stored.params, digest: stored.digest, updatedAt: stored.updatedAt };
+        const fenced = await tradeAgent.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async (sql) => {
+          const existing = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id, sql);
+          if (existing === null) throw new ConflictError("Stored trading settings are unavailable.");
+          const current = parseTradeSettings(existing.params);
+          if (!current.ok) throw new ConflictError("Stored trading settings are invalid.");
+          const immutable = immutableTradeSettingChange(current.value.effective, effective);
+          if (immutable !== null) throw new BadRequestError(`${immutable} cannot be changed after deploy.`);
+          if (existing.drainingAt !== null) throw new ConflictError("Trade settings cannot change while the agent is draining.");
+          const stored = await tradeAgent.settingsStore.put({ agentId: agent.id,
+            ownerAddress: agent.ownerAddress, params: parsed.value.raw, digest: tradeSettingsDigest(parsed.value.raw) }, sql);
+          if (effective.crashProtection === false) {
+            await tradeAgent.positions.clearCrashEvidenceForAgent(agent.ownerAddress, agent.id, sql);
+          }
+          return { settings: stored.params, digest: stored.digest, updatedAt: stored.updatedAt };
+        });
+        if (fenced.kind === "draining") throw new ConflictError("Trade settings cannot change while the agent is draining.");
+        return fenced.value;
       });
     });
 
@@ -4009,7 +4017,7 @@ export function createServer(deps: ServerDeps): Hono {
       const observations = await tradeAgent.observer.observe(agent, positions, c.req.raw.signal);
       const observationById = new Map(observations.map((item) => [item.positionId, item]));
       const parsedStoredSettings = settings === null ? null : parseTradeSettings(settings.params);
-      const maxOpenPositions = parsedStoredSettings?.ok === true ? parsedStoredSettings.value.maxOpenPositions : null;
+      const maxOpenPositions = parsedStoredSettings?.ok === true ? parsedStoredSettings.value.effective.maxOpenPositions : null;
       const marketHours = (token: Address): "us-equities" | null =>
         tradeAgent.readiness.bstocksAddresses.has(token.toLowerCase()) ? "us-equities" : null;
       const open = positions.filter((position) => position.status !== "closed");

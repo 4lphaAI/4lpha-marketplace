@@ -93,3 +93,13 @@ describe("AGENT-GAS-ATTENTION review 3: the bucket predicates' controls", () => 
     expect(runSucceeded(rehearsed)).toBe(false);
   });
 });
+
+it("labels the session backstop rows", () => {
+  expect(renderToStaticMarkup(<TradeRunLog symbols={{}} runs={[
+    { id: "expired", dryRun: false, reason: "session-expired", candidates: 0, entries: 0, exits: 0, refusals: 0, createdAt: 1 },
+    { id: "soon", dryRun: false, reason: "session-expiring", candidates: 0, entries: 0, exits: 0, refusals: 0, createdAt: 2 },
+  ]} />)).toContain("Session expired — nothing can execute");
+  expect(renderToStaticMarkup(<TradeRunLog symbols={{}} runs={[
+    { id: "soon", dryRun: false, reason: "session-expiring", candidates: 0, entries: 0, exits: 0, refusals: 0, createdAt: 2 },
+  ]} />)).toContain("No new entries — session ends soon");
+});

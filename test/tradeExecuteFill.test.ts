@@ -25,14 +25,14 @@ describe("receipt-derived trade fills", () => {
       receipt: { status: "CONFIRMED", transactionHash: HASH }, wbnb: WBNB,
       reader: { async getReceipt() { return { logs: [{ address: TOKEN,
         topics: [transfer, topicAddress(WBNB), topicAddress(WALLET)], data: toHex(77n, { size: 32 }) }] }; } } });
-    assert.deepEqual(fill, { side: "buy", entryWei: 101n, tokenAmount: 77n, fillStatus: "verified" });
+    assert.deepEqual(fill, { side: "buy", entryWei: 101n, tokenAmount: 77n, fillStatus: "verified", receiptAttributable: true });
   });
 
   it("returns unverified instead of a zero token fill when receipt evidence is absent", async () => {
     const fill = await tradeReceiptFill({ request: request("buy"), walletAddress: WALLET, nativeInWei: 101n,
       receipt: { status: "CONFIRMED", transactionHash: HASH }, wbnb: WBNB,
       reader: { async getReceipt() { throw new Error("receipt RPC failed"); } } });
-    assert.deepEqual(fill, { side: "buy", entryWei: 101n, tokenAmount: null, fillStatus: "unverified" });
+    assert.deepEqual(fill, { side: "buy", entryWei: 101n, tokenAmount: null, fillStatus: "unverified", receiptAttributable: false });
   });
 
   it("returns the exact WBNB Withdrawal amount for a sell", async () => {
