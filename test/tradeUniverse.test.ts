@@ -20,6 +20,7 @@ import {
   isEntryExcludedToken,
   isUsEquityOpen,
   marketHoursByAddress,
+  partitionPinnedCandidates,
   pinUniverse,
   rerankHeld,
   selectEntryCandidates,
@@ -305,6 +306,69 @@ describe("TRADING-AGENT R3.4/C26 entry pipeline", () => {
       },
     })));
     assert.deepEqual(result.kind === "aborted" ? result.reason : null, "data-plane-unavailable");
+  });
+
+  // 2026-09-15: a Sigma agent's run log said "13 skipped/refused" every cycle
+  // while twelve of its twenty-five pinned tokens were dropped in silence by
+  // `noReentry`. The partition is the selector's own first step, reported.
+  it("reports what the owner's rules set aside before any read, once per token, re-entry first", async () => {
+    const candidates = await pinUniverse("blue-chip", { dataPlane: fakeReads() });
+    const [first, second, third, fourth] = candidates;
+    assert.ok(first && second && third && fourth);
+    const base = {
+      candidates,
+      pinnedAddresses: new Set(candidates.map((row) => row.address.toLowerCase())),
+      previouslyEnteredAddresses: new Set([first.address.toLowerCase(), second.address.toLowerCase()]),
+      // `second` is both traded-before and open: reported ONCE, as open.
+      openPositionAddresses: new Set([second.address.toLowerCase(), third.address.toLowerCase()]),
+      forbiddenAddresses: new Set([fourth.address.toLowerCase()]),
+    };
+    const on = partitionPinnedCandidates({ ...base, settings: { ...settings, noReentry: true } });
+    assert.deepEqual(on.summary, {
+      pinned: candidates.length,
+      skippedReentry: [first.address],
+      skippedOpen: 2,
+      skippedForbidden: 1,
+    });
+    assert.equal(on.kept.length, candidates.length - 4);
+    assert.equal(on.kept.some((row) => [first, second, third, fourth].includes(row)), false);
+
+    // With the rule off, `first` flows through; `second` is still open.
+    const off = partitionPinnedCandidates({ ...base, settings });
+    assert.deepEqual(off.summary, { pinned: candidates.length, skippedReentry: [], skippedOpen: 2, skippedForbidden: 1 });
+    assert.equal(off.kept.length, candidates.length - 3);
+
+    // A token outside the pinned set is not part of the universe at all: not counted, not reported.
+    const unpinned = partitionPinnedCandidates({ ...base, settings, pinnedAddresses: new Set([first.address.toLowerCase()]) });
+    assert.deepEqual(unpinned.summary, { pinned: 1, skippedReentry: [], skippedOpen: 0, skippedForbidden: 0 });
+    assert.deepEqual(unpinned.kept, [first]);
+
+    // Review condition: the `.filter()` this replaced skipped array holes, so a
+    // sparse candidate list still partitions instead of throwing before a read.
+    const sparse = new Array<PinnedCandidate>(2);
+    sparse[1] = first;
+    const holes = partitionPinnedCandidates({ ...base, settings, candidates: sparse });
+    assert.deepEqual(holes.kept, [first]);
+    assert.equal(holes.summary.pinned, 1);
+  });
+
+  it("carries the prefilter summary on every result shape, including an abort", async () => {
+    const base = await inputs(fakeReads());
+    const [first] = base.candidates;
+    assert.ok(first);
+    const withReentry = { ...base, settings: { ...settings, noReentry: true }, previouslyEnteredAddresses: new Set([first.address.toLowerCase()]) };
+    const selected = await selectEntryCandidates(withReentry);
+    assert.equal(selected.prefilter.pinned, base.candidates.length);
+    assert.deepEqual(selected.prefilter.skippedReentry, [first.address]);
+    // A fresh verdict cache: the first call cached every scan, and a cached verdict never reads.
+    const aborted = await selectEntryCandidates({ ...withReentry, verdictCache: createTradeVerdictCache(), dataPlane: fakeReads({ async security() { throw new Error("transport detail"); } }) });
+    assert.equal(aborted.kind, "aborted");
+    assert.deepEqual(aborted.prefilter.skippedReentry, [first.address]);
+    // Everything set aside: no read is spent and the summary still says why.
+    const nothingLeft = await selectEntryCandidates({ ...withReentry, previouslyEnteredAddresses: new Set(base.candidates.map((row) => row.address.toLowerCase())) });
+    assert.equal(nothingLeft.kind, "selected");
+    assert.equal(nothingLeft.reads, 0);
+    assert.equal(nothingLeft.prefilter.skippedReentry.length, base.candidates.length);
   });
 
   it("caches scan verdicts for 300 seconds", async () => {

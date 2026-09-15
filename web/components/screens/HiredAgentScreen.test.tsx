@@ -55,6 +55,7 @@ const view: AgentDetailView = {
   status: "armed",
   walletAddress: "0x2222222222222222222222222222222222222222",
   sessionPublicKey: `0x${"33".repeat(64)}`,
+  sessionExpiresAt: null,
   provisioning: false,
   actionDisabledReason: null,
   armMs: 1_000,

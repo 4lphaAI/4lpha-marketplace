@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { formatEther } from "viem";
 import { Button, Icon, StatusBadge } from "@/design-system";
 import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
+import { SessionExpiryChip, sessionExpiry } from "@/components/agent/SessionExpiry";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
 import { TradeRunLog } from "./TradeRunLog";
 import { TokenIcon } from "@/components/TokenIcon";
@@ -148,6 +149,19 @@ function Stepper({ value, suffix, onChange, min = 0, max = Number.MAX_SAFE_INTEG
   </div>;
 }
 
+/**
+ * What "no time limit" means for THIS draft, stated the way the worker
+ * actually behaves: the model is asked about an exit only when the owner left
+ * take profit or stop loss blank (`runExits`); with both set, the rules alone
+ * decide and an untouched position simply stays open.
+ */
+export function noLimitNote(draft: Pick<TradeSettings, "takeProfitBps" | "stopLossBps">): string {
+  const rules = [draft.takeProfitBps === null ? null : "take profit", draft.stopLossBps === null ? null : "stop loss"].filter((rule): rule is string => rule !== null);
+  const model = draft.takeProfitBps === null || draft.stopLossBps === null;
+  if (rules.length === 0) return "No time limit — positions exit only when the model says so.";
+  return `No time limit — positions exit only on ${rules.join(" or ")}${model ? ", or when the model says so" : ""}.`;
+}
+
 function EditPanel({ initial, onCancel, onSave, busy }: {
   readonly initial: TradeSettings;
   readonly onCancel: () => void;
@@ -171,7 +185,15 @@ function EditPanel({ initial, onCancel, onSave, busy }: {
     <div className="fl-trade-edit__grid fl-trade-edit__grid--three">
       <label><span><input type="checkbox" checked={draft.takeProfitBps !== null} onChange={(event) => setDraft({ ...draft, takeProfitBps: event.target.checked ? 10_000 : null })} /> Take profit</span><Stepper value={(draft.takeProfitBps ?? 10_000) / 100} suffix="%" min={1} max={100} onChange={(value) => setDraft({ ...draft, takeProfitBps: Math.round(value * 100) })} /></label>
       <label><span><input type="checkbox" checked={draft.stopLossBps !== null} onChange={(event) => setDraft({ ...draft, stopLossBps: event.target.checked ? 5_000 : null })} /> Stop loss</span><Stepper value={stopLossPercentFromBps(draft.stopLossBps ?? 5_000)} suffix="%" min={-100} max={-1} onChange={(value) => setDraft({ ...draft, stopLossBps: stopLossBpsFromPercent(value) })} /></label>
-      <label><span>Max holding time</span><Stepper value={Math.round((draft.maxHoldSec ?? 7_200) / 60)} suffix="min" min={1} max={10_080} onChange={(value) => setDraft({ ...draft, maxHoldSec: value * 60 })} /></label>
+      {/* `null` on the wire is "no limit" (settings.ts), so the control must be able
+          to show and set it: before 2026-09-15 this stepper displayed `?? 7_200` as
+          "120 min" over a live agent that had no limit at all, and its min of 1
+          made the true value unreachable from here. Untick = no time limit. */}
+      <label><span><input type="checkbox" checked={draft.maxHoldSec !== null} onChange={(event) => setDraft({ ...draft, maxHoldSec: event.target.checked ? 7_200 : null })} /> Max holding time</span>
+        {draft.maxHoldSec === null
+          ? <small className="fl-trade-edit__no-limit">{noLimitNote(draft)}</small>
+          : <Stepper value={Math.round(draft.maxHoldSec / 60)} suffix="min" min={1} max={10_080} onChange={(value) => setDraft({ ...draft, maxHoldSec: value * 60 })} />}
+      </label>
     </div>
     <div className="fl-trade-kicker">Risk and execution</div>
     <div className="fl-trade-edit__grid fl-trade-edit__grid--three">
@@ -264,16 +286,33 @@ export function TradeAgentDetail(props: Props) {
   const summary = trade?.summary;
   const gross = summary?.grossDeltaWei ?? null;
   const grossTone = gross === null ? "normal" : BigInt(gross) < 0n ? "loss" : "profit";
-  const status = view?.status === "armed" ? "live" : "paused";
+  // A minute clock for the session chip: the countdown must move without a
+  // refetch, and one minute is the finest unit it prints.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+  const expiry = sessionExpiry(view?.sessionExpiresAt, nowMs);
   const draining = trade?.lifecycle?.draining === true;
-  const statusLabel = view === null ? "—" : draining ? "draining" : ["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined;
+  // An armed agent whose session has expired is not live: nothing it decides
+  // can reach the chain. The plane's status row does not change on expiry
+  // (there is no sweep for it), so the page says it from the clock.
+  const sessionDead = expiry.state === "expired" && view?.status === "armed";
+  const status = sessionDead ? "danger" : view?.status === "armed" ? "live" : "paused";
+  const statusLabel = view === null ? "—" : draining ? "draining" : sessionDead ? "expired" : ["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined;
   const unresolved = trade?.pendingIntents ?? [];
   const recoveryRequired = unresolved.length > 0 || (trade?.open ?? []).some((position) => position.status === "orphaned");
   return <div className="fl-shell fl-hired-agent-page fl-trade-detail-page">
     <Button variant="ghost" size="sm" icon={<Icon name="chevron-right" size={14} style={{ transform: "rotate(180deg)" }} />} onClick={() => props.go("/account")}>My agents</Button>
     <div className="fl-trade-hero">
-      <div className="fl-trade-title"><span className="fl-card__glyph"><Icon name="yield" size={22} /></span><h1>{settings?.name ?? view?.id ?? agentId}</h1><StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} /><AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." /></div>
+      <div className="fl-trade-title"><span className="fl-card__glyph"><Icon name="yield" size={22} /></span><h1>{settings?.name ?? view?.id ?? agentId}</h1><StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} /><SessionExpiryChip expiresAt={view?.sessionExpiresAt} nowMs={nowMs} /><AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." /></div>
       <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
+      {sessionDead
+        ? <div className="fl-trade-message fl-trade-message--warning" role="alert">Session expired. The agent can no longer trade or exit{(trade?.open.length ?? 0) > 0 ? ` its ${trade?.open.length} open position${trade?.open.length === 1 ? "" : "s"}` : ""}; withdraw tokens from Account → Withdraw, then remove this agent and hire again.</div>
+        : expiry.state === "soon" && (trade?.open.length ?? 0) > 0
+          ? <div className="fl-trade-message fl-trade-message--warning" role="alert">Session ends in {expiry.label.replace(/^Expires in /u, "")}. Exits stop working after that — sell the open positions before then, or remove the agent now to exit everything to BNB.</div>
+          : null}
       <div className="fl-hired-actions">
         {signedOut ? <Button variant="primary" onClick={() => void props.signIn()}>Sign in to view</Button> : null}
         <Button variant={editing ? "primary" : "secondary"} icon={<Icon name="settings" size={15} />} disabled={busy || settings === null || draining || unresolved.length > 0} onClick={() => setEditing((value) => !value)}>{editing ? "Editing" : "Edit"}</Button>

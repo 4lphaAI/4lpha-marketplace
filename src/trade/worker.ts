@@ -34,6 +34,7 @@ import {
   createTradeVerdictCache,
   selectEntryCandidates,
   type EntryCandidate,
+  type PinnedPrefilterSummary,
   type TradeVerdictCache,
 } from "./universe.js";
 import type { TradeDataPlaneReads } from "./dataPlaneReads.js";
@@ -166,6 +167,37 @@ type MutableCounts = { events?: TradeRunEvent[]; startedAt?: number; candidates:
 function observe(counts: MutableCounts, event: Omit<TradeRunEvent, "elapsedMs">): void {
   if (counts.events === undefined || counts.events.length >= 100) return;
   counts.events.push(...normalizeTradeRunEvents([{ ...event, elapsedMs: Date.now() - (counts.startedAt ?? Date.now()) }]));
+}
+
+/** `0x1234…abcd` — the run log's own short form, matched by the web's fallback. */
+function shortAddress(address: string): string {
+  return `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
+
+/**
+ * ONE `screen` line for what the owner's own rules set aside before the data
+ * plane saw the cycle, so "N skipped/refused" has a denominator. The tokens
+ * are the owner's (pinned at hire), the rule is the owner's (`noReentry`), and
+ * a per-token refusal row for each would count the owner's choice as a
+ * screening failure and grow every cycle's trace by the size of the universe.
+ * Silent when nothing was set aside: the common case stays one line shorter.
+ */
+export function prefilterEvent(prefilter: PinnedPrefilterSummary): Omit<TradeRunEvent, "elapsedMs"> | null {
+  const skipped = prefilter.skippedReentry.length + prefilter.skippedOpen + prefilter.skippedForbidden;
+  if (skipped === 0) return null;
+  const parts: string[] = [];
+  if (prefilter.skippedReentry.length > 0) {
+    const shown = prefilter.skippedReentry.slice(0, 8).map(shortAddress);
+    const more = prefilter.skippedReentry.length - shown.length;
+    parts.push(`${prefilter.skippedReentry.length} traded before and No re-entry is on: ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}`);
+  }
+  if (prefilter.skippedOpen > 0) parts.push(`${prefilter.skippedOpen} already open`);
+  if (prefilter.skippedForbidden > 0) parts.push(`${prefilter.skippedForbidden} not enterable`);
+  return {
+    stage: "screen",
+    code: "owner-rules",
+    reason: `${skipped} of ${prefilter.pinned} pinned tokens set aside before screening — ${parts.join("; ")}.`,
+  };
 }
 
 function settingsFrom(value: unknown): TradeSettings {
@@ -581,6 +613,8 @@ async function runEntry(
     nowMs,
     ...(deps.verdictCache === undefined ? {} : { verdictCache: deps.verdictCache }),
   });
+  const setAside = prefilterEvent(selected.prefilter);
+  if (setAside !== null) observe(counts, setAside);
   for (const refusal of selected.refusals) observe(counts, { stage: "screen", code: refusal.reason, token: refusal.address });
   counts.refusals += selected.refusals.length;
   if (selected.kind === "aborted") return selected.reason;
@@ -615,7 +649,8 @@ async function runEntry(
   }
   counts.candidates = routeable.length;
   signal?.throwIfAborted();
-  observe(counts, { stage: "screen", code: "shortlisted", reason: `${routeable.length} candidates passed screening and routeability` });
+  const screened = selected.prefilter.pinned - selected.prefilter.skippedReentry.length - selected.prefilter.skippedOpen - selected.prefilter.skippedForbidden;
+  observe(counts, { stage: "screen", code: "shortlisted", reason: `${routeable.length} of ${screened} screened candidates passed screening and routeability` });
   if (routeable.length === 0) return selected.candidates.length === 0 ? "no-candidates" : "no-route";
   let accepted: readonly number[];
   try {

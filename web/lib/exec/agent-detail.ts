@@ -347,6 +347,13 @@ export type AgentDetailView = {
   readonly hireSizingName: string | null;
   readonly walletAddress: string;
   readonly sessionPublicKey: string | null;
+  /**
+   * When the on-chain session's authority ends, unix SECONDS, or `null` when
+   * no session is on record. The owner DTO already carried this inside the
+   * daily cap's note; it is a field of its own because the page has to say
+   * "expires in 6h" and "expired" without parsing a sentence back apart.
+   */
+  readonly sessionExpiresAt: number | null;
   readonly provisioning: boolean;
   readonly actionDisabledReason: string | null;
   readonly armMs: number | null;
@@ -595,6 +602,12 @@ function quoteUsdFor(quote: string, tokenSnapshot: unknown, nowMs = Date.now()):
 /** Order-book order: the ask above the bid, anything unassigned last. */
 function rowOrder(role: string): number {
   return role === "sell" ? 0 : role === "buy" ? 1 : 2;
+}
+
+/** The session's expiry as the plane recorded it, or `null` when absent or malformed. */
+function sessionExpiresAt(session: Row | null): number | null {
+  const expiry = session?.["expiresAt"];
+  return safeInteger(expiry) && expiry >= 0 ? expiry : null;
 }
 
 function dailyLimit(session: Row | null, nowMs: number, tokenSnapshot: unknown): DetailMetric {
@@ -918,6 +931,7 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
+    sessionExpiresAt: sessionExpiresAt(session),
     provisioning,
     actionDisabledReason: provisioning ? "This agent is still being hired. Finish the on-chain grant, or cancel the hire." : null,
     armMs: null,
@@ -1250,6 +1264,7 @@ function mapLpAgentDetail(
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
+    sessionExpiresAt: sessionExpiresAt(session),
     provisioning,
     actionDisabledReason: provisioning ? "This agent is still being hired. Finish the on-chain grant, or cancel the hire." : null,
     armMs: latestArmed?.createdAt ?? null,
@@ -1601,6 +1616,7 @@ export function mapAgentDetail(
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey,
+    sessionExpiresAt: sessionExpiresAt(owner.session),
     provisioning,
     actionDisabledReason: provisioning ? "This agent is still being hired. Finish the on-chain grant, or cancel the hire." : null,
     armMs: hodl.armedAtMs ?? (liveCreatedAt.length === 0 ? null : Math.min(...liveCreatedAt)),

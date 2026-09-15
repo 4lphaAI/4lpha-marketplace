@@ -430,6 +430,39 @@ describe("trade worker cycle", () => {
     assert.equal(run?.events?.some((event) => event.code === "non-entry-asset" && event.token === usdt), true);
   });
 
+  // 2026-09-15: a Sigma agent showed "13 skipped/refused" every cycle while
+  // twelve more of its pinned tokens were dropped in silence by `noReentry`.
+  it("records what the owner's own rules set aside, once per cycle, with the pinned denominator", async () => {
+    // Exits run first: the open position must survive them — a flat 1x quote
+    // trips neither threshold, and the hold window is a day.
+    const h = await harness({
+      settings: settings({ noReentry: true, maxOpenPositions: 3, maxHoldSec: 86_400 }),
+      routeReader: quoteReader(async (_path, amount) => amount),
+    });
+    const [traded, open] = [address(100), address(101)];
+    await openPosition(h, traded, "done");
+    await h.positions.closePosition({ ownerAddress: OWNER, agentId: "agent-a", positionId: "done", exitWei: 120n, reason: "take-profit" });
+    await openPosition(h, open, "still-open", Date.UTC(2026, 8, 7, 14));
+    await runTradeWorkerOnce(h.deps);
+    const [run] = await h.positions.listRuns(OWNER, "agent-a", 1);
+    const setAside = (run?.events ?? []).filter((event) => event.stage === "screen" && event.code === "owner-rules");
+    assert.equal(setAside.length, 1, "one summary line, not one row per token");
+    // The open one is reported as open even though it was also "entered before".
+    assert.match(setAside[0]?.reason ?? "", /^2 of 6 pinned tokens set aside before screening — 1 traded before and No re-entry is on: 0x0000…0064; 1 already open\.$/u);
+    // The owner's rule is not a screening refusal: the count the summary line shows stays the plane's.
+    assert.equal(run?.refusals, 0);
+    assert.equal((run?.events ?? []).some((event) => event.code === "shortlisted" && /of 4 screened candidates/u.test(event.reason ?? "")), true);
+    // The traded token was never offered to the data plane or the model again.
+    assert.equal(h.calls.some((call) => call.side === "buy" && call.token === traded), false);
+  });
+
+  it("stays silent when nothing was set aside", async () => {
+    const h = await harness();
+    await runTradeWorkerOnce(h.deps);
+    const [run] = await h.positions.listRuns(OWNER, "agent-a", 1);
+    assert.equal((run?.events ?? []).some((event) => event.code === "owner-rules"), false);
+  });
+
   it("filters an unrouteable candidate before the entry LLM", async () => {
     const blocked = address(105);
     let prompt = "";

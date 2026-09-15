@@ -270,6 +270,7 @@ export function mockAgentDetailView(agentId: string): AgentDetailView {
     hireSizingName: "grid-v1",
     walletAddress: WALLET,
     sessionPublicKey: "0x04224619950bb006d2ae7e0daa3ce3d1b94ed01a1a05797aaa04b68981bedf80d859e5420c03242d261582c0d5e1d67d7ee5381d31987b290f4e637f6951f31857",
+    sessionExpiresAt: 1_789_000_000,
     provisioning: false,
     actionDisabledReason: null,
     armMs: NOW - 4 * 60 * MINUTE,

@@ -498,6 +498,8 @@
   --paused-tint: rgb(122 122 122 / 0.12);
   --warn: #f0913a;
   --warn-tint: rgb(240 145 58 / 0.10);
+  /* Alias: ten call sites write var(--warning); until 2026-09-15 it resolved to nothing. */
+  --warning: var(--warn);
   --danger: #e5484d;
   --danger-tint: rgb(229 72 77 / 0.10);
 

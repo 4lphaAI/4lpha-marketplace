@@ -310,19 +310,80 @@ export type SelectEntryCandidatesInput = {
   readonly verdictCache?: TradeVerdictCache;
 };
 
+/**
+ * What the owner's OWN rules removed before the data plane saw anything.
+ *
+ * An observation, never an input to selection. It exists because the run log
+ * could not explain a shrinking universe: on 2026-09-15 a Sigma agent showed
+ * "13 skipped/refused" every cycle while twelve more of its twenty-five pinned
+ * tokens had been dropped in silence by `noReentry` — the owner's rule, not a
+ * refusal — and nothing on the page said where they went.
+ */
+export type PinnedPrefilterSummary = {
+  /** Pinned tokens offered to this cycle, before any rule. */
+  readonly pinned: number;
+  /** Skipped because they were entered once and `noReentry` is on; checksummed. */
+  readonly skippedReentry: readonly Address[];
+  /** Skipped because a position (or a pending buy) is already open on them. */
+  readonly skippedOpen: number;
+  /** Skipped because the plane forbids them (exit-only assets, forbidden lists). */
+  readonly skippedForbidden: number;
+};
+
 export type SelectEntryCandidatesResult =
   | {
       readonly kind: "selected";
       readonly candidates: readonly EntryCandidate[];
       readonly refusals: readonly CandidateRefusal[];
       readonly reads: number;
+      readonly prefilter: PinnedPrefilterSummary;
     }
   | {
       readonly kind: "aborted";
       readonly reason: "data-plane-unavailable" | "read-budget";
       readonly refusals: readonly CandidateRefusal[];
       readonly reads: number;
+      readonly prefilter: PinnedPrefilterSummary;
     };
+
+/**
+ * R3.4 step 1: the owner's and the plane's own rules, applied to the pinned
+ * universe BEFORE any read. Pure and exported so the worker's run log reports
+ * the same partition the selector acted on, rather than a second copy of it.
+ * Each token is reported under ONE reason, the most specific first: a token
+ * with a position open on it is "open" whether or not it was also entered
+ * before, since that is the fact the owner can see on the page. The three
+ * tests drop the same tokens in any order; only the label depends on it.
+ */
+export function partitionPinnedCandidates(
+  input: Pick<SelectEntryCandidatesInput, "settings" | "candidates" | "pinnedAddresses" | "previouslyEnteredAddresses" | "openPositionAddresses" | "forbiddenAddresses">,
+): { readonly kept: readonly PinnedCandidate[]; readonly summary: PinnedPrefilterSummary } {
+  const kept: PinnedCandidate[] = [];
+  const skippedReentry: Address[] = [];
+  let pinned = 0;
+  let skippedOpen = 0;
+  let skippedForbidden = 0;
+  // `forEach`, not `for…of`: the `.filter()` this replaces skipped array holes,
+  // and the review (TRADE-RUNLOG-OWNER-RULES-REVIEW) kept that equivalence as
+  // its one condition — a sparse `candidates` must not throw before any read.
+  input.candidates.forEach((candidate) => {
+    const key = candidate.address.toLowerCase();
+    if (!input.pinnedAddresses.has(key)) return;
+    pinned += 1;
+    if (input.openPositionAddresses.has(key)) { skippedOpen += 1; return; }
+    if (input.settings.noReentry && input.previouslyEnteredAddresses.has(key)) { skippedReentry.push(candidate.address); return; }
+    if (input.forbiddenAddresses.has(key)) { skippedForbidden += 1; return; }
+    // MEASURED 2026-09-03 at 13:10 UTC, US market closed: 11 of the 25 bStocks
+    // quoted inside the impact limit, 3 were too thin and 11 had no pool at all.
+    // The AMM never closes, so "the underlying is a US-listed instrument" is a
+    // FACT ABOUT THE ASSET (the data plane's job) and not a reason to refuse a
+    // swap (this plane's job). The bound that separated the three groups was
+    // the 300 bps impact refusal, which reads the chain. So the window is now
+    // advisory: it reaches the model as a fact and refuses nothing.
+    kept.push(candidate);
+  });
+  return { kept, summary: { pinned, skippedReentry, skippedOpen, skippedForbidden } };
+}
 
 function routeFor(row: EligibilityBatchRow): EntryCandidate["routeKind"] | null {
   switch (row.source) {
@@ -359,33 +420,20 @@ export async function selectEntryCandidates(
     reads += 1;
     return true;
   };
-  const prefiltered = input.candidates.filter((candidate) => {
-    const key = candidate.address.toLowerCase();
-    if (!input.pinnedAddresses.has(key)) return false;
-    if (input.settings.noReentry && input.previouslyEnteredAddresses.has(key)) return false;
-    if (input.openPositionAddresses.has(key) || input.forbiddenAddresses.has(key)) return false;
-    // MEASURED 2026-09-03 at 13:10 UTC, US market closed: 11 of the 25 bStocks
-    // quoted inside the impact limit, 3 were too thin and 11 had no pool at all.
-    // The AMM never closes, so "the underlying is a US-listed instrument" is a
-    // FACT ABOUT THE ASSET (the data plane's job) and not a reason to refuse a
-    // swap (this plane's job). The bound that separated the three groups was
-    // the 300 bps impact refusal, which reads the chain. So the window is now
-    // advisory: it reaches the model as a fact and refuses nothing.
-    return true;
-  });
-  if (prefiltered.length === 0) return { kind: "selected", candidates: [], refusals, reads };
+  const { kept: prefiltered, summary: prefilter } = partitionPinnedCandidates(input);
+  if (prefiltered.length === 0) return { kind: "selected", candidates: [], refusals, reads, prefilter };
 
   const tokens: TokenBatchRow[] = [];
   const eligibility: EligibilityBatchRow[] = [];
   try {
     for (const batch of chunks(prefiltered.map(({ address }) => address), 50)) {
-      if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads };
+      if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads, prefilter };
       tokens.push(...await input.dataPlane.tokensBatch(batch, input.signal));
-      if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads };
+      if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads, prefilter };
       eligibility.push(...await input.dataPlane.eligibilityBatch(batch, input.signal));
     }
   } catch {
-    return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads };
+    return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads, prefilter };
   }
 
   const tokenByAddress = new Map(tokens.map((row) => [row.address.toLowerCase(), row]));
@@ -396,7 +444,7 @@ export async function selectEntryCandidates(
     const token = tokenByAddress.get(key);
     const gate = eligibilityByAddress.get(key);
     if (token === undefined || gate === undefined) {
-      return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads };
+      return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads, prefilter };
     }
     if (isEntryExcludedToken(candidate.address, token.symbol)) {
       refusals.push({ address: candidate.address, reason: "non-entry-asset" });
@@ -447,12 +495,12 @@ export async function selectEntryCandidates(
     if (verdict !== undefined) {
       resolved = verdict.verdict;
     } else {
-      if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads };
+      if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads, prefilter };
       let payload: unknown;
       try {
         payload = await input.dataPlane.security(candidate.address, input.signal);
       } catch {
-        return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads };
+        return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads, prefilter };
       }
       resolved = evaluateSecurityPayload(payload, true);
       cache.set(key, { expiresAtMs: input.nowMs + TRADE_SCAN_TTL_SEC * 1_000, verdict: resolved });
@@ -463,5 +511,5 @@ export async function selectEntryCandidates(
     }
     selected.push({ ...candidate, scanReasons: resolved.reasons });
   }
-  return { kind: "selected", candidates: selected, refusals, reads };
+  return { kind: "selected", candidates: selected, refusals, reads, prefilter };
 }
