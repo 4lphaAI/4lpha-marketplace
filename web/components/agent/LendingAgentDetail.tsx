@@ -27,6 +27,7 @@ import * as React from "react";
 import { TokenIcon } from "@/components/TokenIcon";
 import { ActivityRow, Button, Category, Checkbox, Icon, Input, MetricTile, PermissionItem, SegmentedToggle, StatusBadge } from "@/design-system";
 import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
+import { SessionExpiryChip, SessionExpiryNotice, sessionExpiry, sessionPillOverride, useSessionClock } from "@/components/agent/SessionExpiry";
 import { portfolioApy, portfolioUsd, type LendingPortfolio } from "@/lib/exec/lending-portfolio";
 import { usePublicClient } from "wagmi";
 import type { Address } from "viem";
@@ -330,6 +331,11 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
   const lending = detail.lending;
   const mapped: LendingAgentView | null = lending === null || lending === INVALID ? null : lending;
   const mapFailed = lending === INVALID;
+  // The session clock, shared with the trade/LP/grid pages: an armed guard
+  // with a dead session is "expired", not "Live" (2026-09-15). Above the
+  // provisioning return because it is a hook.
+  const nowMs = useSessionClock();
+  const sessionPill = sessionPillOverride(sessionExpiry(view?.sessionExpiresAt, nowMs), view?.status);
 
   /* ---- provisioning: the guard row does not exist yet -------------------- */
 
@@ -679,12 +685,16 @@ export function LendingAgentDetail(props: LendingAgentDetailProps) {
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <h1 style={{ font: "var(--type-page-title)" }}>{view?.id ?? props.agentId}</h1>
-            <StatusBadge pill status={view?.status === "armed" ? "live" : "paused"} label={guard?.status ?? view?.status ?? "state unavailable"} />
+            <StatusBadge pill status={sessionPill?.status ?? (view?.status === "armed" ? "live" : "paused")} label={sessionPill?.label ?? guard?.status ?? view?.status ?? "state unavailable"} />
+            <SessionExpiryChip expiresAt={view?.sessionExpiresAt} nowMs={nowMs} />
             {/* AGENT-GAS-ATTENTION §3.3 — WARN ONLY for a Venus guard: it is
                 never stood down for gas (src/lending/sizing.ts rule 2). */}
             <AttentionChip state={gasAttention(view?.gas)} title="This guard wallet is low on BNB for relay gas." />
           </div>
           <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
+          {/* A guard is "exposed" while it is armed or held: its reserve and its
+              promise to repay both die with the session. */}
+          <SessionExpiryNotice kind="lending" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={guard !== null && (guard.status === "armed" || guard.status === "held" || guard.status === "arming") ? 1 : 0} />
 
           {props.message ? <p role="status">{props.message}</p> : null}
           {notice !== null ? <p role="status" style={{ color: "var(--ink-1)", maxWidth: "70ch" }}>{notice}</p> : null}

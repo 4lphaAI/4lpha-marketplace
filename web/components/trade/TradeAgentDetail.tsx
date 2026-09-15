@@ -4,7 +4,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { formatEther } from "viem";
 import { Button, Icon, StatusBadge } from "@/design-system";
 import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
-import { SessionExpiryChip, sessionExpiry } from "@/components/agent/SessionExpiry";
+import { SessionExpiryChip, SessionExpiryNotice, sessionExpiry, sessionPillOverride, useSessionClock } from "@/components/agent/SessionExpiry";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
 import { TradeRunLog } from "./TradeRunLog";
 import { TokenIcon } from "@/components/TokenIcon";
@@ -286,21 +286,14 @@ export function TradeAgentDetail(props: Props) {
   const summary = trade?.summary;
   const gross = summary?.grossDeltaWei ?? null;
   const grossTone = gross === null ? "normal" : BigInt(gross) < 0n ? "loss" : "profit";
-  // A minute clock for the session chip: the countdown must move without a
-  // refetch, and one minute is the finest unit it prints.
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNowMs(Date.now()), 60_000);
-    return () => clearInterval(timer);
-  }, []);
-  const expiry = sessionExpiry(view?.sessionExpiresAt, nowMs);
+  const nowMs = useSessionClock();
   const draining = trade?.lifecycle?.draining === true;
   // An armed agent whose session has expired is not live: nothing it decides
-  // can reach the chain. The plane's status row does not change on expiry
-  // (there is no sweep for it), so the page says it from the clock.
-  const sessionDead = expiry.state === "expired" && view?.status === "armed";
-  const status = sessionDead ? "danger" : view?.status === "armed" ? "live" : "paused";
-  const statusLabel = view === null ? "—" : draining ? "draining" : sessionDead ? "expired" : ["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined;
+  // can reach the chain. The pill override comes from the shared clock so all
+  // four agent pages say the same thing about the same fact.
+  const pill = sessionPillOverride(sessionExpiry(view?.sessionExpiresAt, nowMs), view?.status);
+  const status = pill?.status ?? (view?.status === "armed" ? "live" : "paused");
+  const statusLabel = view === null ? "—" : draining ? "draining" : pill?.label ?? (["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined);
   const unresolved = trade?.pendingIntents ?? [];
   const recoveryRequired = unresolved.length > 0 || (trade?.open ?? []).some((position) => position.status === "orphaned");
   return <div className="fl-shell fl-hired-agent-page fl-trade-detail-page">
@@ -308,11 +301,7 @@ export function TradeAgentDetail(props: Props) {
     <div className="fl-trade-hero">
       <div className="fl-trade-title"><span className="fl-card__glyph"><Icon name="yield" size={22} /></span><h1>{settings?.name ?? view?.id ?? agentId}</h1><StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} /><SessionExpiryChip expiresAt={view?.sessionExpiresAt} nowMs={nowMs} /><AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." /></div>
       <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
-      {sessionDead
-        ? <div className="fl-trade-message fl-trade-message--warning" role="alert">Session expired. The agent can no longer trade or exit{(trade?.open.length ?? 0) > 0 ? ` its ${trade?.open.length} open position${trade?.open.length === 1 ? "" : "s"}` : ""}; withdraw tokens from Account → Withdraw, then remove this agent and hire again.</div>
-        : expiry.state === "soon" && (trade?.open.length ?? 0) > 0
-          ? <div className="fl-trade-message fl-trade-message--warning" role="alert">Session ends in {expiry.label.replace(/^Expires in /u, "")}. Exits stop working after that — sell the open positions before then, or remove the agent now to exit everything to BNB.</div>
-          : null}
+      <SessionExpiryNotice kind="trade" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={trade?.open.length ?? 0} />
       <div className="fl-hired-actions">
         {signedOut ? <Button variant="primary" onClick={() => void props.signIn()}>Sign in to view</Button> : null}
         <Button variant={editing ? "primary" : "secondary"} icon={<Icon name="settings" size={15} />} disabled={busy || settings === null || draining || unresolved.length > 0} onClick={() => setEditing((value) => !value)}>{editing ? "Editing" : "Edit"}</Button>

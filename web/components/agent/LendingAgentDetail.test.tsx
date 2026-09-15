@@ -295,6 +295,18 @@ describe("the hero and the tiles", () => {
     await openTab("Permissions");
     expect(host.textContent).toContain("Session key");
   });
+
+  it("an armed guard with a dead session wears the expired pill and the lending notice; a live one wears the chip", async () => {
+    await mount(lendingView(), { view: { ...agentView, sessionExpiresAt: Math.floor(Date.now() / 1_000) - 60 } });
+    expect(host.querySelector(".fl-status")?.textContent).toBe("expired");
+    expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
+    expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
+    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toContain("repay on the borrower's behalf; the reserve stays in the guard wallet");
+    await mount(lendingView(), { view: { ...agentView, sessionExpiresAt: Math.floor(Date.now() / 1_000) + 5 * 86_400 } });
+    expect(host.querySelector(".fl-status")?.textContent).toBe("armed");
+    expect(host.querySelector('[data-session-expiry="ok"]')?.textContent).toMatch(/^Session · (4d 23h|5d)$/u);
+    expect(host.querySelector("[data-session-notice]")).toBeNull();
+  });
 });
 
 describe("dash with reason", () => {

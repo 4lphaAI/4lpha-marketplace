@@ -397,3 +397,20 @@ it("the Dust info icon opens its explanation on hover and on focus", async () =>
     expect(button.getAttribute("style")).toContain("width: 18px");
   } finally { await act(async () => root.unmount()); host.remove(); }
 });
+
+describe("session clock on the LP page (2026-09-15)", () => {
+  it("an armed agent with a dead session wears the expired pill and the LP notice; a live one wears the chip", () => {
+    const base = rangeView(false);
+    const dead = render({ ...base, sessionExpiresAt: Math.floor(Date.now() / 1_000) - 60 });
+    const host = document.createElement("div"); host.innerHTML = dead;
+    expect(host.querySelector(".fl-status")?.textContent).toBe("expired");
+    expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
+    expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
+    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toContain("rotate, harvest or close");
+    const live = render({ ...base, sessionExpiresAt: Math.floor(Date.now() / 1_000) + 5 * 86_400 });
+    host.innerHTML = live;
+    expect(host.querySelector(".fl-status")?.textContent).toBe("armed");
+    expect(host.querySelector('[data-session-expiry="ok"]')?.textContent).toMatch(/^Session · (4d 23h|5d)$/u);
+    expect(host.querySelector("[data-session-notice]")).toBeNull();
+  });
+});

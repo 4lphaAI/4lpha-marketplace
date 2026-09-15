@@ -3,6 +3,7 @@ import { lpSequenceLabel } from "../../lib/exec/remove-agent";
 import React, { useEffect, useState } from "react";
 import { Button, Category, Icon, MetricTile, Num, SegmentedToggle, StatusBadge } from "@/design-system";
 import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
+import { SessionExpiryChip, SessionExpiryNotice, sessionExpiry, sessionPillOverride, useSessionClock } from "@/components/agent/SessionExpiry";
 import { TRADE_LLM_MODELS } from "@/lib/trade";
 import { PairIcons } from "@/components/TokenIcon";
 import { ZeroGCredit } from "@/components/ZeroGCredit";
@@ -320,6 +321,11 @@ export function LpAgentDetail(props: Props) {
     runFilter === "All"
     || (runFilter === "Succeeded" ? sequenceOutcome(s) === "succeeded" : sequenceOutcome(s) === "failed"));
   const openRow = (view?.positions ?? []).find(row => row.state !== "closed");
+  // The session clock, shared with the trade/grid/lending pages: an armed
+  // agent with a dead session is "expired", not "Live" (2026-09-15).
+  const nowMs = useSessionClock();
+  const sessionPill = sessionPillOverride(sessionExpiry(view?.sessionExpiresAt, nowMs), view?.status);
+  const openLpCount = (view?.positions ?? []).filter(row => row.state !== "closed").length;
   const tileRead = liveReadFor({ tokenId: openRow?.tokenId ?? null, chainReads: props.chainReads, discovered });
   const accounting = matchingLpAccounting({read:props.accounting,wallet:view?.walletAddress ?? null,
     pool:pool?.poolAddress ?? null,tokenId:tileRead?.position.tokenId ?? null,nowMs:now});
@@ -361,12 +367,14 @@ export function LpAgentDetail(props: Props) {
             </h1>
             <StatusBadge
               pill
-              status={view?.status === "armed" ? "live" : "paused"}
-              label={view?.status ?? "state unavailable"} />
+              status={sessionPill?.status ?? (view?.status === "armed" ? "live" : "paused")}
+              label={sessionPill?.label ?? view?.status ?? "state unavailable"} />
+            <SessionExpiryChip expiresAt={view?.sessionExpiresAt} nowMs={nowMs} />
             {/* AGENT-GAS-ATTENTION §3.3 */}
             <AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." />
           </div>
           <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
+          <SessionExpiryNotice kind="lp" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={openLpCount} />
 
           {props.message ? <p role="status">
             {props.message}

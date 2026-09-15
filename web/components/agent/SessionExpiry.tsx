@@ -16,7 +16,22 @@
  * plane recorded no session — silence, not a guess.
  */
 
+import { useEffect, useState } from "react";
+
 export type SessionExpiryState = "none" | "ok" | "soon" | "expired";
+
+/**
+ * A minute clock for the chip and the notice: the countdown must move without
+ * a refetch, and one minute is the finest unit either prints.
+ */
+export function useSessionClock(): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+  return nowMs;
+}
 
 export type SessionExpiryView = {
   readonly state: SessionExpiryState;
@@ -64,6 +79,94 @@ export function sessionExpiry(expiresAtSec: number | null | undefined, nowMs: nu
   if (left <= 0) return { state: "expired", label: "Session expired", title: `${title}. The agent can no longer trade or exit; withdraw with the passkey or hire again.` };
   if (left < SESSION_SOON_MS) return { state: "soon", label: `Expires in ${formatRemaining(left)}`, title: `${title}. Exits stop working after this; close positions before then.` };
   return { state: "ok", label: `Session · ${formatRemaining(left)}`, title };
+}
+
+/**
+ * The status pill an ARMED agent with a dead session should wear. The plane's
+ * status row does not change on expiry (there is no sweep for it), so every
+ * detail page derives "expired" from the same clock instead of saying "Live"
+ * about an agent nothing can execute for. `null` = keep the page's own pill.
+ */
+export function sessionPillOverride(
+  view: SessionExpiryView,
+  status: string | undefined,
+): { readonly status: "danger"; readonly label: "expired" } | null {
+  return view.state === "expired" && status === "armed" ? { status: "danger", label: "expired" } : null;
+}
+
+export type SessionExpiryKind = "trade" | "lp" | "grid" | "lending";
+
+/** The per-kind sentences: what stops, and what the owner can still do. */
+const COPY: Record<SessionExpiryKind, {
+  readonly stops: (open: number) => string;
+  readonly expiredRecovery: string;
+  readonly soonAdvice: string;
+  readonly pausedAdvice: string;
+}> = {
+  trade: {
+    stops: (open) => `trade or exit${open > 0 ? ` its ${open} open position${open === 1 ? "" : "s"}` : ""}`,
+    expiredRecovery: "withdraw tokens from Account → Withdraw, then remove this agent and hire again.",
+    soonAdvice: "Exits stop working after that — sell the open positions before then, or remove the agent now to exit everything to BNB.",
+    pausedAdvice: "Resume to let the agent sell, or withdraw tokens yourself before then.",
+  },
+  lp: {
+    stops: (open) => `rotate, harvest or close${open > 0 ? ` its ${open} open position${open === 1 ? "" : "s"}` : ""}`,
+    expiredRecovery: "the positions stay in your wallet — close them with the passkey from this page, or hire again.",
+    soonAdvice: "Rotates, harvests and closes stop working after that — close the positions before then, or remove the agent now.",
+    pausedAdvice: "Resume to let the agent act, or close the positions yourself before then.",
+  },
+  grid: {
+    stops: (open) => `requote or close${open > 0 ? ` its ${open} live order${open === 1 ? "" : "s"}` : ""}`,
+    expiredRecovery: "the orders stay in your wallet as positions — close them with the passkey from this page, or hire again.",
+    soonAdvice: "Requotes and closes stop working after that — close the ladder before then, or remove the agent now.",
+    pausedAdvice: "Resume to let the agent act, or close the ladder yourself before then.",
+  },
+  lending: {
+    stops: () => "repay on the borrower's behalf",
+    expiredRecovery: "the reserve stays in the guard wallet — withdraw it from Account → Withdraw, then remove this guard and hire again.",
+    soonAdvice: "The guard stops repaying after that — remove the guard before then and hire it again.",
+    pausedAdvice: "Resume to let the guard act, or remove it before then.",
+  },
+};
+
+/**
+ * The one-line consequence under the title, on every agent kind, ONCE.
+ *
+ * Renders nothing while the session has more than a day left, nothing without
+ * a recorded session, and — for `soon` — nothing when there is no exposure to
+ * strand (`open === 0`): a warning with nothing to do is noise. `expired`
+ * always shows for an armed or paused agent, because the page's own pill is
+ * the only other place the fact could live and the pill has no room for the
+ * remedy. Revoked / retired / provisioning agents are past or before the
+ * session and get nothing here.
+ */
+export function SessionExpiryNotice({ kind, expiresAt, nowMs, status, open }: {
+  readonly kind: SessionExpiryKind;
+  readonly expiresAt: number | null | undefined;
+  readonly nowMs: number;
+  readonly status: string | undefined;
+  /** Open positions / live orders / an active guard (1) — what the session's death strands. */
+  readonly open: number;
+}) {
+  const view = sessionExpiry(expiresAt, nowMs);
+  if (view.state === "none" || view.state === "ok") return null;
+  if (status !== "armed" && status !== "paused") return null;
+  const copy = COPY[kind];
+  const remaining = view.label.replace(/^Expires in /u, "");
+  if (view.state === "expired") {
+    return <div className="fl-trade-message fl-trade-message--warning" role="alert" data-session-notice="expired">
+      Session expired. The agent can no longer {copy.stops(open)}; {copy.expiredRecovery}
+    </div>;
+  }
+  if (open <= 0) return null;
+  if (status === "paused") {
+    return <div className="fl-trade-message fl-trade-message--warning" role="alert" data-session-notice="paused-soon">
+      Paused — the session ends in {remaining}. {copy.pausedAdvice}
+    </div>;
+  }
+  return <div className="fl-trade-message fl-trade-message--warning" role="alert" data-session-notice="soon">
+    Session ends in {remaining}. {copy.soonAdvice}
+  </div>;
 }
 
 const TONES: Record<Exclude<SessionExpiryState, "none">, string> = {

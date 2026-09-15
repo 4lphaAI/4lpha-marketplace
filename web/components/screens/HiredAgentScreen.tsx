@@ -23,6 +23,7 @@ import { LpAgentDetail } from "@/components/agent/LpAgentDetail";
 import { LendingAgentDetail } from "@/components/agent/LendingAgentDetail";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
 import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
+import { SessionExpiryChip, SessionExpiryNotice, sessionExpiry, sessionPillOverride, useSessionClock } from "@/components/agent/SessionExpiry";
 import {
   EMPTY_REMOVE_PROGRESS,
   advanceRemoveAttempt,
@@ -1433,8 +1434,12 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   });
 
   const cat = Category("grid");
-  const status = view?.status === "armed" ? "live" : "paused";
-  const statusLabel = view === null ? "—" : ["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined;
+  // The session clock, shared with the trade/LP/lending pages: an armed agent
+  // with a dead session is "expired", not "Live" (2026-09-15).
+  const nowMs = useSessionClock();
+  const sessionPill = sessionPillOverride(sessionExpiry(view?.sessionExpiresAt, nowMs), view?.status);
+  const status = sessionPill?.status ?? (view?.status === "armed" ? "live" : "paused");
+  const statusLabel = view === null ? "—" : sessionPill?.label ?? (["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined);
   const actionsDisabled = busy || view === null || view.provisioning || removed;
   const removeProgressHydrated = attemptBindings !== null
     && removeStorageCheckpoint?.attemptKey === attemptKey;
@@ -1556,10 +1561,12 @@ export function HiredAgentScreen({ agentId, go }: Props) {
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <h1 style={{ font: "var(--type-page-title)" }}>{view?.id ?? agentId}</h1>
               <StatusBadge status={status} pill {...(statusLabel === undefined ? {} : { label: statusLabel })} />
+              <SessionExpiryChip expiresAt={view?.sessionExpiresAt} nowMs={nowMs} />
               {/* AGENT-GAS-ATTENTION §3.3 — the same chip the Account list shows,
                   so an agent that needs gas is identifiable without opening it. */}
               <AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." />
             </div>
+            <SessionExpiryNotice kind="grid" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={view?.grid.liveRows ?? 0} />
             {statusMessage ? <span role="status" style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>{statusMessage}</span> : null}
             {identityStatus}
             {removeCallsId !== undefined ? (
