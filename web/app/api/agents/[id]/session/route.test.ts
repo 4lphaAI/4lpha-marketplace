@@ -39,6 +39,21 @@ describe("hire session BFF", () => {
     ]);
   });
 
+  it("moves a provision-issued read token into the strict /api cookie and strips it from the browser body", async () => {
+    exec.ownerMutation.mockResolvedValue({ status: 200, body: JSON.stringify({ data: { status: "provisioning", readSession: { token: "secret-bearer", expiry: 2_000_000_000 } } }) });
+    const response = await POST(new NextRequest("https://app.test/api/agents/agent-1/session", { method: "POST", body: "{}" }), context);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).not.toContain("secret-bearer");
+    expect(JSON.parse(body) as unknown).toEqual({ data: { status: "provisioning", readSession: { expiry: 2_000_000_000 } } });
+    expect(response.headers.get("set-cookie") ?? "").toMatch(/4lpha_account_read=secret-bearer;.*Path=\/api;.*HttpOnly;.*SameSite=strict/u);
+
+    exec.ownerMutation.mockResolvedValue({ status: 409, body: JSON.stringify({ error: { code: "agent_exists" } }) });
+    const refused = await POST(new NextRequest("https://app.test/api/agents/agent-1/session", { method: "POST", body: "{}" }), context);
+    expect(refused.status).toBe(409);
+    expect(refused.headers.get("set-cookie")).toBeNull();
+  });
+
   it("forwards the reusable read header and never exposes the service token", async () => {
     exec.ownerRead.mockResolvedValue({ status: 200, body: "{\"data\":{\"status\":\"provisioning\"}}" });
     const response = await GET(new NextRequest("https://app.test/api/agents/agent-1/session", { headers: { "x-owner-action": "signed-read" } }), context);
@@ -63,6 +78,16 @@ describe("hire session BFF", () => {
     expect((await GET(both, context)).status).toBe(200);
     expect(exec.ownerRead).toHaveBeenCalledWith("/agents/agent-1/session", "signed");
     expect(exec.accountRead).not.toHaveBeenCalled();
+  });
+
+  it("expires a rejected bearer cookie at the same /api path it was issued on", async () => {
+    exec.accountRead.mockResolvedValue({ status: 401, body: "{}" });
+    const result = await GET(new NextRequest("https://app.test/api/agents/agent-1/session", {
+      headers: { cookie: "4lpha_account_read=expired-token" },
+    }), context);
+    expect(result.status).toBe(401);
+    expect(result.headers.get("set-cookie") ?? "")
+      .toMatch(/4lpha_account_read=;.*Path=\/api;.*Max-Age=0/u);
   });
 
   it("forwards the exact S1 continuation without exposing or mixing another owner credential", async () => {

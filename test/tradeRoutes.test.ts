@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { getAddress, keccak256, stringToBytes, type Address, type Hex } from "viem";
 import { canonicalEncode } from "../src/auth/canonical.js";
-import { parseAccountReadSessionSecret } from "../src/auth/accountReadSession.js";
+import { parseAccountReadSessionSecret, verifyAccountReadSession } from "../src/auth/accountReadSession.js";
 import { resolveDomainSalt } from "../src/auth/ownerAuth.js";
 import type { KeyStoreReader } from "../src/account/keyStoreReader.js";
 import type { GrantEvidenceReader } from "../src/wallet/grantEvidence.js";
@@ -299,6 +299,23 @@ describe("trading-agent owner routes", () => {
     assert.deepEqual(pinned, TOKENS);
     const source = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
     assert.match(source, /if \(nativeCaps\.length !== 1\) throw new HireEvidenceError\(\);/u);
+  });
+
+  it("issues the read session only on fresh Trading acceptance, never on replay", async () => {
+    const f = await fixture();
+    const id = "trade-read-session";
+    const action = await signed("provisionAgent", id, hireParams());
+    const first = await post(f.harness, `/agents/${id}/session`, action);
+    assert.equal(first.status, 200, first.text);
+    const readSession = (first.body["data"] as { readSession?: { token?: unknown; expiry?: unknown } }).readSession;
+    assert.equal(typeof readSession?.token, "string");
+    assert.equal(typeof readSession?.expiry, "number");
+    const config = { key: parseAccountReadSessionSecret("cd".repeat(32))!, chainId: 56,
+      environment: resolveDomainSalt({ chainId: 56, network: "mainnet" }) };
+    assert.equal(verifyAccountReadSession(readSession?.token as string, config, NOW_SEC), ownerAccount.address);
+    const replay = await post(f.harness, `/agents/${id}/session`, action);
+    assert.equal(replay.status, 200, replay.text);
+    assert.equal((replay.body["data"] as Record<string, unknown>)["readSession"], undefined);
   });
 
   it("converges a removed Grid key that is absent at one stable finalized block before Trading S1", async () => {

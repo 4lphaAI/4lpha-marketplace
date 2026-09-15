@@ -226,7 +226,7 @@ beforeEach(() => {
   configPayload = CONFIG;
   mocks.signReadHeader.mockResolvedValue("signed-read");
   mocks.signEnvelope.mockImplementation(async (action: string, agentId: string, params: unknown) => ({
-    signed: { action, agentId }, signature: "0x1234", params,
+    signed: { action, agentId, owner: mocks.owner.ownerAddress }, signature: "0x1234", params,
   }));
   mocks.grant.mockResolvedValue({});
   fetchMock = vi.fn<typeof fetch>(async (input, init) => {
@@ -245,6 +245,7 @@ beforeEach(() => {
       // shows the deposit landed, exactly as the LP hire test does.
       return json(preview(previewReads === 1 ? "1000" : "999999999999999999"));
     }
+    if (url === "/api/account/session") return new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
     if (url === "/api/agents") return json({ agents: agentList });
     if (url.endsWith("/session/grant-attempt") && init?.method === "POST") {
       current = provisioning(true);
@@ -257,7 +258,13 @@ beforeEach(() => {
     if (url.endsWith("/session/cancel") && init?.method === "POST") {
       return json({ ...provisioning(false), cancelRequested: true });
     }
-    if (url.endsWith("/session")) return init?.method === "POST" ? provisionResponse ?? json(current) : json(current);
+    if (url.endsWith("/session")) {
+      if (init?.method === "POST") {
+        if (provisionResponse !== null) return provisionResponse;
+        return json({ ...current, readSession: { expiry: Math.floor(Date.now() / 1_000) + 900 } });
+      }
+      return json(current);
+    }
     if (url.endsWith("/lending/settings") && init?.method === "POST") {
       const saved = JSON.parse(String(init.body)) as { params: PersistedLendingArmParams["settings"] };
       lendingViewBody = { ...(lendingViewBody as Record<string, unknown>), settings: { ...saved.params, notifyOnlyBelowHf: "notifyOnlyBelowHf" in saved.params ? saved.params.notifyOnlyBelowHf : null }, settingsDigest: paramsHash("lendingSettings", saved.params) };
@@ -359,26 +366,24 @@ describe("lending durable grant recovery", () => {
   });
 });
 
-describe("the PRE-SIGNATURE gates (R3.13, R2.20)", () => {
+describe("lending hire gates", () => {
   // R3.13: a guard hired onto a wallet that already carries a live agent is
   // refused by the plane AFTER the owner has signed and possibly funded. The
   // browser must refuse first — before `provisionAgent`, and before any passkey
   // wallet ceremony.
-  it("blocks a SHARED wallet before the hire signature and before createPasskeyWallet", async () => {
-    agentList = [{ id: "grid-agent-01", status: "armed", walletAddress: mocks.owner.walletAddress }];
+  it("surfaces a plane wallet refusal after the hire signature without a wallet ceremony", async () => {
+    provisionResponse = new Response(JSON.stringify({ error: { code: "wallet_in_use", message: "Remove the existing agent before deploying Lending Agent." } }), { status: 409 });
     await mount();
     await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
 
     const signedActions = mocks.signEnvelope.mock.calls.map(([action]) => action);
-    expect(signedActions).not.toContain("provisionAgent");
+    expect(signedActions).toContain("provisionAgent");
     expect(mocks.createPasskey).not.toHaveBeenCalled();
     expect(mocks.createPasskeyWallet).not.toHaveBeenCalled();
     expect(mocks.grant).not.toHaveBeenCalled();
     expect(fetchMock.mock.calls.filter(([url, init]) =>
-      String(url).endsWith("/session") && init?.method === "POST")).toHaveLength(0);
-    expect(host.textContent).toContain("already carries a live agent");
-    expect(host.textContent).toContain("The guard needs its own account");
-    expect(host.querySelector("a[href=\"/account\"]")?.textContent).toBe("Create account");
+      String(url).startsWith("/api/agents/") && String(url).endsWith("/session") && init?.method === "POST")).toHaveLength(1);
+    expect(host.textContent).toContain("Remove the existing agent before deploying Lending Agent.");
   });
 
   /**
@@ -390,7 +395,7 @@ describe("the PRE-SIGNATURE gates (R3.13, R2.20)", () => {
    * things actually happen. So the un-blocked hire is measured too: the agent
    * list must be read strictly before the first signature.
    */
-  it("reads the wallet's occupancy STRICTLY BEFORE the hire signature", async () => {
+  it("starts with the hire signature without an owner list read", async () => {
     await mount();
     await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
 
@@ -402,9 +407,9 @@ describe("the PRE-SIGNATURE gates (R3.13, R2.20)", () => {
       .map((call, index) => ({ action: call[0] as string, order: mocks.signEnvelope.mock.invocationCallOrder[index]! }));
     const provision = signOrders.find((entry) => entry.action === "provisionAgent");
 
-    expect(listOrder.length, host.textContent ?? "").toBeGreaterThan(0);
+    expect(listOrder).toHaveLength(0);
     expect(provision, host.textContent ?? "").toBeDefined();
-    expect(Math.min(...listOrder)).toBeLessThan(provision!.order);
+    expect(provision!.order).toBeGreaterThan(0);
     // …and the gate really is what stops the blocked case: the SAME read runs,
     // and this time no `provisionAgent` follows it.
     expect(mocks.createPasskey).not.toHaveBeenCalled();
@@ -975,5 +980,189 @@ describe("Demo mode", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(10); });
     expect(host.textContent).toContain("Demo engine coming soon.");
     expect(mocks.go).not.toHaveBeenCalled();
+  });
+});
+
+function signedTarget(init: RequestInit | undefined): string | null {
+  const header = new Headers(init?.headers).get("x-owner-action");
+  if (header === null) return null;
+  const padded = header.replace(/-/gu, "+").replace(/_/gu, "/") + "=".repeat((4 - header.length % 4) % 4);
+  const envelope = JSON.parse(atob(padded)) as { signed?: { agentId?: unknown } };
+  return typeof envelope.signed?.agentId === "string" ? envelope.signed.agentId : null;
+}
+
+function lendingLedger(): string[] {
+  const entries = mocks.signEnvelope.mock.calls.map((call, index) => ({
+    order: mocks.signEnvelope.mock.invocationCallOrder[index]!,
+    label: call[0] === "read" ? `read(${String(call[1])})` : String(call[0]),
+  }));
+  entries.push(...mocks.grant.mock.invocationCallOrder.map((order) => ({ order, label: "grant" })));
+  return entries.sort((a, b) => a.order - b.order).map((entry) => entry.label);
+}
+
+async function runLendingLedger(scenario: {
+  readonly issuer: "cookie" | "hidden";
+  readonly rememberedExpiryMs?: number;
+  readonly fundingWait?: boolean;
+}): Promise<string[]> {
+  if (scenario.rememberedExpiryMs !== undefined) {
+    localStorage.setItem("4lpha:account-read-expiry:v1", String(scenario.rememberedExpiryMs));
+  }
+  let previewReads = 0;
+  current = provisioning(false);
+  const armed: HireSessionView = { ...current, status: "armed", missing: [] };
+  mocks.grant.mockImplementation(async () => { current = armed; return {}; });
+  fetchMock.mockImplementation(async (request, init) => {
+    const url = String(request);
+    if (url.startsWith("/api/lending/config")) return json(configPayload);
+    if (url.startsWith("/api/market-data/tokens/")) {
+      return new Response(JSON.stringify({
+        data: { address: WBNB.toLowerCase(), priceUsd: 900 },
+        meta: { staleness: "fresh", source: "test", asOf: Date.now() },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.startsWith("/api/lending/guardable")) return json(guardableView());
+    if (url.includes("/hire/preview")) {
+      previewReads += 1;
+      const balance = scenario.fundingWait && previewReads < 3
+        ? "1000" : scenario.fundingWait ? "1000000000000000000" : "1000000000000000000";
+      return json(preview(balance));
+    }
+    if (url === "/api/account/session") {
+      return scenario.issuer === "cookie"
+        ? json({ expiry: Math.floor(Date.now() / 1_000) + 900 })
+        : new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
+    }
+    if (url.endsWith("/session/grant-attempt") && init?.method === "POST") {
+      current = provisioning(true);
+      return json({ ...current, attemptId: ATTEMPT_ID, mayInvoke: true });
+    }
+    if (url.endsWith("/session") && init?.method === "POST") {
+      return scenario.issuer === "cookie"
+        ? json({ ...current, readSession: { expiry: Math.floor(Date.now() / 1_000) + 900 } })
+        : json(current);
+    }
+    if (url.endsWith("/session")) return json(current);
+    if (url.endsWith("/lending/view")) return json(lendingViewBody, lendingViewStatus);
+    if (url.endsWith("/lending/arm") && init?.method === "POST") {
+      return json({ arm: {
+        status: "completed", reason: "completed reason", txHash: null, effect: "changed",
+        idleUsdtWei: "0", mintUsdtWei: "40000000000000000000",
+        supplyNativeWei: "40000000000000000", reserveNativeWei: "10000000000000000", swapFeeTier: 100,
+      } });
+    }
+    throw new Error(`Unexpected URL ${url}`);
+  });
+  await mount();
+  await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+  for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); });
+  if (scenario.fundingWait) {
+    await act(async () => { await vi.advanceTimersByTimeAsync(6_001); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  } else {
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  }
+  for (let i = 0; i < 5; i += 1) {
+    await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
+  }
+  return lendingLedger();
+}
+
+describe("HIRE-SIGNATURES-BC lending prompt ledger", () => {
+  it("records the funded cookie ledger and uses the provision-issued read window", async () => {
+    const observed = await runLendingLedger({ issuer: "cookie" });
+    expect(observed).toEqual(["provisionAgent", "grant", "lendingArm"]);
+    const list = fetchMock.mock.calls.find(([url]) => String(url) === "/api/agents");
+    expect(list).toBeUndefined();
+    const sessions = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/")
+      && String(url).endsWith("/session") && init?.method !== "POST");
+    expect(sessions.every(([, init]) => new Headers(init?.headers).get("x-owner-action") === null)).toBe(true);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+    console.info(`HIRE_SIGNATURES_LEDGER lending funded: ${JSON.stringify(observed)}`);
+  });
+
+  it("records the warm cookie ledger with no read-session signature", async () => {
+    const observed = await runLendingLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 1_800_000 });
+    expect(observed).toEqual(["provisionAgent", "grant", "lendingArm"]);
+    expect(mocks.signEnvelope).not.toHaveBeenCalledWith("createAccountReadSession", "*", {});
+    console.info(`HIRE_SIGNATURES_LEDGER lending warm: ${JSON.stringify(observed)}`);
+  });
+
+  it("uses the signed per-agent read fallback when the issuer is hidden", async () => {
+    const observed = await runLendingLedger({ issuer: "hidden" });
+    expect(observed).toEqual(["provisionAgent", "createAccountReadSession", `read(${ID})`, "grant", "lendingArm"]);
+    const list = fetchMock.mock.calls.find(([url]) => String(url) === "/api/agents");
+    expect(list).toBeUndefined();
+    const sessions = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/")
+      && String(url).endsWith("/session") && init?.method !== "POST");
+    expect(sessions.length).toBeGreaterThan(0);
+    expect(sessions.every(([, init]) => signedTarget(init) === ID)).toBe(true);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+    console.info(`HIRE_SIGNATURES_LEDGER lending hidden-issuer: ${JSON.stringify(observed)}`);
+  });
+
+  it("treats remembered expiry at exactly 60 seconds as cold", async () => {
+    const observed = await runLendingLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 60_000 });
+    expect(observed[0]).toBe("provisionAgent");
+    expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "createAccountReadSession")).toHaveLength(0);
+  });
+
+  it("keeps the provision-issued read window after a remembered cookie", async () => {
+    const observed = await runLendingLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 1_800_000 });
+    expect(observed).toEqual(["provisionAgent", "grant", "lendingArm"]);
+    expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "createAccountReadSession")).toHaveLength(0);
+  });
+
+  it("does not read the owner list before signing a new hire", async () => {
+    const observed = await runLendingLedger({ issuer: "cookie" });
+    expect(observed[0]).toBe("provisionAgent");
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === "/api/agents")).toBe(false);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+  });
+
+  it("keeps one credential across funding expiry and renews before the lending grant read", async () => {
+    const observed = await runLendingLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 66_000, fundingWait: true });
+    expect(observed).toEqual(["provisionAgent", "grant", "lendingArm"]);
+    console.info(`HIRE_SIGNATURES_LEDGER lending cold-short: ${JSON.stringify(["provisionAgent", "<MetaMask deposit>", "grant", "lendingArm"])}`);
+  });
+
+  it("resumes a same-owner collision without provisioning id-2", async () => {
+    let posts = 0;
+    current = { ...provisioning(false), status: "armed", missing: [] };
+    localStorage.setItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`, ARMABLE_HIRE);
+    fetchMock.mockImplementation(async (request, init) => {
+      const url = String(request);
+      if (url.startsWith("/api/lending/config")) return json(configPayload);
+      if (url.startsWith("/api/market-data/tokens/")) return new Response(JSON.stringify({
+        data: { address: WBNB.toLowerCase(), priceUsd: 900 }, meta: { staleness: "fresh", source: "test", asOf: Date.now() },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.startsWith("/api/lending/guardable")) return json(guardableView());
+      if (url.includes("/hire/preview")) return json(preview("1000000000000000000"));
+      if (url === "/api/account/session") return json({ expiry: Math.floor(Date.now() / 1_000) + 900 });
+      if (url.endsWith("/session") && init?.method === "POST") {
+        posts += 1;
+        return new Response(JSON.stringify({ error: { code: "agent_exists" }, data: current, meta: { owned: true } }), { status: 409 });
+      }
+      if (url.endsWith("/session")) return json(current);
+      if (url.endsWith("/lending/view")) return json(lendingViewBody, lendingViewStatus);
+      if (url.endsWith("/lending/arm") && init?.method === "POST") return json({ arm: {
+        status: "completed", reason: "completed reason", effect: "changed",
+        idleUsdtWei: "0", mintUsdtWei: "40000000000000000000",
+        supplyNativeWei: "40000000000000000", reserveNativeWei: "10000000000000000", swapFeeTier: 100,
+      } });
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    await mount();
+    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
+    expect(posts).toBe(1);
+    expect(lendingLedger()).toEqual(["provisionAgent", "createAccountReadSession", "lendingArm"]);
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === "/api/agents")).toBe(false);
+  });
+
+  it("does not need a read-session signature after a fresh provision", async () => {
+    const observed = await runLendingLedger({ issuer: "cookie" });
+    expect(observed[0]).toBe("provisionAgent");
+    expect(mocks.signEnvelope.mock.calls.some(([action]) => action === "createAccountReadSession" || action === "read")).toBe(false);
   });
 });

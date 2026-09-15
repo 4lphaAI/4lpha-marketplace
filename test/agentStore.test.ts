@@ -23,6 +23,7 @@ import {
   type CreateAgentInput,
   type SessionFacts,
   type PendingGrant,
+  type SessionArmPlan,
 } from "../src/store/agents.js";
 import { parseMasterKey } from "../src/store/crypto.js";
 import { validateSessionSpec } from "../src/core/session.js";
@@ -80,6 +81,10 @@ function input(id: string, owner: Address): CreateAgentInput {
     sessionFacts: sampleFacts(),
     caps: { dailyNativeWei: parseEther("1") },
   };
+}
+
+function armPlan(claim: SessionArmPlan["claim"] = null): SessionArmPlan {
+  return { params: { kind: "grid" }, digest: `0x${"55".repeat(32)}` as Hex, kind: "grid", claim };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -315,6 +320,58 @@ for (const factory of FACTORIES) {
           hireSizing: { name: "trade-v1", version: 1, openNativeBudgetWei: "0" } } });
       const created = await store.createAgent({ ...input("replacement", OWNER_A), status: "armed" });
       assert.equal(created.id, "replacement");
+      await store.close();
+    });
+  });
+}
+
+for (const factory of FACTORIES) {
+  describe(`arm-plan CAS — ${factory.name}`, () => {
+    it("claims an explicit JSON null once and records only the claim owner's outcome", async () => {
+      const store = await factory.make();
+      const facts = { ...sampleFacts(), armPlan: armPlan() };
+      const created = await store.createAgent({ ...input("arm-plan", OWNER_A), status: "armed", sessionFacts: facts });
+      const actionId = `0x${"66".repeat(32)}` as Hex;
+      const claimed = await store.claimArmPlanCas({ ownerAddress: OWNER_A, agentId: "arm-plan", expectedRowVersion: created.rowVersion, by: "signed", actionId, nowSec: 10 });
+      assert.equal(claimed.kind, "claimed");
+      const conflict = await store.claimArmPlanCas({ ownerAddress: OWNER_A, agentId: "arm-plan", expectedRowVersion: created.rowVersion, by: "continuation", actionId: `0x${"77".repeat(32)}` as Hex, nowSec: 11 });
+      assert.equal(conflict.kind, "conflict");
+      const recorded = await store.recordArmPlanOutcomeCas({ ownerAddress: OWNER_A, agentId: "arm-plan", callerActionId: actionId, outcome: { status: "completed", atSec: 12 } });
+      assert.equal(recorded.kind, "recorded");
+      const same = await store.recordArmPlanOutcomeCas({ ownerAddress: OWNER_A, agentId: "arm-plan", callerActionId: actionId, outcome: { status: "held", atSec: 13 } });
+      assert.equal(same.kind, "same");
+      assert.equal((await store.getAgent(OWNER_A, "arm-plan"))?.sessionFacts?.armPlan?.claim?.outcome?.status, "completed");
+      await store.close();
+    });
+
+    it("returns a not-found-shaped refusal for an absent plan and retries after an unrelated row bump", async () => {
+      const store = await factory.make();
+      const absent = await store.createAgent({ ...input("without-plan", OWNER_A), status: "armed" });
+      const noPlan = await store.claimArmPlanCas({ ownerAddress: OWNER_A, agentId: absent.id, expectedRowVersion: absent.rowVersion, by: "continuation", actionId: `0x${"88".repeat(32)}` as Hex, nowSec: 10 });
+      assert.equal(noPlan.kind, "not_found");
+
+      const created = await store.createAgent({ ...input("bumped", OWNER_A), status: "armed", sessionFacts: { ...sampleFacts(), armPlan: armPlan() } });
+      const bumped = await store.updateAgentCaps(OWNER_A, created.id, { dailyNativeWei: 2n });
+      assert.equal(bumped?.rowVersion, created.rowVersion + 1);
+      const retryable = await store.claimArmPlanCas({ ownerAddress: OWNER_A, agentId: created.id, expectedRowVersion: created.rowVersion, by: "continuation", actionId: `0x${"99".repeat(32)}` as Hex, nowSec: 10 });
+      assert.equal(retryable.kind, "conflict");
+      assert.equal(retryable.kind === "conflict" ? retryable.agent.sessionFacts?.armPlan?.claim : "unexpected", null);
+      const retried = await store.claimArmPlanCas({ ownerAddress: OWNER_A, agentId: created.id, expectedRowVersion: bumped!.rowVersion, by: "continuation", actionId: `0x${"99".repeat(32)}` as Hex, nowSec: 10 });
+      assert.equal(retried.kind, "claimed");
+      await store.close();
+    });
+
+    it("preserves a signed claim when stale session facts are written", async () => {
+      const store = await factory.make();
+      const original = armPlan();
+      const created = await store.createAgent({ ...input("stale-facts", OWNER_A), status: "armed", sessionFacts: { ...sampleFacts(), armPlan: original } });
+      const actionId = `0x${"aa".repeat(32)}` as Hex;
+      const claimed = await store.claimArmPlanCas({ ownerAddress: OWNER_A, agentId: created.id, expectedRowVersion: created.rowVersion, by: "signed", actionId, nowSec: 10 });
+      assert.equal(claimed.kind, "claimed");
+      await store.updateAgentSessionFacts(OWNER_A, created.id, { ...sampleFacts(), armPlan: { ...original, claim: null } });
+      const reread = await store.getAgent(OWNER_A, created.id);
+      assert.equal(reread?.sessionFacts?.armPlan?.claim?.actionId, actionId);
+      assert.equal((await store.claimArmPlanCas({ ownerAddress: OWNER_A, agentId: created.id, expectedRowVersion: reread!.rowVersion, by: "continuation", actionId, nowSec: 11 })).kind, "conflict");
       await store.close();
     });
   });

@@ -1,5 +1,5 @@
 "use client";
-import { accountHireStorage, accountSwitchRequiresContinue } from "@/lib/exec/account-hire-storage";
+import { accountHireStorage, accountSwitchRequiresContinue, assertHireOwner } from "@/lib/exec/account-hire-storage";
 
 import * as React from "react";
 import { formatEther, formatUnits, getAddress, type Address } from "viem";
@@ -8,9 +8,10 @@ import { FundsModal, type FundsWallet } from "@/components/FundsModal";
 import { grantAgentSession, GrantAgentSessionError } from "@/lib/altana/client";
 import { freshFundingGate, hireResumeStep, type HireFunding, type HireSessionView } from "@/lib/altana/hire-state";
 import { credentialUsable, ensureHireReadCredential, HireReadRefused, pollStatusText, readHireSession, rememberedHireReadCredential, type HireReadCredential } from "@/lib/altana/hire-read-session";
+import { rememberReadExpiry } from "@/lib/exec/read-session-window";
 import { cancelGridHire, cancellationMessage, cancellationRecorded, forgetHire, GridDeployRun, GridDeployStopped } from "@/lib/altana/grid-hire-recovery";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
-import { depositAmountBnb, depositAmountWei, requiredLendingDepositWei, walletSharedWithLiveAgents } from "@/lib/altana/hire-funding";
+import { depositAmountBnb, depositAmountWei, requiredLendingDepositWei } from "@/lib/altana/hire-funding";
 import { walletBlockerAgentId } from "@/lib/altana/hire-wallet-blocker";
 import { parseBnbToWei } from "@/lib/grid/geometry";
 import { WBNB_56 } from "@/lib/exec/pairs";
@@ -239,7 +240,7 @@ type DeployStepState = "pending" | "active" | "done" | "failed" | "skipped";
 type DeployStep = { readonly state: DeployStepState; readonly detail?: string };
 
 const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: string; readonly hint: string }[] = [
-  { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key" },
+  { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key (a read session may be authorized first)" },
   { key: "fund", title: "Fund the agent wallet", hint: "The reserve, the registration fee and the relay gas" },
   { key: "grant", title: "Grant the session on chain", hint: "Your passkey authorises the session; the relay submits it" },
   { key: "converge", title: "Verify the grant", hint: "Relay, account, KeyStore and owner binding must all agree" },
@@ -609,15 +610,53 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     pollTimer.current = null;
   }, []);
 
-  const readWithCredential = React.useCallback(async (id: string, longLived = false): Promise<HireSessionView> => {
+  const clearReadCredential = React.useCallback(() => {
+    readCredential.current = null;
+    try { hireStorage.removeItem("4lpha:account-read-expiry:v1"); } catch { /* private window */ }
+  }, [hireStorage]);
+
+  const ensureLongLivedCredential = React.useCallback(async <T,>(
+    run: GridDeployRun,
+    target: "*" | string,
+    read: (credential: HireReadCredential) => Promise<T>,
+  ): Promise<T> => {
+    const attempt = async (): Promise<T> => {
+      run.check();
+      const nowMs = Date.now();
+      let credential = readCredential.current;
+      if (!credentialUsable(credential, nowMs, target)) {
+        credential = await run.guarded(() => ensureHireReadCredential({
+          current: credential,
+          target,
+          signEnvelope: owner.signEnvelope,
+          storage: hireStorage,
+          nowMs,
+        }));
+        readCredential.current = credential;
+      }
+      if (credential === null) throw new Error("No read credential.");
+      return run.guarded(() => read(credential));
+    };
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!(error instanceof HireReadRefused) || error.status !== 401) throw error;
+      clearReadCredential();
+      run.check();
+      return attempt();
+    }
+  }, [clearReadCredential, hireStorage, owner.signEnvelope]);
+
+  const readWithCredential = React.useCallback(async (id: string, longLived = false, run?: GridDeployRun): Promise<HireSessionView> => {
+    if (longLived && run !== undefined) {
+      return ensureLongLivedCredential(run, id, (credential) => readHireSession({ agentId: id, credential }));
+    }
     const attempt = async (): Promise<HireSessionView> => {
       const nowMs = Date.now();
       let credential = readCredential.current;
-      if (!credentialUsable(credential, nowMs)) {
+      if (!credentialUsable(credential, nowMs, id)) {
         credential = rememberedHireReadCredential(hireStorage, nowMs)
-          ?? (longLived
-            ? await ensureHireReadCredential({ current: null, signEnvelope: owner.signEnvelope, storage: hireStorage, nowMs })
-            : { mode: "signed", header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 });
+          ?? { mode: "signed", target: id, header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 };
         readCredential.current = credential;
       }
       if (credential === null) throw new Error("No read credential.");
@@ -626,12 +665,12 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     try {
       return await attempt();
     } catch (error) {
-      if (!(error instanceof HireReadRefused)) throw error;
-      readCredential.current = null;
-      try { hireStorage.removeItem("4lpha:account-read-expiry:v1"); } catch { /* private window */ }
-      return await attempt();
+      if (!(error instanceof HireReadRefused) || error.status !== 401) throw error;
+      clearReadCredential();
+      run?.check();
+      return attempt();
     }
-  }, [hireStorage, owner.signEnvelope, owner.signReadHeader]);
+  }, [clearReadCredential, ensureLongLivedCredential, hireStorage, owner.signReadHeader]);
 
   /**
    * The owner-read credential, as HEADERS, for a read that is not `/session`.
@@ -643,9 +682,9 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
   const viewReadHeaders = React.useCallback(async (id: string): Promise<Record<string, string>> => {
     const nowMs = Date.now();
     let credential = readCredential.current;
-    if (!credentialUsable(credential, nowMs)) {
+    if (!credentialUsable(credential, nowMs, id)) {
       credential = rememberedHireReadCredential(hireStorage, nowMs)
-        ?? { mode: "signed", header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 };
+        ?? { mode: "signed", target: id, header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 };
       readCredential.current = credential;
     }
     return credential !== null && credential.mode === "signed"
@@ -692,7 +731,11 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     if (saved === null) return;
     const savedArmOutcome = loadArmOutcome(hireStorage, saved);
     setArmOutcome(savedArmOutcome);
-    provisionEnvelope.current = loadProvisionEnvelope(hireStorage, saved);
+    const savedEnvelope = loadProvisionEnvelope(hireStorage, saved);
+    if (savedEnvelope !== null) {
+      try { assertHireOwner(savedEnvelope, owner.ownerAddress, owner.walletAddress); provisionEnvelope.current = savedEnvelope; }
+      catch { provisionEnvelope.current = null; }
+    }
     setAgentId(saved);
     setWorking("Checking the durable hire state before offering another grant…");
     void beginPolling(saved).then((resumedView) => {
@@ -722,7 +765,7 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
   };
 
   const readSession = async (id: string, run: GridDeployRun): Promise<HireSessionView> => {
-    const data = await run.guarded(() => readWithCredential(id, true));
+    const data = await run.guarded(() => readWithCredential(id, true, run));
     run.check();
     setView(data);
     return data;
@@ -738,7 +781,7 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
 
   const readCurrentArm = async (id: string, run: GridDeployRun) => {
     checkArmOwner(run);
-    const session = await run.guarded(() => readWithCredential(id, true));
+    const session = await run.guarded(() => readWithCredential(id, true, run));
     checkArmOwner(run);
     setView(session);
     if (hireResumeStep(session) !== "arm" || cancellationRecorded(session)) {
@@ -801,36 +844,7 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     return parsed;
   };
 
-  /**
-   * R3.13 — the PRE-SIGNATURE wallet gate.
-   *
-   * A guard hired onto a wallet that already carries a live agent is refused by
-   * the plane's `walletConflict`, and by then the owner has signed a hire and
-   * possibly funded a wallet. So the browser asks first, and refuses BEFORE the
-   * `provisionAgent` signature and before any passkey wallet is created.
-   */
-  const assertWalletFree = async (run: GridDeployRun, base: string): Promise<readonly string[]> => {
-    const taken: string[] = [];
-    const header = await run.guarded(() => owner.signReadHeader("*"));
-    const listed = await fetch("/api/agents", { headers: { "x-owner-action": header }, cache: "no-store" });
-    type ListedAgent = { id: string; status?: unknown; walletAddress?: unknown };
-    const rows = await listed.json() as { data?: { agents?: ListedAgent[] } | ListedAgent[] };
-    if (!listed.ok) {
-      throw new Error("Your agent list could not be read, so this wallet's occupancy is unknown. Nothing was signed.");
-    }
-    const agents = Array.isArray(rows.data) ? rows.data : rows.data?.agents ?? [];
-    taken.push(...agents.map((agent) => agent.id));
-    if (owner.walletAddress !== undefined
-      && walletSharedWithLiveAgents({ agents, walletAddress: owner.walletAddress, excludingId: base })) {
-      const neighbour = agents.find((agent) =>
-        typeof agent.walletAddress === "string"
-        && agent.walletAddress.toLowerCase() === owner.walletAddress?.toLowerCase()
-        && agent.id !== base) ?? null;
-      throw new LendingWalletBlockedError(neighbour === null ? null : neighbour.id);
-    }
-    return taken;
-  };
-
+  /** The plane's wallet fence is authoritative after the hire is signed. */
   const startHire = async (run: GridDeployRun): Promise<{ readonly id: string; readonly view: HireSessionView } | null> => {
     setMessage(null);
     setWalletBlocked(null);
@@ -843,8 +857,8 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
       const base = agentIdFromName(props.agentName);
 
       // BEFORE the hire signature, and before any wallet ceremony.
-      setWorking("Checking that this wallet is free for its own guard…");
-      const taken = [...await run.guarded(() => assertWalletFree(run, base))];
+      setWorking("Preparing the signed lending hire…");
+      const taken: string[] = [];
 
       setWorking("Re-reading the guarded account and taking the plane's sizing receipt…");
       /**
@@ -902,16 +916,18 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
           : `${taken[taken.length - 1] ?? base} is taken. Confirm the signature again to hire ${id}…`;
         setWorking(`${signatureNote} USDT daily cap: ${formatAtomicAmount(params.reserveCapWei, usdtDecimals, usdtDecimals)} USDT, including 10% quote headroom.`);
         const envelope = await run.guarded(() => owner.signEnvelope("provisionAgent", id, params));
-        provisionEnvelope.current = envelope;
-        saveProvisionEnvelope(hireStorage, id, envelope);
         hireStorage.setItem(LENDING_HIRE_STORAGE_KEY, id);
         const response = await fetch(`/api/agents/${encodeURIComponent(id)}/session`, {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope),
         });
         const payload = await response.json() as { data?: HireSessionView };
         if (response.ok && payload.data !== undefined) {
+          provisionEnvelope.current = envelope;
+          saveProvisionEnvelope(hireStorage, id, envelope);
           const saved = hireStorage.getItem(LENDING_HIRE_STORAGE_KEY);
           if (!run.stopped || saved === null || saved === id) hireStorage.setItem(LENDING_HIRE_STORAGE_KEY, id);
+          const expiry = payload.data.readSession?.expiry;
+          if (typeof expiry === "number") rememberReadExpiry(hireStorage, expiry * 1_000);
         }
         run.check();
         // Only an id collision is "taken". `wallet_in_use`, `s1_ambiguous` and
@@ -922,33 +938,29 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
           throw new Error(errorMessage(payload, `HTTP ${response.status}`));
         }
         if (response.status === 409) {
-          hireStorage.removeItem(provisionEnvelopeKey(id));
-          provisionEnvelope.current = null;
-          setWorking("An agent with this id already exists — reading its hire state…");
-          let existing: HireSessionView;
-          try {
-            existing = await beginPolling(id);
-          } catch (error) {
-            if (error instanceof GridDeployStopped) throw error;
-            const text = error instanceof Error ? error.message : "";
-            if (!/not_found|HTTP 404/iu.test(text)) throw error;
-            stopPolling();
-            setView(null);
-            setAgentId(null);
+          const owned = (payload as { readonly meta?: { readonly owned?: boolean } }).meta?.owned === true;
+          if (!owned) {
             taken.push(id);
             continue;
           }
-          run.check();
-          if (existing.status !== "revoked" && existing.status !== "retired") {
-            hireStorage.setItem(LENDING_HIRE_STORAGE_KEY, id);
-            setAgentId(id);
-            return { id, view: existing };
+          const existing = payload.data;
+          if (existing === undefined) {
+            taken.push(id);
+            continue;
           }
-          stopPolling();
-          setView(null);
-          setAgentId(null);
-          taken.push(id);
-          continue;
+          if (existing.status === "revoked" || existing.status === "retired") {
+            taken.push(id);
+            continue;
+          }
+          hireStorage.setItem(LENDING_HIRE_STORAGE_KEY, id);
+          const accepted = loadProvisionEnvelope(hireStorage, id);
+          if (accepted !== null) {
+            try { assertHireOwner(accepted, owner.ownerAddress, owner.walletAddress); provisionEnvelope.current = accepted; }
+            catch { provisionEnvelope.current = null; }
+          }
+          setAgentId(id);
+          setView(existing);
+          return { id, view: existing };
         }
         if (!response.ok || payload.data === undefined) throw new Error(errorMessage(payload, `HTTP ${response.status}`));
         hireStorage.setItem(LENDING_HIRE_STORAGE_KEY, id);

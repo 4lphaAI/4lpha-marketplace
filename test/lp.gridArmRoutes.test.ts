@@ -23,9 +23,10 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getAddress, zeroAddress, type Address, type Hex } from "viem";
+import { getAddress, keccak256, stringToBytes, zeroAddress, type Address, type Hex } from "viem";
 import {
   NOW_SEC,
+  EXEC_TOKEN,
   ROUTER_V3,
   SESSION_KEY,
   TOKEN,
@@ -37,7 +38,10 @@ import {
   toReadHeader,
   type Harness,
 } from "./support/serverHarness.js";
-import type { SessionFacts } from "../src/store/agents.js";
+import type { AgentStore, SessionFacts } from "../src/store/agents.js";
+import { MemoryAgentStore } from "../src/store/agents.js";
+import { parseMasterKey } from "../src/store/crypto.js";
+import type { GrantEvidenceReader } from "../src/wallet/grantEvidence.js";
 import { DRAFT_KEY, cancelDraft, pendingDraft } from "./support/provisioningDraft.js";
 import type { SessionSpec } from "../src/core/types.js";
 import {
@@ -55,7 +59,13 @@ import type { LpPositionSnapshot } from "../src/lp/sagas.js";
 import { getSqrtRatioAtTick } from "../src/lp/tickMath.js";
 import type { LpWorkerChainReaders } from "../src/lp/readers.js";
 import { lpSettingsParamsView } from "../src/http/lpWire.js";
+import { explicitRangeFromPrices } from "../src/lp/explicitRange.js";
+import { parseOwnerActionEnvelope } from "../src/http/wire.js";
 import { paramsHash } from "../src/auth/canonical.js";
+import { canonicalEncode } from "../src/auth/canonical.js";
+import { ownerActionIdempotencyKey } from "../src/auth/executeDecision.js";
+import { parseAccountReadSessionSecret } from "../src/auth/accountReadSession.js";
+import { resolveDomainSalt } from "../src/auth/ownerAuth.js";
 import {
   DEFAULT_LP_SETTINGS,
   type LpAutomationSettings,
@@ -190,6 +200,7 @@ type Fixture = {
     maxGridFlipsPerDay?: number | undefined;
   }[];
   readonly capReads: { count: number; fail: boolean };
+  readonly poolStateReads: () => number;
   readonly chain: {
     snapshot: LpPositionSnapshot | "burned";
     tick: number;
@@ -208,6 +219,7 @@ async function fixture(
     readonly canceledDraft?: boolean;
     readonly hireSizingName?: "lp-v1" | "grid-v1";
     readonly benchmarkReader?: LpServerDeps["readers"]["gridArmBenchmark"];
+    readonly hireEnabled?: boolean;
   } = {},
 ): Promise<Fixture> {
   const lpStore = new MemoryLpSequenceStore();
@@ -215,6 +227,7 @@ async function fixture(
   const observations = new MemoryLpObservationStore();
   const cycles = new MemoryLpGridCycleStore();
   const capReads = { count: 0, fail: false };
+  let poolStateReads = 0;
   const chain: Fixture["chain"] = {
     snapshot: mintedSnapshot(),
     tick: 0,
@@ -240,7 +253,7 @@ async function fixture(
   const readers = {
     ...(options.benchmarkReader === undefined ? {} : { gridArmBenchmark: options.benchmarkReader }),
     getPool: async (): Promise<Address> => POOL,
-    poolState: async (): Promise<LpPoolStateReading> => state(),
+    poolState: async (): Promise<LpPoolStateReading> => { poolStateReads += 1; return state(); },
     positions: async (tokenId: bigint): Promise<LpPositionSnapshot | "burned"> => {
       if (tokenId === 778n) {
         return mintedSnapshot({ tickLower: -1_000, tickUpper: -500 });
@@ -293,7 +306,48 @@ async function fixture(
     readers,
   };
 
-  const harness = await createHarness({ lp, seedAgent: options.canceledDraft !== true });
+  const hireStore = options.hireEnabled === true
+    ? (() => {
+        const target = new MemoryAgentStore(parseMasterKey(`0x${"ab".repeat(32)}`), () => NOW_SEC * 1_000);
+        return new Proxy(target, {
+          get(inner, property, receiver): unknown {
+            if (property === "durable" || property === "keyEncryptionConfigured") return true;
+            const value = Reflect.get(inner, property, receiver) as unknown;
+            return typeof value === "function" ? value.bind(inner) : value;
+          },
+        }) as AgentStore;
+      })()
+    : undefined;
+  const hireEvidence: GrantEvidenceReader = {
+    readFunding: async (_wallet, relayGasHeadroomWei, observedAtSec) => ({
+      version: 1, observedAtSec, registrationFeeWei: "1", registrations: 1,
+      relayGasHeadroomWei: relayGasHeadroomWei.toString(10), requiredWei: "1", balanceWei: "1",
+    }),
+    readGrant: async () => ({
+      relayKeys: [], accountKey: null, accountSpend: [], canExecute: [],
+      keyStore: { kind: "missing" }, ownerVerdict: "verified",
+    }),
+  };
+  const harness = await createHarness({
+    lp,
+    seedAgent: options.canceledDraft !== true,
+    ...(hireStore === undefined ? {} : {
+      agentStore: hireStore,
+      config: {
+        chainId: 56,
+        network: "mainnet",
+        hireEnabled: true,
+        passkey: { enabled: true, rpId: "4lpha.test", origins: ["https://4lpha.test"], uvRequired: true },
+        accountReadSession: {
+          key: parseAccountReadSessionSecret("cd".repeat(32))!,
+          chainId: 56,
+          environment: resolveDomainSalt({ chainId: 56, network: "mainnet" }),
+        },
+      },
+      hire: { evidence: hireEvidence, nfpm: NFPM, routerV3: ROUTER_V3, wbnb: WBNB, treasury: NFPM,
+        feeBps: 0, relayFeePerSubmitWei: 1n, grantGasHeadroomWei: 1n },
+    }),
+  });
   if (options.canceledDraft === true) {
     await harness.agentStore.createProvisioningAgent({ record: { id: AGENT_ID, ownerAddress: ownerAccount.address,
       walletAddress: ownerAccount.address, custodyModel: "passkey" },
@@ -331,6 +385,7 @@ async function fixture(
     observations,
     sizingCalls: [],
     capReads,
+    poolStateReads: () => poolStateReads,
     chain,
     workerDeps(workerOptions = {}) {
       return {
@@ -369,6 +424,14 @@ async function armCall(
     method: "POST",
     body: envelope,
   });
+}
+
+async function lpArmCall(
+  f: Fixture,
+  params: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const envelope = await signOwnerAction("lpArm", params, { agentId: AGENT_ID, chainId: 56, network: "mainnet" });
+  return call(f.harness, `/agents/${AGENT_ID}/lp/arm`, { method: "POST", body: envelope });
 }
 
 function armParams(
@@ -413,6 +476,63 @@ function shiftGrid(overrides: Partial<LpGridSettings> = {}): LpGridSettings {
     shift,
     ...overrides,
   });
+}
+
+function explicitLpPlan(minPrice = 0.9, maxPrice = 1.1): { readonly params: Record<string, unknown>; readonly digest: Hex } {
+  const settings = lpSettingsParamsView({ ...DEFAULT_LP_SETTINGS, autoRotate: true, rotateMinHoldMinutes: 5, minMinutesBetweenExits: 5 });
+  const params = {
+    kind: "lp",
+    settings,
+    budgetWei: BUDGET.toString(10),
+    pool: { address: POOL, token0: WBNB, token1: TOKEN, fee: 2_500 },
+    prices: { minPrice, maxPrice, tickSpacing: 50, quoteIsToken0: false },
+  };
+  return { params, digest: keccak256(stringToBytes(canonicalEncode(params))) };
+}
+
+function shiftPlan(tickSpacing = 50): { readonly params: Record<string, unknown>; readonly digest: Hex } {
+  const fullGrid = grid({
+    tickSpacing,
+    ...gridDeriveRanges({ currentTick: 0, tickSpacing, gapTicks: 50, widthTicks: 50, wbnbIsToken0: true, minTick: -887_272, maxTick: 887_272 }),
+    maxFlipsPerDay: 1,
+    mode: "shift",
+    shift: { gapTicks: 50, widthTicks: 50, deployPctBps: 3_000, driftPctOfGap: 0, shiftsPerDay: 16 },
+  });
+  const fullSettings = settingsWith(fullGrid);
+  const fullGridWire = fullSettings["grid"] as Record<string, unknown>;
+  const { buyRange: _buy, sellRange: _sell, ...planGrid } = fullGridWire;
+  void _buy;
+  void _sell;
+  const params = { kind: "grid", settings: { ...fullSettings, grid: planGrid }, budgetWei: BUDGET.toString(10), levels: 2 };
+  return { params, digest: keccak256(stringToBytes(canonicalEncode(params))) };
+}
+
+async function seedArmPlan(
+  plan: { readonly params: Record<string, unknown>; readonly digest: Hex },
+  sizingPreset: "grid-shift-v1" | "lp-v1",
+): Promise<{ readonly f: Fixture; readonly provision: Awaited<ReturnType<typeof signOwnerAction>> }> {
+  const f = await fixture({ gridEnabled: true, hireEnabled: true });
+  const provisionParams = {
+    walletAddress: ownerAccount.address,
+    token: TOKEN,
+    capDayWei: "1000000000000000000",
+    openNativeBudgetWei: BUDGET.toString(10),
+    ttlSec: 3_600,
+    sizingPreset,
+    armPlan: plan,
+  };
+  const provision = await signOwnerAction("provisionAgent", provisionParams, { agentId: AGENT_ID, chainId: 97, network: "testnet" });
+  const parsed = parseOwnerActionEnvelope(provision);
+  if (!parsed.ok) assert.fail(parsed.message);
+  const current = await f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID);
+  assert.ok(current?.sessionFacts !== null && current?.sessionFacts !== undefined);
+  await f.harness.agentStore.updateAgentSessionFacts(ownerAccount.address, AGENT_ID, {
+    ...current.sessionFacts,
+    provisionActionId: ownerActionIdempotencyKey(parsed.value.signed),
+    hireSizing: { name: sizingPreset, version: 1, openNativeBudgetWei: BUDGET.toString(10) },
+    armPlan: { params: plan.params, digest: plan.digest, kind: sizingPreset === "lp-v1" ? "lp" : "grid", claim: null },
+  });
+  return { f, provision };
 }
 
 async function viewCall(f: Fixture): Promise<Record<string, unknown>> {
@@ -1076,5 +1196,304 @@ describe("PHASE3.16: the arm is owner-signed and reachable by nothing else", () 
     const response = await armCall(f, armParams({ budgetWei: 0n }));
     assert.equal(response.status, 400);
     assert.match(reason(response.body), /never-re-drive sentinel/u);
+  });
+});
+
+describe("HIRE-SIGNATURES-BC continuation grid arm", () => {
+  it("derives, claims, records the outcome, and replays without a second pool read", async () => {
+    const f = await fixture({ gridEnabled: true, hireEnabled: true });
+    const fullGrid = grid({
+      maxFlipsPerDay: 1,
+      mode: "shift",
+      shift: { gapTicks: 50, widthTicks: 50, deployPctBps: 3_000, driftPctOfGap: 0, shiftsPerDay: 16 },
+    });
+    const fullSettings = settingsWith(fullGrid);
+    const fullGridWire = fullSettings["grid"] as Record<string, unknown>;
+    const { buyRange: _buyRange, sellRange: _sellRange, ...planGrid } = fullGridWire;
+    void _buyRange;
+    void _sellRange;
+    const plan = { kind: "grid", settings: { ...fullSettings, grid: planGrid }, budgetWei: BUDGET.toString(10), levels: 2 };
+    const provisionParams = {
+      walletAddress: ownerAccount.address,
+      token: TOKEN,
+      capDayWei: "1000000000000000000",
+      openNativeBudgetWei: BUDGET.toString(10),
+      ttlSec: 3_600,
+      sizingPreset: "grid-shift-v1",
+      armPlan: { params: plan, digest: `0x${"01".repeat(32)}` as Hex },
+    };
+    provisionParams.armPlan.digest = keccak256(stringToBytes(canonicalEncode(plan)));
+    const provision = await signOwnerAction("provisionAgent", provisionParams, { agentId: AGENT_ID, chainId: 97, network: "testnet" });
+    const parsedProvision = parseOwnerActionEnvelope(provision);
+    if (!parsedProvision.ok) assert.fail(parsedProvision.message);
+    const current = await f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID);
+    assert.ok(current?.sessionFacts !== null && current?.sessionFacts !== undefined);
+    await f.harness.agentStore.updateAgentSessionFacts(ownerAccount.address, AGENT_ID, {
+      ...current.sessionFacts,
+      provisionActionId: ownerActionIdempotencyKey(parsedProvision.value.signed),
+      hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: BUDGET.toString(10) },
+      armPlan: { params: plan, digest: provisionParams.armPlan.digest, kind: "grid", claim: null },
+    });
+    // HIRE-SIGNATURES-BC audit A1: production caps for a grid/LP hire are the BUDGET (createProvisioningAgent), not capDayWei — the continuation must still bind capDayWei through the session spec.
+    await f.harness.agentStore.updateAgentCaps(ownerAccount.address, AGENT_ID, { dailyNativeWei: BUDGET });
+    const armed = await f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID);
+    assert.equal(armed?.sessionFacts?.provisionActionId, ownerActionIdempotencyKey(parsedProvision.value.signed));
+    assert.equal(armed?.sessionFacts?.armPlan?.digest, provisionParams.armPlan.digest);
+    const header = toReadHeader(provision);
+    const continued = await f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST",
+      headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": header },
+      body: "{}",
+    });
+    const continuedText = await continued.text();
+    assert.equal(continued.status, 200, continuedText);
+    const continuedBody = JSON.parse(continuedText) as { data?: Record<string, unknown> };
+    const armPlan = (continuedBody.data?.["armPlan"] ?? {}) as Record<string, unknown>;
+    const claim = armPlan["claim"] as Record<string, unknown>;
+    const outcome = claim["outcome"] as Record<string, unknown>;
+    assert.equal(outcome["status"], "completed");
+    assert.equal((await f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 2);
+
+    const poolReadsAfterFirst = f.poolStateReads();
+    f.chain.tick = 50;
+    const replay = await f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST",
+      headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": header },
+      body: "{}",
+    });
+    assert.equal(replay.status, 200);
+    const replayBody = await replay.json() as { meta?: { replayed?: boolean }; data?: { armPlan?: { claim?: { outcome?: { status?: string } | null } | null } } };
+    assert.equal(replayBody.meta?.replayed, true);
+    assert.equal(replayBody.data?.armPlan?.claim?.outcome?.status, "completed");
+    assert.equal(f.poolStateReads(), poolReadsAfterFirst);
+  });
+
+  it("projects an explicit LP price plan against one admitted pool snapshot and records its outcome", async () => {
+    const f = await fixture({ hireEnabled: true });
+    const settings = lpSettingsParamsView({ ...DEFAULT_LP_SETTINGS, autoRotate: true, rotateMinHoldMinutes: 5, minMinutesBetweenExits: 5 });
+    const plan = {
+      kind: "lp",
+      settings,
+      budgetWei: BUDGET.toString(10),
+      pool: { address: POOL, token0: WBNB, token1: TOKEN, fee: 2_500 },
+      prices: { minPrice: 0.9, maxPrice: 1.1, tickSpacing: 50, quoteIsToken0: false },
+    };
+    const provisionParams = {
+      walletAddress: ownerAccount.address,
+      token: TOKEN,
+      capDayWei: "1000000000000000000",
+      openNativeBudgetWei: BUDGET.toString(10),
+      ttlSec: 3_600,
+      sizingPreset: "lp-v1",
+      armPlan: { params: plan, digest: keccak256(stringToBytes(canonicalEncode(plan))) },
+    };
+    const provision = await signOwnerAction("provisionAgent", provisionParams, { agentId: AGENT_ID, chainId: 97, network: "testnet" });
+    const parsedProvision = parseOwnerActionEnvelope(provision);
+    if (!parsedProvision.ok) assert.fail(parsedProvision.message);
+    const current = await f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID);
+    assert.ok(current?.sessionFacts !== null && current?.sessionFacts !== undefined);
+    await f.harness.agentStore.updateAgentSessionFacts(ownerAccount.address, AGENT_ID, {
+      ...current.sessionFacts,
+      provisionActionId: ownerActionIdempotencyKey(parsedProvision.value.signed),
+      hireSizing: { name: "lp-v1", version: 1, openNativeBudgetWei: BUDGET.toString(10) },
+      armPlan: { params: plan, digest: provisionParams.armPlan.digest, kind: "lp", claim: null },
+    });
+    const response = await f.harness.app.request(`/agents/${AGENT_ID}/lp/arm`, {
+      method: "POST",
+      headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(provision) },
+      body: "{}",
+    });
+    const responseText = await response.text();
+    assert.equal(response.status, 200, responseText);
+    const body = JSON.parse(responseText) as { data?: { armPlan?: { claim?: { outcome?: { status?: string } | null } | null } } };
+    assert.equal(body.data?.armPlan?.claim?.outcome?.status, "completed");
+    assert.equal((await f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 1);
+  });
+
+  it("implements the Rev4.4 authority and route dispatch matrix", async () => {
+    const seeded = await seedArmPlan(shiftPlan(), "grid-shift-v1");
+    const header = toReadHeader(seeded.provision);
+    const both = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST",
+      headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": header, "x-owner-action": "signed" },
+      body: "{}",
+    });
+    assert.equal(both.status, 400);
+    assert.equal((await both.json() as { error?: { code?: string } }).error?.code, "ambiguous_owner_auth");
+
+    const wrongRoute = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": header }, body: "{}",
+    });
+    assert.equal(wrongRoute.status, 409);
+
+    const foreign = await signOwnerAction("provisionAgent", {
+      walletAddress: ownerAccount.address, token: TOKEN, capDayWei: "1000000000000000000",
+      openNativeBudgetWei: BUDGET.toString(10), ttlSec: 3_600, sizingPreset: "grid-shift-v1", armPlan: shiftPlan().params,
+    }, { agentId: "foreign-agent", chainId: 97, network: "testnet" });
+    const foreignHeader = toReadHeader(foreign);
+    const continuationRead = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/session`, {
+      headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": foreignHeader },
+    });
+    const foreignArm = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": foreignHeader }, body: "{}",
+    });
+    assert.equal(foreignArm.status, continuationRead.status);
+    assert.equal(foreignArm.status, 401);
+  });
+
+  it("refuses a signed grid spacing mismatch before claiming and leaves the arm retryable", async () => {
+    const seeded = await seedArmPlan(shiftPlan(10), "grid-shift-v1");
+    const response = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) }, body: "{}",
+    });
+    assert.equal(response.status, 400);
+    assert.match(await response.text(), /tickSpacing/u);
+    assert.equal((await seeded.f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID))?.sessionFacts?.armPlan?.claim, null);
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 0);
+  });
+
+  it("refuses an explicit LP straddle before the claim, then the signed door still works", async () => {
+    const seeded = await seedArmPlan(explicitLpPlan(1.1, 1.2), "lp-v1");
+    const refused = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) }, body: "{}",
+    });
+    assert.equal(refused.status, 400);
+    assert.match(await refused.text(), /left the typed band/u);
+    assert.equal((await seeded.f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID))?.status, "armed");
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 0);
+
+    const validRange = explicitRangeFromPrices({ minPrice: 0.9, maxPrice: 1.1, currentTick: 0, tickSpacing: 50, quoteIsToken0: false });
+    const settings = (explicitLpPlan().params["settings"] ?? {}) as Record<string, unknown>;
+    const signed = await lpArmCall(seeded.f, {
+      settings,
+      budgetWei: BUDGET.toString(10),
+      pool: { token0: WBNB, token1: TOKEN, fee: 2_500 },
+      range: { tickLower: validRange.tickLower, tickUpper: validRange.tickUpper },
+    });
+    assert.equal(signed.status, 200, JSON.stringify(signed.body));
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 1);
+  });
+
+  it("makes a simultaneous continuation race one claim and one downstream submission", async () => {
+    const seeded = await seedArmPlan(shiftPlan(), "grid-shift-v1");
+    const headers = { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) };
+    const responses = await Promise.all([1, 2].map(() => seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST", headers, body: "{}",
+    })));
+    assert.deepEqual(responses.map((response) => response.status).sort(), [200, 200]);
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 2);
+    assert.equal(seeded.f.harness.provider.executeCalls.length, 1);
+  });
+
+  it("maps held and proven rollback saga results onto the durable arm outcome", async () => {
+    for (const [receipt, expected] of [
+      [{ status: "PENDING", callsId: `0x${"d1".repeat(32)}` }, "held"],
+      [{ status: "FAILED", callsId: `0x${"d2".repeat(32)}`, failureCode: "PROVIDER_ERROR" }, "rolled-back"],
+    ] as const) {
+      const seeded = await seedArmPlan(shiftPlan(), "grid-shift-v1");
+      seeded.f.harness.provider.nextReceipt = receipt;
+      const response = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+        method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) }, body: "{}",
+      });
+      const body = await response.json() as { data?: { armPlan?: { claim?: { outcome?: { status?: string } | null } | null } } };
+      assert.equal(response.status, 200);
+      assert.equal(body.data?.armPlan?.claim?.outcome?.status, expected);
+    }
+  });
+
+  it("turns an unrelated row-version bump at the hook into a retryable 409 without writes", async () => {
+    const seeded = await seedArmPlan(shiftPlan(), "grid-shift-v1");
+    const store = seeded.f.harness.agentStore as AgentStore & { claimArmPlanCas: AgentStore["claimArmPlanCas"] };
+    const original = store.claimArmPlanCas.bind(store);
+    store.claimArmPlanCas = async (input) => {
+      await store.updateAgentCaps(ownerAccount.address, AGENT_ID, { dailyNativeWei: 2n });
+      return original(input);
+    };
+    const response = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) }, body: "{}",
+    });
+    assert.equal(response.status, 409);
+    assert.match(await response.text(), /admission changed/u);
+    assert.equal((await seeded.f.settingsStore.get(ownerAccount.address, AGENT_ID)), null);
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 0);
+    assert.equal(seeded.f.harness.provider.executeCalls.length, 0);
+    assert.equal((await seeded.f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID))?.sessionFacts?.armPlan?.claim, null);
+  });
+});
+
+describe("HIRE-SIGNATURES-BC audit: the two authorities share one initial-arm claim", () => {
+  async function signedArm(f: Fixture): Promise<{ status: number; body: Record<string, unknown> }> {
+    const envelope = await signOwnerAction("gridArm", signedShiftArmParams(), { agentId: AGENT_ID, chainId: 56, network: "mainnet" });
+    return call(f.harness, `/agents/${AGENT_ID}/lp/grid/arm`, { method: "POST", body: envelope });
+  }
+
+  function signedShiftArmParams(): Record<string, unknown> {
+    const fullGrid = grid({
+      tickSpacing: 50,
+      ...gridDeriveRanges({ currentTick: 0, tickSpacing: 50, gapTicks: 50, widthTicks: 50, wbnbIsToken0: true, minTick: -887_272, maxTick: 887_272 }),
+      maxFlipsPerDay: 1,
+      mode: "shift",
+      shift: { gapTicks: 50, widthTicks: 50, deployPctBps: 3_000, driftPctOfGap: 0, shiftsPerDay: 16 },
+    });
+    return { settings: settingsWith(fullGrid), budgetWei: BUDGET.toString(10), levels: 2 };
+  }
+
+  it("a signed initial arm claims the plan, and the unused hire continuation is spent for good (B3)", async () => {
+    const seeded = await seedArmPlan(shiftPlan(), "grid-shift-v1");
+    const signed = await signedArm(seeded.f);
+    assert.equal(signed.status, 200, JSON.stringify(signed.body));
+    const after = await seeded.f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID);
+    assert.equal(after?.sessionFacts?.armPlan?.claim?.by, "signed");
+    assert.equal(after?.sessionFacts?.armPlan?.claim?.outcome?.status, "completed");
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 2);
+    const submissions = seeded.f.harness.provider.executeCalls.length;
+    // The provision envelope now answers as a replay: no derivation, no claim, no submission.
+    const continued = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) }, body: "{}",
+    });
+    const body = await continued.json() as { data?: { armPlan?: { claim?: { by?: string } | null } }; meta?: { replayed?: boolean } };
+    assert.equal(continued.status, 200);
+    assert.equal(body.meta?.replayed, true);
+    assert.equal(body.data?.armPlan?.claim?.by, "signed");
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 2);
+    assert.equal(seeded.f.harness.provider.executeCalls.length, submissions);
+  });
+
+  it("a signed arm is refused while a continuation claim is pending (B13), and it never mutates", async () => {
+    const seeded = await seedArmPlan(shiftPlan(), "grid-shift-v1");
+    const current = await seeded.f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID);
+    assert.ok(current !== null);
+    const claimed = await seeded.f.harness.agentStore.claimArmPlanCas({
+      ownerAddress: ownerAccount.address, agentId: AGENT_ID, expectedRowVersion: current.rowVersion,
+      by: "continuation", actionId: `0x${"ab".repeat(32)}`, nowSec: NOW_SEC,
+    });
+    assert.equal(claimed.kind, "claimed");
+    const signed = await signedArm(seeded.f);
+    assert.equal(signed.status, 409, JSON.stringify(signed.body));
+    assert.match(JSON.stringify(signed.body), /in progress/u);
+    assert.equal((await seeded.f.settingsStore.get(ownerAccount.address, AGENT_ID)), null);
+    assert.equal((await seeded.f.lpStore.listPositions(ownerAccount.address, AGENT_ID)).length, 0);
+    assert.equal(seeded.f.harness.provider.executeCalls.length, 0);
+  });
+
+  it("a held continuation outcome blocks the signed path until the sequence is terminal (Rev4.2)", async () => {
+    const seeded = await seedArmPlan(shiftPlan(), "grid-shift-v1");
+    seeded.f.harness.provider.nextReceipt = { status: "PENDING", callsId: `0x${"d3".repeat(32)}` };
+    const held = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) }, body: "{}",
+    });
+    assert.equal(held.status, 200);
+    const after = await seeded.f.harness.agentStore.getAgent(ownerAccount.address, AGENT_ID);
+    assert.equal(after?.sessionFacts?.armPlan?.claim?.outcome?.status, "held");
+    const submissions = seeded.f.harness.provider.executeCalls.length;
+    const signed = await signedArm(seeded.f);
+    assert.equal(signed.status, 409, JSON.stringify(signed.body));
+    assert.equal(seeded.f.harness.provider.executeCalls.length, submissions);
+    // The continuation stays spent: a replay answers the held outcome without a second submission.
+    const replay = await seeded.f.harness.app.request(`/agents/${AGENT_ID}/lp/grid/arm`, {
+      method: "POST", headers: { "x-exec-token": EXEC_TOKEN, "x-provision-action": toReadHeader(seeded.provision) }, body: "{}",
+    });
+    assert.equal(replay.status, 200);
+    assert.equal(seeded.f.harness.provider.executeCalls.length, submissions);
   });
 });

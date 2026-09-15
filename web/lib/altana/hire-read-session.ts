@@ -23,7 +23,7 @@ export { ACCOUNT_READ_EXPIRY_KEY } from "../exec/read-session-window";
  */
 export type HireReadCredential =
   | { readonly mode: "cookie"; readonly expiryMs: number }
-  | { readonly mode: "signed"; readonly header: string; readonly expiryMs: number };
+  | { readonly mode: "signed"; readonly target: "*" | string; readonly header: string; readonly expiryMs: number };
 
 /** Same key `use-agent-detail` remembers its window under, so the two share one cookie. */
 
@@ -34,8 +34,10 @@ export const RENEW_BEFORE_MS = 60_000;
 type Signer = (action: string, agentId: string, params: unknown) => Promise<OwnerActionEnvelope>;
 type ReadStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
-export function credentialUsable(credential: HireReadCredential | null, nowMs: number): boolean {
-  return credential !== null && credential.expiryMs - nowMs > RENEW_BEFORE_MS;
+export function credentialUsable(credential: HireReadCredential | null, nowMs: number, forTarget: string): boolean {
+  return credential !== null
+    && credential.expiryMs - nowMs > RENEW_BEFORE_MS
+    && (credential.mode === "cookie" || credential.target === forTarget);
 }
 
 export function rememberedHireReadCredential(storage: ReadStorage | undefined, nowMs: number): HireReadCredential | null {
@@ -46,9 +48,15 @@ export function rememberedHireReadCredential(storage: ReadStorage | undefined, n
     const expiryMs = Number(raw);
     if (!Number.isSafeInteger(expiryMs)) return null;
     const window: HireReadCredential = { mode: "cookie", expiryMs };
-    return credentialUsable(window, nowMs) ? window : null;
+    return credentialUsable(window, nowMs, "*") ? window : null;
   } catch {
     return null;
+  }
+}
+
+export class HireReadRefused extends Error {
+  constructor(readonly status: number, message?: string) {
+    super(status === 401 ? "owner_auth_failed" : message ?? (status === 429 ? "rate_limited" : `HTTP ${status}`));
   }
 }
 
@@ -58,15 +66,27 @@ export function rememberedHireReadCredential(storage: ReadStorage | undefined, n
  */
 export async function ensureHireReadCredential(input: {
   readonly current: HireReadCredential | null;
+  readonly target: "*" | string;
   readonly signEnvelope: Signer;
   readonly storage?: ReadStorage;
   readonly fetcher?: typeof fetch;
   readonly nowMs?: number;
 }): Promise<HireReadCredential> {
   const nowMs = input.nowMs ?? Date.now();
-  if (credentialUsable(input.current, nowMs)) return input.current as HireReadCredential;
+  if (credentialUsable(input.current, nowMs, input.target)) return input.current as HireReadCredential;
   const remembered = rememberedHireReadCredential(input.storage, nowMs);
   if (remembered !== null) return remembered;
+
+  // A signed list credential is bound to `*`, while a session read is bound to
+  // its agent id. Renewing it must not retry the hidden issuer or send a
+  // wildcard header to the session route.
+  if (input.current?.mode === "signed") {
+    const renewed = await input.signEnvelope("read", input.target, {});
+    const expiry = renewed.signed.expiry;
+    const expiryMs = typeof expiry === "string" && /^\d+$/u.test(expiry)
+      ? Number(BigInt(expiry) * 1_000n) : nowMs + 120_000;
+    return { mode: "signed", target: input.target, header: encodeReadHeader(renewed), expiryMs };
+  }
 
   const envelope = await input.signEnvelope("createAccountReadSession", "*", {});
   try {
@@ -75,6 +95,7 @@ export async function ensureHireReadCredential(input: {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(envelope),
     });
+    if (response.status === 429) throw new HireReadRefused(429);
     if (response.ok) {
       const payload = await response.json() as { data?: { expiry?: unknown } };
       const expirySec = payload.data?.expiry;
@@ -86,34 +107,56 @@ export async function ensureHireReadCredential(input: {
     }
     // 404 = the issuer is capability-hidden on this deployment; anything else
     // unexpected is treated the same way rather than failing the hire.
-  } catch {
+  } catch (error) {
+    if (error instanceof HireReadRefused) throw error;
     // Unreachable issuer: fall through to the signed window.
   }
-  const fallback = await input.signEnvelope("read", "*", {});
+  const fallback = await input.signEnvelope("read", input.target, {});
   const expiry = fallback.signed.expiry;
   const expiryMs = typeof expiry === "string" && /^\d+$/u.test(expiry) ? Number(BigInt(expiry) * 1_000n) : nowMs + 120_000;
-  return { mode: "signed", header: encodeReadHeader(fallback), expiryMs };
+  return { mode: "signed", target: input.target, header: encodeReadHeader(fallback), expiryMs };
 }
 
-export class HireReadRefused extends Error {
-  constructor(readonly status: number) { super(status === 401 ? "owner_auth_failed" : `HTTP ${status}`); }
+export type ListedAgent = { readonly id: string; readonly status?: unknown; readonly walletAddress?: unknown };
+
+/** One owner-scoped list read on the shared credential. */
+export async function readOwnedAgents(input: {
+  readonly credential: HireReadCredential;
+  readonly fetcher?: typeof fetch;
+}): Promise<readonly ListedAgent[]> {
+  if (input.credential.mode === "signed" && input.credential.target !== "*") {
+    throw new Error("The read credential is not bound to the agent list.");
+  }
+  const headers: Record<string, string> = input.credential.mode === "signed"
+    ? { "x-owner-action": input.credential.header } : {};
+  const response = await (input.fetcher ?? fetch)("/api/agents", { headers, cache: "no-store" });
+  const payload = await response.json() as {
+    data?: { agents?: ListedAgent[] } | ListedAgent[];
+    error?: { code?: string; message?: string };
+  };
+  if (!response.ok) {
+    if (response.status === 401) throw new HireReadRefused(401);
+    if (response.status === 429) throw new HireReadRefused(429, payload.error?.message ?? payload.error?.code);
+    throw new Error(payload.error?.message ?? payload.error?.code ?? `HTTP ${response.status}`);
+  }
+  return Array.isArray(payload.data) ? payload.data : payload.data?.agents ?? [];
 }
 
-/**
- * One read of the hire row. A `signed` credential for `*` is accepted by the
- * plane's read binding for any agent; a `cookie` credential sends nothing and
- * lets the BFF forward the HttpOnly bearer.
- */
+/** One read of the hire row on the credential bound to that agent id. */
 export async function readHireSession(input: {
   readonly agentId: string;
   readonly credential: HireReadCredential;
   readonly fetcher?: typeof fetch;
 }): Promise<HireSessionView> {
+  if (input.credential.mode === "signed" && input.credential.target !== input.agentId) {
+    throw new Error("The read credential is not bound to this agent.");
+  }
   const headers: Record<string, string> = input.credential.mode === "signed" ? { "x-owner-action": input.credential.header } : {};
   const response = await (input.fetcher ?? fetch)(`/api/agents/${encodeURIComponent(input.agentId)}/session`, { headers, cache: "no-store" });
   const payload = await response.json() as { data?: HireSessionView; error?: { code?: string; message?: string } };
   if (!response.ok || payload.data === undefined) {
     if (response.status === 401) throw new HireReadRefused(401);
+    if (response.status === 429) throw new HireReadRefused(429, payload.error?.message ?? payload.error?.code);
     throw new Error(payload.error?.message ?? payload.error?.code ?? `HTTP ${response.status}`);
   }
   return payload.data;

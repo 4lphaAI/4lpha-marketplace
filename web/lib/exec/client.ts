@@ -78,6 +78,18 @@ export function execOwnerMutation(path: string, rawBody: string): Promise<ExecRe
   return forward(path, { method: "POST", body: rawBody });
 }
 
+/** Exact hire continuation for the two arm routes; it never carries a signed body. */
+export function execProvisionContinuationMutation(path: string, provisionActionHeader: string): Promise<ExecResponse> {
+  if (provisionActionHeader.length === 0 || provisionActionHeader.length > 64 * 1024) {
+    return Promise.reject(new Error("The provision continuation header is too large."));
+  }
+  return forward(path, {
+    method: "POST",
+    headers: { "x-provision-action": provisionActionHeader },
+    body: "{}",
+  });
+}
+
 /**
  * DEMO MODE — a service-perimeter call carrying the anonymous demo owner id.
  *

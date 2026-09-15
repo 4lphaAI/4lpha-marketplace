@@ -29,7 +29,7 @@ import {
   type V3FeeTier,
 } from "../ops/route.js";
 import type { OwnerActionRequest, OwnerActionStruct, OwnerActionType } from "../auth/ownerAuth.js";
-import { validProvisioningCancellation, type AgentCaps, type AgentRecord } from "../store/agents.js";
+import { validProvisioningCancellation, type AgentCaps, type AgentRecord, type SessionArmPlan } from "../store/agents.js";
 import { identityOwnerView } from "../identity/types.js";
 import type { WalletCall } from "../core/types.js";
 import { parseTradeSettings, type TradeSettings } from "../trade/settings.js";
@@ -43,6 +43,33 @@ export type ParseResult<T> =
 
 function fail<T>(message: string): ParseResult<T> {
   return { ok: false, message };
+}
+
+export type ArmPlanEnvelope = {
+  readonly params: unknown;
+  readonly digest: Hex;
+};
+
+function parseArmPlanEnvelope(value: unknown): ParseResult<ArmPlanEnvelope> {
+  if (!isRecord(value)) return fail('"armPlan" must be a JSON object.');
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== "digest" || keys[1] !== "params") {
+    return fail('"armPlan" must contain exactly: params, digest.');
+  }
+  const digest = value["digest"];
+  if (typeof digest !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(digest)) {
+    return fail('"armPlan.digest" must be a 32-byte hex value.');
+  }
+  let computed: Hex;
+  try {
+    computed = keccak256(stringToBytes(canonicalEncode(value["params"])));
+  } catch {
+    return fail('"armPlan.params" is not canonical JSON.');
+  }
+  if (computed.toLowerCase() !== digest.toLowerCase()) {
+    return fail('"armPlan.digest" does not match its canonical params.');
+  }
+  return { ok: true, value: { params: value["params"], digest: digest as Hex } };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -95,6 +122,7 @@ export type GridHireParams = {
   readonly openNativeBudgetWei: bigint;
   readonly ttlSec: number;
   readonly sizingPreset: "grid-v1" | "grid-shift-v1" | "lp-v1";
+  readonly armPlan?: ArmPlanEnvelope;
 };
 
 export type TradeHireParams = {
@@ -224,8 +252,9 @@ export function parseHireParams(value: unknown): ParseResult<HireParams> {
   if (!isRecord(value)) return fail("Hire params must be a JSON object.");
   if (value["sizingPreset"] === "trade-v1") return parseTradeHireParams(value);
   if (value["sizingPreset"] === "lending-v1") return parseLendingHireParams(value);
+  const hasArmPlan = value["armPlan"] !== undefined;
   const keys = Object.keys(value).sort();
-  const expected = [...HIRE_PARAM_KEYS].sort();
+  const expected = [...HIRE_PARAM_KEYS, ...(hasArmPlan ? ["armPlan"] : [])].sort();
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
     return fail(`Hire params must contain exactly: ${HIRE_PARAM_KEYS.join(", ")}.`);
   }
@@ -250,9 +279,19 @@ export function parseHireParams(value: unknown): ParseResult<HireParams> {
   ) {
     return fail('"sizingPreset" must be "grid-v1", "grid-shift-v1", or "lp-v1".');
   }
+  let armPlan: ArmPlanEnvelope | undefined;
+  if (hasArmPlan) {
+    const parsedPlan = parseArmPlanEnvelope(value["armPlan"]);
+    if (!parsedPlan.ok) return parsedPlan;
+    if (value["sizingPreset"] === "grid-v1") {
+      return fail("arm plans exist for the shift grid only; a fixed grid is armed with a signed gridArm.");
+    }
+    armPlan = parsedPlan.value;
+  }
   return { ok: true, value: {
     walletAddress: walletAddress.value, token: token.value, capDayWei: capDayWei.value,
     openNativeBudgetWei: openNativeBudgetWei.value, ttlSec: ttlSec as number, sizingPreset: value["sizingPreset"],
+    ...(armPlan === undefined ? {} : { armPlan }),
   } };
 }
 
@@ -1053,6 +1092,36 @@ export type ProvisioningMissing =
   | "evidence-unreadable"
   | "expired";
 
+const ARM_PLAN_INTERRUPT_SEC = 600;
+
+function armPlanView(
+  plan: SessionArmPlan | { readonly digest: Hex; readonly kind: "grid" | "lp" },
+  nowSec: number,
+): Record<string, unknown> {
+  const claim = "claim" in plan ? plan.claim : null;
+  const timedOut = claim !== null && claim.outcome === null
+    && nowSec - claim.claimedAtSec > ARM_PLAN_INTERRUPT_SEC;
+  const outcome = timedOut
+    ? {
+        status: "interrupted" as const,
+        message: "The arm was interrupted after it started; see the sequence for its settlement state.",
+        atSec: nowSec,
+      }
+    : claim?.outcome ?? null;
+  return {
+    digest: plan.digest,
+    kind: plan.kind,
+    claim:
+      claim === null
+        ? null
+        : {
+            by: claim.by,
+            claimedAtSec: claim.claimedAtSec,
+            outcome,
+          },
+  };
+}
+
 /** Explicit non-secret projection of pending-grant state. */
 export function provisioningView(
   agent: AgentRecord,
@@ -1067,6 +1136,7 @@ export function provisioningView(
       agent: agentOwnerView(agent),
       hireSizing: agent.sessionFacts?.hireSizing ?? null,
       ...(agent.sessionFacts?.hireRunId === undefined ? {} : { hireRunId: agent.sessionFacts.hireRunId }),
+      ...(agent.sessionFacts?.armPlan === undefined ? {} : { armPlan: armPlanView(agent.sessionFacts.armPlan, nowSec) }),
     };
   }
   const pending = agent.pendingGrant;
@@ -1091,6 +1161,7 @@ export function provisioningView(
     expiresAt: pending.expiresAt,
     funding: pending.funding,
     sizing: pending.sizing,
+    ...(pending.initialArmPlan === undefined ? {} : { armPlan: armPlanView(pending.initialArmPlan, nowSec) }),
     ...(pending.hireRunId === undefined ? {} : { hireRunId: pending.hireRunId }),
     ...(pending.grantAttempt === undefined ? {} : { grantAttempt: pending.grantAttempt }),
     missing: [...missing],

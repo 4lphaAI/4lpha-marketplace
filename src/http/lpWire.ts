@@ -1730,6 +1730,109 @@ export function parseLpGridArmParams(
   };
 }
 
+export type ArmPlanDerived =
+  | { readonly buyRange: LpGridRange; readonly sellRange: LpGridRange }
+  | { readonly tickLower: number; readonly tickUpper: number };
+
+function exactPlanKeys(record: Record<string, unknown>, expected: readonly string[], where: string): void {
+  const keys = Object.keys(record).sort();
+  const sorted = [...expected].sort();
+  if (keys.length !== sorted.length || keys.some((key, index) => key !== sorted[index])) {
+    throw new Error(`${where} must contain exactly: ${expected.join(", ")}.`);
+  }
+}
+
+function planRecord(value: unknown, where: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${where} must be a JSON object.`);
+  return value;
+}
+
+function planBudget(value: unknown): string {
+  if (typeof value !== "string" || !/^\d{1,78}$/.test(value) || BigInt(value) <= 0n) {
+    throw new Error('"budgetWei" must be a positive decimal bigint string.');
+  }
+  return value;
+}
+
+function validatePlanPrices(value: unknown): Record<string, unknown> {
+  const prices = planRecord(value, '"prices"');
+  const hasWbnbOrientation = prices["wbnbIsToken0"] !== undefined;
+  const hasQuoteOrientation = prices["quoteIsToken0"] !== undefined;
+  if (hasWbnbOrientation === hasQuoteOrientation) {
+    throw new Error('"prices" must contain exactly one of "wbnbIsToken0" or "quoteIsToken0".');
+  }
+  exactPlanKeys(prices, ["minPrice", "maxPrice", "tickSpacing", ...(hasWbnbOrientation ? ["wbnbIsToken0"] : ["quoteIsToken0"])], '"prices"');
+  for (const name of ["minPrice", "maxPrice"] as const) {
+    const price = prices[name];
+    if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) {
+      throw new Error(`"prices.${name}" must be a positive finite number.`);
+    }
+  }
+  const minPrice = prices["minPrice"];
+  const maxPrice = prices["maxPrice"];
+  if (typeof minPrice !== "number" || typeof maxPrice !== "number" || !(maxPrice > minPrice)) {
+    throw new Error('"prices.maxPrice" must be above "prices.minPrice".');
+  }
+  if (typeof prices["tickSpacing"] !== "number" || !Number.isInteger(prices["tickSpacing"]) || (prices["tickSpacing"] as number) <= 0) {
+    throw new Error('"prices.tickSpacing" must be a positive integer.');
+  }
+  if (hasWbnbOrientation && typeof prices["wbnbIsToken0"] !== "boolean") {
+    throw new Error('"prices.wbnbIsToken0" must be a boolean.');
+  }
+  if (hasQuoteOrientation && typeof prices["quoteIsToken0"] !== "boolean") {
+    throw new Error('"prices.quoteIsToken0" must be a boolean.');
+  }
+  return prices;
+}
+
+/** Project one stored hire plan into the exact existing arm wire shape. */
+export function armRequestFromPlan(
+  value: unknown,
+  derived?: ArmPlanDerived,
+): Record<string, unknown> {
+  const plan = planRecord(value, "armPlan.params");
+  const kind = plan["kind"];
+  const settings = planRecord(plan["settings"], '"settings"');
+  const budgetWei = planBudget(plan["budgetWei"]);
+  if (kind === "grid") {
+    exactPlanKeys(plan, ["kind", "settings", "budgetWei", "levels"], "Grid arm plan");
+    if (plan["levels"] !== 2) throw new Error('Grid arm plan "levels" must be 2.');
+    const grid = planRecord(settings["grid"], '"settings.grid"');
+    for (const field of ["buyRange", "sellRange", "buyRange2", "sellRange2"]) {
+      if (grid[field] !== undefined) throw new Error(`Grid arm plan settings must omit grid.${field}.`);
+    }
+    if (derived === undefined || !("buyRange" in derived)) {
+      throw new Error("Grid arm plan ranges were not derived.");
+    }
+    return {
+      settings: { ...settings, grid: { ...grid, buyRange: derived.buyRange, sellRange: derived.sellRange } },
+      budgetWei,
+      levels: 2,
+    };
+  }
+  if (kind !== "lp") throw new Error('"armPlan.params.kind" must be "grid" or "lp".');
+  if (plan["range"] === "server-fenced") {
+    exactPlanKeys(plan, ["kind", "settings", "budgetWei", "selectPool", "range"], "Routed LP arm plan");
+    return { settings, budgetWei, selectPool: plan["selectPool"]!, range: "server-fenced" };
+  }
+  exactPlanKeys(plan, ["kind", "settings", "budgetWei", "pool", "prices"], "Explicit LP arm plan");
+  const pool = planRecord(plan["pool"], '"pool"');
+  exactPlanKeys(pool, ["address", "token0", "token1", "fee"], '"pool"');
+  if (typeof pool["address"] !== "string" || !isAddress(pool["address"], { strict: false })) {
+    throw new Error('"pool.address" must be a 20-byte hex address.');
+  }
+  validatePlanPrices(plan["prices"]);
+  if (derived === undefined || !("tickLower" in derived)) {
+    throw new Error("Explicit LP arm plan range was not derived.");
+  }
+  return {
+    settings,
+    budgetWei,
+    pool: { token0: pool["token0"]!, token1: pool["token1"]!, fee: pool["fee"]! },
+    range: { tickLower: derived.tickLower, tickUpper: derived.tickUpper },
+  };
+}
+
 /**
  * What the owner is shown about a position's PROTECTION (PHASE3.2 Decision 4 /
  * Rev2 items 26–28).

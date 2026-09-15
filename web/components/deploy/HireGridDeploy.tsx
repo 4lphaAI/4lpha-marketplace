@@ -1,20 +1,23 @@
 "use client";
-import { accountHireStorage, accountSwitchRequiresContinue } from "@/lib/exec/account-hire-storage";
+import { accountHireStorage, accountSwitchRequiresContinue, assertHireOwner } from "@/lib/exec/account-hire-storage";
 
 import { walletBlockerAgentId } from "@/lib/altana/hire-wallet-blocker";
 
 import * as React from "react";
-import { formatEther, getAddress, type Address } from "viem";
+import { formatEther, getAddress, keccak256, stringToBytes, type Address } from "viem";
 import { useAccount } from "wagmi";
 import { FundsModal, type FundsWallet } from "@/components/FundsModal";
 import { grantAgentSession, GrantAgentSessionError } from "@/lib/altana/client";
 import { freshFundingGate, hireResumeStep, type HireFunding, type HireSessionView } from "@/lib/altana/hire-state";
 import { credentialUsable, ensureHireReadCredential, HireReadRefused, pollStatusText, readHireSession, rememberedHireReadCredential, type HireReadCredential } from "@/lib/altana/hire-read-session";
+import { rememberReadExpiry } from "@/lib/exec/read-session-window";
 import { cancelGridHire, cancellationMessage, cancellationRecorded, forgetGridHire, GRID_HIRE_CHOICES_STORAGE_KEY, GridDeployRun, GridDeployStopped, type GridHireChoices } from "@/lib/altana/grid-hire-recovery";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
-import { parseBnbToWei } from "@/lib/grid/geometry";
-import { depositAmountBnb, depositAmountWei, requiredDepositWei, walletSharedWithLiveAgents } from "@/lib/altana/hire-funding";
-import { armGridAgent, GridDeployActions, type LivePool } from "./GridLiveDeploy";
+import { deriveGridFromPreset, FEE_TO_TICK_SPACING, parseBnbToWei } from "@/lib/grid/geometry";
+import { buildShiftGridSettings } from "@/lib/grid/settings";
+import { canonicalEncode, type OwnerActionEnvelope } from "@/lib/exec/owner-action";
+import { depositAmountBnb, depositAmountWei, requiredDepositWei } from "@/lib/altana/hire-funding";
+import { armGridAgent, GridDeployActions, UI_PRESET_TO_GEOMETRY, type LivePool } from "./GridLiveDeploy";
 
 /** Same primitive as GridLiveDeploy's deploy button, so Live mode keeps one visual language. */
 const primaryBtn: React.CSSProperties = { cursor: "pointer", padding: "14px 22px", borderRadius: "var(--radius-sm)", background: "var(--cat-grid)", border: "none", color: "#08110c", font: "var(--weight-medium) var(--text-md)/1 var(--font-sans)" };
@@ -73,6 +76,80 @@ function poolToken(pool: LivePool): Address {
   return getAddress(pool.wbnbIsToken0 ? pool.token1 : pool.token0);
 }
 
+function armPlanDigest(plan: Record<string, unknown>): `0x${string}` {
+  return keccak256(stringToBytes(canonicalEncode(plan)));
+}
+
+function buildGridArmPlan(pool: LivePool, choices: GridDeployChoiceSnapshot): Record<string, unknown> | null {
+  if (pool.fee === null || FEE_TO_TICK_SPACING[pool.fee] === undefined) {
+    return null;
+  }
+  const tickSpacing = FEE_TO_TICK_SPACING[pool.fee];
+  const derived = deriveGridFromPreset({
+    presetId: UI_PRESET_TO_GEOMETRY[choices.uiPresetId] ?? "standard",
+    spreadFactor: 1,
+    currentTick: 0,
+    tickSpacing,
+    wbnbIsToken0: pool.wbnbIsToken0,
+  });
+  const settings = buildShiftGridSettings({
+    pool: { token0: pool.token0, token1: pool.token1, fee: pool.fee },
+    wbnbIsToken0: pool.wbnbIsToken0,
+    tickSpacing,
+    buyRange: derived.buyRange,
+    sellRange: derived.sellRange,
+    stopLossPct: choices.stopLossPct,
+    takeProfitPct: choices.takeProfitPct,
+    gapTicks: derived.gapTicks,
+    widthTicks: derived.widthTicks,
+    deployPctBps: choices.utilizationPct * 100,
+    shiftsPerDay: choices.maxRequotesDaily,
+  });
+  const grid = settings["grid"];
+  if (typeof grid !== "object" || grid === null || Array.isArray(grid)) throw new Error("The signed grid plan has no grid block.");
+  const { buyRange: _buyRange, sellRange: _sellRange, ...planGrid } = grid as Record<string, unknown>;
+  void _buyRange;
+  void _sellRange;
+  return {
+    kind: "grid",
+    settings: { ...settings, grid: planGrid },
+    budgetWei: parseBnbToWei(choices.capitalBnb).toString(10),
+    levels: 2,
+  };
+}
+
+function gridContinuationMatches(
+  envelope: OwnerActionEnvelope,
+  view: HireSessionView,
+  agentId: string,
+  owner: string | undefined,
+  wallet: string | undefined,
+): boolean {
+  try {
+    assertHireOwner(envelope, owner, wallet);
+    const params = envelope.params;
+    if (envelope.signed.action !== "provisionAgent" || envelope.signed.agentId !== agentId
+      || typeof params !== "object" || params === null || Array.isArray(params)) return false;
+    const plan = (params as { readonly armPlan?: { readonly digest?: unknown; readonly params?: unknown } }).armPlan;
+    if (plan === undefined || plan.digest !== view.armPlan?.digest) return false;
+    return typeof plan.params === "object" && plan.params !== null && !Array.isArray(plan.params)
+      && (plan.params as { readonly kind?: unknown }).kind === "grid";
+  } catch {
+    return false;
+  }
+}
+
+function saveGridArmPlanFallback(storage: Storage, agentId: string): void {
+  const raw = storage.getItem(GRID_HIRE_CHOICES_STORAGE_KEY);
+  if (raw === null) return;
+  try {
+    const choices = JSON.parse(raw) as GridHireChoices;
+    if (choices.version === 1 && choices.agentId === agentId) {
+      storage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({ ...choices, armPlanFallback: "signed" } satisfies GridHireChoices));
+    }
+  } catch { /* malformed local state cannot authorize or select a continuation */ }
+}
+
 function errorMessage(payload: unknown, fallback: string): string {
   if (typeof payload !== "object" || payload === null) return fallback;
   const error = (payload as { error?: { code?: string; message?: string } }).error;
@@ -99,11 +176,11 @@ type DeployStepState = "pending" | "active" | "done" | "failed" | "skipped";
 type DeployStep = { readonly state: DeployStepState; readonly detail?: string };
 
 const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: string; readonly hint: string }[] = [
-  { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key" },
+  { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key and read session" },
   { key: "fund", title: "Fund the agent wallet", hint: "Only when the wallet cannot cover the registration fee" },
   { key: "grant", title: "Grant the session on chain", hint: "Your passkey authorises the session; the relay submits it" },
   { key: "converge", title: "Verify the grant", hint: "Relay, account, KeyStore and owner binding must all agree" },
-  { key: "arm", title: "Arm the grid", hint: "Wraps your budget and mints both rungs in one transaction" },
+  { key: "arm", title: "Arm the grid", hint: "Placed from your signed plan — no further signature" },
 ];
 
 const STEP_MARK: Record<DeployStepState, string> = {
@@ -185,10 +262,10 @@ function HireGridDeployLive(props: {
   const owner = useOwnerActions();
   const hireStorage = React.useMemo(() => accountHireStorage(typeof window === "undefined" ? undefined : window.localStorage, owner.ownerAddress), [owner.ownerAddress]);
   const { address: connectedAddress } = useAccount();
-  // GRID-GAS-RESERVE W1 — whether ANOTHER live agent already sits on the agent
-  // wallet, decided from the owner-signed list read below. Defaults to TRUE and
-  // stays true on a resumed run (no list read): an unknown neighbour is a
-  // neighbour, so none of the wallet's balance is credited to this deposit.
+  // GRID-GAS-RESERVE W1 — whether another live agent may share the agent wallet.
+  // Defaults to TRUE and becomes false only after a fresh provision succeeds.
+  // A resumed run keeps the conservative default because no new occupancy proof
+  // is taken in this browser step.
   const sharedPot = React.useRef(true);
   const [agentId, setAgentId] = React.useState<string | null>(null);
   const [view, setView] = React.useState<HireSessionView | null>(null);
@@ -197,6 +274,7 @@ function HireGridDeployLive(props: {
   const [message, setMessage] = React.useState<string | null>(null);
   const [deposit, setDeposit] = React.useState(false);
   const [depositWei, setDepositWei] = React.useState<bigint | null>(null);
+  const [armPlanFallback, setArmPlanFallback] = React.useState(false);
   const autoContinued = React.useRef(false);
   // The one-press run: every step the owner would otherwise have clicked
   // through, driven in order and reported as it happens.
@@ -209,6 +287,7 @@ function HireGridDeployLive(props: {
   const mounted = React.useRef(true);
   const cancelling = React.useRef(false);
   const readCredential = React.useRef<HireReadCredential | null>(null);
+  const provisionEnvelope = React.useRef<OwnerActionEnvelope | null>(null);
 
   const stopPolling = React.useCallback(() => {
     pollGeneration.current += 1;
@@ -216,26 +295,59 @@ function HireGridDeployLive(props: {
     pollTimer.current = null;
   }, []);
 
+  const clearReadCredential = React.useCallback(() => {
+    readCredential.current = null;
+    try { hireStorage.removeItem("4lpha:account-read-expiry:v1"); } catch { /* private window */ }
+  }, [hireStorage]);
+
+  const ensureLongLivedCredential = React.useCallback(async <T,>(
+    run: GridDeployRun,
+    target: "*" | string,
+    read: (credential: HireReadCredential) => Promise<T>,
+  ): Promise<T> => {
+    const attempt = async (): Promise<T> => {
+      run.check();
+      const nowMs = Date.now();
+      let credential = readCredential.current;
+      if (!credentialUsable(credential, nowMs, target)) {
+        credential = await run.guarded(() => ensureHireReadCredential({
+          current: credential,
+          target,
+          signEnvelope: owner.signEnvelope,
+          storage: hireStorage,
+          nowMs,
+        }));
+        readCredential.current = credential;
+      }
+      if (credential === null) throw new Error("No read credential.");
+      return run.guarded(() => read(credential));
+    };
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!(error instanceof HireReadRefused) || error.status !== 401) throw error;
+      clearReadCredential();
+      if (!mounted.current) throw new GridDeployStopped();
+      run.check();
+      return attempt();
+    }
+  }, [clearReadCredential, hireStorage, owner.signEnvelope]);
+
   /**
-   * Every hire read goes through here. The credential is the 900 s account
-   * read session (one passkey, shared with the agent page) with the 120 s
-   * signed header as the fallback; a 401 means the window lapsed underneath
-   * us and is answered by re-issuing once — never by showing the owner an
-   * auth error for a hire that is doing nothing wrong.
+   * Every hire read goes through here. Short-lived resume reads retain their
+   * existing signed fallback; the deploy run uses the shared long-lived helper
+   * so the list and convergence poll cannot establish different credentials.
    */
-  const readWithCredential = React.useCallback(async (id: string, longLived = false): Promise<HireSessionView> => {
+  const readWithCredential = React.useCallback(async (id: string, longLived = false, run?: GridDeployRun): Promise<HireSessionView> => {
+    if (longLived && run !== undefined) {
+      return ensureLongLivedCredential(run, id, (credential) => readHireSession({ agentId: id, credential }));
+    }
     const attempt = async (): Promise<HireSessionView> => {
       const nowMs = Date.now();
       let credential = readCredential.current;
-      if (!credentialUsable(credential, nowMs)) {
-        // A window the agent page already opened costs nothing. Otherwise a
-        // LONG run (the deploy's ten-minute convergence wait) earns the 900 s
-        // session, while a mount or a status check keeps the 120 s signed
-        // read it always had — one signature, no request that is not a read.
+      if (!credentialUsable(credential, nowMs, id)) {
         credential = rememberedHireReadCredential(hireStorage, nowMs)
-          ?? (longLived
-            ? await ensureHireReadCredential({ current: null, signEnvelope: owner.signEnvelope, storage: hireStorage, nowMs })
-            : { mode: "signed", header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 });
+          ?? { mode: "signed", target: id, header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 };
         readCredential.current = credential;
       }
       if (credential === null) throw new Error("No read credential.");
@@ -244,19 +356,14 @@ function HireGridDeployLive(props: {
     try {
       return await attempt();
     } catch (error) {
-      if (!(error instanceof HireReadRefused)) throw error;
-      readCredential.current = null;
-      try { hireStorage.removeItem("4lpha:account-read-expiry:v1"); } catch { /* private window */ }
-      // FIX-REVIEW-2 FINDING 2. The retry re-issues a CREDENTIAL, which can mean
-      // a wallet prompt — and a 401 that lands after the component is gone would
-      // raise that prompt over whatever the owner is looking at now, including
-      // the Demo screen they just switched to. The unmount check belongs here
-      // rather than only at the call sites, because this is the line that can
-      // ask for a signature.
+      if (!(error instanceof HireReadRefused) || error.status !== 401) throw error;
+      clearReadCredential();
+      // FIX-REVIEW-2 FINDING 2: a late refusal must not open a prompt after
+      // this component has unmounted.
       if (!mounted.current) throw new GridDeployStopped();
-      return await attempt();
+      return attempt();
     }
-  }, [owner.signEnvelope, owner.signReadHeader]);
+  }, [clearReadCredential, ensureLongLivedCredential, hireStorage, owner.signReadHeader]);
 
   const beginPolling = React.useCallback(async (id: string) => {
     stopPolling();
@@ -304,6 +411,11 @@ function HireGridDeployLive(props: {
             && typeof candidate.utilizationPct === "number" && typeof candidate.maxRequotesDaily === "number"
             && typeof candidate.takeProfitPct === "number" && typeof candidate.stopLossPct === "number") {
             restoredChoices = candidate as GridHireChoices;
+            setArmPlanFallback(restoredChoices.armPlanFallback === "signed");
+            if (restoredChoices.provisionEnvelope !== undefined) {
+              assertHireOwner(restoredChoices.provisionEnvelope, owner.ownerAddress, owner.walletAddress);
+              provisionEnvelope.current = restoredChoices.provisionEnvelope;
+            }
             props.onRestoreChoices?.(restoredChoices);
           }
         }
@@ -319,7 +431,9 @@ function HireGridDeployLive(props: {
       // wallet-owner-mismatch) still needs the owner to act on THAT agent, so
       // it is left exactly where it is.
       if (!accountSwitchRequiresContinue(hireStorage) && restoredChoices !== null && props.pool !== null
-        && resumedView !== undefined && hireResumeStep(resumedView) === "arm" && !cancellationRecorded(resumedView) && !autoContinued.current) {
+        && resumedView !== undefined && hireResumeStep(resumedView) === "arm"
+        && (resumedView.armPlan === undefined || resumedView.armPlan.claim === null)
+        && !cancellationRecorded(resumedView) && !autoContinued.current) {
         autoContinued.current = true;
         void deployAll({ id: saved, view: resumedView, choices: restoredChoices });
       }
@@ -366,32 +480,11 @@ function HireGridDeployLive(props: {
     try {
       const fresh = await run.guarded(() => loadPreview(chosen.capitalBnb));
       setPreview(fresh);
-      // ONE owner-signed list read decides the number: `grid-agent-01`, then
-      // `-2`, `-3`. The list includes revoked and retired rows, which is what
-      // makes re-hiring under the same name work. A list that cannot be read
-      // falls back to the bare slug — the 409 branch below is the backstop.
+      // The first S1 uses the readable slug. A global-id 409 is handled below by
+      // trying the next suffix; no owner list is needed before the hire.
       const base = agentIdFromName(agentName);
       const taken: string[] = [];
-      try {
-        setWorking("Checking which agent names you already hold…");
-        const header = await run.guarded(() => owner.signReadHeader("*"));
-        const listed = await fetch("/api/agents", { headers: { "x-owner-action": header }, cache: "no-store" });
-        type ListedAgent = { id: string; status?: unknown; walletAddress?: unknown };
-        const rows = await listed.json() as { data?: { agents?: ListedAgent[] } | ListedAgent[] };
-        if (listed.ok) {
-          const agents = Array.isArray(rows.data) ? rows.data : rows.data?.agents ?? [];
-          taken.push(...agents.map((agent) => agent.id));
-          // GRID-GAS-RESERVE W1: the same list says whether the agent wallet is
-          // already someone's gas pot. The id being hired is not yet in it.
-          if (owner.walletAddress !== undefined) {
-            sharedPot.current = walletSharedWithLiveAgents({ agents, walletAddress: owner.walletAddress, excludingId: base });
-          }
-        }
-      } catch {
-        run.check();
-        // An unreadable list is not a reason to refuse: fall through on the
-        // bare slug and let the 409 loop below find the free number.
-      }
+      const plan = buildGridArmPlan(pool, chosen);
       const params = {
         walletAddress: owner.walletAddress!,
         token: poolToken(pool),
@@ -399,11 +492,11 @@ function HireGridDeployLive(props: {
         openNativeBudgetWei: fresh.sizing.openNativeBudgetWei,
         ttlSec: 604_800,
         sizingPreset: HIRE_PROFILE,
+        ...(plan === null ? {} : { armPlan: { params: plan, digest: armPlanDigest(plan) } }),
       };
-      // The list can be stale or unreadable, so a 409 still has to be handled —
-      // by taking the NEXT number, not by parking on the row that answered it.
-      // Three attempts: a fourth would mean the list is lying systematically,
-      // and silently signing forever is worse than saying so.
+      // A 409 can race another owner, so take the NEXT number rather than
+      // parking on the row that answered it. Three attempts keep the prompt
+      // bounded.
       for (let attempt = 0; attempt < 3; attempt += 1) {
         run.check();
         const id = nextFreeAgentId(base, taken);
@@ -418,47 +511,49 @@ function HireGridDeployLive(props: {
         // Preserve a successful S1 even if navigation stopped this run while
         // the request was in flight; never continue from it into a grant.
         if (response.ok && payload.data !== undefined) {
+          // A successful fresh passkey provision excludes another occupying row for this owner and wallet under walletConflict; the browser's deposit can credit its balance.
+          sharedPot.current = false;
+          provisionEnvelope.current = envelope;
+          setArmPlanFallback(false);
           const saved = hireStorage.getItem("4lpha:grid-hire:v1");
           if (!run.stopped || saved === null || saved === id) {
             hireStorage.setItem("4lpha:grid-hire:v1", id);
-            hireStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({ version: 1, agentId: id, ...chosen } satisfies GridHireChoices));
+            hireStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({ version: 1, agentId: id, ...chosen, provisionEnvelope: envelope } satisfies GridHireChoices));
+            const expiry = payload.data.readSession?.expiry;
+            if (typeof expiry === "number") rememberReadExpiry(hireStorage, expiry * 1_000);
           }
         }
         run.check();
         if (response.status === 409 && payload.error?.code === "agent_exists") {
-          // Agent ids are GLOBAL but the session read is owner-scoped. Resume
-          // a row owned by this account; when another account owns the id, the
-          // read deliberately answers not_found, which means this candidate is
-          // taken and the next numbered suffix must be tried. LP and Trading
-          // use the same rule.
-          setWorking("An agent with this id already exists — reading its hire state…");
-          let existing: HireSessionView;
-          try {
-            existing = await beginPolling(id);
-          } catch (error) {
-            if (error instanceof GridDeployStopped) throw error;
-            const text = error instanceof Error ? error.message : "";
-            if (!/not_found|HTTP 404/iu.test(text)) throw error;
-            stopPolling();
-            setView(null);
-            setAgentId(null);
+          const owned = (payload as { readonly meta?: { readonly owned?: boolean } }).meta?.owned === true;
+          if (!owned) {
             taken.push(id);
             continue;
           }
-          run.check();
-          if (existing.status !== "revoked" && existing.status !== "retired") {
-            hireStorage.setItem("4lpha:grid-hire:v1", id);
-            // The resumed row is armed with THIS run's choices, so a refresh
-            // must restore these and not the defaults (R7.1).
-            hireStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({ version: 1, agentId: id, ...chosen } satisfies GridHireChoices));
-            setAgentId(id);
-            return { id, view: existing };
+          const existing = payload.data;
+          if (existing === undefined) {
+            taken.push(id);
+            continue;
           }
-          stopPolling();
-          setView(null);
-          setAgentId(null);
-          taken.push(id);
-          continue;
+          if (existing.status === "revoked" || existing.status === "retired") {
+            taken.push(id);
+            continue;
+          }
+          hireStorage.setItem("4lpha:grid-hire:v1", id);
+          const rawAccepted = hireStorage.getItem(GRID_HIRE_CHOICES_STORAGE_KEY);
+          if (rawAccepted !== null) {
+            try {
+              const accepted = JSON.parse(rawAccepted) as GridHireChoices;
+              if (accepted.version === 1 && accepted.agentId === id && accepted.provisionEnvelope !== undefined) {
+                assertHireOwner(accepted.provisionEnvelope, owner.ownerAddress, owner.walletAddress);
+                provisionEnvelope.current = accepted.provisionEnvelope;
+                setArmPlanFallback(accepted.armPlanFallback === "signed");
+                props.onRestoreChoices?.(accepted);
+              }
+            } catch { /* a missing or mismatched local record selects the signed door */ }
+          }
+          setAgentId(id);
+          return { id, view: existing };
         }
         if (!response.ok || payload.data === undefined) throw new Error(errorMessage(payload, `HTTP ${response.status}`));
         hireStorage.setItem("4lpha:grid-hire:v1", id);
@@ -501,7 +596,7 @@ function HireGridDeployLive(props: {
 
   /** One read of the hire row inside a run, on the shared credential. */
   const readSession = async (id: string, run: GridDeployRun): Promise<HireSessionView> => {
-    const data = await run.guarded(() => readWithCredential(id, true));
+    const data = await run.guarded(() => readWithCredential(id, true, run));
     run.check();
     setView(data);
     return data;
@@ -698,6 +793,20 @@ function HireGridDeployLive(props: {
 
       // ── 5. The arm — the step that actually places the money ──────────────
       mark("arm", "active", "Deriving the grid from the live tick…");
+      const claimOutcome = current.armPlan?.claim?.outcome;
+      if (claimOutcome?.status === "completed") {
+        forgetGridHire(hireStorage, id);
+        if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+        return;
+      }
+      if (claimOutcome?.status === "held" || claimOutcome?.status === "interrupted") {
+        throw new Error(claimOutcome.message ?? "The arm is held; continue from the agent's settlement and recovery path.");
+      }
+      if (claimOutcome?.status === "rolled-back" && !armPlanFallback) {
+        setArmPlanFallback(true);
+        saveGridArmPlanFallback(hireStorage, id);
+        throw new Error(claimOutcome.message ?? "The arm rolled back before funding. Press Arm to sign the arm at today's price.");
+      }
       run.check();
       const hireSizing = current.hireSizing;
       const hireProfile = hireSizing?.name;
@@ -709,6 +818,10 @@ function HireGridDeployLive(props: {
       if (chosenBudgetWei > hiredBudgetWei) {
         throw new Error(`Total capital ${chosen.capitalBnb} BNB exceeds this hire's budget of ${formatEther(hiredBudgetWei)} BNB. Lower it to that amount, or cancel this hire and start again.`);
       }
+      const acceptedEnvelope = provisionEnvelope.current;
+      const canContinue = !armPlanFallback && acceptedEnvelope !== null
+        && current.armPlan?.claim === null
+        && gridContinuationMatches(acceptedEnvelope, current, id, owner.ownerAddress, owner.walletAddress);
       const armed = await run.guarded(() => armGridAgent({
         agentId: id!,
         pool,
@@ -720,6 +833,13 @@ function HireGridDeployLive(props: {
         shiftsPerDay: chosen.maxRequotesDaily,
         signEnvelope: (action, targetId, params) => run.guarded(() => owner.signEnvelope(action, targetId, params)),
         hireProfile,
+        ...(canContinue && acceptedEnvelope !== null ? { provisionEnvelope: acceptedEnvelope, armPlan: current.armPlan } : {}),
+        ...(armPlanFallback ? { armPlanFallback: "signed" as const } : {}),
+        onArmPlanFallback: () => {
+          setArmPlanFallback(true);
+          saveGridArmPlanFallback(hireStorage, id!);
+        },
+        onArmPlanOutcome: (plan) => setView({ ...current, armPlan: plan }),
         ...(preview?.sizing.relayFeePerSubmitWei === undefined ? {} : { relayFeePerSubmitWei: preview.sizing.relayFeePerSubmitWei }),
         onNote: (note) => { if (!run.stopped && mounted.current) mark("arm", "active", note); },
       }));
@@ -764,12 +884,13 @@ function HireGridDeployLive(props: {
     // read as "hired but nothing happens" when this step sat under a
     // more prominent "View agent page" button.
     return <div style={{ display: "grid", gap: 12 }}>
+      {armPlanFallback ? <p style={{ color: "var(--loss)", margin: 0 }}>The signed plan could not be placed at the current price. Arm again to sign today&apos;s price.</p> : null}
       <p style={{ color: "var(--text-muted)", font: "var(--type-body-sm)", margin: 0 }}>
         Session <code>{agentId}</code> is live on chain. One step left: arm the grid, which wraps your budget and mints both rungs. <strong>Until it is armed the agent holds no position and places no orders.</strong>
       </p>
       <div>
         <button type="button" style={busyBtn(running, primaryBtn)} onClick={() => void deployAll()} disabled={running}>
-          Arm the grid
+          {armPlanFallback ? "Arm the grid with a signature" : "Arm the grid"}
         </button>
       </div>
       {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}

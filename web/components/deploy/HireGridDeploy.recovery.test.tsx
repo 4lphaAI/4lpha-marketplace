@@ -12,7 +12,7 @@ vi.mock("wagmi", () => ({ useAccount: () => ({ address: undefined }) }));
 vi.mock("@/lib/exec/use-owner-actions", () => ({ useOwnerActions: () => ({ ...mocks.owner, signReadHeader: mocks.signReadHeader, signEnvelope: mocks.signEnvelope }) }));
 vi.mock("@/lib/altana/client", () => ({ grantAgentSession: mocks.grant, GrantAgentSessionError: class extends Error {} }));
 vi.mock("@/components/FundsModal", () => ({ FundsModal: ({ onClose }: { onClose: () => void }) => <button onClick={onClose}>Close deposit</button> }));
-vi.mock("./GridLiveDeploy", () => ({ armGridAgent: mocks.arm, GridDeployActions: () => null }));
+vi.mock("./GridLiveDeploy", () => ({ armGridAgent: mocks.arm, GridDeployActions: () => null, UI_PRESET_TO_GEOMETRY: { balanced: "standard" } }));
 
 import { HireGridDeploy } from "./HireGridDeploy";
 import { HireRecoveryActions } from "./HireRecoveryActions";
@@ -43,7 +43,7 @@ let nextFunding: Promise<Response> | null;
 let nextSession: Promise<Response> | null;
 let nextProvision: Promise<Response> | null;
 let cancelResponse: () => Response;
-const gridPool = { pool: "0x4444444444444444444444444444444444444444", token0: "0x5555555555555555555555555555555555555555", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", wbnbIsToken0: false } as React.ComponentProps<typeof HireGridDeploy>["pool"];
+const gridPool = { pool: "0x4444444444444444444444444444444444444444", token0: "0x5555555555555555555555555555555555555555", token1: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", fee: 2500, wbnbIsToken0: false } as React.ComponentProps<typeof HireGridDeploy>["pool"];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -51,7 +51,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
   mocks.signReadHeader.mockResolvedValue("signed-read");
-  mocks.signEnvelope.mockImplementation(async (action: string, agentId: string, params: unknown) => ({ signed: { action, agentId }, signature: "0xsignature", params }));
+  mocks.signEnvelope.mockImplementation(async (action: string, agentId: string, params: unknown) => ({ signed: { action, agentId, owner: mocks.owner.ownerAddress }, signature: "0xsignature", params }));
   mocks.grant.mockResolvedValue({});
   mocks.arm.mockResolvedValue({});
   currentSession = session;
@@ -62,6 +62,7 @@ beforeEach(() => {
   fetchMock = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     if (url.includes("/hire/preview")) return nextFunding ?? json(preview());
+    if (url === "/api/account/session") return new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
     if (url === "/api/agents") return json({ agents: [] });
     if (url.endsWith("/session/cancel")) return cancelResponse();
     if (url.endsWith("/session")) return init?.method === "POST" ? nextProvision ?? json(session) : nextSession ?? json(currentSession);
@@ -168,7 +169,7 @@ describe("grid hire interruption in the rendered UI", () => {
     await click("Deploy grid agent");
     await act(async () => { root!.unmount(); root = null; });
     await act(async () => { signature.resolve({ signed: {}, signature: "0xsig", params: {} }); });
-    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/") && init?.method === "POST")).toHaveLength(0);
     expect(mocks.grant).not.toHaveBeenCalled();
     expect(mocks.arm).not.toHaveBeenCalled();
   });
@@ -279,33 +280,46 @@ it("does not reinterpret unrelated 409 errors as an existing agent", async () =>
 it("increments the suffix when another owner holds the global agent id", async () => {
   let provisionCalls = 0;
   let choicesAtArm: string | null = null;
-  mocks.arm.mockImplementation(async () => {
+  let armed: HireSessionView = { ...session, status: "armed", missing: [], hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "30000000000000000" } };
+  mocks.grant.mockImplementation(async () => { currentSession = armed; return {}; });
+  mocks.arm.mockImplementation(async (input: { readonly provisionEnvelope?: unknown }) => {
     choicesAtArm = localStorage.getItem(GRID_HIRE_CHOICES_STORAGE_KEY);
+    expect(input.provisionEnvelope).toBeDefined();
     return {};
   });
   fetchMock.mockImplementation(async (input, init) => {
     const url = String(input);
-    if (url.includes("/hire/preview")) return json(preview("100"));
-    if (url === "/api/agents") return json({ agents: [] });
+    if (url.includes("/hire/preview")) return json(preview("1000"));
+    if (url === "/api/account/session") return new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
     if (url.endsWith("/session") && init?.method === "POST") {
       provisionCalls += 1;
-      return provisionCalls === 1
-        ? new Response(JSON.stringify({ error: { code: "agent_exists" } }), { status: 409 })
-        : json({ ...session, status: "armed", hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "30000000000000000" } });
+      if (provisionCalls === 1) return new Response(JSON.stringify({ error: { code: "agent_exists" }, meta: { owned: false } }), { status: 409 });
+      const body = JSON.parse(String(init.body)) as { readonly params?: { readonly armPlan?: { readonly digest?: string } } };
+      const signedPlan = body.params?.armPlan;
+      armed = { ...armed, ...(signedPlan?.digest === undefined ? {} : { armPlan: { digest: signedPlan.digest as `0x${string}`, kind: "grid", claim: null } }) };
+      currentSession = { ...session, armPlan: armed.armPlan };
+      return json({ ...currentSession, readSession: { expiry: Math.floor(Date.now() / 1_000) + 900 } });
     }
     if (url.endsWith("/session")) {
-      return new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
+      return json(currentSession);
     }
     throw new Error(`Unexpected URL ${url}`);
   });
   await deploy();
   await click("Deploy grid agent");
+  await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
   expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "provisionAgent").map(([, agentId]) => agentId))
     .toEqual(["grid-agent-01-3", "grid-agent-01-3-2"]);
-  expect(JSON.parse(choicesAtArm ?? "null")).toEqual({
+  const choices = JSON.parse(choicesAtArm ?? "null") as Record<string, unknown>;
+  expect(choices).toMatchObject({
     version: 1, agentId: "grid-agent-01-3-2", uiPresetId: "balanced", capitalBnb: "0.03",
     utilizationPct: 30, maxRequotesDaily: 16, takeProfitPct: 0, stopLossPct: 0,
   });
+  expect(choices.provisionEnvelope).toBeDefined();
+  expect(gridLedger()).toEqual(["provisionAgent", "provisionAgent", "grant"]);
+  console.info(`HIRE_SIGNATURES_LEDGER grid collision: ${JSON.stringify(["provisionAgent(id)", "provisionAgent(id-2)", "grant"])}`);
+  expect(fetchMock.mock.calls.some(([url]) => String(url) === "/api/agents")).toBe(false);
   expect(mocks.arm).toHaveBeenCalledTimes(1);
   expect(host.textContent).not.toContain("not_found");
 });
@@ -345,6 +359,34 @@ it("refuses capital above the immutable hire budget before armGridAgent", async 
   expect(host.textContent).toContain("Total capital 0.03 BNB exceeds this hire's budget of 0.02 BNB. Lower it to that amount, or cancel this hire and start again.");
 });
 
+it("persists a proven rollback fallback and signs the arm on the next press", async () => {
+  localStorage.setItem(key, id);
+  localStorage.setItem(GRID_HIRE_CHOICES_STORAGE_KEY, JSON.stringify({
+    version: 1, agentId: id, uiPresetId: "balanced", capitalBnb: "0.03",
+    utilizationPct: 30, maxRequotesDaily: 16, takeProfitPct: 0, stopLossPct: 0,
+  }));
+  currentSession = {
+    ...session,
+    status: "armed",
+    missing: [],
+    hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "30000000000000000" },
+    armPlan: { digest: `0x${"44".repeat(32)}`, kind: "grid", claim: {
+      by: "continuation", claimedAtSec: 100, outcome: { status: "rolled-back", message: "safe rollback", atSec: 101 },
+    } },
+  };
+  mocks.arm.mockImplementation(async (input: { readonly signEnvelope: (action: string, agentId: string, params: Record<string, unknown>) => Promise<unknown> }) => {
+    await input.signEnvelope("gridArm", id, {});
+    return {};
+  });
+  await deploy();
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  await click("Arm the grid");
+  expect(host.textContent).toContain("safe rollback");
+  expect(JSON.parse(localStorage.getItem(GRID_HIRE_CHOICES_STORAGE_KEY) ?? "{}")).toMatchObject({ armPlanFallback: "signed" });
+  await click("Arm the grid with a signature");
+  expect(mocks.signEnvelope).toHaveBeenCalledWith("gridArm", id, {});
+});
+
 it("cancels a scoped Trading draft, clears only its JSON pointer and returns to Trading", async () => {
   const tradeKey = "4lpha:trade-hire:v2";
   const scoped = tradeKey + ":owner:" + mocks.owner.ownerAddress;
@@ -378,4 +420,189 @@ it("notifies Account only after confirmed cancellation, including a page reload"
   currentSession = { ...session, cancelRequested: true };
   await act(async () => { root!.render(<HireRecoveryActions key="reload" agentId={id} readHeaders={{}} go={vi.fn()} onCancelled={onCancelled} />); });
   expect(onCancelled).toHaveBeenCalledWith(id);
+});
+
+function signedTarget(init: RequestInit | undefined): string | null {
+  const header = new Headers(init?.headers).get("x-owner-action");
+  if (header === null) return null;
+  const padded = header.replace(/-/gu, "+").replace(/_/gu, "/") + "=".repeat((4 - header.length % 4) % 4);
+  const envelope = JSON.parse(atob(padded)) as { signed?: { agentId?: unknown } };
+  return typeof envelope.signed?.agentId === "string" ? envelope.signed.agentId : null;
+}
+
+function gridLedger(): string[] {
+  const entries = mocks.signEnvelope.mock.calls.map((call, index) => ({
+    order: mocks.signEnvelope.mock.invocationCallOrder[index]!,
+    label: call[0] === "read" ? `read(${String(call[1])})` : String(call[0]),
+  }));
+  entries.push(...mocks.grant.mock.invocationCallOrder.map((order) => ({ order, label: "grant" })));
+  return entries.sort((a, b) => a.order - b.order).map((entry) => entry.label);
+}
+
+async function runGridLedger(scenario: {
+  readonly issuer: "cookie" | "hidden";
+  readonly rememberedExpiryMs?: number;
+  readonly fundingWait?: boolean;
+}): Promise<string[]> {
+  const agentId = "grid-agent-01-3";
+  if (scenario.rememberedExpiryMs !== undefined) {
+    localStorage.setItem("4lpha:account-read-expiry:v1", String(scenario.rememberedExpiryMs));
+  }
+  let previewReads = 0;
+  currentSession = session;
+  let armed: HireSessionView = {
+    ...session,
+    status: "armed",
+    missing: [],
+    hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "30000000000000000" },
+  };
+  mocks.grant.mockImplementation(async () => { currentSession = armed; return {}; });
+  mocks.arm.mockImplementation(async (input: { readonly signEnvelope: (action: string, agentId: string, params: Record<string, unknown>) => Promise<unknown>; readonly provisionEnvelope?: unknown }) => {
+    if (input.provisionEnvelope === undefined) await input.signEnvelope("gridArm", agentId, {});
+    return {};
+  });
+  fetchMock.mockImplementation(async (request, init) => {
+    const url = String(request);
+    if (url.includes("/hire/preview")) {
+      previewReads += 1;
+      const balance = scenario.fundingWait && previewReads < 3
+        ? "0" : scenario.fundingWait ? "100000000000000" : "1000";
+      return json(preview(balance));
+    }
+    if (url === "/api/account/session") {
+      return scenario.issuer === "cookie"
+        ? json({ expiry: Math.floor(Date.now() / 1_000) + 900 })
+        : new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
+    }
+    if (url.endsWith("/session") && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { readonly params?: { readonly armPlan?: { readonly digest?: string } } };
+      const signedPlan = body.params?.armPlan;
+      if (signedPlan?.digest !== undefined) {
+        armed = { ...armed, armPlan: { digest: signedPlan.digest as `0x${string}`, kind: "grid", claim: null } };
+        currentSession = { ...session, armPlan: armed.armPlan };
+        return scenario.issuer === "cookie"
+          ? json({ ...currentSession, readSession: { expiry: Math.floor(Date.now() / 1_000) + 900 } })
+          : json(currentSession);
+      }
+      return json(currentSession);
+    }
+    if (url.endsWith("/session")) return json(currentSession);
+    throw new Error(`Unexpected URL ${url}`);
+  });
+  await deploy();
+  await act(async () => {
+    button("Deploy grid agent").click();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  for (let i = 0; i < 5; i += 1) {
+    await act(async () => { await Promise.resolve(); });
+  }
+  if (scenario.fundingWait) {
+    await act(async () => { await vi.advanceTimersByTimeAsync(6_001); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  } else {
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  }
+  for (let i = 0; i < 5; i += 1) {
+    await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
+  }
+  return gridLedger();
+}
+
+describe("HIRE-SIGNATURES-BC grid prompt ledger", () => {
+  it("records the funded cookie ledger and uses the provision-issued read window", async () => {
+    const observed = await runGridLedger({ issuer: "cookie" });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    const list = fetchMock.mock.calls.find(([url]) => String(url) === "/api/agents");
+    expect(list).toBeUndefined();
+    const sessions = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/")
+      && String(url).endsWith("/session") && init?.method !== "POST");
+    expect(sessions.every(([, init]) => new Headers(init?.headers).get("x-owner-action") === null)).toBe(true);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+    console.info(`HIRE_SIGNATURES_LEDGER grid funded: ${JSON.stringify(observed)}`);
+  });
+
+  it("records the warm cookie ledger with no read-session signature", async () => {
+    const observed = await runGridLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 1_800_000 });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    expect(mocks.signEnvelope).not.toHaveBeenCalledWith("createAccountReadSession", "*", {});
+    console.info(`HIRE_SIGNATURES_LEDGER grid warm: ${JSON.stringify(observed)}`);
+  });
+
+  it("uses the signed per-agent read fallback when the issuer is hidden", async () => {
+    const observed = await runGridLedger({ issuer: "hidden" });
+    expect(observed).toEqual(["provisionAgent", "createAccountReadSession", `read(${id})`, "grant"]);
+    const list = fetchMock.mock.calls.find(([url]) => String(url) === "/api/agents");
+    expect(list).toBeUndefined();
+    const sessions = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/")
+      && String(url).endsWith("/session") && init?.method !== "POST");
+    expect(sessions.length).toBeGreaterThan(0);
+    expect(sessions.every(([, init]) => signedTarget(init) === id)).toBe(true);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+    console.info(`HIRE_SIGNATURES_LEDGER grid hidden-issuer: ${JSON.stringify(observed)}`);
+  });
+
+  it("treats remembered expiry at exactly 60 seconds as cold", async () => {
+    const observed = await runGridLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 60_000 });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "createAccountReadSession")).toHaveLength(0);
+  });
+
+  it("keeps the provision-issued read window after a remembered cookie", async () => {
+    const observed = await runGridLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 1_800_000 });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "createAccountReadSession")).toHaveLength(0);
+  });
+
+  it("does not read the owner list before signing a new hire", async () => {
+    const observed = await runGridLedger({ issuer: "cookie" });
+    expect(observed[0]).toBe("provisionAgent");
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === "/api/agents")).toBe(false);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+  });
+
+  it("keeps one credential across funding expiry and renews before grid convergence", async () => {
+    const observed = await runGridLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 66_000, fundingWait: true });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    console.info(`HIRE_SIGNATURES_LEDGER grid cold-short: ${JSON.stringify(["provisionAgent", "<MetaMask deposit>", "grant"])}`);
+  });
+
+  it("resumes a same-owner collision without provisioning a numbered replacement", async () => {
+    const agentId = "grid-agent-01-3";
+    let posts = 0;
+    currentSession = session;
+    const armed: HireSessionView = { ...session, status: "armed", missing: [], hireSizing: { name: "grid-shift-v1", version: 1, openNativeBudgetWei: "30000000000000000" } };
+    mocks.grant.mockImplementation(async () => { currentSession = armed; return {}; });
+    mocks.arm.mockImplementation(async (input: { readonly signEnvelope: (action: string, agentId: string, params: Record<string, unknown>) => Promise<unknown> }) => {
+      await input.signEnvelope("gridArm", agentId, {});
+      return {};
+    });
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.includes("/hire/preview")) return json(preview("1000"));
+      if (url === "/api/account/session") return json({ expiry: Math.floor(Date.now() / 1_000) + 900 });
+      if (url === "/api/agents") return json({ agents: [] });
+      if (url.endsWith("/session") && init?.method === "POST") {
+        posts += 1;
+        return posts === 1
+          ? new Response(JSON.stringify({ error: { code: "agent_exists" }, data: armed, meta: { owned: true } }), { status: 409 })
+          : json(currentSession);
+      }
+      if (url.endsWith("/session")) return json(currentSession);
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    await deploy();
+    await act(async () => { button("Deploy grid agent").click(); await vi.advanceTimersByTimeAsync(5_001); });
+    for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
+    expect(posts).toBe(1);
+    expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "provisionAgent")).toHaveLength(1);
+    expect(gridLedger()).toEqual(["provisionAgent", "gridArm"]);
+    expect(host.textContent).not.toContain("Every candidate name");
+  });
+
+  it("does not need a read-session signature after a fresh provision", async () => {
+    const observed = await runGridLedger({ issuer: "cookie" });
+    expect(observed[0]).toBe("provisionAgent");
+    expect(mocks.signEnvelope.mock.calls.some(([action]) => action === "createAccountReadSession" || action === "read")).toBe(false);
+  });
 });

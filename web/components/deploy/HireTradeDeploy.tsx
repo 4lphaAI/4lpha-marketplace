@@ -11,6 +11,7 @@ import { grantAgentSession, GrantAgentSessionError } from "@/lib/altana/client";
 import { GridDeployRun, GridDeployStopped } from "@/lib/altana/grid-hire-recovery";
 import { depositAmountWei, requiredTradeDepositWei } from "@/lib/altana/hire-funding";
 import { freshFundingGate, type HireSessionView } from "@/lib/altana/hire-state";
+import { rememberReadExpiry } from "@/lib/exec/read-session-window";
 import { encodeReadHeader, type OwnerActionEnvelope } from "@/lib/exec/owner-action";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
 import {
@@ -329,7 +330,7 @@ export function HireTradeDeploy(props: {
       throw new ContinuationReadError(409, "The stored hire pointer does not match this agent.");
     }
     return parsed.data;
-  }, [owner.ownerAddress, owner.walletAddress]);
+  }, [hireStorage, owner.ownerAddress, owner.walletAddress]);
 
   const submitSignedHire = React.useCallback(async (current: TradeHireRecord): Promise<HireSessionView> => {
     if (current.provisionEnvelope === null) throw new Error("The hire signature was not completed; press Sign hire again.");
@@ -345,8 +346,9 @@ export function HireTradeDeploy(props: {
     if (parsed.data.hireRunId !== current.hireRunId) {
       throw new ContinuationReadError(409, "The signed hire response does not match this run.", "conflict");
     }
+    if (parsed.data.readSession !== undefined) rememberReadExpiry(hireStorage, parsed.data.readSession.expiry * 1_000);
     return parsed.data;
-  }, [owner.ownerAddress, owner.walletAddress]);
+  }, [hireStorage, owner.ownerAddress, owner.walletAddress]);
 
   const startHire = React.useCallback(async (run: GridDeployRun, seed?: TradeHireSeed): Promise<{ readonly record: TradeHireRecord; readonly view: HireSessionView }> => {
     if (owner.passkey === null || owner.walletAddress === undefined) throw new Error("Create or recover your passkey wallet first.");

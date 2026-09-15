@@ -1,20 +1,21 @@
 "use client";
-import { accountHireStorage, accountSwitchRequiresContinue } from "@/lib/exec/account-hire-storage";
+import { accountHireStorage, accountSwitchRequiresContinue, assertHireOwner } from "@/lib/exec/account-hire-storage";
 
 import * as React from "react";
-import { formatEther, getAddress, type Address } from "viem";
+import { formatEther, getAddress, keccak256, stringToBytes, type Address } from "viem";
 import { useAccount } from "wagmi";
 import { FundsModal, type FundsWallet } from "@/components/FundsModal";
 import { grantAgentSession, GrantAgentSessionError } from "@/lib/altana/client";
-import { freshFundingGate, hireResumeStep, type HireFunding, type HireSessionView } from "@/lib/altana/hire-state";
+import { freshFundingGate, hireResumeStep, type HireArmPlan, type HireFunding, type HireSessionView } from "@/lib/altana/hire-state";
 import { credentialUsable, ensureHireReadCredential, HireReadRefused, pollStatusText, readHireSession, rememberedHireReadCredential, type HireReadCredential } from "@/lib/altana/hire-read-session";
 import { cancelGridHire, cancellationMessage, cancellationRecorded, forgetHire, GridDeployRun, GridDeployStopped } from "@/lib/altana/grid-hire-recovery";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
-import { depositAmountBnb, depositAmountWei, requiredDepositWei, walletSharedWithLiveAgents } from "@/lib/altana/hire-funding";
+import { depositAmountBnb, depositAmountWei, requiredDepositWei } from "@/lib/altana/hire-funding";
 import { parseBnbToWei } from "@/lib/grid/geometry";
 import { buildLpSettings } from "@/lib/lp/settings";
 import { explicitRangeFromPrices } from "@/lib/lp/range";
-import type { OwnerActionEnvelope } from "@/lib/exec/owner-action";
+import { canonicalEncode, encodeReadHeader, type OwnerActionEnvelope } from "@/lib/exec/owner-action";
+import { rememberReadExpiry } from "@/lib/exec/read-session-window";
 import { nextFreeAgentId } from "./HireGridDeploy";
 import { walletBlockerAgentId } from "@/lib/altana/hire-wallet-blocker";
 import type { LivePool } from "./GridLiveDeploy";
@@ -48,8 +49,9 @@ function provisionEnvelopeKey(agentId: string): string {
 }
 
 type DurableArmOutcome = {
-  readonly status: "held" | "rolled-back";
+  readonly status: "held" | "interrupted" | "rolled-back";
   readonly reason: string;
+  readonly armPlanFallback?: "signed";
 };
 
 function armOutcomeKey(agentId: string): string {
@@ -65,8 +67,8 @@ function loadArmOutcome(storage: Storage, agentId: string): DurableArmOutcome | 
   if (raw === null) return null;
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
-    return (value.status === "held" || value.status === "rolled-back") && typeof value.reason === "string"
-      ? { status: value.status, reason: value.reason }
+    return (value.status === "held" || value.status === "interrupted" || value.status === "rolled-back") && typeof value.reason === "string"
+      ? { status: value.status, reason: value.reason, ...(value.armPlanFallback === "signed" ? { armPlanFallback: "signed" } : {}) }
       : null;
   } catch {
     return null;
@@ -94,6 +96,15 @@ function forgetLpHire(storage: Storage, agentId: string): void {
   forgetHire(storage, agentId, LP_HIRE_STORAGE_KEY);
   storage.removeItem(provisionEnvelopeKey(agentId));
   storage.removeItem(armOutcomeKey(agentId));
+}
+
+function saveLpArmPlanFallback(storage: Storage, agentId: string): DurableArmOutcome {
+  const current = loadArmOutcome(storage, agentId);
+  const outcome: DurableArmOutcome = current === null
+    ? { status: "rolled-back", reason: "The signed arm plan was refused; sign the arm at today's price.", armPlanFallback: "signed" }
+    : { ...current, armPlanFallback: "signed" };
+  saveArmOutcome(storage, agentId, outcome);
+  return outcome;
 }
 
 type Preview = {
@@ -124,7 +135,7 @@ type DeployStepState = "pending" | "active" | "done" | "failed" | "skipped";
 type DeployStep = { readonly state: DeployStepState; readonly detail?: string };
 
 const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: string; readonly hint: string }[] = [
-  { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key" },
+  { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key (a read session may be authorized first)" },
   { key: "fund", title: "Fund the agent wallet", hint: "Only when the wallet cannot cover the registration fee" },
   { key: "grant", title: "Grant the session on chain", hint: "Your passkey authorises the session; the relay submits it" },
   { key: "converge", title: "Verify the grant", hint: "Relay, account, KeyStore and owner binding must all agree" },
@@ -211,10 +222,77 @@ type ExplicitPrices = {
   readonly ready: boolean;
 };
 
-export class LpArmOutcomeError extends Error {
-  readonly status: "held" | "rolled-back";
+function lpArmPlanDigest(plan: Record<string, unknown>): `0x${string}` {
+  return keccak256(stringToBytes(canonicalEncode(plan)));
+}
 
-  constructor(status: "held" | "rolled-back", reason: string) {
+function buildLpArmPlan(input: {
+  readonly settings: Record<string, unknown>;
+  readonly budgetWei: bigint;
+  readonly uiPresetId: string;
+  readonly routeBy: "fee-apr" | "volume";
+  readonly pool: LivePool | null;
+  readonly explicitPrices: ExplicitPrices | null;
+}): Record<string, unknown> {
+  if (input.uiPresetId === "wide") {
+    return {
+      kind: "lp",
+      settings: input.settings,
+      budgetWei: input.budgetWei.toString(10),
+      selectPool: { by: input.routeBy, window: "24h" },
+      range: "server-fenced",
+    };
+  }
+  if (input.pool === null || input.pool.fee === null || input.explicitPrices === null || input.explicitPrices.ready !== true) {
+    throw new Error("Select a pool and wait for its live tick before signing the range.");
+  }
+  const prices = {
+    minPrice: input.explicitPrices.minPrice,
+    maxPrice: input.explicitPrices.maxPrice,
+    tickSpacing: input.explicitPrices.tickSpacing,
+    ...(input.explicitPrices.quoteIsToken0 === undefined
+      ? { wbnbIsToken0: input.explicitPrices.wbnbIsToken0 }
+      : { quoteIsToken0: input.explicitPrices.quoteIsToken0 }),
+  };
+  return {
+    kind: "lp",
+    settings: input.settings,
+    budgetWei: input.budgetWei.toString(10),
+    pool: {
+      address: input.pool.pool,
+      token0: input.pool.token0,
+      token1: input.pool.token1,
+      fee: input.pool.fee,
+    },
+    prices,
+  };
+}
+
+function lpContinuationMatches(
+  envelope: OwnerActionEnvelope,
+  view: HireSessionView,
+  agentId: string,
+  owner: string | undefined,
+  wallet: string | undefined,
+): boolean {
+  try {
+    assertHireOwner(envelope, owner, wallet);
+    if (envelope.signed.action !== "provisionAgent" || envelope.signed.agentId !== agentId) return false;
+    const params = envelope.params;
+    if (typeof params !== "object" || params === null || Array.isArray(params)) return false;
+    const plan = (params as { readonly armPlan?: { readonly digest?: unknown; readonly params?: unknown } }).armPlan;
+    return plan?.digest === view.armPlan?.digest
+      && typeof plan?.params === "object" && plan.params !== null && !Array.isArray(plan.params)
+      && (plan.params as { readonly kind?: unknown }).kind === "lp";
+  } catch {
+    return false;
+  }
+}
+
+export class LpArmOutcomeError extends Error {
+  readonly status: "held" | "interrupted" | "rolled-back";
+
+  constructor(status: "held" | "interrupted" | "rolled-back", reason: string) {
     super(reason);
     this.name = "LpArmOutcomeError";
     this.status = status;
@@ -239,8 +317,44 @@ export async function armLpAgent(input: {
   readonly skillFile: { readonly name: string; readonly text: string } | null;
   readonly explicitPrices: ExplicitPrices | null;
   readonly signEnvelope: (action: string, agentId: string, params: Record<string, unknown>) => Promise<unknown>;
+  readonly provisionEnvelope?: OwnerActionEnvelope;
+  readonly armPlan?: HireArmPlan;
+  readonly armPlanFallback?: "signed";
+  readonly onArmPlanFallback?: () => void;
+  readonly onArmPlanOutcome?: (plan: HireArmPlan) => void;
   readonly onNote?: (note: string) => void;
 }): Promise<Record<string, unknown>> {
+  const useContinuation = input.provisionEnvelope !== undefined
+    && input.armPlan?.kind === "lp"
+    && input.armPlan.claim === null
+    && input.armPlanFallback !== "signed";
+  if (useContinuation) {
+    input.onNote?.("Arming from your signed plan at the live tick (the relay mints on-chain; this can take a minute)…");
+    const response = await fetch(`/api/agents/${encodeURIComponent(input.agentId)}/lp/arm`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-provision-action": encodeReadHeader(input.provisionEnvelope!) },
+      body: "{}",
+    });
+    const payload = await response.json() as { data?: Record<string, unknown>; error?: { code: string; message?: string } };
+    if (!response.ok || payload.data === undefined) {
+      if (response.status === 400) input.onArmPlanFallback?.();
+      throw new Error(payload.error?.message ? `${payload.error.code}: ${payload.error.message}` : payload.error?.code ?? `HTTP ${response.status}`);
+    }
+    const rawPlan = payload.data["armPlan"];
+    if (typeof rawPlan !== "object" || rawPlan === null || Array.isArray(rawPlan)) throw new Error("The execution plane returned no arm-plan outcome.");
+    const armPlan = rawPlan as HireArmPlan;
+    input.onArmPlanOutcome?.(armPlan);
+    const outcome = armPlan.claim?.outcome;
+    if (outcome?.status === "completed") return payload.data;
+    if (outcome?.status === "rolled-back") {
+      input.onArmPlanFallback?.();
+      throw new LpArmOutcomeError("rolled-back", outcome.message ?? "The arm rolled back before funding. Press Arm to sign the arm at today's price.");
+    }
+    if (outcome?.status === "held" || outcome?.status === "interrupted") {
+      throw new LpArmOutcomeError(outcome.status, outcome.message ?? "The arm is held; continue from the agent's settlement and recovery path.");
+    }
+    throw new Error("The execution plane returned an invalid arm-plan outcome.");
+  }
   const budgetWei = parseBnbToWei(input.capitalBnb);
   if (budgetWei <= 0n) throw new Error("Total capital must be positive.");
   const settings = buildLpSettings({
@@ -418,15 +532,53 @@ export function HireLpDeploy(props: {
     pollTimer.current = null;
   }, []);
 
-  const readWithCredential = React.useCallback(async (id: string, longLived = false): Promise<HireSessionView> => {
+  const clearReadCredential = React.useCallback(() => {
+    readCredential.current = null;
+    try { hireStorage.removeItem("4lpha:account-read-expiry:v1"); } catch { /* private window */ }
+  }, [hireStorage]);
+
+  const ensureLongLivedCredential = React.useCallback(async <T,>(
+    run: GridDeployRun,
+    target: "*" | string,
+    read: (credential: HireReadCredential) => Promise<T>,
+  ): Promise<T> => {
+    const attempt = async (): Promise<T> => {
+      run.check();
+      const nowMs = Date.now();
+      let credential = readCredential.current;
+      if (!credentialUsable(credential, nowMs, target)) {
+        credential = await run.guarded(() => ensureHireReadCredential({
+          current: credential,
+          target,
+          signEnvelope: owner.signEnvelope,
+          storage: hireStorage,
+          nowMs,
+        }));
+        readCredential.current = credential;
+      }
+      if (credential === null) throw new Error("No read credential.");
+      return run.guarded(() => read(credential));
+    };
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!(error instanceof HireReadRefused) || error.status !== 401) throw error;
+      clearReadCredential();
+      run.check();
+      return attempt();
+    }
+  }, [clearReadCredential, hireStorage, owner.signEnvelope]);
+
+  const readWithCredential = React.useCallback(async (id: string, longLived = false, run?: GridDeployRun): Promise<HireSessionView> => {
+    if (longLived && run !== undefined) {
+      return ensureLongLivedCredential(run, id, (credential) => readHireSession({ agentId: id, credential }));
+    }
     const attempt = async (): Promise<HireSessionView> => {
       const nowMs = Date.now();
       let credential = readCredential.current;
-      if (!credentialUsable(credential, nowMs)) {
+      if (!credentialUsable(credential, nowMs, id)) {
         credential = rememberedHireReadCredential(hireStorage, nowMs)
-          ?? (longLived
-            ? await ensureHireReadCredential({ current: null, signEnvelope: owner.signEnvelope, storage: hireStorage, nowMs })
-            : { mode: "signed", header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 });
+          ?? { mode: "signed", target: id, header: await owner.signReadHeader(id), expiryMs: nowMs + 120_000 };
         readCredential.current = credential;
       }
       if (credential === null) throw new Error("No read credential.");
@@ -435,12 +587,12 @@ export function HireLpDeploy(props: {
     try {
       return await attempt();
     } catch (error) {
-      if (!(error instanceof HireReadRefused)) throw error;
-      readCredential.current = null;
-      try { hireStorage.removeItem("4lpha:account-read-expiry:v1"); } catch { /* private window */ }
-      return await attempt();
+      if (!(error instanceof HireReadRefused) || error.status !== 401) throw error;
+      clearReadCredential();
+      run?.check();
+      return attempt();
     }
-  }, [owner.signEnvelope, owner.signReadHeader]);
+  }, [clearReadCredential, ensureLongLivedCredential, hireStorage, owner.signReadHeader]);
 
   const beginPolling = React.useCallback(async (id: string) => {
     stopPolling();
@@ -481,12 +633,18 @@ export function HireLpDeploy(props: {
     if (saved === null) return;
     const savedArmOutcome = loadArmOutcome(hireStorage, saved);
     setArmOutcome(savedArmOutcome);
-    provisionEnvelope.current = loadProvisionEnvelope(hireStorage, saved);
+    const savedEnvelope = loadProvisionEnvelope(hireStorage, saved);
+    if (savedEnvelope !== null) {
+      try { assertHireOwner(savedEnvelope, owner.ownerAddress, owner.walletAddress); provisionEnvelope.current = savedEnvelope; }
+      catch { provisionEnvelope.current = null; }
+    }
     setAgentId(saved);
     setWorking("Checking the durable hire state before offering another grant…");
     void beginPolling(saved).then((resumedView) => {
       if (!mounted.current) return;
-      if (!accountSwitchRequiresContinue(hireStorage) && resumedView !== undefined && hireResumeStep(resumedView) === "arm" && savedArmOutcome === null && !cancellationRecorded(resumedView) && !autoContinued.current) {
+      if (!accountSwitchRequiresContinue(hireStorage) && resumedView !== undefined && hireResumeStep(resumedView) === "arm"
+        && (resumedView.armPlan === undefined || resumedView.armPlan.claim === null)
+        && savedArmOutcome === null && !cancellationRecorded(resumedView) && !autoContinued.current) {
         autoContinued.current = true;
         void deployAll({ id: saved, view: resumedView });
       }
@@ -516,7 +674,7 @@ export function HireLpDeploy(props: {
   };
 
   const readSession = async (id: string, run: GridDeployRun): Promise<HireSessionView> => {
-    const data = await run.guarded(() => readWithCredential(id, true));
+    const data = await run.guarded(() => readWithCredential(id, true, run));
     run.check();
     setView(data);
     return data;
@@ -556,22 +714,71 @@ export function HireLpDeploy(props: {
       setPreview(fresh);
       const base = agentIdFromName(props.agentName);
       const taken: string[] = [];
-      try {
-        setWorking("Checking which agent names you already hold…");
-        const header = await run.guarded(() => owner.signReadHeader("*"));
-        const listed = await fetch("/api/agents", { headers: { "x-owner-action": header }, cache: "no-store" });
-        type ListedAgent = { id: string; status?: unknown; walletAddress?: unknown };
-        const rows = await listed.json() as { data?: { agents?: ListedAgent[] } | ListedAgent[] };
-        if (listed.ok) {
-          const agents = Array.isArray(rows.data) ? rows.data : rows.data?.agents ?? [];
-          taken.push(...agents.map((agent) => agent.id));
-          if (owner.walletAddress !== undefined) {
-            sharedPot.current = walletSharedWithLiveAgents({ agents, walletAddress: owner.walletAddress, excludingId: base });
-          }
+      const budgetWei = parseBnbToWei(props.capitalBnb);
+      const settings = buildLpSettings({
+        compoundOn: props.compoundOn,
+        takeProfitPct: props.takeProfitPct,
+        stopLossPct: props.stopLossPct,
+        budgetWei,
+        minFees: props.minFees,
+        rotateMinHoldMinutes: props.rotateMinHoldMinutes,
+        rotateMode: props.rotateMode,
+        primaryModel: props.primaryModel,
+        fallbackModel: props.fallbackModel,
+        instructions: props.instructions,
+        skillFile: props.skillFile,
+      });
+      if (props.uiPresetId !== "wide") {
+        const pool = props.pool;
+        const explicitPrices = props.explicitPrices;
+        if (pool === null || pool.fee === null || explicitPrices === null || explicitPrices.ready !== true) {
+          throw new Error("Select a pool and wait for its live tick before signing the range.");
         }
-      } catch {
-        run.check();
+        const signedPoolAddress = getAddress(pool.pool);
+        const token0IsWbnb = getAddress(pool.token0) === getAddress(WBNB);
+        const token1IsWbnb = getAddress(pool.token1) === getAddress(WBNB);
+        if (getAddress(explicitPrices.poolAddress) !== signedPoolAddress
+          || token0IsWbnb === token1IsWbnb
+          || token0IsWbnb !== pool.wbnbIsToken0
+          || token0IsWbnb !== explicitPrices.wbnbIsToken0) {
+          throw new Error("The signed pool's spacing or WBNB orientation changed. Refresh the displayed range before signing.");
+        }
+        const stateResponse = await fetch(`/api/pool-state?address=${signedPoolAddress.toLowerCase()}`, { cache: "no-store" });
+        const statePayload = await stateResponse.json() as {
+          readonly data?: { readonly pool?: unknown; readonly currentTick?: unknown; readonly tickSpacing?: unknown };
+          readonly error?: { readonly code?: string; readonly message?: string };
+        };
+        if (!stateResponse.ok || statePayload.data === undefined
+          || typeof statePayload.data.pool !== "string"
+          || getAddress(statePayload.data.pool) !== signedPoolAddress
+          || !Number.isInteger(statePayload.data.currentTick)
+          || !Number.isInteger(statePayload.data.tickSpacing)
+          || statePayload.data.tickSpacing !== explicitPrices.tickSpacing) {
+          throw new Error(statePayload.error?.message ?? "The signed pool's spacing or WBNB orientation changed. Refresh the displayed range before signing.");
+        }
+        const currentTick = statePayload.data.currentTick;
+        if (typeof currentTick !== "number") {
+          throw new Error("The signed pool's current tick is unavailable. Refresh the displayed range before signing.");
+        }
+        const orientation = explicitPrices.quoteIsToken0 === undefined
+          ? { wbnbIsToken0: explicitPrices.wbnbIsToken0 }
+          : { quoteIsToken0: explicitPrices.quoteIsToken0 };
+        explicitRangeFromPrices({
+          minPrice: explicitPrices.minPrice,
+          maxPrice: explicitPrices.maxPrice,
+          currentTick,
+          tickSpacing: explicitPrices.tickSpacing,
+          ...orientation,
+        });
       }
+      const plan = buildLpArmPlan({
+        settings,
+        budgetWei,
+        uiPresetId: props.uiPresetId,
+        routeBy: props.routeBy,
+        pool: props.pool,
+        explicitPrices: props.explicitPrices,
+      });
       const params = {
         walletAddress: owner.walletAddress!,
         token: poolToken(props.pool!),
@@ -579,6 +786,7 @@ export function HireLpDeploy(props: {
         openNativeBudgetWei: fresh.sizing.openNativeBudgetWei,
         ttlSec: 604_800,
         sizingPreset: HIRE_PROFILE,
+        armPlan: { params: plan, digest: lpArmPlanDigest(plan) },
       };
       for (let attempt = 0; attempt < 3; attempt += 1) {
         run.check();
@@ -587,16 +795,20 @@ export function HireLpDeploy(props: {
           ? "Confirm the one off-chain hire signature with your passkey…"
           : `${taken[taken.length - 1] ?? base} is taken. Confirm the signature again to hire ${id}…`);
         const envelope = await run.guarded(() => owner.signEnvelope("provisionAgent", id, params));
-        provisionEnvelope.current = envelope;
-        saveProvisionEnvelope(hireStorage, id, envelope);
         hireStorage.setItem(LP_HIRE_STORAGE_KEY, id);
         const response = await fetch(`/api/agents/${encodeURIComponent(id)}/session`, {
           method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope),
         });
         const payload = await response.json() as { data?: HireSessionView };
         if (response.ok && payload.data !== undefined) {
+          // A successful fresh passkey provision excludes another occupying row for this owner and wallet under walletConflict; the browser's deposit can credit its balance.
+          sharedPot.current = false;
+          provisionEnvelope.current = envelope;
+          saveProvisionEnvelope(hireStorage, id, envelope);
           const saved = hireStorage.getItem(LP_HIRE_STORAGE_KEY);
           if (!run.stopped || saved === null || saved === id) hireStorage.setItem(LP_HIRE_STORAGE_KEY, id);
+          const expiry = payload.data.readSession?.expiry;
+          if (typeof expiry === "number") rememberReadExpiry(hireStorage, expiry * 1_000);
         }
         run.check();
         // Only an id collision is "taken" (the Grid hire's rule). Every other
@@ -609,38 +821,29 @@ export function HireLpDeploy(props: {
           throw new Error(errorMessage(payload, `HTTP ${response.status}`));
         }
         if (response.status === 409) {
-          hireStorage.removeItem(provisionEnvelopeKey(id));
-          provisionEnvelope.current = null;
-          setWorking("An agent with this id already exists — reading its hire state…");
-          // Agent ids are GLOBAL but the session read is owner-scoped: an id
-          // held by ANOTHER owner answers 409 here and then `not_found` on
-          // the read. That is "taken by someone else", not a failure — move
-          // to the next candidate (2026-09-06: a fresh passkey account naming
-          // its first agent `lp-agent-01` died on the previous owner's id).
-          let existing: HireSessionView;
-          try {
-            existing = await beginPolling(id);
-          } catch (error) {
-            if (error instanceof GridDeployStopped) throw error;
-            const text = error instanceof Error ? error.message : "";
-            if (!/not_found|HTTP 404/iu.test(text)) throw error;
-            stopPolling();
-            setView(null);
-            setAgentId(null);
+          const owned = (payload as { readonly meta?: { readonly owned?: boolean } }).meta?.owned === true;
+          if (!owned) {
             taken.push(id);
             continue;
           }
-          run.check();
-          if (existing.status !== "revoked" && existing.status !== "retired") {
-            hireStorage.setItem(LP_HIRE_STORAGE_KEY, id);
-            setAgentId(id);
-            return { id, view: existing };
+          const existing = payload.data;
+          if (existing === undefined) {
+            taken.push(id);
+            continue;
           }
-          stopPolling();
-          setView(null);
-          setAgentId(null);
-          taken.push(id);
-          continue;
+          if (existing.status === "revoked" || existing.status === "retired") {
+            taken.push(id);
+            continue;
+          }
+          hireStorage.setItem(LP_HIRE_STORAGE_KEY, id);
+          const accepted = loadProvisionEnvelope(hireStorage, id);
+          if (accepted !== null) {
+            try { assertHireOwner(accepted, owner.ownerAddress, owner.walletAddress); provisionEnvelope.current = accepted; }
+            catch { provisionEnvelope.current = null; }
+          }
+          setAgentId(id);
+          setView(existing);
+          return { id, view: existing };
         }
         if (!response.ok || payload.data === undefined) throw new Error(errorMessage(payload, `HTTP ${response.status}`));
         hireStorage.setItem(LP_HIRE_STORAGE_KEY, id);
@@ -853,6 +1056,25 @@ export function HireLpDeploy(props: {
       mark("converge", "done", "The session is live on chain.");
 
       mark("arm", "active", "Preparing the LP settings and range…");
+      const fallback = armOutcome?.armPlanFallback === "signed";
+      const claimOutcome = current.armPlan?.claim?.outcome;
+      if (claimOutcome?.status === "completed") {
+        forgetLpHire(hireStorage, id);
+        if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+        return;
+      }
+      if (claimOutcome?.status === "held" || claimOutcome?.status === "interrupted") {
+        throw new LpArmOutcomeError(claimOutcome.status, claimOutcome.message ?? "The arm is held; continue from the agent's settlement and recovery path.");
+      }
+      if (claimOutcome?.status === "rolled-back" && !fallback) {
+        const savedFallback = saveLpArmPlanFallback(hireStorage, id);
+        setArmOutcome(savedFallback);
+        throw new LpArmOutcomeError("rolled-back", claimOutcome.message ?? savedFallback.reason);
+      }
+      const acceptedEnvelope = provisionEnvelope.current;
+      const canContinue = !fallback && acceptedEnvelope !== null
+        && current.armPlan?.claim === null
+        && lpContinuationMatches(acceptedEnvelope, current, id, owner.ownerAddress, owner.walletAddress);
       const opened = await run.guarded(() => armLpAgent({
         agentId: id!,
         uiPresetId: props.uiPresetId,
@@ -870,7 +1092,14 @@ export function HireLpDeploy(props: {
         instructions: props.instructions,
         skillFile: props.skillFile,
         explicitPrices: props.explicitPrices,
+        ...(canContinue && acceptedEnvelope !== null ? { provisionEnvelope: acceptedEnvelope, armPlan: current.armPlan! } : {}),
+        ...(fallback ? { armPlanFallback: "signed" as const } : {}),
         signEnvelope: (action, targetId, params) => run.guarded(() => owner.signEnvelope(action, targetId, params)),
+        onArmPlanFallback: () => {
+          const savedFallback = saveLpArmPlanFallback(hireStorage, id!);
+          setArmOutcome(savedFallback);
+        },
+        onArmPlanOutcome: (plan) => setView({ ...current, armPlan: plan }),
         onNote: (note) => { if (!run.stopped && mounted.current) mark("arm", "active", note); },
       }));
       const position = opened["position"] as { readonly tokenId?: unknown } | undefined;
@@ -884,20 +1113,18 @@ export function HireLpDeploy(props: {
       if (!mounted.current || run.stopped) return;
       const text = error instanceof Error ? error.message : "The deploy could not be completed.";
       if (error instanceof LpArmOutcomeError && id !== null) {
-        const outcome = { status: error.status, reason: text } as const;
+        const prior = loadArmOutcome(hireStorage, id);
+        const outcome: DurableArmOutcome = {
+          status: error.status,
+          reason: text,
+          ...(prior?.armPlanFallback === "signed" || error.status === "rolled-back" && prior?.armPlanFallback === "signed"
+            ? { armPlanFallback: "signed" as const } : {}),
+        };
         saveArmOutcome(hireStorage, id, outcome);
         setArmOutcome(outcome);
-        // A HELD open is a live sequence the plane is still driving (a
-        // pending relay submission, resolved by reconcile) — the agent page is
-        // where it is followed, so go there without another press (operator
-        // request 2026-09-06). The hire pointer and the durable outcome stay,
-        // so a reload lands on the same recovery path; only a ROLLED-BACK open
-        // keeps the owner here with the explicit retry.
-        if (error.status === "held") {
-          if (mounted.current) setRunning(false);
-          if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
-          return;
-        }
+        // A held or interrupted open stays on the arm step with its durable
+        // settlement remedy. Only a completed continuation navigates; neither
+        // an ambiguous result nor its historical claim is silently retried.
       }
       setSteps((current) => {
         const active = DEPLOY_STEPS.find(({ key }) => current[key].state === "active")?.key ?? "hire";
@@ -951,14 +1178,14 @@ export function HireLpDeploy(props: {
   if (step === "arm" && agentId !== null) {
     const openAgent = (id: string): void => { if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`); };
     const retryArm = (): void => {
-      hireStorage.removeItem(armOutcomeKey(agentId));
-      setArmOutcome(null);
+      const savedFallback = saveLpArmPlanFallback(hireStorage, agentId);
+      setArmOutcome(savedFallback);
       setMessage(null);
       void deployAll();
     };
     return <div style={{ display: "grid", gap: 12 }}>
       <p style={{ color: "var(--text-muted)", font: "var(--type-body-sm)", margin: 0 }}>
-        {armOutcome?.status === "held"
+        {armOutcome?.status === "held" || armOutcome?.status === "interrupted"
           ? <>The position open is held. The durable position and hire pointer are preserved; continue from the agent recovery path.</>
           : armOutcome?.status === "rolled-back"
             ? <>The position open rolled back before funding. The hire pointer is preserved and the arm can be retried.</>
@@ -966,7 +1193,7 @@ export function HireLpDeploy(props: {
       </p>
       {armOutcome !== null ? <p style={{ color: "var(--loss)", margin: 0 }}>{armOutcome.reason}</p> : null}
       <div>
-        {armOutcome?.status === "held"
+        {armOutcome?.status === "held" || armOutcome?.status === "interrupted"
           ? <button type="button" style={primaryBtn} onClick={() => openAgent(agentId)}>Continue from the agent page</button>
           : <button type="button" style={busyBtn(running, primaryBtn)} onClick={armOutcome?.status === "rolled-back" ? retryArm : () => void deployAll()} disabled={running}>
             {armOutcome?.status === "rolled-back" ? "Retry opening position" : "Open the position"}
@@ -974,7 +1201,7 @@ export function HireLpDeploy(props: {
       </div>
       {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
       {message && message !== armOutcome?.reason ? <p style={{ color: "var(--loss)" }}>{message}</p> : null}
-      {armOutcome?.status === "held" ? null : <div><button type="button" style={{ ...secondaryBtn, padding: "10px 16px", font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)" }} onClick={() => openAgent(agentId)}>Open the agent page without opening a position</button></div>}
+      {armOutcome?.status === "held" || armOutcome?.status === "interrupted" ? null : <div><button type="button" style={{ ...secondaryBtn, padding: "10px 16px", font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)" }} onClick={() => openAgent(agentId)}>Open the agent page without opening a position</button></div>}
     </div>;
   }
 

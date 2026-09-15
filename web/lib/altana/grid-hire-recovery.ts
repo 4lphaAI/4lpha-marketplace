@@ -14,6 +14,8 @@ export type GridHireChoices = {
   readonly maxRequotesDaily: number;
   readonly takeProfitPct: number;
   readonly stopLossPct: number;
+  readonly provisionEnvelope?: OwnerActionEnvelope;
+  readonly armPlanFallback?: "signed";
 };
 
 export function cancellationRecorded(view: HireSessionView | null): boolean {

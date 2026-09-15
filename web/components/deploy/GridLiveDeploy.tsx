@@ -18,6 +18,7 @@
 import * as React from "react";
 import { useAccount } from "wagmi";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
+import { encodeReadHeader, type OwnerActionEnvelope } from "@/lib/exec/owner-action";
 import {
   FEE_TO_TICK_SPACING,
   GRID_PRESETS,
@@ -29,6 +30,7 @@ import { buildFixedGridSettings, buildShiftGridSettings, GRID_SHIFT_DEPLOY_PCT_B
 import { WBNB_56 } from "@/lib/exec/pairs";
 import { PairIcons as SharedPairIcons } from "@/components/TokenIcon";
 import { DEMO_GRID_OMISSIONS } from "@/lib/demo/omissions";
+import type { HireArmPlan } from "@/lib/altana/hire-state";
 
 /* ── data ─────────────────────────────────────────────────────────────── */
 
@@ -456,9 +458,46 @@ export async function armGridAgent(input: {
   readonly relayFeePerSubmitWei?: string;
   readonly deployPctBps?: number;
   readonly shiftsPerDay?: number;
+  readonly provisionEnvelope?: OwnerActionEnvelope;
+  readonly armPlan?: HireArmPlan;
+  readonly armPlanFallback?: "signed";
+  readonly onArmPlanFallback?: () => void;
+  readonly onArmPlanOutcome?: (plan: HireArmPlan) => void;
   readonly onNote?: (note: string) => void;
 }): Promise<Record<string, unknown>> {
   const { agentId, pool, capitalBnb } = input;
+  const useContinuation = input.provisionEnvelope !== undefined
+    && input.armPlan?.kind === "grid"
+    && input.armPlan.claim === null
+    && input.armPlanFallback !== "signed";
+  if (useContinuation) {
+    input.onNote?.("Arming from your signed plan at the live tick (the relay mints on-chain; this can take a minute)…");
+    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}/grid/arm`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-provision-action": encodeReadHeader(input.provisionEnvelope!) },
+      body: "{}",
+    });
+    const payload = await response.json() as { data?: Record<string, unknown>; error?: { code: string; message?: string } };
+    if (!response.ok || payload.data === undefined) {
+      if (response.status === 400) input.onArmPlanFallback?.();
+      throw new Error(payload.error?.message ? `${payload.error.code}: ${payload.error.message}` : payload.error?.code ?? `HTTP ${response.status}`);
+    }
+    const plan = payload.data["armPlan"];
+    const claim = typeof plan === "object" && plan !== null && !Array.isArray(plan)
+      ? (plan as { claim?: { outcome?: { status?: string; message?: string } | null } | null }).claim
+      : null;
+    const outcome = claim?.outcome;
+    if (typeof plan === "object" && plan !== null && !Array.isArray(plan)) input.onArmPlanOutcome?.(plan as HireArmPlan);
+    if (outcome?.status === "completed") return payload.data;
+    if (outcome?.status === "rolled-back") {
+      input.onArmPlanFallback?.();
+      throw new Error(outcome.message ?? "The arm rolled back before funding. Press Arm to sign the arm at today's price.");
+    }
+    if (outcome?.status === "held" || outcome?.status === "interrupted") {
+      throw new Error(outcome.message ?? "The arm is held; continue from the agent's settlement and recovery path.");
+    }
+    throw new Error("The execution plane returned an invalid arm-plan outcome.");
+  }
   const geometryPreset = UI_PRESET_TO_GEOMETRY[input.uiPresetId] ?? "standard";
   const shift = input.hireProfile === "grid-shift-v1";
   if (shift) {

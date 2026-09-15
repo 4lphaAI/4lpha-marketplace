@@ -38,6 +38,7 @@ import {
 } from "./HireLpDeploy";
 
 const ID = "lp-agent-recovery";
+const LEDGER_ID = "lp-recovery";
 const WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
 const TOKEN = "0x3333333333333333333333333333333333333333";
 const POOL_ADDRESS = "0x4444444444444444444444444444444444444444";
@@ -145,7 +146,7 @@ beforeEach(() => {
   cancelResponse = json({ ...provisioning(false), cancelRequested: true });
   mocks.signReadHeader.mockResolvedValue("signed-read");
   mocks.signEnvelope.mockImplementation(async (action: string, agentId: string, params: unknown) => ({
-    signed: { action, agentId }, signature: "0x1234", params,
+    signed: { action, agentId, owner: mocks.owner.ownerAddress }, signature: "0x1234", params,
   }));
   mocks.grant.mockResolvedValue({});
   armOutcomeStatus = "completed";
@@ -155,6 +156,7 @@ beforeEach(() => {
       previewReads += 1;
       return json(preview(previewReads === 1 ? "1000" : "100000000000001000"));
     }
+    if (url === "/api/account/session") return new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
     if (url === "/api/agents") return json({ agents: [] });
     if (url.endsWith("/session/cancel") && init?.method === "POST") return cancelResponse;
     if (url.endsWith("/session/grant-attempt") && init?.method === "POST") {
@@ -270,7 +272,7 @@ describe("LP durable grant recovery", () => {
     provisionResponse = new Response(JSON.stringify({ error: { code: "conflict" } }), { status: 409 });
     await mount();
     await act(async () => { button("Deploy LP Agent").click(); await vi.advanceTimersByTimeAsync(0); });
-    const sessionPosts = fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/session") && init?.method === "POST");
+    const sessionPosts = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/") && String(url).endsWith("/session") && init?.method === "POST");
     expect(sessionPosts).toHaveLength(1);
     expect(localStorage.getItem(LP_HIRE_STORAGE_KEY)).not.toBeNull();
     expect(mocks.grant).not.toHaveBeenCalled();
@@ -351,7 +353,7 @@ describe("LP arm browser boundary", () => {
     expect(localStorage.getItem(LP_HIRE_STORAGE_KEY)).toBeNull();
   });
 
-  it("a HELD open goes straight to the agent page — no extra press — and keeps the pointer and outcome", async () => {
+  it("keeps a HELD open on the arm step with the durable remedy and outcome", async () => {
     current = { ...provisioning(false), status: "armed", missing: [] };
     localStorage.setItem(LP_HIRE_STORAGE_KEY, ID);
     localStorage.setItem(`${LP_ARM_OUTCOME_STORAGE_PREFIX}${ID}`, JSON.stringify({ status: "rolled-back", reason: "safe rollback" }));
@@ -359,7 +361,8 @@ describe("LP arm browser boundary", () => {
     await mount();
     await act(async () => { button("Retry opening position").click(); await vi.advanceTimersByTimeAsync(0); });
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/lp/arm"))).toHaveLength(1);
-    expect(mocks.go).toHaveBeenCalledWith(`/account/${ID}`);
+    expect(mocks.go).not.toHaveBeenCalled();
+    expect(button("Continue from the agent page")).toBeDefined();
     expect(localStorage.getItem(LP_HIRE_STORAGE_KEY)).toBe(ID);
     expect(JSON.parse(localStorage.getItem(`${LP_ARM_OUTCOME_STORAGE_PREFIX}${ID}`) ?? "{}")).toMatchObject({ status: "held" });
   });
@@ -530,5 +533,199 @@ describe("LP arm browser boundary", () => {
       signEnvelope: sign as never,
     })).rejects.toThrow(/changed/u);
     expect(sign).not.toHaveBeenCalled();
+  });
+});
+
+function signedTarget(init: RequestInit | undefined): string | null {
+  const header = new Headers(init?.headers).get("x-owner-action");
+  if (header === null) return null;
+  const padded = header.replace(/-/gu, "+").replace(/_/gu, "/") + "=".repeat((4 - header.length % 4) % 4);
+  const envelope = JSON.parse(atob(padded)) as { signed?: { agentId?: unknown } };
+  return typeof envelope.signed?.agentId === "string" ? envelope.signed.agentId : null;
+}
+
+function lpLedger(): string[] {
+  const entries = mocks.signEnvelope.mock.calls.map((call, index) => ({
+    order: mocks.signEnvelope.mock.invocationCallOrder[index]!,
+    label: call[0] === "read" ? `read(${String(call[1])})` : String(call[0]),
+  }));
+  entries.push(...mocks.grant.mock.invocationCallOrder.map((order) => ({ order, label: "grant" })));
+  return entries.sort((a, b) => a.order - b.order).map((entry) => entry.label);
+}
+
+async function runLpLedger(scenario: {
+  readonly issuer: "cookie" | "hidden";
+  readonly rememberedExpiryMs?: number;
+  readonly fundingWait?: boolean;
+}): Promise<string[]> {
+  if (scenario.rememberedExpiryMs !== undefined) {
+    localStorage.setItem("4lpha:account-read-expiry:v1", String(scenario.rememberedExpiryMs));
+  }
+  let previewReads = 0;
+  current = provisioning(false);
+  let armed: HireSessionView = {
+    ...current,
+    status: "armed",
+    missing: [],
+    hireSizing: { name: "lp-v1", version: 1, openNativeBudgetWei: "100" },
+  };
+  mocks.grant.mockImplementation(async () => { current = armed; return {}; });
+  fetchMock.mockImplementation(async (request, init) => {
+    const url = String(request);
+    if (url.includes("/hire/preview")) {
+      previewReads += 1;
+      const balance = scenario.fundingWait && previewReads < 3
+        ? "0" : scenario.fundingWait ? "100000000000000" : "1000";
+      return json(preview(balance));
+    }
+    if (url === "/api/account/session") {
+      return scenario.issuer === "cookie"
+        ? json({ expiry: Math.floor(Date.now() / 1_000) + 900 })
+        : new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
+    }
+    if (url.endsWith("/session/grant-attempt") && init?.method === "POST") {
+      current = provisioning(true);
+      return json({ ...current, attemptId: ATTEMPT_ID, mayInvoke: true });
+    }
+    if (url.endsWith("/session") && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { readonly params?: { readonly armPlan?: { readonly digest?: string } } };
+      const signedPlan = body.params?.armPlan;
+      if (signedPlan?.digest !== undefined) {
+        armed = { ...armed, armPlan: { digest: signedPlan.digest as `0x${string}`, kind: "lp", claim: null } };
+        current = { ...provisioning(false), armPlan: armed.armPlan };
+        return scenario.issuer === "cookie"
+          ? json({ ...current, readSession: { expiry: Math.floor(Date.now() / 1_000) + 900 } })
+          : json(current);
+      }
+      return json(current);
+    }
+    if (url.endsWith("/session")) return json(current);
+    if (url.endsWith("/lp/arm") && init?.method === "POST") {
+      if (new Headers(init.headers).has("x-provision-action")) {
+        return json({ open: { status: "completed" }, position: { tokenId: "1" }, armPlan: {
+          digest: armed.armPlan?.digest, kind: "lp", claim: { by: "continuation", claimedAtSec: 100, outcome: { status: "completed", atSec: 101 } },
+        } });
+      }
+      return json({ open: { status: "completed" }, position: { tokenId: "1" } });
+    }
+    throw new Error(`Unexpected URL ${url}`);
+  });
+  await mount();
+  mocks.signEnvelope.mockImplementation(async (action: string, agentId: string, params: unknown) => ({
+    signed: { action, agentId, owner: mocks.owner.ownerAddress }, signature: "0x1234", params,
+  }));
+  await act(async () => { button("Deploy LP Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+  for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); });
+  if (scenario.fundingWait) {
+    await act(async () => { await vi.advanceTimersByTimeAsync(6_001); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  } else {
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  }
+  for (let i = 0; i < 5; i += 1) {
+    await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
+  }
+  return lpLedger();
+}
+
+describe("HIRE-SIGNATURES-BC LP prompt ledger", () => {
+  it("records the funded cookie ledger and uses the provision-issued read window", async () => {
+    const observed = await runLpLedger({ issuer: "cookie" });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    const list = fetchMock.mock.calls.find(([url]) => String(url) === "/api/agents");
+    expect(list).toBeUndefined();
+    const sessions = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/")
+      && String(url).endsWith("/session") && init?.method !== "POST");
+    expect(sessions.every(([, init]) => new Headers(init?.headers).get("x-owner-action") === null)).toBe(true);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+    console.info(`HIRE_SIGNATURES_LEDGER lp funded: ${JSON.stringify(observed)}`);
+  });
+
+  it("records the warm cookie ledger with no read-session signature", async () => {
+    const observed = await runLpLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 1_800_000 });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    expect(mocks.signEnvelope).not.toHaveBeenCalledWith("createAccountReadSession", "*", {});
+    console.info(`HIRE_SIGNATURES_LEDGER lp warm: ${JSON.stringify(observed)}`);
+  });
+
+  it("uses the signed per-agent read fallback when the issuer is hidden", async () => {
+    const observed = await runLpLedger({ issuer: "hidden" });
+    expect(observed).toEqual(["provisionAgent", "createAccountReadSession", `read(${LEDGER_ID})`, "grant"]);
+    const list = fetchMock.mock.calls.find(([url]) => String(url) === "/api/agents");
+    expect(list).toBeUndefined();
+    const sessions = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/")
+      && String(url).endsWith("/session") && init?.method !== "POST");
+    expect(sessions.length).toBeGreaterThan(0);
+    expect(sessions.every(([, init]) => signedTarget(init) === LEDGER_ID)).toBe(true);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+    console.info(`HIRE_SIGNATURES_LEDGER lp hidden-issuer: ${JSON.stringify(observed)}`);
+  });
+
+  it("treats remembered expiry at exactly 60 seconds as cold", async () => {
+    const observed = await runLpLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 60_000 });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "createAccountReadSession")).toHaveLength(0);
+  });
+
+  it("keeps the provision-issued read window after a remembered cookie", async () => {
+    const observed = await runLpLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 1_800_000 });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "createAccountReadSession")).toHaveLength(0);
+  });
+
+  it("does not read the owner list before signing a new hire", async () => {
+    const observed = await runLpLedger({ issuer: "cookie" });
+    expect(observed[0]).toBe("provisionAgent");
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === "/api/agents")).toBe(false);
+    expect(mocks.signReadHeader).not.toHaveBeenCalled();
+  });
+
+  it("keeps one credential across funding expiry and renews before the LP grant read", async () => {
+    const observed = await runLpLedger({ issuer: "cookie", rememberedExpiryMs: Date.now() + 66_000, fundingWait: true });
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    console.info(`HIRE_SIGNATURES_LEDGER lp cold-short: ${JSON.stringify(["provisionAgent", "<MetaMask deposit>", "grant"])}`);
+  });
+
+  it("uses a second provision signature for a foreign collision and then continues the accepted LP plan", async () => {
+    let posts = 0;
+    let armed: HireSessionView = { ...provisioning(false), status: "armed", missing: [], hireSizing: { name: "lp-v1", version: 1, openNativeBudgetWei: "100" } };
+    mocks.grant.mockImplementation(async () => { current = armed; return {}; });
+    fetchMock.mockImplementation(async (request, init) => {
+      const url = String(request);
+      if (url.includes("/hire/preview")) return json(preview("1000"));
+      if (url === "/api/account/session") return new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 });
+      if (url.endsWith("/session") && init?.method === "POST") {
+        posts += 1;
+        if (posts === 1) return new Response(JSON.stringify({ error: { code: "agent_exists" }, meta: { owned: false } }), { status: 409 });
+        const body = JSON.parse(String(init.body)) as { readonly params?: { readonly armPlan?: { readonly digest?: string } } };
+        const signedPlan = body.params?.armPlan;
+        armed = { ...armed, ...(signedPlan?.digest === undefined ? {} : { armPlan: { digest: signedPlan.digest as `0x${string}`, kind: "lp", claim: null } }) };
+        current = { ...provisioning(false), armPlan: armed.armPlan };
+        return json({ ...current, readSession: { expiry: Math.floor(Date.now() / 1_000) + 900 } });
+      }
+      if (url.endsWith("/session/grant-attempt") && init?.method === "POST") {
+        current = { ...provisioning(true), armPlan: armed.armPlan };
+        return json({ ...current, attemptId: ATTEMPT_ID, mayInvoke: true });
+      }
+      if (url.endsWith("/session")) return json(current);
+      if (url.endsWith("/lp/arm") && init?.method === "POST") return json({ open: { status: "completed" }, position: { tokenId: "1" }, armPlan: {
+        digest: armed.armPlan?.digest, kind: "lp", claim: { by: "continuation", claimedAtSec: 100, outcome: { status: "completed", atSec: 101 } },
+      } });
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    await mount();
+    await act(async () => { button("Deploy LP Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+    for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
+    expect(posts).toBe(2);
+    expect(lpLedger()).toEqual(["provisionAgent", "provisionAgent", "grant"]);
+    console.info(`HIRE_SIGNATURES_LEDGER lp collision: ${JSON.stringify(["provisionAgent(id)", "provisionAgent(id-2)", "grant"])}`);
+  });
+
+  it("does not need a read-session signature after a fresh provision", async () => {
+    const observed = await runLpLedger({ issuer: "cookie" });
+    expect(observed[0]).toBe("provisionAgent");
+    expect(mocks.signEnvelope.mock.calls.some(([action]) => action === "createAccountReadSession" || action === "read")).toBe(false);
   });
 });

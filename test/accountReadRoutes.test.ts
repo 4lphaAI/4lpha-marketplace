@@ -67,9 +67,52 @@ describe("Marketplace detail C1 account-read route matrix", () => {
     })).status, 401);
   });
 
+  it("accepts the bearer or wildcard signed read on the agent list, never both/neither", async () => {
+    const harness = await createHarness({ config: {
+      accountReadSession: accountConfig(),
+      accountPortfolioWbnb: WBNB,
+    } });
+    const token = await issue(harness);
+    const bearer = { authorization: `Bearer ${token}` };
+    const listed = await call(harness, "/agents", { headers: bearer });
+    assert.equal(listed.status, 200);
+    assert.ok(Array.isArray(listed.body["data"]));
+
+    const signed = await call(harness, "/agents", {
+      headers: { "x-owner-action": toReadHeader(await signOwnerAction("read", {}, { agentId: "*" })) },
+    });
+    assert.equal(signed.status, 200);
+    assert.ok(Array.isArray(signed.body["data"]));
+
+    assert.equal((await call(harness, "/agents")).status, 401);
+    assert.equal((await call(harness, "/agents", {
+      headers: {
+        ...bearer,
+        "x-owner-action": toReadHeader(await signOwnerAction("read", {}, { agentId: "*" })),
+      },
+    })).status, 401);
+    for (const authorization of ["bearer token", "Bearer", "Bearer one two", "Basic token"]) {
+      assert.equal((await call(harness, "/agents", { headers: { authorization } })).status, 401);
+    }
+    const specific = await call(harness, "/agents", {
+      headers: { "x-owner-action": toReadHeader(await signOwnerAction("read", {}, { agentId: AGENT_ID })) },
+    });
+    assert.equal(specific.status, 401);
+
+    harness.advance(86_400_000);
+    assert.equal((await call(harness, "/agents", { headers: bearer })).status, 401);
+  });
+
   it("keeps bearer lookup owner-scoped and returns cross-owner 404", async () => {
     const harness = await createHarness({ config: { accountReadSession: accountConfig() } });
     const token = await issue(harness);
+    const listed = await call(harness, "/agents", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(listed.status, 200);
+    const ids = (listed.body["data"] as readonly { id: string }[]).map((agent) => agent.id);
+    assert.ok(ids.includes(AGENT_ID));
+    assert.equal(ids.includes(OTHER_AGENT_ID), false);
     assert.equal((await call(harness, `/agents/${OTHER_AGENT_ID}/owner-view`, {
       headers: { authorization: `Bearer ${token}` },
     })).status, 404);
@@ -85,7 +128,6 @@ describe("Marketplace detail C1 account-read route matrix", () => {
     const bearer = { authorization: `Bearer ${token}` };
     const probes = [
       { path: "/owner-read-session", options: { method: "POST", body: {} } },
-      { path: "/agents", options: {} },
       { path: `/agents/${AGENT_ID}`, options: { noRuntimeAssertion: true } },
       { path: `/agents/${AGENT_ID}/billing`, options: {} },
       { path: `/agents/${AGENT_ID}/lp/importable/1`, options: {} },

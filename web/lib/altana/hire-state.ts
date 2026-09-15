@@ -12,6 +12,24 @@ export type HireFunding = {
   readonly balanceWei: string | null;
 };
 
+export type HireArmPlanOutcome = {
+  readonly status: "completed" | "rolled-back" | "held" | "interrupted";
+  readonly sequenceId?: string;
+  readonly positionIds?: readonly string[];
+  readonly message?: string;
+  readonly atSec: number;
+};
+
+export type HireArmPlan = {
+  readonly digest: `0x${string}`;
+  readonly kind: "grid" | "lp";
+  readonly claim: null | {
+    readonly by: "continuation" | "signed";
+    readonly claimedAtSec: number;
+    readonly outcome: HireArmPlanOutcome | null;
+  };
+};
+
 export type HireSessionView = {
   readonly status: "provisioning" | "armed" | "paused" | "revoked" | "retired";
   readonly sessionAddress?: string;
@@ -32,6 +50,8 @@ export type HireSessionView = {
   readonly cancelRequested?: boolean;
   readonly revocationRequired?: boolean;
   readonly hireRunId?: string;
+  readonly readSession?: { readonly expiry: number };
+  readonly armPlan?: HireArmPlan;
   readonly grantAttempt?: { readonly version: 1; readonly attemptId: `0x${string}`; readonly startedAtSec: number };
   readonly activationError?: "wallet_in_use" | "settings_conflict";
   /** Present once armed: the immutable hire profile the grid arm must stay inside. */

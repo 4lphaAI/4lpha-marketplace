@@ -173,7 +173,67 @@ async function flush(): Promise<void> {
   }
 }
 
+async function runTradeLedger(balances: readonly string[]): Promise<string[]> {
+  let previewReads = 0;
+  let sessionView: Record<string, unknown> = {
+    status: "provisioning",
+    hireRunId,
+    missing: ["account-key", "keystore-id"],
+    permissions: { calls: [], spend: [] },
+    sessionPublicKey: `0x${"33".repeat(65)}`,
+    sessionAddress: "0x3333333333333333333333333333333333333333",
+    expiresAt: 9_999_999_999,
+  };
+  mocks.grant.mockImplementation(async () => {
+    sessionView = { ...sessionView, status: "armed", missing: [] };
+    return {};
+  });
+  fetchMock.mockImplementation(async (input, init) => {
+    const url = String(input);
+    if (url.includes("/hire/preview")) {
+      const balance = balances[Math.min(previewReads++, balances.length - 1)] ?? "0";
+      return response(preview(balance));
+    }
+    if (url.endsWith("/session/grant-attempt") && init?.method === "POST") {
+      sessionView = { ...sessionView, grantAttempt: { version: 1, attemptId: `0x${"55".repeat(32)}`, startedAtSec: 100 } };
+      return response({ ...sessionView, attemptId: `0x${"55".repeat(32)}`, mayInvoke: true });
+    }
+    if (url.endsWith("/session") && init?.method === "POST") {
+      const submitted = JSON.parse(String(init.body)) as OwnerActionEnvelope;
+      sessionView = { ...sessionView, hireRunId: (submitted.params as typeof params).hireRunId };
+      return response({ ...sessionView, readSession: { expiry: Math.floor(Date.now() / 1_000) + 900 } });
+    }
+    if (url.endsWith("/session")) return response(sessionView);
+    throw new Error(`Unexpected URL ${url}`);
+  });
+  await render();
+  await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
+  for (let index = 0; index < 5; index += 1) await act(async () => { await Promise.resolve(); });
+  if (balances[0] === "0") {
+    await act(async () => { await vi.advanceTimersByTimeAsync(6_001); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  } else {
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
+  }
+  await flush();
+  const entries = mocks.signEnvelope.mock.calls.map((call, index) => ({ order: mocks.signEnvelope.mock.invocationCallOrder[index]!, label: String(call[0]) }));
+  entries.push(...mocks.grant.mock.invocationCallOrder.map((order) => ({ order, label: "grant" })));
+  return entries.sort((left, right) => left.order - right.order).map((entry) => entry.label);
+}
+
 describe("Trading one-press recovery", () => {
+  it("HIRE-SIGNATURES-BC records the funded trade ledger", async () => {
+    const observed = await runTradeLedger(["100000000000000000000"]);
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    console.info(`HIRE_SIGNATURES_LEDGER trade funded: ${JSON.stringify(observed)}`);
+  });
+
+  it("HIRE-SIGNATURES-BC records the short trade ledger with a wallet deposit", async () => {
+    const observed = await runTradeLedger(["0", "0", "100000000000000000000"]);
+    expect(observed).toEqual(["provisionAgent", "grant"]);
+    console.info(`HIRE_SIGNATURES_LEDGER trade cold-short: ${JSON.stringify(["provisionAgent", "<MetaMask deposit>", "grant"])}`);
+  });
+
   it("does not resume another account's pointer after switching", async () => {
     localStorage.setItem("4lpha:account-hire-scoped:v1", "1");
     localStorage.setItem(`${storageKey}:owner:0x3333333333333333333333333333333333333333`, JSON.stringify({ version: 2, agentId: "foreign-agent", hireRunId, provisionEnvelope: envelope("foreign-agent") }));

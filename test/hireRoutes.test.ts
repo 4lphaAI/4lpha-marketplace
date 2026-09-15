@@ -5,12 +5,15 @@ import { canonicalEncode } from "../src/auth/canonical.js";
 import { AgentWalletInUseError, MemoryAgentStore, type AgentStore, type PendingGrant } from "../src/store/agents.js";
 import { MemoryExecutionJournal, type ExecutionJournal } from "../src/store/journal.js";
 import type { KeyStoreReader } from "../src/account/keyStoreReader.js";
-import { parseAccountReadSessionSecret } from "../src/auth/accountReadSession.js";
+import { parseAccountReadSessionSecret, verifyAccountReadSession } from "../src/auth/accountReadSession.js";
 import { ownerActionIdempotencyKey } from "../src/auth/executeDecision.js";
 import { resolveDomainSalt } from "../src/auth/ownerAuth.js";
-import { parseOwnerActionEnvelope } from "../src/http/wire.js";
+import { parseHireParams, parseOwnerActionEnvelope } from "../src/http/wire.js";
+import { lpSettingsParamsView } from "../src/http/lpWire.js";
 import type { GrantEvidenceReader, GrantEvidenceSnapshot } from "../src/wallet/grantEvidence.js";
 import { DEFAULT_TRADE_SETTINGS } from "../src/trade/settings.js";
+import { DEFAULT_LP_SETTINGS, type LpGridSettings } from "../src/lp/triggers.js";
+import { gridDeriveRanges } from "../src/lp/gridGeometry.js";
 import {
   call,
   createHarness,
@@ -18,6 +21,7 @@ import {
   NOW_SEC,
   OTHER_OWNER_PK,
   ownerAccount,
+  otherOwnerAccount,
   signOwnerAction,
   toReadHeader,
   type Harness,
@@ -223,6 +227,32 @@ function params() {
   return { walletAddress: WALLET, token: TOKEN, capDayWei: "1053", openNativeBudgetWei: "1000", ttlSec: 3600, sizingPreset: "grid-v1" };
 }
 
+function shiftArmPlan(shiftCount = 16): { readonly params: Record<string, unknown>; readonly digest: Hex } {
+  const fullGrid: LpGridSettings = {
+    pool: { token0: TOKEN, token1: WBNB, fee: 2_500 },
+    wbnbIsToken0: false,
+    tickSpacing: 50,
+    ...gridDeriveRanges({ currentTick: 0, tickSpacing: 50, gapTicks: 50, widthTicks: 50, wbnbIsToken0: false, minTick: -887_272, maxTick: 887_272 }),
+    maxFlipsPerDay: 1,
+    minNetEdgeBps: 0,
+    mode: "shift",
+    shift: { gapTicks: 50, widthTicks: 50, deployPctBps: 3_000, driftPctOfGap: 0, shiftsPerDay: shiftCount },
+  };
+  const settings = lpSettingsParamsView({ ...DEFAULT_LP_SETTINGS, autoRotate: false, autoHarvest: false, minMinutesBetweenExits: 5, grid: fullGrid });
+  const gridView = settings["grid"] as Record<string, unknown>;
+  const { buyRange: _buy, sellRange: _sell, ...planGrid } = gridView;
+  void _buy;
+  void _sell;
+  const plan = { kind: "grid", settings: { ...settings, grid: planGrid }, budgetWei: "1000", levels: 2 };
+  return { params: plan, digest: keccak256(stringToBytes(canonicalEncode(plan))) };
+}
+
+function routedLpArmPlan(): { readonly params: Record<string, unknown>; readonly digest: Hex } {
+  const settings = lpSettingsParamsView({ ...DEFAULT_LP_SETTINGS, autoRotate: true, rotateMinHoldMinutes: 5, minMinutesBetweenExits: 5 });
+  const plan = { kind: "lp", settings, budgetWei: "1000", selectPool: { by: "fee-apr", window: "24h" }, range: "server-fenced" };
+  return { params: plan, digest: keccak256(stringToBytes(canonicalEncode(plan))) };
+}
+
 function tradeParams() {
   return {
     walletAddress: WALLET,
@@ -257,6 +287,105 @@ describe("marketplace hire routes", () => {
     assert.equal(body.data.capDayWei, "1053");
     assert.equal(body.data.sizing.terms.maxGridFlipsPerDay, 12);
     assert.equal(body.data.funding.observedAtSec, NOW_SEC);
+  });
+
+  it("accepts a shift arm plan, stores it verbatim, and refuses a profile failure before nonce consumption", async () => {
+    const f = await fixture();
+    const goodPlan = shiftArmPlan();
+    const good = await signed("provisionAgent", "hire-shift-plan", {
+      ...params(), capDayWei: "10000", sizingPreset: "grid-shift-v1", armPlan: goodPlan,
+    });
+    const accepted = await post(f.harness, "/agents/hire-shift-plan/session", good);
+    assert.equal(accepted.status, 200, accepted.text);
+    assert.deepEqual((await f.store.getAgent(ownerAccount.address, "hire-shift-plan"))?.pendingGrant?.initialArmPlan, {
+      params: goodPlan.params, digest: goodPlan.digest, kind: "grid",
+    });
+
+    const badPlan = shiftArmPlan(17);
+    const bad = await signed("provisionAgent", "hire-shift-plan-bad", {
+      ...params(), sizingPreset: "grid-shift-v1", armPlan: badPlan,
+    });
+    const refused = await post(f.harness, "/agents/hire-shift-plan-bad/session", bad);
+    assert.equal(refused.status, 400);
+    assert.equal(await f.store.getAgentById("hire-shift-plan-bad"), null);
+    assert.equal(await f.harness.nonceStore.consume(ownerAccount.address, bad.signed["nonce"] as Hex, (NOW_SEC + 120) * 1_000), true);
+  });
+
+  it("issues a read session only on a fresh provision and the token reaches only the account-read allowlist", async () => {
+    const f = await fixture();
+    const action = await signed("provisionAgent", "hire-read-session", { ...params(), capDayWei: "10000" });
+    const first = await post(f.harness, "/agents/hire-read-session/session", action);
+    const data = first.body["data"] as Record<string, unknown>;
+    const readSession = data["readSession"] as { token?: unknown; expiry?: unknown };
+    assert.equal(typeof readSession.token, "string");
+    assert.equal(typeof readSession.expiry, "number");
+    const config = {
+      key: parseAccountReadSessionSecret("cd".repeat(32))!, chainId: 56,
+      environment: resolveDomainSalt({ chainId: 56, network: "mainnet" }),
+    };
+    assert.equal(verifyAccountReadSession(readSession.token as string, config, NOW_SEC), ownerAccount.address);
+    assert.equal(verifyAccountReadSession(readSession.token as string, config, NOW_SEC + 86_400 - 1), ownerAccount.address);
+    assert.equal(verifyAccountReadSession(readSession.token as string, config, NOW_SEC + 86_400), null);
+    const replay = await post(f.harness, "/agents/hire-read-session/session", action);
+    assert.equal((replay.body["data"] as Record<string, unknown>)["readSession"], undefined);
+    const bearer = await f.harness.app.request("/agents/hire-read-session/session", {
+      headers: { "x-exec-token": EXEC_TOKEN, authorization: `Bearer ${readSession.token as string}` },
+    });
+    assert.equal(bearer.status, 200);
+  });
+
+  it("marks owned agent_exists responses and never discloses a foreign row", async () => {
+    const ownedFixture = await fixture();
+    const ownedId = "hire-owned-collision";
+    await post(ownedFixture.harness, `/agents/${ownedId}/session`, await signed("provisionAgent", ownedId, params()));
+    const ownedRetry = await signed("provisionAgent", ownedId, params());
+    const owned = await post(ownedFixture.harness, `/agents/${ownedId}/session`, ownedRetry);
+    assert.equal(owned.status, 409);
+    assert.deepEqual(owned.body["meta"], { owned: true });
+    assert.equal((owned.body["data"] as Record<string, unknown>)["status"], "provisioning");
+    assert.equal((owned.body["data"] as Record<string, unknown>)["readSession"], undefined);
+    assert.equal(await ownedFixture.harness.nonceStore.consume(ownerAccount.address, ownedRetry.signed["nonce"] as Hex, (NOW_SEC + 120) * 1_000), true);
+
+    const foreignFixture = await fixture();
+    const foreignId = "hire-foreign-collision";
+    await foreignFixture.store.createAgent({
+      id: foreignId,
+      ownerAddress: otherOwnerAccount.address,
+      walletAddress: otherOwnerAccount.address,
+      custodyModel: "self-eoa",
+      status: "armed",
+    });
+    const foreignRetry = await signed("provisionAgent", foreignId, params());
+    const foreign = await post(foreignFixture.harness, `/agents/${foreignId}/session`, foreignRetry);
+    assert.equal(foreign.status, 409);
+    assert.deepEqual(foreign.body["meta"], { owned: false });
+    assert.equal(foreign.body["data"], undefined);
+    assert.equal(await foreignFixture.harness.nonceStore.consume(ownerAccount.address, foreignRetry.signed["nonce"] as Hex, (NOW_SEC + 120) * 1_000), true);
+  });
+
+  it("accepts routed and explicit LP arm plans and rejects armPlan on fixed grid, trade, and lending", async () => {
+    const f = await fixture();
+    const routed = routedLpArmPlan();
+    const lp = { ...params(), capDayWei: "10000", sizingPreset: "lp-v1" as const, armPlan: routed };
+    const routedResponse = await post(f.harness, "/agents/hire-lp-plan/session", await signed("provisionAgent", "hire-lp-plan", lp));
+    assert.equal(routedResponse.status, 200, routedResponse.text);
+    assert.equal((await f.store.getAgent(ownerAccount.address, "hire-lp-plan"))?.pendingGrant?.initialArmPlan?.kind, "lp");
+
+    const explicitPlan = {
+      kind: "lp",
+      settings: routed.params["settings"],
+      budgetWei: "1000",
+      pool: { address: "0x9000000000000000000000000000000000000009", token0: TOKEN, token1: WBNB, fee: 2_500 },
+      prices: { minPrice: 0.9, maxPrice: 1.1, tickSpacing: 50, wbnbIsToken0: false },
+    };
+    const explicit = { ...lp, armPlan: { params: explicitPlan, digest: keccak256(stringToBytes(canonicalEncode(explicitPlan))) } };
+    const explicitFixture = await fixture();
+    const explicitResponse = await post(explicitFixture.harness, "/agents/hire-lp-explicit/session", await signed("provisionAgent", "hire-lp-explicit", explicit));
+    assert.equal(explicitResponse.status, 200, explicitResponse.text);
+
+    assert.equal(parseHireParams({ ...params(), armPlan: routed }).ok, false);
+    assert.equal(parseHireParams({ ...tradeParams(), armPlan: routed }).ok, false);
+    assert.equal(parseHireParams({ ...params(), sizingPreset: "lending-v1", armPlan: routed }).ok, false);
   });
 
   it("persists row+key before the journal and exact retry returns the durable view", async () => {

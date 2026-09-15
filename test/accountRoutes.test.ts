@@ -4,8 +4,10 @@ import { getAddress, type Hex } from "viem";
 import { parseAccountReadSessionSecret } from "../src/auth/accountReadSession.js";
 import { resolveDomainSalt } from "../src/auth/ownerAuth.js";
 import {
+  AGENT_ID,
   CHAIN_ID,
   NETWORK,
+  OTHER_AGENT_ID,
   call,
   createHarness,
   signOwnerAction,
@@ -46,8 +48,11 @@ describe("account portfolio routes", () => {
       headers: { authorization: `Bearer ${token}`, "x-owner-action": "not-used" },
     });
     assert.equal(ambiguous.status, 401);
-    const wrongRoute = await call(harness, "/agents", { headers: { authorization: `Bearer ${token}` } });
-    assert.equal(wrongRoute.status, 401);
+    const listed = await call(harness, "/agents", { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(listed.status, 200);
+    const ids = (listed.body["data"] as readonly { id: string }[]).map((agent) => agent.id);
+    assert.ok(ids.includes(AGENT_ID));
+    assert.equal(ids.includes(OTHER_AGENT_ID), false);
   });
 
   it("rejects non-empty issuance params before consuming the nonce", async () => {

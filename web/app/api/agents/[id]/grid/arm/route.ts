@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { execOwnerMutation } from "@/lib/exec/client";
+import { execOwnerMutation, execProvisionContinuationMutation } from "@/lib/exec/client";
 
 const AGENT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
 const MAX_BODY_BYTES = 64 * 1024;
@@ -25,6 +25,19 @@ export async function POST(
     return NextResponse.json({ error: { code: "invalid_body" } }, { status: 400 });
   }
   try {
+    const continuation = request.headers.get("x-provision-action");
+    if (continuation !== null) {
+      if (request.headers.has("x-owner-action") || request.headers.has("authorization") || rawBody.trim() !== "{}") {
+        return NextResponse.json({ error: { code: "ambiguous_owner_auth" } }, { status: 400 });
+      }
+      const upstream = await execProvisionContinuationMutation(
+        `/agents/${encodeURIComponent(id)}/lp/grid/arm`, continuation,
+      );
+      return new NextResponse(upstream.body, {
+        status: upstream.status,
+        headers: { "content-type": "application/json", "cache-control": "private, no-store" },
+      });
+    }
     const upstream = await execOwnerMutation(
       `/agents/${encodeURIComponent(id)}/lp/grid/arm`,
       rawBody,

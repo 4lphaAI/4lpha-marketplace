@@ -484,6 +484,8 @@ export class FakeSqlClient implements SqlClient {
       case "agents.cancelRead":
       case "agents.grantAttemptRead":
       case "agents.grantAttemptResetRead":
+      case "agents.armPlanClaimRead":
+      case "agents.armPlanOutcomeRead":
       case "agents.confirmRevocationRead":
       case "agents.putKeyRead":
         return this.#agentsGet(params);
@@ -527,6 +529,30 @@ export class FakeSqlClient implements SqlClient {
           row["erc8004_identity"] = jsonbParam(params[6]); row["identity_absent"] = params[6] == null;
         }
         return [{ id: row["id"] }];
+      }
+      case "agents.claimArmPlan": {
+        const row = this.#agents.get(String(params[0]));
+        const facts = row?.["session_facts"] as Record<string, unknown> | null | undefined;
+        const plan = facts?.["armPlan"] as Record<string, unknown> | null | undefined;
+        if (row === undefined || row["owner_address"] !== params[1] || row["status"] !== "armed"
+          || Number(row["row_version"]) !== Number(params[2]) || plan === null || plan === undefined
+          || !("claim" in plan) || plan["claim"] !== null) return [];
+        row["session_facts"] = jsonbParam(params[3]);
+        row["row_version"] = Number(row["row_version"]) + 1;
+        row["updated_at"] = params[4];
+        return [structuredClone(row)];
+      }
+      case "agents.recordArmPlanOutcome": {
+        const row = this.#agents.get(String(params[0]));
+        const facts = row?.["session_facts"] as Record<string, unknown> | null | undefined;
+        const plan = facts?.["armPlan"] as Record<string, unknown> | null | undefined;
+        const claim = plan?.["claim"] as Record<string, unknown> | null | undefined;
+        if (row === undefined || row["owner_address"] !== params[1] || row["status"] !== "armed"
+          || claim === null || claim === undefined || claim["actionId"] !== params[4] || claim["outcome"] !== null) return [];
+        row["session_facts"] = jsonbParam(params[2]);
+        row["row_version"] = Number(row["row_version"]) + 1;
+        row["updated_at"] = params[3];
+        return [structuredClone(row)];
       }
       case "erc8004.source":
       case "erc8004.enrollRead":
@@ -629,7 +655,11 @@ export class FakeSqlClient implements SqlClient {
         if (typeof marker === "object" && marker !== null && ("cancelRequestedAtSec" in marker || "cancelActionId" in marker)) return [];
         if (this.#agents.get(String(params[0]))?.["session_revocation"] !== null) return [];
         return this.#agentsUpdate(params[0], params[1], (row) => {
-          row["session_facts"] = jsonbParam(params[2]);
+          const next = jsonbParam(params[2]) as Record<string, unknown>;
+          const current = row["session_facts"] as Record<string, unknown> | null | undefined;
+          row["session_facts"] = current !== null && current !== undefined && "armPlan" in current
+            ? { ...next, armPlan: structuredClone(current["armPlan"]) }
+            : next;
           row["row_version"] = Number(row["row_version"]) + 1;
           row["updated_at"] = params[3];
         });

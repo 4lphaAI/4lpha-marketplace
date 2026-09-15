@@ -10,8 +10,9 @@ import {
   type Hex,
 } from "viem";
 import { checkHireSizing, hireSizingPreview } from "../src/ops/policy.js";
-import { paramsHash } from "../src/auth/canonical.js";
-import { lpSettingsParamsView, lpSettingsResponseView } from "../src/http/lpWire.js";
+import { canonicalEncode, paramsHash } from "../src/auth/canonical.js";
+import { armRequestFromPlan, lpSettingsParamsView, lpSettingsResponseView, parseLpArmParams, parseLpGridArmParams } from "../src/http/lpWire.js";
+import { explicitRangeFromPrices } from "../src/lp/explicitRange.js";
 import { gridDeriveRanges } from "../src/lp/gridTriggers.js";
 import { DEFAULT_LP_SETTINGS } from "../src/lp/triggers.js";
 import type { LpPoolStateReading, LpServerDeps } from "../src/server.js";
@@ -44,6 +45,60 @@ const POOL = getAddress("0xCCCCcCCcccCCCccccCcCcCCCcCcCCCcCCcCcccC1");
 const OTHER_POOL = getAddress("0xCCCCCCcCCCcCCccCcccccCcCCccCcccCcCCCccC2");
 const OTHER_TOKEN = getAddress("0x6666666666666666666666666666666666666666");
 const BUDGET = 10n ** 16n;
+
+describe("HIRE-SIGNATURES-BC R4.8 projection equality", () => {
+  it("recreates the signed grid, routed LP, and explicit LP requests from their plans", () => {
+    const gridFull = {
+      pool: { token0: WBNB, token1: TOKEN, fee: 2_500 },
+      wbnbIsToken0: true,
+      tickSpacing: 50,
+      ...gridDeriveRanges({ currentTick: 0, tickSpacing: 50, gapTicks: 50, widthTicks: 50, wbnbIsToken0: true, minTick: -887_272, maxTick: 887_272 }),
+      maxFlipsPerDay: 1,
+      minNetEdgeBps: 0,
+      mode: "shift" as const,
+      shift: { gapTicks: 50, widthTicks: 50, deployPctBps: 3_000, driftPctOfGap: 0, shiftsPerDay: 16 },
+    };
+    const fullSettings = lpSettingsParamsView({ ...DEFAULT_LP_SETTINGS, autoRotate: false, autoHarvest: false, minMinutesBetweenExits: 5, grid: gridFull });
+    const fullGridWire = fullSettings["grid"] as Record<string, unknown>;
+    const { buyRange: _buyRange, sellRange: _sellRange, ...planGrid } = fullGridWire;
+    void _buyRange;
+    void _sellRange;
+    const gridPlan = { kind: "grid", settings: { ...fullSettings, grid: planGrid }, budgetWei: "1000", levels: 2 };
+    const gridDerived = gridDeriveRanges({ currentTick: 125, tickSpacing: 50, gapTicks: 50, widthTicks: 50, wbnbIsToken0: true, minTick: -887_272, maxTick: 887_272 });
+    const gridProjected = armRequestFromPlan(gridPlan, gridDerived);
+    const gridExpected = {
+      settings: { ...gridPlan.settings, grid: { ...planGrid, buyRange: gridDerived.buyRange, sellRange: gridDerived.sellRange } },
+      budgetWei: "1000",
+      levels: 2,
+    };
+    assert.deepEqual(parseLpGridArmParams(gridProjected), parseLpGridArmParams(gridExpected));
+
+    const lpSettings = lpSettingsParamsView(DEFAULT_LP_SETTINGS);
+    const routedPlan = { kind: "lp", settings: lpSettings, budgetWei: "1000", selectPool: { by: "fee-apr", window: "24h" }, range: "server-fenced" };
+    const routedProjected = armRequestFromPlan(routedPlan);
+    assert.deepEqual(parseLpArmParams(routedProjected), parseLpArmParams({ settings: lpSettings, budgetWei: "1000", selectPool: routedPlan.selectPool, range: "server-fenced" }));
+
+    const prices = { minPrice: 0.9, maxPrice: 1.1, tickSpacing: 50, quoteIsToken0: false };
+    const explicitRange = explicitRangeFromPrices({ ...prices, currentTick: 0 });
+    const explicitPlan = {
+      kind: "lp",
+      settings: lpSettings,
+      budgetWei: "1000",
+      pool: { address: POOL, token0: WBNB, token1: TOKEN, fee: 2_500 },
+      prices,
+    };
+    const explicitProjected = armRequestFromPlan(explicitPlan, explicitRange);
+    const explicitExpected = {
+      settings: lpSettings,
+      budgetWei: "1000",
+      pool: { token0: WBNB, token1: TOKEN, fee: 2_500 },
+      range: { tickLower: explicitRange.tickLower, tickUpper: explicitRange.tickUpper },
+    };
+    assert.deepEqual(parseLpArmParams(explicitProjected), parseLpArmParams(explicitExpected));
+    console.info(`HIRE_SIGNATURES_R4_8 ${JSON.stringify({ grid: gridProjected, lpRouted: routedProjected, lpExplicit: explicitProjected })}`);
+    assert.equal(canonicalEncode(gridProjected), canonicalEncode(gridExpected));
+  });
+});
 
 const RAILS: LpRailConfig = {
   maxPriceImpactBps: 300,

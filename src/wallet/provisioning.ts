@@ -195,6 +195,9 @@ export async function convergeProvisioning(input: {
     },
     provisionActionId: pending.provisionActionId,
     ...(pending.hireRunId === undefined ? {} : { hireRunId: pending.hireRunId }),
+    ...(pending.initialArmPlan === undefined ? {} : {
+      armPlan: { ...pending.initialArmPlan, claim: null },
+    }),
   };
   const armed = await input.store.armProvisioningAgent({
     ownerAddress: observed.ownerAddress,

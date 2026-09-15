@@ -71,7 +71,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { createDemoRoutes, type DemoServerDeps } from "./demo/routes.js";
 import type { Context } from "hono";
-import { encodeAbiParameters, encodeFunctionData, formatEther, getAddress, getCreate2Address, isAddress, keccak256, stringToBytes, zeroAddress } from "viem";
+import { bytesToHex, concat, encodeAbiParameters, encodeFunctionData, formatEther, getAddress, getCreate2Address, isAddress, keccak256, stringToBytes, toBytes, zeroAddress } from "viem";
 import { publicKeyToAddress } from "viem/utils";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -154,6 +154,8 @@ import {
   type AgentStatus,
   type AgentStore,
   type PendingGrant,
+  type ArmPlanOutcome,
+  type SessionFacts,
 } from "./store/agents.js";
 import type {
   ExecutionJournal,
@@ -196,6 +198,7 @@ import {
   type TradeRequest,
   type HireParams,
   type LendingHireParams,
+  type ArmPlanEnvelope,
   provisioningView,
 } from "./http/wire.js";
 import {
@@ -456,10 +459,15 @@ import {
   parseLpResolveLandingV1Params,
   parseLpRetirePreBindV1Params,
   parseLpSettingsParams,
+  armRequestFromPlan,
+  type ArmPlanDerived,
   type LpArmRequest,
+  type LpGridArmRequest,
   type LpOpenRequest,
   type LpSequenceStepOutcome,
 } from "./http/lpWire.js";
+import { explicitRangeFromPrices } from "./lp/explicitRange.js";
+import { gridDeriveRanges } from "./lp/gridGeometry.js";
 import type { LpEvidenceStore } from "./store/lpEvidence.js";
 import type { LandingResolutionFinalizer } from "./lp/landingFinalizer.js";
 import {
@@ -1015,6 +1023,7 @@ export type ErrorCode =
   | "runtime_auth_unavailable"
   | "not_found"
   | "invalid_request"
+  | "ambiguous_owner_auth"
   | "payload_too_large"
   | "rate_limited"
   | "throttled"
@@ -1228,6 +1237,22 @@ export function fail(
   );
 }
 
+function hireAgentExistsResponse(
+  c: Context,
+  ownerAddress: Address | undefined,
+  existing: AgentRecord | null,
+  nowSec: number,
+): Response {
+  const owned = existing !== null && ownerAddress !== undefined
+    && existing.ownerAddress.toLowerCase() === ownerAddress.toLowerCase();
+  return c.json(
+    owned
+      ? { error: { code: "agent_exists" }, data: provisioningView(existing, nowSec), meta: { owned: true } }
+      : { error: { code: "agent_exists" }, meta: { owned: false } },
+    409,
+  );
+}
+
 /* -------------------------------------------------------------------------- */
 /* Credentials                                                                */
 /* -------------------------------------------------------------------------- */
@@ -1337,6 +1362,15 @@ export function createServer(deps: ServerDeps): Hono {
   if (runtimeAuth.kind === "enabled" && deps.runtimeReplayStore === undefined) {
     throw new Error("Enabled runtime authorization requires a runtime replay store.");
   }
+  let hireContinuationForArms: ((
+    id: string,
+    rawEnvelope: unknown,
+    alreadyParsed?: boolean,
+  ) => Promise<
+    | { readonly kind: "ok"; readonly agent: AgentRecord }
+    | { readonly kind: "error"; readonly code: "owner_auth_failed" | "not_found" | "conflict" }
+  >) | undefined;
+
   if (config.hireEnabled === true) {
     if (config.chainId !== 56 || config.passkey?.enabled !== true || deps.hire === undefined || !deps.agentStore.durable || !deps.agentStore.keyEncryptionConfigured) {
       throw new Error("HIRE_ENABLED requires chain 56, passkeys, encrypted durable Postgres, and complete hire wiring.");
@@ -1706,7 +1740,7 @@ export function createServer(deps: ServerDeps): Hono {
   /* ---- Owner reads: service credential + owner signature ---------------- */
 
   app.get("/agents", async (c) => {
-    const auth = await authorizeRead(c, GLOBAL_AGENT_SENTINEL);
+    const auth = await authorizeAccountRead(c, GLOBAL_AGENT_SENTINEL);
     if (auth.kind !== "ok") return auth.response;
 
     const agents = await deps.agentStore.listAgents(auth.owner.ownerAddress);
@@ -1918,7 +1952,8 @@ export function createServer(deps: ServerDeps): Hono {
       }
       const params = parseHireParams(parsed.value.params);
       if (!params.ok || (params.value.sizingPreset !== "trade-v1"
-        && params.value.sizingPreset !== "lp-v1" && params.value.sizingPreset !== "lending-v1")) {
+        && params.value.sizingPreset !== "lp-v1" && params.value.sizingPreset !== "lending-v1"
+        && params.value.sizingPreset !== "grid-v1" && params.value.sizingPreset !== "grid-shift-v1")) {
         return { kind: "error", code: "owner_auth_failed" };
       }
       const agent = await deps.agentStore.getAgentById(id);
@@ -1929,6 +1964,15 @@ export function createServer(deps: ServerDeps): Hono {
       if (durableActionId?.toLowerCase() !== actionId.toLowerCase()
         || agent.ownerAddress.toLowerCase() !== parsed.value.signed.owner.toLowerCase()) {
         return { kind: "error", code: "conflict" };
+      }
+      if (params.value.sizingPreset === "grid-shift-v1" || params.value.sizingPreset === "lp-v1") {
+        const envelopePlan = hireArmPlan(params.value);
+        const durablePlan = pending?.initialArmPlan ?? agent.sessionFacts?.armPlan;
+        if ((durablePlan?.digest ?? null)?.toLowerCase() !== (envelopePlan?.digest ?? null)?.toLowerCase()
+          || (envelopePlan !== undefined && armPlanKind(envelopePlan.params)
+            !== (params.value.sizingPreset === "grid-shift-v1" ? "grid" : "lp"))) {
+          return { kind: "error", code: "conflict" };
+        }
       }
       if (params.value.sizingPreset === "trade-v1") {
         const durableRunId = pending?.hireRunId ?? agent.sessionFacts?.hireRunId;
@@ -1951,13 +1995,24 @@ export function createServer(deps: ServerDeps): Hono {
             !== lendingSettingsDigest(params.value.settingsParams).toLowerCase())) {
           return { kind: "error", code: "conflict" };
         }
-      } else if (pending !== null && (pending.sizing.sizingPreset !== "lp-v1"
-        || pending.sizing.openNativeBudgetWei !== params.value.openNativeBudgetWei.toString(10)
-        || pending.sizing.capDayWei !== params.value.capDayWei.toString(10))) {
-        return { kind: "error", code: "conflict" };
+      } else {
+        const openBudget = pending?.sizing.openNativeBudgetWei ?? agent.sessionFacts?.hireSizing?.openNativeBudgetWei;
+        // AUDIT A1 (HIRE-SIGNATURES-BC): once armed, the signed `capDayWei` lives
+        // in the session spec's native day cap. `agent.caps.dailyNativeWei` is
+        // the BUDGET for grid/LP hires (`createProvisioningAgent` below), so
+        // comparing against it refused every real continuation with `conflict`.
+        const capDay = pending?.sizing.capDayWei
+          ?? (agent.sessionFacts === null ? undefined : nativeDayCapWei(agent.sessionFacts)?.toString(10));
+        if ((pending !== null && pending.sizing.sizingPreset !== params.value.sizingPreset)
+          || (openBudget !== undefined && openBudget !== params.value.openNativeBudgetWei.toString(10))
+          || (capDay !== undefined && capDay !== params.value.capDayWei.toString(10))) {
+          return { kind: "error", code: "conflict" };
+        }
       }
       return { kind: "ok", agent };
     }
+
+    hireContinuationForArms = hireContinuation;
 
     app.get("/agents/hire/preview", async (c) => {
       let wallet: Address;
@@ -2080,6 +2135,7 @@ export function createServer(deps: ServerDeps): Hono {
         const tradeParams = earlyParams.value;
         const owner = classified.ownerAddress;
         const actionId = provisionActionId.toLowerCase();
+        let freshlyAccepted = false;
         const exactRow = (row: AgentRecord | null): row is AgentRecord => {
           if (row === null || row.ownerAddress.toLowerCase() !== owner.toLowerCase()) return false;
           const durableAction = row.pendingGrant?.provisionActionId ?? row.sessionFacts?.provisionActionId;
@@ -2123,7 +2179,11 @@ export function createServer(deps: ServerDeps): Hono {
             return c.json({ data: provisioningView(existing, nowSec()), meta: { durable: deps.agentStore.durable, replayed: true, repaired: prior === null } });
           }
 
-          if (existing !== null) return fail(c, 409, "agent_exists");
+          if (existing !== null) {
+            let verifiedOwner: Address | undefined;
+            try { verifiedOwner = (await verifyOwnerAction(ownerAction, verifyOptions())).ownerAddress; } catch { /* do not disclose the row to an invalid signer */ }
+            return hireAgentExistsResponse(c, verifiedOwner, existing, nowSec());
+          }
           if (claimState.kind === "plain") return fail(c, 409, "s1_ambiguous");
           if (claimState.kind === "provision") {
             if (claimState.claim.actionId.toLowerCase() !== actionId) return fail(c, 409, "conflict");
@@ -2230,6 +2290,7 @@ export function createServer(deps: ServerDeps): Hono {
             }
             ensureConvergenceActive();
             if (!inserted) return fail(c, 409, "s1_ambiguous");
+            freshlyAccepted = true;
           }
           ensureConvergenceActive();
           if (nowMs() >= authorityExpiresAtMs) {
@@ -2299,7 +2360,7 @@ export function createServer(deps: ServerDeps): Hono {
             }
             if (!(error instanceof AgentExistsError)) throw error;
             const joined = await deps.agentStore.getAgentById(id);
-            if (!exactRow(joined)) return fail(c, 409, "agent_exists");
+            if (!exactRow(joined)) return hireAgentExistsResponse(c, owner, joined, nowSec());
             row = joined;
           }
           try {
@@ -2311,7 +2372,20 @@ export function createServer(deps: ServerDeps): Hono {
             return fail(c, 503, "evidence_unreadable");
           }
           await lease.transition(provisionActionId, "live", "committed");
-          return c.json({ data: provisioningView(row, nowSec()), meta: { durable: deps.agentStore.durable } });
+          const issuedAtSec = nowSec();
+          const view = provisioningView(row, issuedAtSec);
+          return c.json({ data: {
+            ...view,
+            ...(freshlyAccepted && config.accountReadSession !== undefined ? {
+              readSession: issueAccountReadSession({
+                owner,
+                nowSec: issuedAtSec,
+                signedIssuedAt: ownerAction.signed.issuedAt,
+                signedExpiry: ownerAction.signed.expiry,
+                config: config.accountReadSession,
+              }),
+            } : {}),
+          }, meta: { durable: deps.agentStore.durable } });
           });
         } catch (error) {
           if (error instanceof TradeNotReadyError) return fail(c, 503, "trade_not_ready");
@@ -2365,9 +2439,11 @@ export function createServer(deps: ServerDeps): Hono {
               rateLimited = true;
               throw new OwnerAuthError("Per-owner rate limit exceeded.");
             }
-            if (await deps.agentStore.getAgentById(id) !== null) throw new HireAgentExistsError();
+            const existing = await deps.agentStore.getAgentById(id);
+            if (existing !== null) throw new HireAgentExistsError(existing, verified.ownerAddress);
             const params = parseHireParams(ownerAction.params);
             if (!params.ok) throw new BadRequestError(params.message);
+            validateHireArmPlan(params.value);
             const observedAtSec = nowSec();
             if (params.value.sizingPreset === "trade-v1") {
               const tradeParams = params.value;
@@ -2686,6 +2762,7 @@ export function createServer(deps: ServerDeps): Hono {
               walletAddress: params.value.walletAddress,
               keyStoreAddress: config.keyStore,
             });
+            const initialArmPlan = pendingArmPlan(params.value);
             const pending: PendingGrant = {
               version: 1,
               recoveredOwner: verified.ownerAddress,
@@ -2708,13 +2785,16 @@ export function createServer(deps: ServerDeps): Hono {
               createdAtSec: observedAtSec,
               keyStoreVerdictAtS1: ownerVerdict,
               provisionActionId,
+              ...(initialArmPlan === undefined ? {} : { initialArmPlan }),
             };
             prepared = { pending, sessionKey, params: params.value };
           },
         });
       } catch (error) {
         if (rateLimited) return fail(c, 429, "rate_limited");
-        if (error instanceof HireAgentExistsError) return fail(c, 409, "agent_exists");
+        if (error instanceof HireAgentExistsError) {
+          return hireAgentExistsResponse(c, error.ownerAddress, error.existing, nowSec());
+        }
         if (error instanceof HireWalletOwnerError) return fail(c, 403, "wallet_owner_mismatch");
         if (error instanceof HireEvidenceError) return fail(c, 503, "evidence_unreadable");
         if (error instanceof TradeNotReadyError) return fail(c, 503, "trade_not_ready");
@@ -2778,7 +2858,10 @@ export function createServer(deps: ServerDeps): Hono {
           sessionKey: prepared.sessionKey,
         });
       } catch (error) {
-        if (error instanceof AgentExistsError) return fail(c, 409, "agent_exists");
+        if (error instanceof AgentExistsError) {
+          const existing = await deps.agentStore.getAgentById(id);
+          return hireAgentExistsResponse(c, prepared.pending.recoveredOwner, existing, nowSec());
+        }
         if (error instanceof AgentWalletInUseError) {
           // Match Trading's remedy, but never disclose another owner's agent.
           const blocker = error.agentId === null ? null
@@ -2810,7 +2893,20 @@ export function createServer(deps: ServerDeps): Hono {
       } catch {
         return fail(c, 503, "evidence_unreadable");
       }
-      return c.json({ data: provisioningView(row, nowSec()), meta: { durable: deps.agentStore.durable } });
+      const issuedAtSec = nowSec();
+      const view = provisioningView(row, issuedAtSec);
+      return c.json({ data: {
+        ...view,
+        ...(config.accountReadSession === undefined ? {} : {
+          readSession: issueAccountReadSession({
+            owner: prepared.pending.recoveredOwner,
+            nowSec: issuedAtSec,
+            signedIssuedAt: ownerAction.signed.issuedAt,
+            signedExpiry: ownerAction.signed.expiry,
+            config: config.accountReadSession,
+          }),
+        }),
+      }, meta: { durable: deps.agentStore.durable } });
     });
 
     app.post("/agents/:id/session/grant-attempt", async (c) => {
@@ -4266,10 +4362,15 @@ export function createServer(deps: ServerDeps): Hono {
   }
 
   /**
-   * The account-session capability is accepted only by the account/detail GET
-   * allowlist, including Trading detail. Keeping it separate from `authorizeRead` makes it
-   * structurally unavailable to every owner mutation and every other owner
+   * The account-session capability is accepted only by these account-read GETs
+   * (the complete `authorizeAccountRead(` call-site list):
+   * `/account/portfolio`, `/agents`, `/agents/:id/owner-view`,
+   * `/agents/:id/session`, `/agents/:id/trade/view`, `/agents/:id/lp`, and
+   * `/agents/:id/lending/view`. Keeping it separate from `authorizeRead` makes
+   * it structurally unavailable to every owner mutation and every other owner
    * read. Header presence is XOR, including empty or malformed raw values.
+   * `/agents` is the post-closure amendment to MARKETPLACE-AGENT-DETAIL
+   * REVIEW2 C1 from HIRE-SIGNATURES-A Revision 2.
    */
   async function authorizeAccountRead(
     c: Context,
@@ -4654,55 +4755,21 @@ export function createServer(deps: ServerDeps): Hono {
       return { settings: parsed.value, digest: stored.digest };
     }
 
-    function lpV1ProfileError(reason: string): never {
-      throw new BadRequestError(
-        `These LP settings exceed the immutable lp-v1 hire profile: ${reason}. ` +
-          "Revoke the session on chain and hire again with a reviewed profile.",
-      );
-    }
-
-    function enforceLpV1Profile(
-      agent: AgentRecord,
-      settings: LpAutomationSettings,
-      budgetWei?: bigint,
-    ): void {
-      const hireSizing = agent.sessionFacts?.hireSizing;
-      if (hireSizing?.name !== "lp-v1") return;
-      if (settings.grid !== null) {
-        lpV1ProfileError("grid is not supported on lp-v1 hires");
-      }
-      if (settings.autoRotate !== true) {
-        lpV1ProfileError("autoRotate must stay true");
-      }
-      if (settings.maxExitSequencesPerDay > 4) {
-        lpV1ProfileError("maxExitSequencesPerDay must be at most 4");
-      }
-      // Operator ruling 2026-09-06: floor lowered 5 → 3 minutes. Below that the
-      // durable two-observation hysteresis (one worker interval apart) is the
-      // effective bound anyway, so 3 is the smallest value that still means
-      // something as a cooldown.
-      if (settings.rotateMinHoldMinutes < 3) {
-        lpV1ProfileError("rotateMinHoldMinutes must be at least 3");
-      }
-      if (settings.brainEnabled !== (settings.brain !== undefined)) {
-        lpV1ProfileError("brainEnabled must exactly match whether a brain block is present");
-      }
-      if (budgetWei !== undefined && budgetWei > BigInt(hireSizing.openNativeBudgetWei)) {
-        lpV1ProfileError("budgetWei exceeds the hire's openNativeBudgetWei");
-      }
-    }
+    type ResolvedLpArmPool = {
+      readonly candidate: { token0: Address; token1: Address; fee: number };
+      readonly gate: Extract<LpGateResult, { ok: true }>;
+      readonly selectionMeta?: LpArmMeta["selection"];
+      readonly model: "custom" | "sigma";
+    };
 
     async function resolveLpArmPool(
       agent: AgentRecord,
       rails: LpRailConfig,
       settings: LpAutomationSettings,
       request: LpOpenRequest | LpArmRequest,
-    ): Promise<{
-      readonly candidate: { token0: Address; token1: Address; fee: number };
-      readonly gate: Extract<LpGateResult, { ok: true }>;
-      readonly selectionMeta?: LpArmMeta["selection"];
-      readonly model: "custom" | "sigma";
-    }> {
+      preRead?: ResolvedLpArmPool,
+    ): Promise<ResolvedLpArmPool> {
+      if (preRead !== undefined) return preRead;
       if (request.pool !== undefined) {
         const result = await gateLpPool(agent, rails, request.pool);
         if (!result.ok) throw new BadRequestError(result.message);
@@ -4864,6 +4931,49 @@ export function createServer(deps: ServerDeps): Hono {
         priorWidthTicks: Math.max(2 * spacing, lp.runtime.defaultOpenWidthTicks),
         tickSpacing: spacing,
       });
+    }
+
+    function armPlanOutcome(data: Record<string, unknown>, field: "arm" | "open"): ArmPlanOutcome {
+      const value = data[field];
+      if (!isRecord(value)) throw new Error("The arm returned no outcome.");
+      const status = value["status"];
+      if (status !== "completed" && status !== "held" && status !== "rolled-back") {
+        throw new Error("The arm returned an unknown outcome.");
+      }
+      const positionIds: string[] = [];
+      for (const name of ["position", "siblingPosition"] as const) {
+        const position = data[name];
+        if (isRecord(position) && typeof position["positionId"] === "string") positionIds.push(position["positionId"]);
+      }
+      const sequenceId = typeof value["sequenceId"] === "string" ? value["sequenceId"] : undefined;
+      const reason = typeof value["reason"] === "string" && value["reason"].length > 0
+        ? sanitizeMessage(value["reason"])
+        : undefined;
+      return {
+        status,
+        ...(sequenceId === undefined ? {} : { sequenceId }),
+        ...(positionIds.length === 0 ? {} : { positionIds }),
+        ...(reason === undefined ? {} : { message: reason }),
+        atSec: nowSec(),
+      };
+    }
+
+    async function recordArmPlanInterrupted(agent: AgentRecord, actionId: Hex): Promise<void> {
+      try {
+        await deps.agentStore.recordArmPlanOutcomeCas({
+          ownerAddress: agent.ownerAddress,
+          agentId: agent.id,
+          callerActionId: actionId,
+          outcome: {
+            status: "interrupted",
+            message: "The arm was interrupted after it started; see the sequence for its settlement state.",
+            atSec: nowSec(),
+          },
+        });
+      } catch {
+        // A missing outcome is intentionally read as interrupted after the
+        // timeout; never replace the original failure with a guessed rollback.
+      }
     }
 
     async function ownerLandingMutation(
@@ -5322,6 +5432,7 @@ export function createServer(deps: ServerDeps): Hono {
       agent: AgentRecord,
       grid: LpGridSettings | null,
       purpose: "settings" | "arm" = "settings",
+      preRead?: Extract<LpGateResult, { ok: true }>,
     ): Promise<GridAdmission | null> {
       if (grid === null) return null;
       if (lp.gridEnabled !== true) {
@@ -5330,7 +5441,7 @@ export function createServer(deps: ServerDeps): Hono {
         );
       }
       const rails = requireRails();
-      const gate = await gateLpPool(agent, rails, grid.pool);
+      const gate = preRead ?? await gateLpPool(agent, rails, grid.pool);
       if (!gate.ok) throw new BadRequestError(gate.message);
 
       // C1's cross-check. The signed orientation and spacing decide EVERY later
@@ -6174,12 +6285,13 @@ export function createServer(deps: ServerDeps): Hono {
 
     /* ---- POST /agents/:id/lp/arm ----------------------------------------- */
 
-    app.post("/agents/:id/lp/arm", (c) =>
-      ownerMutation(c, c.req.param("id"), "lpArm", "lpArm", async ({ agent, params }) => {
-        const parsed = parseLpArmParams(params);
-        if (!parsed.ok) throw new BadRequestError(parsed.message);
-        const request = parsed.value;
-        const rails = requireRails();
+    async function armLpFromRequest(
+      agent: AgentRecord,
+      request: LpArmRequest,
+      rails: LpRailConfig,
+      preRead?: ResolvedLpArmPool,
+      beforeMutation?: () => Promise<void>,
+    ): Promise<Record<string, unknown>> {
         if (agent.sessionFacts === null) {
           throw new BadRequestError(
             "Agent has no granted session; an open that could not later be exited is refused.",
@@ -6209,7 +6321,7 @@ export function createServer(deps: ServerDeps): Hono {
             );
           }
 
-          const resolved = await resolveLpArmPool(agent, rails, request.settings, request);
+          const resolved = await resolveLpArmPool(agent, rails, request.settings, request, preRead);
           const grantedToken = lpRankedDiscoveryToken(agent.sessionFacts!.spec, lp.venue.wbnb);
           if (!grantedToken.ok || resolved.gate.token.toLowerCase() !== grantedToken.token.toLowerCase()) {
             throw new BadRequestError("The selected pool's token is not the token this session was granted for.");
@@ -6258,6 +6370,7 @@ export function createServer(deps: ServerDeps): Hono {
           }
 
           const digest = paramsHash("lpSettings", request.settingsParams);
+          if (beforeMutation !== undefined) await beforeMutation();
           await fence.putSettings(lp.settingsStore, {
             agentId: agent.id,
             ownerAddress: agent.ownerAddress,
@@ -6317,8 +6430,231 @@ export function createServer(deps: ServerDeps): Hono {
           settingsDigest: digest,
           model: resolved.model,
         };
-      }),
-    );
+    }
+
+    app.post("/agents/:id/lp/arm", async (c) => {
+      const id = c.req.param("id");
+      const continuationHeader = c.req.header("x-provision-action");
+      if (continuationHeader !== undefined) {
+        return continueLpArm(c, id, continuationHeader);
+      }
+      return ownerMutation(c, id, "lpArm", "lpArm", async ({ agent, params, idempotencyKey }) => {
+        const plan = agent.sessionFacts?.armPlan;
+        let claimedByThisRequest = false;
+        let outcomeWriteStarted = false;
+        let beforeMutation: (() => Promise<void>) | undefined;
+        if (plan !== undefined) {
+          if (plan.kind !== "lp") throw new ConflictError("This arm plan belongs to another route.");
+          if (plan.claim === null) {
+            beforeMutation = async () => {
+              const claimed = await deps.agentStore.claimArmPlanCas({
+                ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+                by: "signed", actionId: idempotencyKey as Hex, nowSec: nowSec(),
+              });
+              if (claimed.kind !== "claimed") throw new ConflictError("An arm from your hire plan is already in progress or done.");
+              claimedByThisRequest = true;
+            };
+          } else if (plan.claim.outcome === null) {
+            throw new ConflictError("An arm from your hire plan is in progress.");
+          } else if (plan.claim.outcome.status === "held" || plan.claim.outcome.status === "interrupted") {
+            const sequenceId = plan.claim.outcome.sequenceId;
+            let sequence = null;
+            try {
+              sequence = sequenceId === undefined ? null
+                : await lp.store.getSequence(agent.ownerAddress, agent.id, sequenceId);
+            } catch {
+              throw new ConflictError("The arm's settlement could not be read; settle or abandon the sequence before arming again.");
+            }
+            if (sequence === null || !isTerminalLpSequence(sequence.state, sequence.recoveryState)) {
+              throw new ConflictError("The arm's settlement is still in progress; settle or abandon the sequence before arming again.");
+            }
+          }
+        }
+        try {
+          const parsed = parseLpArmParams(params);
+          if (!parsed.ok) throw new BadRequestError(parsed.message);
+          const data = await armLpFromRequest(agent, parsed.value, requireRails(), undefined, beforeMutation);
+          if (!claimedByThisRequest) return data;
+          const outcome = armPlanOutcome(data, "open");
+          outcomeWriteStarted = true;
+          const recorded = await deps.agentStore.recordArmPlanOutcomeCas({
+            ownerAddress: agent.ownerAddress, agentId: agent.id,
+            callerActionId: idempotencyKey as Hex, outcome,
+          });
+          if (recorded.kind !== "recorded" && recorded.kind !== "same") {
+            throw new Error("The arm plan outcome could not be recorded.");
+          }
+          return { ...data, armPlan: provisioningView(recorded.agent, nowSec())["armPlan"] };
+        } catch (error) {
+          if (claimedByThisRequest && !outcomeWriteStarted) {
+            await recordArmPlanInterrupted(agent, idempotencyKey as Hex);
+          }
+          throw error;
+        }
+      });
+    });
+
+    async function continueLpArm(c: Context, id: string, header: string): Promise<Response> {
+      if (c.req.header("x-owner-action") !== undefined || c.req.header("authorization") !== undefined) {
+        return fail(c, 400, "ambiguous_owner_auth");
+      }
+      const rawBody = await c.req.text();
+      if (rawBody.trim() !== "{}") return fail(c, 400, "ambiguous_owner_auth");
+      const decoded = decodeOwnerActionHeader(header);
+      if (!decoded.ok) return fail(c, 401, "owner_auth_failed");
+      if (hireContinuationForArms === undefined) return fail(c, 404, "not_found");
+      const continuation = await hireContinuationForArms(id, decoded.value, true);
+      if (continuation.kind === "error") {
+        return continuation.code === "not_found"
+          ? fail(c, 404, "not_found")
+          : continuation.code === "conflict"
+            ? fail(c, 409, "conflict")
+            : fail(c, 401, "owner_auth_failed");
+      }
+      const agent = continuation.agent;
+      const plan = agent.sessionFacts?.armPlan;
+      if (agent.status !== "armed" || plan === undefined || plan.kind !== "lp") {
+        return fail(c, 409, "conflict", "This hire carries no arm plan for this route; sign the arm.");
+      }
+      if (plan.claim !== null) {
+        return c.json({
+          data: { armPlan: provisioningView(agent, nowSec())["armPlan"] },
+          meta: { action: "lpArm", agentId: id, replayed: true },
+        });
+      }
+      if (!ownerLimiter.tryConsume(agent.ownerAddress.toLowerCase())) return fail(c, 429, "rate_limited");
+
+      try {
+      const rails = requireRails();
+      const rawPlan = plan.params;
+      let request: LpArmRequest;
+      let preRead: ResolvedLpArmPool;
+      if (isRecord(rawPlan) && rawPlan["range"] === "server-fenced") {
+        let projected: Record<string, unknown>;
+        try { projected = armRequestFromPlan(rawPlan); }
+        catch (error) { throw new BadRequestError(error instanceof Error ? error.message : "The arm plan is invalid."); }
+        const parsed = parseLpArmParams(projected);
+        if (!parsed.ok) throw new BadRequestError(parsed.message);
+        request = parsed.value;
+        enforceLpV1Profile(agent, request.settings, request.budgetWei);
+        preRead = await resolveLpArmPool(agent, rails, request.settings, request);
+      } else {
+        const prices = isRecord(rawPlan) && isRecord(rawPlan["prices"]) ? rawPlan["prices"] : null;
+        const rawPool = isRecord(rawPlan) && isRecord(rawPlan["pool"]) ? rawPlan["pool"] : null;
+        const tickSpacing = prices?.["tickSpacing"];
+        if (prices === null || rawPool === null || typeof tickSpacing !== "number" || !Number.isInteger(tickSpacing)) {
+          throw new BadRequestError("The explicit LP arm plan is invalid.");
+        }
+        let placeholder: Record<string, unknown>;
+        try { placeholder = armRequestFromPlan(rawPlan, { tickLower: 0, tickUpper: tickSpacing }); }
+        catch (error) { throw new BadRequestError(error instanceof Error ? error.message : "The arm plan is invalid."); }
+        const placeholderParsed = parseLpArmParams(placeholder);
+        if (!placeholderParsed.ok || placeholderParsed.value.pool === undefined) {
+          throw new BadRequestError(placeholderParsed.ok ? "The explicit LP arm plan has no pool." : placeholderParsed.message);
+        }
+        if (typeof rawPool["address"] !== "string" || !isAddress(rawPool["address"], { strict: false })) {
+          throw new BadRequestError('"pool.address" must be a 20-byte hex address.');
+        }
+        const expectedPool = getAddress(rawPool["address"]);
+        const gate = await gateLpPool(agent, rails, placeholderParsed.value.pool, expectedPool);
+        if (!gate.ok) throw new BadRequestError(gate.message);
+        const actualWbnbIsToken0 = placeholderParsed.value.pool.token0.toLowerCase() === lp.venue.wbnb.toLowerCase();
+        if (typeof prices["wbnbIsToken0"] === "boolean" && prices["wbnbIsToken0"] !== actualWbnbIsToken0) {
+          throw new BadRequestError(
+            `The signed LP pool says WBNB is ${prices["wbnbIsToken0"] ? "token0" : "token1"}, but the admitted pool has it as ${actualWbnbIsToken0 ? "token0" : "token1"}.`,
+          );
+        }
+        if (tickSpacing !== gate.state.tickSpacing) {
+          throw new BadRequestError(
+            `The signed LP tick spacing (${tickSpacing}) does not match the pool's own (${gate.state.tickSpacing}).`,
+          );
+        }
+        const orientation = typeof prices["quoteIsToken0"] === "boolean"
+          ? { quoteIsToken0: prices["quoteIsToken0"] }
+          : { wbnbIsToken0: prices["wbnbIsToken0"] as boolean };
+        let range: { readonly tickLower: number; readonly tickUpper: number };
+        try {
+          range = explicitRangeFromPrices({
+            minPrice: prices["minPrice"] as number,
+            maxPrice: prices["maxPrice"] as number,
+            currentTick: gate.state.currentTick,
+            tickSpacing,
+            ...orientation,
+          });
+        } catch (error) {
+          throw new BadRequestError(error instanceof Error ? error.message : "The explicit LP range is invalid.");
+        }
+        let projected: Record<string, unknown>;
+        try { projected = armRequestFromPlan(rawPlan, range); }
+        catch (error) { throw new BadRequestError(error instanceof Error ? error.message : "The arm plan is invalid."); }
+        const parsed = parseLpArmParams(projected);
+        if (!parsed.ok) throw new BadRequestError(parsed.message);
+        request = parsed.value;
+        enforceLpV1Profile(agent, request.settings, request.budgetWei);
+        preRead = { candidate: request.pool!, gate, model: "custom" };
+      }
+
+      const provisionActionId = agent.pendingGrant?.provisionActionId ?? agent.sessionFacts?.provisionActionId;
+      if (provisionActionId === undefined) return fail(c, 409, "conflict");
+      const continuationKey = armContinuationKey(provisionActionId);
+      let claimed = false;
+      let claimConflict = false;
+      const beforeMutation = async (): Promise<void> => {
+        const result = await deps.agentStore.claimArmPlanCas({
+          ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+          by: "continuation", actionId: continuationKey, nowSec: nowSec(),
+        });
+        if (result.kind !== "claimed") {
+          claimConflict = true;
+          throw new ConflictError("The arm admission changed before it could start; retry.");
+        }
+        claimed = true;
+      };
+      let journalStarted = false;
+      let outcomeWriteStarted = false;
+      try {
+        await deps.journal.begin({
+          idempotencyKey: continuationKey,
+          agentId: agent.id,
+          ownerAddress: agent.ownerAddress,
+          kind: "lpArm",
+          externalRef: { publicKey: agent.sessionFacts!.publicKey },
+        });
+        journalStarted = true;
+        const data = await armLpFromRequest(agent, request, rails, preRead, beforeMutation);
+        const outcome = armPlanOutcome(data, "open");
+        outcomeWriteStarted = true;
+        const recorded = await deps.agentStore.recordArmPlanOutcomeCas({
+          ownerAddress: agent.ownerAddress, agentId: agent.id, callerActionId: continuationKey, outcome,
+        });
+        if (recorded.kind !== "recorded" && recorded.kind !== "same") throw new Error("The arm plan outcome could not be recorded.");
+        await deps.journal.markCommitted(continuationKey);
+        return c.json({
+          data: { ...data, armPlan: provisioningView(recorded.agent, nowSec())["armPlan"] },
+          meta: { action: "lpArm", agentId: id, authority: "provision-continuation" },
+        });
+      } catch (error) {
+        if (claimConflict) {
+          const current = await deps.agentStore.getAgent(agent.ownerAddress, agent.id);
+          if (current?.sessionFacts?.armPlan?.claim !== null && current?.sessionFacts?.armPlan?.claim !== undefined) {
+            return c.json({ data: { armPlan: provisioningView(current, nowSec())["armPlan"] }, meta: { action: "lpArm", agentId: id, replayed: true } });
+          }
+          return fail(c, 409, "conflict", "admission changed; retry");
+        }
+        if (claimed && !outcomeWriteStarted) await recordArmPlanInterrupted(agent, continuationKey);
+        if (journalStarted && !outcomeWriteStarted) {
+          try { await deps.journal.markRolledBack(continuationKey, sanitizeMessage(error instanceof Error ? error.message : "arm failed")); }
+          catch { /* the claim outcome remains the authoritative read-side state */ }
+        }
+        if (error instanceof BadRequestError) return failBadRequest(c, error);
+        if (error instanceof ConflictError) return fail(c, 409, "conflict", error.message);
+        throw error;
+      }
+      } catch (error) {
+        if (error instanceof BadRequestError) return failBadRequest(c, error);
+        throw error;
+      }
+    }
 
     /* ---- POST /agents/:id/lp/grid/arm (PHASE3.16) -------------------------- */
 
@@ -6411,12 +6747,13 @@ export function createServer(deps: ServerDeps): Hono {
      * SUPPORTED state — 3.15's "armed but holds no level yet" — and the next
      * `gridArm` takes the `alreadyGrid` path with step 2 protecting it.
      */
-    app.post("/agents/:id/lp/grid/arm", (c) =>
-      ownerMutation(c, c.req.param("id"), "gridArm", "lpGridArm", async ({ agent, params }) => {
-        const parsed = parseLpGridArmParams(params);
-        if (!parsed.ok) throw new BadRequestError(parsed.message);
-        const request = parsed.value;
-        const rails = requireRails();
+    async function armGridFromRequest(
+      agent: AgentRecord,
+      request: LpGridArmRequest,
+      rails: LpRailConfig,
+      preRead?: Extract<LpGateResult, { ok: true }>,
+      beforeMutation?: () => Promise<void>,
+    ): Promise<Record<string, unknown>> {
 
         // (0) C4. Its own text, before and independent of `admitGridSettings`.
         const grid = request.settings.grid;
@@ -6430,40 +6767,7 @@ export function createServer(deps: ServerDeps): Hono {
             "Agent has no granted session; an arm that could not later be exited is refused.",
           );
         }
-        const hireSizing = agent.sessionFacts.hireSizing;
-        if (hireSizing !== undefined) {
-          let outsideProfile: boolean;
-          switch (hireSizing.name) {
-            case "grid-shift-v1":
-              outsideProfile =
-                gridModeOf(grid) !== "shift"
-                || request.levels !== 2
-                || request.settings.maxExitSequencesPerDay > 4
-                || grid.requote !== undefined
-                || (shiftNativeSizingTerm(request.settings).shiftMotionsPerDay ?? 0) > 16
-                || request.budgetWei > BigInt(hireSizing.openNativeBudgetWei);
-              break;
-            case "grid-v1":
-              outsideProfile =
-                gridModeOf(grid) !== "fixed"
-                || request.levels > 2
-                || request.settings.maxExitSequencesPerDay > 4
-                || grid.maxFlipsPerDay > 12
-                || grid.requote !== undefined
-                || request.budgetWei > BigInt(hireSizing.openNativeBudgetWei);
-              break;
-            case "lp-v1":
-              throw new BadRequestError("An lp-v1 hire cannot arm a grid.");
-            default:
-              outsideProfile = true;
-              break;
-          }
-          if (outsideProfile) {
-            throw new BadRequestError(
-              "These grid settings exceed the immutable " + hireSizing.name + " hire profile. Revoke the session on chain and hire again with a reviewed profile.",
-            );
-          }
-        }
+        checkGridArmProfile(agent.sessionFacts.hireSizing, request);
 
         // (0b) PHASE3.17 R2.2 — the `levels` <=> pair-2 CROSS-RULE, scoped to
         // THIS ROUTE (R3.1). `levels` rides the gridArm ENVELOPE beside
@@ -6560,7 +6864,7 @@ export function createServer(deps: ServerDeps): Hono {
         }
 
         // (1) chain-and-config admission, checks 1-4 (C1).
-        const admission = await admitGridSettings(agent, grid, "arm");
+        const admission = await admitGridSettings(agent, grid, "arm", preRead);
         if (admission === null) {
           // Unreachable: the null-grid case is refused above. Fail closed
           // rather than proceed on an admission that did not happen.
@@ -7020,6 +7324,7 @@ export function createServer(deps: ServerDeps): Hono {
         // (and therefore the "settings nobody provably signed" skip) intact
         // while the phase still promises ONE signature.
         const digest = paramsHash("lpSettings", request.settingsParams);
+        if (beforeMutation !== undefined) await beforeMutation();
         await lp.settingsStore.put({
           agentId: agent.id,
           ownerAddress: agent.ownerAddress,
@@ -7340,8 +7645,179 @@ export function createServer(deps: ServerDeps): Hono {
                 : ""),
           },
         };
-      }),
-    );
+    }
+
+    app.post("/agents/:id/lp/grid/arm", async (c) => {
+      const id = c.req.param("id");
+      const continuationHeader = c.req.header("x-provision-action");
+      if (continuationHeader !== undefined) return continueGridArm(c, id, continuationHeader);
+      return ownerMutation(c, id, "gridArm", "lpGridArm", async ({ agent, params, idempotencyKey }) => {
+        const plan = agent.sessionFacts?.armPlan;
+        let claimedByThisRequest = false;
+        let outcomeWriteStarted = false;
+        let beforeMutation: (() => Promise<void>) | undefined;
+        if (plan !== undefined) {
+          if (plan.kind !== "grid") throw new ConflictError("This arm plan belongs to another route.");
+          if (plan.claim === null) {
+            beforeMutation = async () => {
+              const claimed = await deps.agentStore.claimArmPlanCas({
+                ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+                by: "signed", actionId: idempotencyKey as Hex, nowSec: nowSec(),
+              });
+              if (claimed.kind !== "claimed") throw new ConflictError("An arm from your hire plan is already in progress or done.");
+              claimedByThisRequest = true;
+            };
+          } else if (plan.claim.outcome === null) {
+            throw new ConflictError("An arm from your hire plan is in progress.");
+          } else if (plan.claim.outcome.status === "held" || plan.claim.outcome.status === "interrupted") {
+            const sequenceId = plan.claim.outcome.sequenceId;
+            let sequence = null;
+            try {
+              sequence = sequenceId === undefined ? null
+                : await lp.store.getSequence(agent.ownerAddress, agent.id, sequenceId);
+            } catch {
+              throw new ConflictError("The arm's settlement could not be read; settle or abandon the sequence before arming again.");
+            }
+            if (sequence === null || !isTerminalLpSequence(sequence.state, sequence.recoveryState)) {
+              throw new ConflictError("The arm's settlement is still in progress; settle or abandon the sequence before arming again.");
+            }
+          }
+        }
+        try {
+          const parsed = parseLpGridArmParams(params);
+          if (!parsed.ok) throw new BadRequestError(parsed.message);
+          const data = await armGridFromRequest(agent, parsed.value, requireRails(), undefined, beforeMutation);
+          if (!claimedByThisRequest) return data;
+          const outcome = armPlanOutcome(data, "arm");
+          outcomeWriteStarted = true;
+          const recorded = await deps.agentStore.recordArmPlanOutcomeCas({
+            ownerAddress: agent.ownerAddress, agentId: agent.id,
+            callerActionId: idempotencyKey as Hex, outcome,
+          });
+          if (recorded.kind !== "recorded" && recorded.kind !== "same") throw new Error("The arm plan outcome could not be recorded.");
+          return { ...data, armPlan: provisioningView(recorded.agent, nowSec())["armPlan"] };
+        } catch (error) {
+          if (claimedByThisRequest && !outcomeWriteStarted) await recordArmPlanInterrupted(agent, idempotencyKey as Hex);
+          throw error;
+        }
+      });
+    });
+
+    async function continueGridArm(c: Context, id: string, header: string): Promise<Response> {
+      if (c.req.header("x-owner-action") !== undefined || c.req.header("authorization") !== undefined) {
+        return fail(c, 400, "ambiguous_owner_auth");
+      }
+      const rawBody = await c.req.text();
+      if (rawBody.trim() !== "{}") return fail(c, 400, "ambiguous_owner_auth");
+      const decoded = decodeOwnerActionHeader(header);
+      if (!decoded.ok) return fail(c, 401, "owner_auth_failed");
+      if (hireContinuationForArms === undefined) return fail(c, 404, "not_found");
+      const continuation = await hireContinuationForArms(id, decoded.value, true);
+      if (continuation.kind === "error") {
+        return continuation.code === "not_found"
+          ? fail(c, 404, "not_found")
+          : continuation.code === "conflict"
+            ? fail(c, 409, "conflict")
+            : fail(c, 401, "owner_auth_failed");
+      }
+      const agent = continuation.agent;
+      const plan = agent.sessionFacts?.armPlan;
+      if (agent.status !== "armed" || plan === undefined || plan.kind !== "grid") {
+        return fail(c, 409, "conflict", "This hire carries no arm plan for this route; sign the arm.");
+      }
+      if (plan.claim !== null) {
+        return c.json({
+          data: { armPlan: provisioningView(agent, nowSec())["armPlan"] },
+          meta: { action: "gridArm", agentId: id, replayed: true },
+        });
+      }
+      if (!ownerLimiter.tryConsume(agent.ownerAddress.toLowerCase())) return fail(c, 429, "rate_limited");
+      try {
+      const rails = requireRails();
+      const rawPlan = plan.params;
+      if (!isRecord(rawPlan) || !isRecord(rawPlan["settings"]) || !isRecord(rawPlan["settings"]["grid"])) {
+        return fail(c, 400, "invalid_request", "The grid arm plan is invalid.");
+      }
+      const rawGrid = rawPlan["settings"]["grid"];
+      const shift = isRecord(rawGrid["shift"]) ? rawGrid["shift"] : null;
+      const tickSpacing = rawGrid["tickSpacing"];
+      const gapTicks = shift?.["gapTicks"];
+      const widthTicks = shift?.["widthTicks"];
+      const wbnbIsToken0 = rawGrid["wbnbIsToken0"];
+      if (typeof tickSpacing !== "number" || typeof gapTicks !== "number" || typeof widthTicks !== "number"
+        || typeof wbnbIsToken0 !== "boolean") {
+        return fail(c, 400, "invalid_request", "The grid arm plan is missing its signed shift geometry.");
+      }
+      const admission = await gateLpPool(agent, rails, {
+        token0: rawGrid["pool"] && isRecord(rawGrid["pool"]) ? rawGrid["pool"]["token0"] as Address : "0x0000000000000000000000000000000000000000",
+        token1: rawGrid["pool"] && isRecord(rawGrid["pool"]) ? rawGrid["pool"]["token1"] as Address : "0x0000000000000000000000000000000000000000",
+        fee: rawGrid["pool"] && isRecord(rawGrid["pool"]) && typeof rawGrid["pool"]["fee"] === "number" ? rawGrid["pool"]["fee"] : 0,
+      });
+      if (!admission.ok) throw new BadRequestError(admission.message);
+      if (tickSpacing !== admission.state.tickSpacing) {
+        throw new BadRequestError(
+          `The signed grid.tickSpacing (${tickSpacing}) does not match the pool's own (${admission.state.tickSpacing}); a range aligned to the wrong spacing would revert at the mint.`,
+        );
+      }
+      let ranges: { readonly buyRange: import("./lp/triggers.js").LpGridRange; readonly sellRange: import("./lp/triggers.js").LpGridRange };
+      try {
+        ranges = gridDeriveRanges({ currentTick: admission.state.currentTick, tickSpacing, gapTicks, widthTicks, wbnbIsToken0, minTick: MIN_TICK, maxTick: MAX_TICK });
+      } catch (error) {
+        throw new BadRequestError(error instanceof Error ? error.message : "The grid arm plan could not be derived.");
+      }
+      let projected: Record<string, unknown>;
+      try { projected = armRequestFromPlan(rawPlan, ranges); }
+      catch (error) { throw new BadRequestError(error instanceof Error ? error.message : "The arm plan is invalid."); }
+      const parsed = parseLpGridArmParams(projected);
+      if (!parsed.ok) throw new BadRequestError(parsed.message);
+      checkGridArmProfile(agent.sessionFacts?.hireSizing, parsed.value);
+      const provisionActionId = agent.pendingGrant?.provisionActionId ?? agent.sessionFacts?.provisionActionId;
+      if (provisionActionId === undefined) return fail(c, 409, "conflict");
+      const continuationKey = armContinuationKey(provisionActionId);
+      let claimed = false;
+      let claimConflict = false;
+      const beforeMutation = async (): Promise<void> => {
+        const result = await deps.agentStore.claimArmPlanCas({
+          ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+          by: "continuation", actionId: continuationKey, nowSec: nowSec(),
+        });
+        if (result.kind !== "claimed") { claimConflict = true; throw new ConflictError("The arm admission changed before it could start; retry."); }
+        claimed = true;
+      };
+      let journalStarted = false;
+      let outcomeWriteStarted = false;
+      try {
+        await deps.journal.begin({ idempotencyKey: continuationKey, agentId: agent.id, ownerAddress: agent.ownerAddress,
+          kind: "lpGridArm", externalRef: { publicKey: agent.sessionFacts!.publicKey } });
+        journalStarted = true;
+        const data = await armGridFromRequest(agent, parsed.value, rails, admission, beforeMutation);
+        const outcome = armPlanOutcome(data, "arm");
+        outcomeWriteStarted = true;
+        const recorded = await deps.agentStore.recordArmPlanOutcomeCas({ ownerAddress: agent.ownerAddress, agentId: agent.id, callerActionId: continuationKey, outcome });
+        if (recorded.kind !== "recorded" && recorded.kind !== "same") throw new Error("The arm plan outcome could not be recorded.");
+        await deps.journal.markCommitted(continuationKey);
+        return c.json({ data: { ...data, armPlan: provisioningView(recorded.agent, nowSec())["armPlan"] }, meta: { action: "gridArm", agentId: id, authority: "provision-continuation" } });
+      } catch (error) {
+        if (claimConflict) {
+          const current = await deps.agentStore.getAgent(agent.ownerAddress, agent.id);
+          if (current?.sessionFacts?.armPlan?.claim !== null && current?.sessionFacts?.armPlan?.claim !== undefined) {
+            return c.json({ data: { armPlan: provisioningView(current, nowSec())["armPlan"] }, meta: { action: "gridArm", agentId: id, replayed: true } });
+          }
+          return fail(c, 409, "conflict", "admission changed; retry");
+        }
+        if (claimed && !outcomeWriteStarted) await recordArmPlanInterrupted(agent, continuationKey);
+        if (journalStarted && !outcomeWriteStarted) {
+          try { await deps.journal.markRolledBack(continuationKey, sanitizeMessage(error instanceof Error ? error.message : "arm failed")); } catch { /* outcome remains authoritative */ }
+        }
+        if (error instanceof BadRequestError) return failBadRequest(c, error);
+        if (error instanceof ConflictError) return fail(c, 409, "conflict", error.message);
+        throw error;
+      }
+      } catch (error) {
+        if (error instanceof BadRequestError) return failBadRequest(c, error);
+        throw error;
+      }
+    }
 
     /* ---- POST /agents/:id/lp/open ----------------------------------------- */
 
@@ -12236,7 +12712,11 @@ export function createServer(deps: ServerDeps): Hono {
 
 /** Thrown by an owner action whose PARAMS are malformed, after a valid signature. */
 class BadRequestError extends Error {}
-class HireAgentExistsError extends Error {}
+class HireAgentExistsError extends Error {
+  constructor(readonly existing: AgentRecord, readonly ownerAddress: Address) {
+    super("Agent already exists.");
+  }
+}
 class HireWalletOwnerError extends Error {}
 class HireEvidenceError extends Error {}
 class TradeCapitalTooSmallError extends Error {
@@ -12244,6 +12724,169 @@ class TradeCapitalTooSmallError extends Error {
 }
 class TradeNotExecutableError extends Error {}
 class TradeNotReadyError extends Error {}
+
+type HireSizingProfile = NonNullable<SessionFacts["hireSizing"]>;
+
+function lpV1ProfileError(reason: string): never {
+  throw new BadRequestError(
+    `These LP settings exceed the immutable lp-v1 hire profile: ${reason}. ` +
+      "Revoke the session on chain and hire again with a reviewed profile.",
+  );
+}
+
+function enforceLpV1Profile(
+  agent: { readonly sessionFacts: { readonly hireSizing?: HireSizingProfile } | null },
+  settings: LpAutomationSettings,
+  budgetWei?: bigint,
+): void {
+  const hireSizing = agent.sessionFacts?.hireSizing;
+  if (hireSizing?.name !== "lp-v1") return;
+  if (settings.grid !== null) {
+    lpV1ProfileError("grid is not supported on lp-v1 hires");
+  }
+  if (settings.autoRotate !== true) {
+    lpV1ProfileError("autoRotate must stay true");
+  }
+  if (settings.maxExitSequencesPerDay > 4) {
+    lpV1ProfileError("maxExitSequencesPerDay must be at most 4");
+  }
+  if (settings.rotateMinHoldMinutes < 3) {
+    lpV1ProfileError("rotateMinHoldMinutes must be at least 3");
+  }
+  if (settings.brainEnabled !== (settings.brain !== undefined)) {
+    lpV1ProfileError("brainEnabled must exactly match whether a brain block is present");
+  }
+  if (budgetWei !== undefined && budgetWei > BigInt(hireSizing.openNativeBudgetWei)) {
+    lpV1ProfileError("budgetWei exceeds the hire's openNativeBudgetWei");
+  }
+}
+
+function checkGridArmProfile(
+  hireSizing: HireSizingProfile | undefined,
+  request: LpGridArmRequest,
+): void {
+  if (hireSizing === undefined) return;
+  const grid = request.settings.grid;
+  if (grid === null) return;
+  let outsideProfile: boolean;
+  switch (hireSizing.name) {
+    case "grid-shift-v1":
+      outsideProfile =
+        gridModeOf(grid) !== "shift"
+        || request.levels !== 2
+        || request.settings.maxExitSequencesPerDay > 4
+        || grid.requote !== undefined
+        || (shiftNativeSizingTerm(request.settings).shiftMotionsPerDay ?? 0) > 16
+        || request.budgetWei > BigInt(hireSizing.openNativeBudgetWei);
+      break;
+    case "grid-v1":
+      outsideProfile =
+        gridModeOf(grid) !== "fixed"
+        || request.levels > 2
+        || request.settings.maxExitSequencesPerDay > 4
+        || grid.maxFlipsPerDay > 12
+        || grid.requote !== undefined
+        || request.budgetWei > BigInt(hireSizing.openNativeBudgetWei);
+      break;
+    case "lp-v1":
+      throw new BadRequestError("An lp-v1 hire cannot arm a grid.");
+    default:
+      outsideProfile = true;
+      break;
+  }
+  if (outsideProfile) {
+    throw new BadRequestError(
+      "These grid settings exceed the immutable " + hireSizing.name + " hire profile. Revoke the session on chain and hire again with a reviewed profile.",
+    );
+  }
+}
+
+function validateHireArmPlan(params: HireParams): void {
+  const envelope = hireArmPlan(params);
+  if (envelope === undefined) return;
+  const kind = armPlanKind(envelope.params);
+  try {
+    if (params.sizingPreset === "grid-shift-v1") {
+      if (kind !== "grid" || !isRecord(envelope.params)) {
+        throw new Error('"armPlan.params.kind" must be "grid" for a grid-shift-v1 hire.');
+      }
+      const settings = isRecord(envelope.params["settings"]) ? envelope.params["settings"] : null;
+      const grid = settings !== null && isRecord(settings["grid"]) ? settings["grid"] : null;
+      const shift = grid !== null && isRecord(grid["shift"]) ? grid["shift"] : null;
+      const tickSpacing = grid?.["tickSpacing"];
+      const gapTicks = shift?.["gapTicks"];
+      const widthTicks = shift?.["widthTicks"];
+      const wbnbIsToken0 = grid?.["wbnbIsToken0"];
+      if (typeof tickSpacing !== "number" || !Number.isInteger(tickSpacing)
+        || typeof gapTicks !== "number" || !Number.isInteger(gapTicks)
+        || typeof widthTicks !== "number" || !Number.isInteger(widthTicks)
+        || typeof wbnbIsToken0 !== "boolean") {
+        throw new Error("The grid arm plan is missing its signed shift geometry.");
+      }
+      const derived = gridDeriveRanges({
+        currentTick: 0,
+        tickSpacing,
+        gapTicks,
+        widthTicks,
+        wbnbIsToken0,
+        minTick: MIN_TICK,
+        maxTick: MAX_TICK,
+      });
+      const projected = armRequestFromPlan(envelope.params, derived);
+      const parsed = parseLpGridArmParams(projected);
+      if (!parsed.ok) throw new Error(parsed.message);
+      checkGridArmProfile({ name: "grid-shift-v1", version: 1, openNativeBudgetWei: params.openNativeBudgetWei.toString(10) }, parsed.value);
+      return;
+    }
+    if (params.sizingPreset === "lp-v1") {
+      if (kind !== "lp") {
+        throw new Error('"armPlan.params.kind" must be "lp" for an lp-v1 hire.');
+      }
+      let derived: ArmPlanDerived | undefined;
+      if (isRecord(envelope.params) && envelope.params["range"] !== "server-fenced") {
+        const prices = isRecord(envelope.params["prices"]) ? envelope.params["prices"] : null;
+        const tickSpacing = prices?.["tickSpacing"];
+        if (typeof tickSpacing !== "number" || !Number.isInteger(tickSpacing)) {
+          throw new Error('"prices.tickSpacing" must be a positive integer.');
+        }
+        derived = { tickLower: 0, tickUpper: tickSpacing };
+      }
+      const projected = armRequestFromPlan(envelope.params, derived);
+      const parsed = parseLpArmParams(projected);
+      if (!parsed.ok) throw new Error(parsed.message);
+      enforceLpV1Profile(
+        { sessionFacts: { hireSizing: { name: "lp-v1", version: 1, openNativeBudgetWei: params.openNativeBudgetWei.toString(10) } } },
+        parsed.value.settings,
+        parsed.value.budgetWei,
+      );
+      return;
+    }
+    throw new Error("arm plans are supported only for grid-shift-v1 and lp-v1 hires.");
+  } catch (error) {
+    if (error instanceof BadRequestError) throw error;
+    throw new BadRequestError(error instanceof Error ? error.message : "The arm plan is invalid.");
+  }
+}
+
+function hireArmPlan(params: HireParams): ArmPlanEnvelope | undefined {
+  return "armPlan" in params ? params.armPlan : undefined;
+}
+
+function pendingArmPlan(params: HireParams): PendingGrant["initialArmPlan"] {
+  const envelope = hireArmPlan(params);
+  if (envelope === undefined) return undefined;
+  const kind = armPlanKind(envelope.params);
+  return kind === null ? undefined : { params: envelope.params, digest: envelope.digest, kind };
+}
+
+function armPlanKind(value: unknown): "grid" | "lp" | null {
+  if (!isRecord(value)) return null;
+  return value["kind"] === "grid" || value["kind"] === "lp" ? value["kind"] : null;
+}
+
+function armContinuationKey(provisionActionId: Hex): Hex {
+  return keccak256(concat([provisionActionId, bytesToHex(toBytes("arm-continuation:v1"))]));
+}
 /** PHASE3.25 R8.1.3/R10.1 — exact sizing evidence survives message clipping. */
 /**
  * THE ONE PLACE A 400 IS BUILT FROM A `BadRequestError`, and the ONE producer

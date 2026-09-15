@@ -43,6 +43,28 @@ export type SessionRevocationContext = {
   readonly keyStoreAddress: Address;
 };
 
+export type ArmPlanOutcome = {
+  readonly status: "completed" | "rolled-back" | "held" | "interrupted";
+  readonly sequenceId?: string;
+  readonly positionIds?: readonly string[];
+  readonly message?: string;
+  readonly atSec: number;
+};
+
+export type ArmPlanClaim = {
+  readonly by: "continuation" | "signed";
+  readonly actionId: Hex;
+  readonly claimedAtSec: number;
+  readonly outcome: ArmPlanOutcome | null;
+};
+
+export type SessionArmPlan = {
+  readonly params: unknown;
+  readonly digest: Hex;
+  readonly kind: "grid" | "lp";
+  readonly claim: ArmPlanClaim | null;
+};
+
 /** Lifecycle state of an agent. 1b drives the transitions; 1a only stores them. */
 export type AgentStatus =
   | "provisioning"
@@ -97,6 +119,7 @@ export type SessionFacts = {
   readonly provisionActionId?: Hex;
   /** Browser run correlation; authority remains the accepted provision action. */
   readonly hireRunId?: string;
+  readonly armPlan?: SessionArmPlan;
 };
 
 export type FundingRequirement = {
@@ -136,6 +159,11 @@ export type PendingGrant = {
   readonly initialTradeSettings?: {
     readonly params: TradeSettings;
     readonly digest: Hex;
+  };
+  readonly initialArmPlan?: {
+    readonly params: unknown;
+    readonly digest: Hex;
+    readonly kind: "grid" | "lp";
   };
   /**
    * MARKETPLACE-LENDING-AGENT R3.3(2), closing REVIEW2 H3(c).
@@ -309,6 +337,17 @@ export type GrantAttemptResetCasResult =
   | { readonly kind: "conflict" }
   | { readonly kind: "not_found" };
 
+export type ArmPlanClaimCasResult =
+  | { readonly kind: "claimed"; readonly agent: AgentRecord }
+  | { readonly kind: "conflict"; readonly agent: AgentRecord }
+  | { readonly kind: "not_found" };
+
+export type ArmPlanOutcomeCasResult =
+  | { readonly kind: "recorded"; readonly agent: AgentRecord }
+  | { readonly kind: "same"; readonly agent: AgentRecord }
+  | { readonly kind: "conflict"; readonly agent: AgentRecord }
+  | { readonly kind: "not_found" };
+
 /** Liveness of a long-running executor. Mirrors the data-plane job-health row. */
 export type ExecutorHealth = {
   readonly executor: string;
@@ -376,6 +415,20 @@ export interface AgentStore {
     readonly resetActionId: Hex;
     readonly resetAtSec: number;
   }): Promise<GrantAttemptResetCasResult>;
+  claimArmPlanCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedRowVersion: number;
+    readonly by: "continuation" | "signed";
+    readonly actionId: Hex;
+    readonly nowSec: number;
+  }): Promise<ArmPlanClaimCasResult>;
+  recordArmPlanOutcomeCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly callerActionId: Hex;
+    readonly outcome: ArmPlanOutcome;
+  }): Promise<ArmPlanOutcomeCasResult>;
   confirmSessionRevokedCas(input: ConfirmSessionRevokedInput): Promise<ConfirmSessionRevokedResult>;
   cancelProvisioningAgent(input: {
     readonly ownerAddress: Address;
@@ -1002,6 +1055,64 @@ export class MemoryAgentStore implements AgentStore {
     });
   }
 
+  async claimArmPlanCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly by: "continuation" | "signed"; readonly actionId: Hex; readonly nowSec: number;
+  }): Promise<ArmPlanClaimCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const facts = entry?.record.sessionFacts;
+      const plan = facts?.armPlan;
+      if (entry === undefined || entry.record.status !== "armed" || facts === null || plan === undefined) {
+        return { kind: "not_found" };
+      }
+      if (entry.record.rowVersion !== input.expectedRowVersion || plan.claim !== null) {
+        return { kind: "conflict", agent: structuredClone(entry.record) };
+      }
+      const updated = this.#mutate(input.ownerAddress, input.agentId, (record) => ({
+        ...record,
+        sessionFacts: {
+          ...record.sessionFacts!,
+          armPlan: {
+            ...record.sessionFacts!.armPlan!,
+            claim: { by: input.by, actionId: input.actionId, claimedAtSec: input.nowSec, outcome: null },
+          },
+        },
+      }));
+      return updated === null ? { kind: "not_found" } : { kind: "claimed", agent: updated };
+    });
+  }
+
+  async recordArmPlanOutcomeCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly callerActionId: Hex;
+    readonly outcome: ArmPlanOutcome;
+  }): Promise<ArmPlanOutcomeCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const plan = entry?.record.sessionFacts?.armPlan;
+      const claim = plan?.claim;
+      if (entry === undefined || entry.record.status !== "armed" || plan === undefined || claim === null || claim === undefined) {
+        return { kind: "not_found" };
+      }
+      if (claim.actionId.toLowerCase() !== input.callerActionId.toLowerCase()) {
+        return { kind: "conflict", agent: structuredClone(entry.record) };
+      }
+      if (claim.outcome !== null) return { kind: "same", agent: structuredClone(entry.record) };
+      const updated = this.#mutate(input.ownerAddress, input.agentId, (record) => ({
+        ...record,
+        sessionFacts: {
+          ...record.sessionFacts!,
+          armPlan: { ...record.sessionFacts!.armPlan!, claim: { ...claim, outcome: structuredClone(input.outcome) } },
+        },
+      }));
+      return updated === null ? { kind: "not_found" } : { kind: "recorded", agent: updated };
+    });
+  }
+
   async cancelProvisioningAgent(input: {
     readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
     readonly expectedGrantDigest: Hex; readonly nowSec: number;
@@ -1101,7 +1212,12 @@ export class MemoryAgentStore implements AgentStore {
         ? null
         : this.#mutate(ownerAddress, id, (record) => ({
           ...record,
-          sessionFacts: structuredClone(facts),
+          sessionFacts: {
+            ...structuredClone(facts),
+            ...(record.sessionFacts?.armPlan === undefined
+              ? {}
+              : { armPlan: structuredClone(record.sessionFacts.armPlan) }),
+          },
         })),
     );
   }
@@ -1598,6 +1714,93 @@ export class PostgresAgentStore implements AgentStore {
     });
   }
 
+  async claimArmPlanCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly by: "continuation" | "signed"; readonly actionId: Hex; readonly nowSec: number;
+  }): Promise<ArmPlanClaimCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    return this.#sql.transaction(async (tx) => {
+      const selected = await tx.query<AgentRow>(
+        `/* agents.armPlanClaimRead */ select ${AGENT_COLUMNS}
+         from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const plan = current.sessionFacts?.armPlan;
+      if (current.status !== "armed" || current.sessionFacts === null || plan === undefined) {
+        return { kind: "not_found" } as const;
+      }
+      if (current.rowVersion !== input.expectedRowVersion || plan.claim !== null) {
+        return { kind: "conflict", agent: current } as const;
+      }
+      const nextFacts: SessionFacts = {
+        ...current.sessionFacts,
+        armPlan: {
+          ...plan,
+          claim: { by: input.by, actionId: input.actionId, claimedAtSec: input.nowSec, outcome: null },
+        },
+      };
+      const updated = await tx.query<AgentRow>(
+        `/* agents.claimArmPlan */ update agents
+         set session_facts = $4::jsonb, row_version = row_version + 1, updated_at = $5
+         where id = $1 and owner_address = $2 and status = 'armed'
+           and row_version = $3
+           and session_facts->'armPlan' IS NOT NULL
+           AND session_facts->'armPlan'->'claim' = 'null'::jsonb
+         returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, input.expectedRowVersion, encodeJsonbParam(nextFacts), new Date(this.#now())],
+      );
+      return updated.rows[0] === undefined
+        ? { kind: "conflict", agent: current } as const
+        : { kind: "claimed", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async recordArmPlanOutcomeCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly callerActionId: Hex;
+    readonly outcome: ArmPlanOutcome;
+  }): Promise<ArmPlanOutcomeCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    return this.#sql.transaction(async (tx) => {
+      const selected = await tx.query<AgentRow>(
+        `/* agents.armPlanOutcomeRead */ select ${AGENT_COLUMNS}
+         from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const plan = current.sessionFacts?.armPlan;
+      const claim = plan?.claim;
+      if (current.status !== "armed" || current.sessionFacts === null || plan === undefined || claim === null || claim === undefined) {
+        return { kind: "not_found" } as const;
+      }
+      if (claim.actionId.toLowerCase() !== input.callerActionId.toLowerCase()) {
+        return { kind: "conflict", agent: current } as const;
+      }
+      if (claim.outcome !== null) return { kind: "same", agent: current } as const;
+      const nextFacts: SessionFacts = {
+        ...current.sessionFacts,
+        armPlan: { ...plan, claim: { ...claim, outcome: input.outcome } },
+      };
+      const updated = await tx.query<AgentRow>(
+        `/* agents.recordArmPlanOutcome */ update agents
+         set session_facts = $3::jsonb, row_version = row_version + 1, updated_at = $4
+         where id = $1 and owner_address = $2 and status = 'armed'
+           and session_facts->'armPlan' IS NOT NULL
+           AND session_facts->'armPlan'->'claim'->>'actionId' = $5
+           AND session_facts->'armPlan'->'claim'->'outcome' = 'null'::jsonb
+         returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, encodeJsonbParam(nextFacts), new Date(this.#now()), input.callerActionId],
+      );
+      return updated.rows[0] === undefined
+        ? { kind: "conflict", agent: current } as const
+        : { kind: "recorded", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
   async startGrantAttemptCas(input: {
     readonly ownerAddress: Address; readonly agentId: string; readonly expectedGrantDigest: Hex;
     readonly attemptId: Hex; readonly startedAtSec: number;
@@ -1863,7 +2066,13 @@ export class PostgresAgentStore implements AgentStore {
       await tx.query(`/* agents.walletFence */ select pg_advisory_xact_lock(hashtext($1))`, [`${owner}|${before.walletAddress.toLowerCase()}`]);
       const result = await tx.query<AgentRow>(
         `/* agents.updateFacts */
-         update agents set session_facts = $3::jsonb, row_version = row_version + 1, updated_at = $4
+         update agents
+         set session_facts = case
+               when session_facts->'armPlan' IS NOT NULL
+                 then $3::jsonb || jsonb_build_object('armPlan', session_facts->'armPlan')
+               else $3::jsonb
+             end,
+             row_version = row_version + 1, updated_at = $4
          where id = $1 and owner_address = $2 and session_revocation is null
            and not coalesce(pending_grant ?| array['cancelRequestedAtSec', 'cancelActionId'], false)
          returning ${AGENT_COLUMNS}`,
