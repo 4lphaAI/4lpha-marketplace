@@ -406,7 +406,7 @@ describe("session clock on the LP page (2026-09-15)", () => {
     expect(host.querySelector(".fl-status")?.textContent).toBe("expired");
     expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
     expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
-    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toContain("rotate, harvest or close");
+    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toBe("Session expired — the agent can't rotate or close. Close positions with your passkey below, or hire again.");
     const live = render({ ...base, sessionExpiresAt: Math.floor(Date.now() / 1_000) + 5 * 86_400 });
     host.innerHTML = live;
     expect(host.querySelector(".fl-status")?.textContent).toBe("armed");

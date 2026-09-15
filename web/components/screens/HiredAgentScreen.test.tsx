@@ -734,7 +734,7 @@ describe("session clock on the grid page (2026-09-15)", () => {
     expect(host.querySelector(".fl-status")?.textContent).toBe("expired");
     expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
     expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
-    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toContain("requote or close its 1 live order; the orders stay in your wallet as positions");
+    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toBe("Session expired — the agent can't requote or close. Close orders on chain below, or hire again.");
     host.innerHTML = render({ ...view, sessionExpiresAt: Math.floor(Date.now() / 1_000) + 5 * 86_400 });
     expect(host.querySelector(".fl-status")?.textContent).toBe("Live");
     expect(host.querySelector('[data-session-expiry="ok"]')?.textContent).toMatch(/^Session · (4d 23h|5d)$/u);

@@ -301,7 +301,7 @@ describe("the hero and the tiles", () => {
     expect(host.querySelector(".fl-status")?.textContent).toBe("expired");
     expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
     expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
-    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toContain("repay on the borrower's behalf; the reserve stays in the guard wallet");
+    expect(host.querySelector('[data-session-notice="expired"]')?.textContent).toBe("Session expired — the guard can't repay. Withdraw the reserve from Account, or hire again.");
     await mount(lendingView(), { view: { ...agentView, sessionExpiresAt: Math.floor(Date.now() / 1_000) + 5 * 86_400 } });
     expect(host.querySelector(".fl-status")?.textContent).toBe("armed");
     expect(host.querySelector('[data-session-expiry="ok"]')?.textContent).toMatch(/^Session · (4d 23h|5d)$/u);

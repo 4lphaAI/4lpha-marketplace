@@ -99,7 +99,7 @@ describe("the session clock on the trade page (2026-09-15)", () => {
     const withPositions = await render(view({ sessionExpiresAt: soon }), trade(4));
     try {
       expect(withPositions.host.querySelector('[data-session-expiry="soon"]')?.textContent).toMatch(/^Expires in 5h 59m$|^Expires in 6h$/u);
-      expect(withPositions.host.querySelector('[role="alert"]')?.textContent).toMatch(/^Session ends in 5h 59m\. Exits stop working after that|^Session ends in 6h\. Exits stop working after that/u);
+      expect(withPositions.host.querySelector('[role="alert"]')?.textContent).toMatch(/^Session ends in (5h 59m|6h) — sell open positions before then, or remove the agent\.$/u);
       expect(withPositions.host.querySelector(".fl-status")?.textContent).toBe("Live");
     } finally { await withPositions.done(); }
     const empty = await render(view({ sessionExpiresAt: soon }), trade(0));
@@ -115,7 +115,7 @@ describe("the session clock on the trade page (2026-09-15)", () => {
       expect(host.querySelector(".fl-status")?.textContent).toBe("expired");
       expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
       expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
-      expect(host.querySelector('[role="alert"]')?.textContent).toBe("Session expired. The agent can no longer trade or exit its 4 open positions; withdraw tokens from Account → Withdraw, then remove this agent and hire again.");
+      expect(host.querySelector('[role="alert"]')?.textContent).toBe("Session expired — the agent can't trade or sell. Withdraw tokens from Account, or hire again.");
     } finally { await done(); }
   });
 

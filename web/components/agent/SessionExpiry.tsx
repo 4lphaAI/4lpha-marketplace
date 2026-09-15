@@ -96,36 +96,35 @@ export function sessionPillOverride(
 
 export type SessionExpiryKind = "trade" | "lp" | "grid" | "lending";
 
-/** The per-kind sentences: what stops, and what the owner can still do. */
+/**
+ * One short line per kind and state. Operator, 2026-09-15, on the first live
+ * render: "banner to quá, text quá dài" — so: no box, no counts, the remedy in
+ * the fewest words, in the same mono line as the gas notice above it.
+ */
 const COPY: Record<SessionExpiryKind, {
-  readonly stops: (open: number) => string;
-  readonly expiredRecovery: string;
-  readonly soonAdvice: string;
-  readonly pausedAdvice: string;
+  readonly expired: string;
+  readonly soon: (remaining: string) => string;
+  readonly paused: (remaining: string) => string;
 }> = {
   trade: {
-    stops: (open) => `trade or exit${open > 0 ? ` its ${open} open position${open === 1 ? "" : "s"}` : ""}`,
-    expiredRecovery: "withdraw tokens from Account → Withdraw, then remove this agent and hire again.",
-    soonAdvice: "Exits stop working after that — sell the open positions before then, or remove the agent now to exit everything to BNB.",
-    pausedAdvice: "Resume to let the agent sell, or withdraw tokens yourself before then.",
+    expired: "Session expired — the agent can't trade or sell. Withdraw tokens from Account, or hire again.",
+    soon: (r) => `Session ends in ${r} — sell open positions before then, or remove the agent.`,
+    paused: (r) => `Paused · session ends in ${r} — resume so the agent can sell, or withdraw tokens yourself.`,
   },
   lp: {
-    stops: (open) => `rotate, harvest or close${open > 0 ? ` its ${open} open position${open === 1 ? "" : "s"}` : ""}`,
-    expiredRecovery: "the positions stay in your wallet — close them with the passkey from this page, or hire again.",
-    soonAdvice: "Rotates, harvests and closes stop working after that — close the positions before then, or remove the agent now.",
-    pausedAdvice: "Resume to let the agent act, or close the positions yourself before then.",
+    expired: "Session expired — the agent can't rotate or close. Close positions with your passkey below, or hire again.",
+    soon: (r) => `Session ends in ${r} — close positions before then, or remove the agent.`,
+    paused: (r) => `Paused · session ends in ${r} — resume, or close positions yourself.`,
   },
   grid: {
-    stops: (open) => `requote or close${open > 0 ? ` its ${open} live order${open === 1 ? "" : "s"}` : ""}`,
-    expiredRecovery: "the orders stay in your wallet as positions — close them with the passkey from this page, or hire again.",
-    soonAdvice: "Requotes and closes stop working after that — close the ladder before then, or remove the agent now.",
-    pausedAdvice: "Resume to let the agent act, or close the ladder yourself before then.",
+    expired: "Session expired — the agent can't requote or close. Close orders on chain below, or hire again.",
+    soon: (r) => `Session ends in ${r} — close the ladder before then, or remove the agent.`,
+    paused: (r) => `Paused · session ends in ${r} — resume, or close the ladder yourself.`,
   },
   lending: {
-    stops: () => "repay on the borrower's behalf",
-    expiredRecovery: "the reserve stays in the guard wallet — withdraw it from Account → Withdraw, then remove this guard and hire again.",
-    soonAdvice: "The guard stops repaying after that — remove the guard before then and hire it again.",
-    pausedAdvice: "Resume to let the guard act, or remove it before then.",
+    expired: "Session expired — the guard can't repay. Withdraw the reserve from Account, or hire again.",
+    soon: (r) => `Session ends in ${r} — remove the guard before then and hire it again.`,
+    paused: (r) => `Paused · session ends in ${r} — resume, or remove the guard.`,
   },
 };
 
@@ -135,14 +134,10 @@ const COPY: Record<SessionExpiryKind, {
  * Renders nothing while the session has more than a day left, nothing without
  * a recorded session, and — for `soon` — nothing when there is no exposure to
  * strand (`open === 0`): a warning with nothing to do is noise. `expired`
- * always shows for an armed or paused agent, because the page's own pill is
- * the only other place the fact could live and the pill has no room for the
- * remedy. Revoked / retired / provisioning agents are past or before the
- * session and get nothing here.
+ * always shows for an armed or paused agent, because the pill has no room for
+ * the remedy. Revoked / retired / provisioning agents are past or before the
+ * session and get nothing here. Same visual as `GasNotice`: a mono line, no box.
  */
-/** Bounded so a page whose hero is a flex row (LP, grid, lending title columns) wraps its actions instead of stretching. */
-const NOTICE_STYLE = { maxWidth: "88ch" } as const;
-
 export function SessionExpiryNotice({ kind, expiresAt, nowMs, status, open }: {
   readonly kind: SessionExpiryKind;
   readonly expiresAt: number | null | undefined;
@@ -156,20 +151,12 @@ export function SessionExpiryNotice({ kind, expiresAt, nowMs, status, open }: {
   if (status !== "armed" && status !== "paused") return null;
   const copy = COPY[kind];
   const remaining = view.label.replace(/^Expires in /u, "");
-  if (view.state === "expired") {
-    return <div className="fl-trade-message fl-trade-message--warning" style={NOTICE_STYLE} role="alert" data-session-notice="expired">
-      Session expired. The agent can no longer {copy.stops(open)}; {copy.expiredRecovery}
-    </div>;
-  }
+  const line = (state: "expired" | "paused-soon" | "soon", text: string, tone: string) =>
+    <span role="alert" data-session-notice={state} style={{ font: "var(--type-mono-xs)", color: tone }}>{text}</span>;
+  if (view.state === "expired") return line("expired", copy.expired, "var(--danger)");
   if (open <= 0) return null;
-  if (status === "paused") {
-    return <div className="fl-trade-message fl-trade-message--warning" style={NOTICE_STYLE} role="alert" data-session-notice="paused-soon">
-      Paused — the session ends in {remaining}. {copy.pausedAdvice}
-    </div>;
-  }
-  return <div className="fl-trade-message fl-trade-message--warning" style={NOTICE_STYLE} role="alert" data-session-notice="soon">
-    Session ends in {remaining}. {copy.soonAdvice}
-  </div>;
+  if (status === "paused") return line("paused-soon", copy.paused(remaining), "var(--warn)");
+  return line("soon", copy.soon(remaining), "var(--warn)");
 }
 
 const TONES: Record<Exclude<SessionExpiryState, "none">, string> = {

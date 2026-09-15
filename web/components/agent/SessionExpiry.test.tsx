@@ -79,25 +79,25 @@ describe("the shared pill override and notice, one wording for four agent kinds"
     expect(renderToStaticMarkup(<SessionExpiryNotice kind="trade" expiresAt={soon} nowMs={NOW} status="armed" open={0} />)).toBe("");
     const trade = renderToStaticMarkup(<SessionExpiryNotice kind="trade" expiresAt={soon} nowMs={NOW} status="armed" open={4} />);
     expect(trade).toContain('data-session-notice="soon"');
-    expect(trade).toContain("Session ends in 6h. Exits stop working after that — sell the open positions before then, or remove the agent now to exit everything to BNB.");
-    expect(renderToStaticMarkup(<SessionExpiryNotice kind="lp" expiresAt={soon} nowMs={NOW} status="armed" open={1} />)).toContain("Rotates, harvests and closes stop working after that");
-    expect(renderToStaticMarkup(<SessionExpiryNotice kind="grid" expiresAt={soon} nowMs={NOW} status="armed" open={2} />)).toContain("Requotes and closes stop working after that — close the ladder before then");
-    expect(renderToStaticMarkup(<SessionExpiryNotice kind="lending" expiresAt={soon} nowMs={NOW} status="armed" open={1} />)).toContain("The guard stops repaying after that");
+    expect(trade).toContain("Session ends in 6h — sell open positions before then, or remove the agent.");
+    expect(renderToStaticMarkup(<SessionExpiryNotice kind="lp" expiresAt={soon} nowMs={NOW} status="armed" open={1} />)).toContain("Session ends in 6h — close positions before then, or remove the agent.");
+    expect(renderToStaticMarkup(<SessionExpiryNotice kind="grid" expiresAt={soon} nowMs={NOW} status="armed" open={2} />)).toContain("Session ends in 6h — close the ladder before then, or remove the agent.");
+    expect(renderToStaticMarkup(<SessionExpiryNotice kind="lending" expiresAt={soon} nowMs={NOW} status="armed" open={1} />)).toContain("Session ends in 6h — remove the guard before then and hire it again.");
     const paused = renderToStaticMarkup(<SessionExpiryNotice kind="trade" expiresAt={soon} nowMs={NOW} status="paused" open={2} />);
     expect(paused).toContain('data-session-notice="paused-soon"');
-    expect(paused).toContain("Paused — the session ends in 6h. Resume to let the agent sell, or withdraw tokens yourself before then.");
+    expect(paused).toContain("Paused · session ends in 6h — resume so the agent can sell, or withdraw tokens yourself.");
   });
 
   it("says what died and what the owner can still do once the session is over, with or without exposure", () => {
     expect(renderToStaticMarkup(<SessionExpiryNotice kind="trade" expiresAt={dead} nowMs={NOW} status="armed" open={4} />))
-      .toContain("Session expired. The agent can no longer trade or exit its 4 open positions; withdraw tokens from Account → Withdraw, then remove this agent and hire again.");
+      .toContain("Session expired — the agent can&#x27;t trade or sell. Withdraw tokens from Account, or hire again.");
     expect(renderToStaticMarkup(<SessionExpiryNotice kind="trade" expiresAt={dead} nowMs={NOW} status="paused" open={0} />))
-      .toContain("Session expired. The agent can no longer trade or exit; withdraw tokens");
+      .toContain("Session expired — the agent can&#x27;t trade or sell.");
     expect(renderToStaticMarkup(<SessionExpiryNotice kind="lp" expiresAt={dead} nowMs={NOW} status="armed" open={1} />))
-      .toContain("can no longer rotate, harvest or close its 1 open position; the positions stay in your wallet — close them with the passkey from this page, or hire again.");
+      .toContain("the agent can&#x27;t rotate or close. Close positions with your passkey below, or hire again.");
     expect(renderToStaticMarkup(<SessionExpiryNotice kind="grid" expiresAt={dead} nowMs={NOW} status="armed" open={2} />))
-      .toContain("can no longer requote or close its 2 live orders; the orders stay in your wallet as positions");
+      .toContain("the agent can&#x27;t requote or close. Close orders on chain below, or hire again.");
     expect(renderToStaticMarkup(<SessionExpiryNotice kind="lending" expiresAt={dead} nowMs={NOW} status="armed" open={1} />))
-      .toContain("can no longer repay on the borrower&#x27;s behalf; the reserve stays in the guard wallet");
+      .toContain("the guard can&#x27;t repay. Withdraw the reserve from Account, or hire again.");
   });
 });
