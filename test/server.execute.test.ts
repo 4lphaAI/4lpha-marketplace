@@ -57,6 +57,20 @@ async function execute(
 }
 
 describe("execute — the happy path", () => {
+  it("[F8] reads one coherent executing session tuple for each raw submission", async () => {
+    const harness = await createHarness();
+    let reads = 0;
+    const original = harness.agentStore.readExecutingSession.bind(harness.agentStore);
+    harness.agentStore.readExecutingSession = async (owner, id) => {
+      reads += 1;
+      return original(owner, id);
+    };
+    const response = await execute(harness);
+    assert.equal(response.status, 200);
+    assert.equal(harness.provider.executeCalls.length, 1);
+    assert.equal(reads, harness.provider.executeCalls.length);
+  });
+
   it("submits with only the service credential and no owner signature", async () => {
     const harness = await createHarness();
     const response = await execute(harness);

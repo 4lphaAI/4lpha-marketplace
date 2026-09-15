@@ -87,7 +87,13 @@ function validGas(value: unknown): boolean {
 
 function validAgent(value: unknown): boolean {
   const agent = row(value); const holdings = row(agent?.["holdings"]); const pnl = row(agent?.["pnl"]);
-  if (agent === null || holdings === null || pnl === null || !exact(agent, ["id", "status", "httpRuntimeProfile", "walletAddress", "attention", "gas", "holdings", "pnl"]) || !validGas(agent["gas"])) return false;
+  const legacyKeys = ["id", "status", "httpRuntimeProfile", "walletAddress", "attention", "gas", "holdings", "pnl"];
+  const hasSession = agent !== null && Object.prototype.hasOwnProperty.call(agent, "session");
+  if (agent === null || holdings === null || pnl === null || (!exact(agent, legacyKeys) && !exact(agent, [...legacyKeys, "session"])) || !validGas(agent["gas"])) return false;
+  if (hasSession) {
+    const session = row(agent["session"]);
+    if (session === null || !exact(session, ["expiresAt", "renewable"]) || (session["expiresAt"] !== null && !integer(session["expiresAt"])) || typeof session["renewable"] !== "boolean") return false;
+  }
   if (typeof agent["id"] !== "string" || typeof agent["status"] !== "string" || !STATUSES.has(agent["status"]) || typeof agent["httpRuntimeProfile"] !== "string" || !PROFILES.has(agent["httpRuntimeProfile"]) || typeof agent["walletAddress"] !== "string" || !ADDRESS.test(agent["walletAddress"]) || typeof agent["attention"] !== "string" || !ATTENTION.has(agent["attention"])) return false;
   if (!exact(holdings, ["method", "state", "reason", "valueUsdMicros", "venusReference", "held"]) || typeof holdings["method"] !== "string" || !HOLDING_METHODS.has(holdings["method"]) || typeof holdings["state"] !== "string" || !STATES.has(holdings["state"]) || typeof holdings["reason"] !== "string" || !REASONS.has(holdings["reason"] as AccountCoverageReason) || !decimalOrNull(holdings["valueUsdMicros"], true) || holdings["venusReference"] !== null && holdings["venusReference"] !== "owner-wide" || typeof holdings["held"] !== "boolean") return false;
   if ((holdings["state"] === "partial" || holdings["state"] === "unavailable") && holdings["valueUsdMicros"] !== null) return false;

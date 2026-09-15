@@ -68,6 +68,26 @@ function agent(id: string, profile: AgentRecord["httpRuntimeProfile"], custodyMo
 }
 
 describe("account portfolio", () => {
+  it("[F7] emits the session row only for account view 2 and computes renewable eligibility", async () => {
+    const live = agent("renewable", "trade-v1");
+    const expiredAt = Math.floor(NOW / 1_000) - 1;
+    const expired = { ...live, sessionFacts: { ...live.sessionFacts!, spec: { ...live.sessionFacts!.spec, expiresAt: expiredAt }, expiry: expiredAt } } as AgentRecord;
+    const legacy = await buildAccountPortfolio(OWNER, deps([expired]));
+    assert.equal(Object.prototype.hasOwnProperty.call(legacy.agents[0]!, "session"), false);
+
+    const versioned = await buildAccountPortfolio(OWNER, deps([expired]), { accountViewVersion: 2 });
+    assert.deepEqual(versioned.agents[0]?.session, { expiresAt: expiredAt, renewable: true });
+
+    const paused = await buildAccountPortfolio(OWNER, deps([{ ...expired, status: "paused" } as AgentRecord]), { accountViewVersion: 2 });
+    assert.equal(paused.agents[0]?.session?.renewable, true);
+    const revoked = await buildAccountPortfolio(OWNER, deps([{ ...expired, status: "revoked" } as AgentRecord]), { accountViewVersion: 2 });
+    assert.equal(revoked.agents[0]?.session?.renewable, false);
+    const pending = await buildAccountPortfolio(OWNER, deps([{ ...expired, pendingRenewal: {} } as unknown as AgentRecord]), { accountViewVersion: 2 });
+    assert.equal(pending.agents[0]?.session?.renewable, false);
+    const lending = await buildAccountPortfolio(OWNER, deps([{ ...expired, sessionFacts: { ...expired.sessionFacts!, hireSizing: { name: "lending-v1", version: 1, openNativeBudgetWei: "0" } } } as AgentRecord]), { accountViewVersion: 2 });
+    assert.equal(lending.agents[0]?.session?.renewable, false);
+  });
+
   it("returns an honest empty account", async () => {
     const view = await buildAccountPortfolio(OWNER, deps([]));
     assert.equal(view.coverage.wallet.state, "empty");

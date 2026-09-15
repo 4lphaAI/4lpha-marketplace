@@ -42,10 +42,12 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const path = wallets.length === 0
     ? "/account/portfolio"
     : `/account/portfolio?wallets=${encodeURIComponent(wallets.join(","))}`;
+  const accountView = request.headers.get("x-account-view");
+  const versionHeaders: Record<string, string> = accountView === "2" ? { "x-account-view": "2" } : {};
   try {
     const upstream = credential.kind === "bearer"
-      ? await execAccountRead(path, credential.value)
-      : await execOwnerRead(path, credential.value);
+      ? accountView === "2" ? await execAccountRead(path, credential.value, versionHeaders) : await execAccountRead(path, credential.value)
+      : accountView === "2" ? await execOwnerRead(path, credential.value, versionHeaders) : await execOwnerRead(path, credential.value);
     const response = new NextResponse(upstream.body, {
       status: upstream.status,
       headers: { "content-type": "application/json", "cache-control": "private, no-store" },

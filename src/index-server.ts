@@ -66,7 +66,7 @@ import {
 } from "./lending/wiring.js";
 import { resolveLendingEnabled } from "./ops/config.js";
 import { resolveLpRpcUrls } from "./lp/readers.js";
-import { createKeyStoreReader } from "./account/keyStoreReader.js";
+import { createKeyStoreReader, readFinalizedSessionRevocation } from "./account/keyStoreReader.js";
 import { createBalanceReader } from "./account/balanceReader.js";
 import { createPreBindRetirementFinalizer } from "./lp/preBindRetirementFinalizer.js";
 import { resolveBillingConfig } from "./billing/config.js";
@@ -76,6 +76,7 @@ import { loadBillingProductionRuntime } from "./billing/runtime.js";
 import { listenBillingInternalGateway } from "./billing/listener.js";
 import { createGrantEvidenceReader } from "./wallet/grantEvidence.js";
 import { createProvisioningWorker } from "./wallet/provisioningWorker.js";
+import { assessRenewalQuiescence } from "./wallet/provisioning.js";
 import { createTradeSettingsStore } from "./store/tradeSettings.js";
 import { createTradePositionStore } from "./store/tradePositions.js";
 import { createTradeIntentStore } from "./store/tradeIntents.js";
@@ -639,6 +640,43 @@ const provisioningWorker = hireEvidence === undefined ? undefined : createProvis
     lendingSettings: lendingBuilt.settingsStore,
     lendingGuards: lendingBuilt.guards,
   }),
+  renewalQuiescence: async (agent) => assessRenewalQuiescence(agent, {
+    ...(tradeIntents === undefined ? {} : { tradeIntents }),
+    ...(lpBuilt === undefined ? {} : { lpSequences: lpBuilt.lp.store }),
+    journal,
+  }),
+  renewalCoverage: async (agent, pending) => {
+    if (pending.sizing.sizingPreset !== "trade-v1") return { ok: true };
+    if (tradePositions === undefined || tradeIntents === undefined) return { ok: false };
+    const allowed = new Set(pending.sessionSpec.allowedCalls
+      .filter((rule) => rule.selector === "approve(address,uint256)" && rule.to !== undefined)
+      .map((rule) => rule.to!.toLowerCase()));
+    const capped = new Set(pending.sessionSpec.spendCaps.filter((cap) => cap.token !== undefined).map((cap) => cap.token!.toLowerCase()));
+    const [positions, unsettled] = await Promise.all([
+      tradePositions.list(agent.ownerAddress, agent.id),
+      tradeIntents.listUnsettled(agent.ownerAddress, agent.id),
+    ]);
+    const held = [...positions.filter((row) => row.status === "open").map((row) => row.token), ...unsettled.map((row) => row.token)];
+    const missing = held.find((token) => !allowed.has(token.toLowerCase()) || !capped.has(token.toLowerCase()));
+    return missing === undefined ? { ok: true } : { ok: false, token: missing };
+  },
+  ...(tradePositions === undefined || tradeSettingsStore === undefined ? {} : { rebaseTradeEvidence: async (owner: Address, id: string, generation: number) => {
+    const fenced = await tradeSettingsStore.withEntryFence(owner, id, (sql) => tradePositions!.rebaseRenewalEvidenceForAgent(owner, id, generation, sql));
+    return fenced.kind === "allowed" && fenced.value;
+  } }),
+  ...(tradePositions === undefined || tradeSettingsStore === undefined ? {} : { clearRenewalMarkers: async (agent: import("./store/agents.js").AgentRecord) => {
+    const fenced = await tradeSettingsStore.withEntryFence(agent.ownerAddress, agent.id, (sql) => tradePositions!.clearSessionExpiringMarkers({ ownerAddress: agent.ownerAddress, agentId: agent.id }, sql));
+    // The pre-swap rebase already cleared the transient marker. Once a drain
+    // owns the entry fence, there is no later writer that can recreate it.
+    return fenced.kind === "allowed" || fenced.kind === "draining";
+  } }),
+  readK2Revocation: async (pending) => {
+    const result = await readFinalizedSessionRevocation({
+      chainId: network.chainId, keyStoreAddress: keyStore, wallet: pending.walletAddress, keyId: pending.keyStoreKeyId,
+      expectedPublicKey: pending.sessionPublicKey, observedAtMs: Date.now(), reader: keyStoreReader,
+    });
+    return result.kind;
+  },
   onError: (message) => console.warn(`[execution-plane] hire convergence failed: ${message}`),
 });
 const provisioningTimer = provisioningWorker === undefined ? undefined : setInterval(() => {

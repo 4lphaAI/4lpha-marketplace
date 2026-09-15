@@ -16,6 +16,7 @@ export type TradeCrashPendingKind = "collapse" | "dust";
 export type TradeAutoExitReason = "crash-stop" | "session-expiring";
 
 export type TradeEvidenceExpected = {
+  readonly sessionGeneration?: number;
   readonly lastQuoteWei: bigint | null;
   readonly lastQuoteBalance: bigint | null;
   readonly lastQuoteRoute: string | null;
@@ -75,12 +76,13 @@ export type TradePositionRecord = {
   readonly autoExitReason: TradeAutoExitReason | null;
   readonly autoExitAtMs: number | null;
   readonly autoExitNote: string | null;
+  readonly sessionGeneration?: number;
 };
 
 export type OpenTradePositionInput = Pick<
   TradePositionRecord,
   "positionId" | "agentId" | "ownerAddress" | "token" | "route" | "entryWei" | "tokenAmount" | "fillStatus" | "openedAt"
-> & { readonly entryTxHash?: Hex | null; readonly crashBasisVerified?: boolean };
+> & { readonly entryTxHash?: Hex | null; readonly crashBasisVerified?: boolean; readonly sessionGeneration?: number };
 
 /** Closed telemetry fields; event projection discards arbitrary payloads and credentials. */
 export type TradeRunInput = {
@@ -143,7 +145,8 @@ export interface TradePositionStore {
     readonly routeKey?: string;
     readonly pnlBps: bigint | null;
     readonly atMs: number;
-    readonly expected?: Pick<TradeEvidenceExpected, "lastQuoteWei" | "lastQuoteBalance" | "lastQuoteRoute" | "lastQuoteAtMs">;
+    readonly sessionGeneration?: number;
+    readonly expected?: Pick<TradeEvidenceExpected, "lastQuoteWei" | "lastQuoteBalance" | "lastQuoteRoute" | "lastQuoteAtMs" | "sessionGeneration">;
   }, sql?: SqlClient): Promise<TradePositionRecord | null>;
   recordCrashEvidence(input: {
     readonly ownerAddress: Address;
@@ -151,7 +154,14 @@ export interface TradePositionStore {
     readonly positionId: string;
     readonly expected: TradeEvidenceExpected;
     readonly action: TradeCrashEvidenceAction;
+    readonly writerGeneration?: number;
   }, sql?: SqlClient): Promise<TradePositionRecord | null>;
+  rebaseRenewalEvidenceForAgent(ownerAddress: Address, agentId: string, generation: number, sql?: SqlClient): Promise<boolean>;
+  clearSessionExpiringMarkers(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly beforeMs?: number;
+  }, sql?: SqlClient): Promise<number>;
   clearCrashEvidenceForAgent(ownerAddress: Address, agentId: string, sql?: SqlClient): Promise<number>;
   incrementNoPrice(ownerAddress: Address, agentId: string, positionId: string): Promise<TradePositionRecord | null>;
   resetNoPrice(ownerAddress: Address, agentId: string, positionId: string): Promise<TradePositionRecord | null>;
@@ -279,6 +289,7 @@ export class MemoryTradePositionStore implements TradePositionStore {
       autoExitReason: null,
       autoExitAtMs: null,
       autoExitNote: null,
+       sessionGeneration: input.sessionGeneration ?? 0,
     };
     this.#positions.set(row.positionId, structuredClone(row));
     return structuredClone(row);
@@ -396,7 +407,8 @@ export class MemoryTradePositionStore implements TradePositionStore {
     readonly routeKey?: string;
     readonly pnlBps: bigint | null;
     readonly atMs: number;
-    readonly expected?: Pick<TradeEvidenceExpected, "lastQuoteWei" | "lastQuoteBalance" | "lastQuoteRoute" | "lastQuoteAtMs">;
+    readonly sessionGeneration?: number;
+    readonly expected?: Pick<TradeEvidenceExpected, "lastQuoteWei" | "lastQuoteBalance" | "lastQuoteRoute" | "lastQuoteAtMs" | "sessionGeneration">;
   }): Promise<TradePositionRecord | null> {
     const row = this.#owned(input.ownerAddress, input.agentId, input.positionId);
     if (row === undefined || row.status !== "open") return null;
@@ -405,10 +417,20 @@ export class MemoryTradePositionStore implements TradePositionStore {
       lastQuoteBalance: row.lastQuoteBalance,
       lastQuoteRoute: row.lastQuoteRoute,
       lastQuoteAtMs: row.lastQuoteAtMs,
+      sessionGeneration: row.sessionGeneration ?? 0,
     };
-    if (!sameQuoteState(row, expected) || !quoteTimestampCanAdvance(expected.lastQuoteAtMs, input.atMs)) return null;
+    const storedGeneration = row.sessionGeneration ?? 0;
+    const expectedGeneration = expected.sessionGeneration ?? storedGeneration;
+    const writerGeneration = input.sessionGeneration ?? expectedGeneration;
+    if (storedGeneration !== expectedGeneration || writerGeneration < expectedGeneration) return null;
+    const rebased = writerGeneration > storedGeneration
+      ? { ...row, sessionGeneration: writerGeneration, crashPendingSinceMs: null, crashPendingKind: null,
+          crashRefQuoteWei: null, crashRefBalance: null, crashRefAtMs: null, crashRefRoute: null,
+          ...(row.autoExitReason === "session-expiring" ? { autoExitReason: null, autoExitAtMs: null, autoExitNote: null } : {}) }
+      : row;
+    if (!sameQuoteState(rebased, expected) || !quoteTimestampCanAdvance(expected.lastQuoteAtMs, input.atMs)) return null;
     const next: TradePositionRecord = {
-      ...row,
+      ...rebased,
       lastQuoteWei: input.quoteOutWei,
       lastQuoteBalance: input.balance ?? null,
       lastQuoteRoute: input.routeKey ?? null,
@@ -426,10 +448,22 @@ export class MemoryTradePositionStore implements TradePositionStore {
     readonly positionId: string;
     readonly expected: TradeEvidenceExpected;
     readonly action: TradeCrashEvidenceAction;
+    readonly writerGeneration?: number;
   }): Promise<TradePositionRecord | null> {
     const row = this.#owned(input.ownerAddress, input.agentId, input.positionId);
-    if (row === undefined || row.status !== "open" || !sameEvidence(row, input.expected)) return null;
-    const next = applyEvidence(row, input.action);
+    if (row === undefined || row.status !== "open") return null;
+    const storedGeneration = row.sessionGeneration ?? 0;
+    const expectedGeneration = input.expected.sessionGeneration ?? storedGeneration;
+    const writerGeneration = input.writerGeneration ?? expectedGeneration;
+    if (storedGeneration !== expectedGeneration || writerGeneration < expectedGeneration || !sameEvidence(row, input.expected)) return null;
+    if (writerGeneration > storedGeneration) {
+      this.#positions.set(row.positionId, structuredClone({ ...row, sessionGeneration: writerGeneration,
+        crashPendingSinceMs: null, crashPendingKind: null, crashRefQuoteWei: null, crashRefBalance: null,
+        crashRefAtMs: null, crashRefRoute: null,
+        ...(row.autoExitReason === "session-expiring" ? { autoExitReason: null, autoExitAtMs: null, autoExitNote: null } : {}) }));
+      return null;
+    }
+    const next = applyEvidence({ ...row, sessionGeneration: writerGeneration }, input.action);
     this.#positions.set(row.positionId, structuredClone(next));
     return structuredClone(next);
   }
@@ -445,6 +479,31 @@ export class MemoryTradePositionStore implements TradePositionStore {
         crashRefQuoteWei: null, crashRefBalance: null, crashRefAtMs: null, crashRefRoute: null,
         ...(row.autoExitReason === "crash-stop" ? { autoExitReason: null, autoExitAtMs: null, autoExitNote: null } : {}),
       }));
+      cleared += 1;
+    }
+    return cleared;
+  }
+
+  async rebaseRenewalEvidenceForAgent(ownerAddress: Address, agentId: string, generation: number): Promise<boolean> {
+    if (!Number.isSafeInteger(generation) || generation < 0) return false;
+    const owner = ownerKey(ownerAddress);
+    for (const [positionId, row] of this.#positions) {
+      if (row.ownerAddress !== owner || row.agentId !== agentId || row.status !== "open") continue;
+      this.#positions.set(positionId, structuredClone({ ...row, sessionGeneration: Math.max(row.sessionGeneration ?? 0, generation),
+        crashPendingSinceMs: null, crashPendingKind: null, crashRefQuoteWei: null, crashRefBalance: null,
+        crashRefAtMs: null, crashRefRoute: null,
+        ...(row.autoExitReason === "session-expiring" ? { autoExitReason: null, autoExitAtMs: null, autoExitNote: null } : {}) }));
+    }
+    return true;
+  }
+
+  async clearSessionExpiringMarkers(input: { readonly ownerAddress: Address; readonly agentId: string; readonly beforeMs?: number }): Promise<number> {
+    const owner = ownerKey(input.ownerAddress);
+    let cleared = 0;
+    for (const [positionId, row] of this.#positions) {
+      if (row.ownerAddress !== owner || row.agentId !== input.agentId || row.status !== "open" || row.autoExitReason !== "session-expiring"
+        || input.beforeMs !== undefined && (row.autoExitAtMs === null || row.autoExitAtMs >= input.beforeMs)) continue;
+      this.#positions.set(positionId, structuredClone({ ...row, autoExitReason: null, autoExitAtMs: null, autoExitNote: null }));
       cleared += 1;
     }
     return cleared;
@@ -530,13 +589,14 @@ type PositionRow = {
   crash_ref_quote_wei: string | null; crash_ref_balance: string | null; crash_ref_at: Date | null;
   crash_ref_route: string | null; auto_exit_reason: string | null; auto_exit_at: Date | null;
   auto_exit_note: string | null; close_note: string | null;
+  session_generation?: number;
 };
 type RunRow = {
   id: string; agent_id: string; owner_address: string; dry_run: boolean;
   events?: unknown; reason: string; candidates: number; refusals: number; entries: number; exits: number; created_at: Date;
 };
 
-const POSITION_COLUMNS = "id, agent_id, owner_address, token, route, entry_wei, token_amount, fill_status, opened_at, entry_tx_hash, status, exit_requested_at, orphaned_at, closed_at, exit_wei, exit_tx_hash, sold_token_amount, exit_fill_status, close_reason, last_sell_refusal, last_sell_refusal_at, no_price_count, crash_basis_verified, last_quote_wei, last_quote_balance, last_quote_route, last_quote_at, peak_pnl_bps, crash_pending_since, crash_pending_kind, crash_ref_quote_wei, crash_ref_balance, crash_ref_at, crash_ref_route, auto_exit_reason, auto_exit_at, auto_exit_note, close_note";
+const POSITION_COLUMNS = "id, agent_id, owner_address, token, route, entry_wei, token_amount, fill_status, opened_at, entry_tx_hash, status, exit_requested_at, orphaned_at, closed_at, exit_wei, exit_tx_hash, sold_token_amount, exit_fill_status, close_reason, last_sell_refusal, last_sell_refusal_at, no_price_count, crash_basis_verified, last_quote_wei, last_quote_balance, last_quote_route, last_quote_at, peak_pnl_bps, crash_pending_since, crash_pending_kind, crash_ref_quote_wei, crash_ref_balance, crash_ref_at, crash_ref_route, auto_exit_reason, auto_exit_at, auto_exit_note, close_note, session_generation";
 const RUN_COLUMNS = "id, agent_id, owner_address, dry_run, reason, candidates, refusals, entries, exits, created_at, events";
 
 const TRADE_POSITIONS_DDL = `
@@ -578,7 +638,8 @@ const TRADE_POSITIONS_DDL = `
     auto_exit_reason text,
     auto_exit_at timestamptz,
     auto_exit_note text,
-    close_note text
+    close_note text,
+    session_generation integer not null default 0
   )
 `;
 const TRADE_RUNS_DDL = `
@@ -638,6 +699,7 @@ export class PostgresTradePositionStore implements TradePositionStore {
       await tx.query(`alter table trade_positions add column if not exists auto_exit_at timestamptz`);
       await tx.query(`alter table trade_positions add column if not exists auto_exit_note text`);
       await tx.query(`alter table trade_positions add column if not exists close_note text`);
+      await tx.query(`alter table trade_positions add column if not exists session_generation integer not null default 0`);
       // R3.6/R4.4: the name is deliberately scoped to this table, so another
       // store's constraint cannot satisfy the migration check.
       await tx.query(`select pg_advisory_xact_lock(hashtext('trade_positions'))`);
@@ -668,13 +730,14 @@ export class PostgresTradePositionStore implements TradePositionStore {
     const result = await this.#sql.query<PositionRow>(
       `/* tradePositions.open */ insert into trade_positions (${POSITION_COLUMNS})
        values ($1,$2,$3,$4,$5::jsonb,$6::numeric,$7::numeric,$8,$9,$10,'open',
-         null,null,null,null,null,null,null,null,null,null,0,$11,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null)
+          null,null,null,null,null,null,null,null,null,null,0,$11,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,$12)
        on conflict (id) do nothing returning ${POSITION_COLUMNS}`,
       [input.positionId, input.agentId, ownerKey(input.ownerAddress), getAddress(input.token),
         encodeJsonbParam(input.route), input.entryWei.toString(10), input.tokenAmount?.toString(10) ?? null,
         input.fillStatus, new Date(input.openedAt), hashOrNull(input.entryTxHash),
-        input.crashBasisVerified === true && input.fillStatus === "verified" && input.tokenAmount !== null
-          && input.tokenAmount > 0n && input.entryTxHash !== null && input.entryTxHash !== undefined],
+         input.crashBasisVerified === true && input.fillStatus === "verified" && input.tokenAmount !== null
+           && input.tokenAmount > 0n && input.entryTxHash !== null && input.entryTxHash !== undefined,
+         input.sessionGeneration ?? 0],
     );
     const row = result.rows[0];
     if (row === undefined) throw new Error(`Trade position "${input.positionId}" already exists.`);
@@ -747,7 +810,8 @@ export class PostgresTradePositionStore implements TradePositionStore {
     readonly routeKey?: string;
     readonly pnlBps: bigint | null;
     readonly atMs: number;
-    readonly expected?: Pick<TradeEvidenceExpected, "lastQuoteWei" | "lastQuoteBalance" | "lastQuoteRoute" | "lastQuoteAtMs">;
+    readonly sessionGeneration?: number;
+    readonly expected?: Pick<TradeEvidenceExpected, "lastQuoteWei" | "lastQuoteBalance" | "lastQuoteRoute" | "lastQuoteAtMs" | "sessionGeneration">;
   }, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
     const expected = input.expected;
     const resolved = expected ?? await this.get(input.ownerAddress, input.agentId, input.positionId, sql);
@@ -757,24 +821,39 @@ export class PostgresTradePositionStore implements TradePositionStore {
       lastQuoteBalance: resolved.lastQuoteBalance,
       lastQuoteRoute: resolved.lastQuoteRoute,
       lastQuoteAtMs: resolved.lastQuoteAtMs,
+      sessionGeneration: resolved.sessionGeneration ?? 0,
     };
+    const expectedGeneration = state.sessionGeneration ?? resolved.sessionGeneration ?? 0;
+    const writerGeneration = input.sessionGeneration ?? expectedGeneration;
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0 || !Number.isSafeInteger(writerGeneration) || writerGeneration < expectedGeneration) return null;
     if (!quoteTimestampCanAdvance(state.lastQuoteAtMs, input.atMs)) return null;
     const result = await sql.query<PositionRow>(
       `/* tradePositions.recordQuote */ update trade_positions set
          last_quote_wei = $4::numeric, last_quote_balance = $5::numeric, last_quote_route = $6,
          last_quote_at = $7, peak_pnl_bps = case when $8::numeric is null then peak_pnl_bps
-           when peak_pnl_bps is null or peak_pnl_bps < $8::numeric then $8::numeric else peak_pnl_bps end
+           when peak_pnl_bps is null or peak_pnl_bps < $8::numeric then $8::numeric else peak_pnl_bps end,
+         session_generation = greatest(session_generation, $13::integer),
+         crash_pending_since = case when $13::integer > session_generation then null else crash_pending_since end,
+         crash_pending_kind = case when $13::integer > session_generation then null else crash_pending_kind end,
+         crash_ref_quote_wei = case when $13::integer > session_generation then null else crash_ref_quote_wei end,
+         crash_ref_balance = case when $13::integer > session_generation then null else crash_ref_balance end,
+         crash_ref_at = case when $13::integer > session_generation then null else crash_ref_at end,
+         crash_ref_route = case when $13::integer > session_generation then null else crash_ref_route end,
+         auto_exit_reason = case when $13::integer > session_generation and auto_exit_reason = 'session-expiring' then null else auto_exit_reason end,
+         auto_exit_at = case when $13::integer > session_generation and auto_exit_reason = 'session-expiring' then null else auto_exit_at end,
+         auto_exit_note = case when $13::integer > session_generation and auto_exit_reason = 'session-expiring' then null else auto_exit_note end
        where id = $1 and agent_id = $2 and owner_address = $3 and status = 'open'
          and last_quote_wei is not distinct from $9::numeric
          and last_quote_balance is not distinct from $10::numeric
          and last_quote_route is not distinct from $11::text
          and last_quote_at is not distinct from $12::timestamptz
          and ($12::timestamptz is null or $7::timestamptz > $12::timestamptz or $12::timestamptz > $7::timestamptz)
+         and session_generation = $14::integer
        returning ${POSITION_COLUMNS}`,
       [input.positionId, input.agentId, ownerKey(input.ownerAddress), input.quoteOutWei.toString(10),
         input.balance?.toString(10) ?? null, input.routeKey ?? null, new Date(input.atMs),
         input.pnlBps?.toString(10) ?? null, state.lastQuoteWei?.toString(10) ?? null,
-        state.lastQuoteBalance?.toString(10) ?? null, state.lastQuoteRoute, state.lastQuoteAtMs === null ? null : new Date(state.lastQuoteAtMs)],
+        state.lastQuoteBalance?.toString(10) ?? null, state.lastQuoteRoute, state.lastQuoteAtMs === null ? null : new Date(state.lastQuoteAtMs), writerGeneration, expectedGeneration],
     );
     return result.rows[0] === undefined ? null : rowToPosition(result.rows[0]);
   }
@@ -785,8 +864,12 @@ export class PostgresTradePositionStore implements TradePositionStore {
     readonly positionId: string;
     readonly expected: TradeEvidenceExpected;
     readonly action: TradeCrashEvidenceAction;
+    readonly writerGeneration?: number;
   }, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
     const expected = input.expected;
+    const expectedGeneration = expected.sessionGeneration ?? 0;
+    const writerGeneration = input.writerGeneration ?? expectedGeneration;
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0 || !Number.isSafeInteger(writerGeneration) || writerGeneration < expectedGeneration) return null;
     let assignment: string;
     let actionParams: readonly unknown[];
     if (input.action.kind === "arm") {
@@ -801,6 +884,14 @@ export class PostgresTradePositionStore implements TradePositionStore {
       assignment = "crash_pending_since = null, crash_pending_kind = null, crash_ref_quote_wei = null, crash_ref_balance = null, crash_ref_at = null, crash_ref_route = null";
       actionParams = [];
     }
+    const rebasing = writerGeneration > expectedGeneration;
+    if (rebasing) {
+      assignment = "crash_pending_since = null, crash_pending_kind = null, crash_ref_quote_wei = null, crash_ref_balance = null, crash_ref_at = null, crash_ref_route = null, auto_exit_reason = case when auto_exit_reason = 'session-expiring' then null else auto_exit_reason end, auto_exit_at = case when auto_exit_reason = 'session-expiring' then null else auto_exit_at end, auto_exit_note = case when auto_exit_reason = 'session-expiring' then null else auto_exit_note end, session_generation = $17";
+      actionParams = [];
+    }
+    const generationParam = 17 + actionParams.length;
+    const expectedGenerationParam = generationParam + 1;
+    if (!rebasing) assignment = `${assignment}, session_generation = $${generationParam}`;
     const result = await sql.query<PositionRow>(
       `/* tradePositions.recordEvidence */ update trade_positions set ${assignment}
        where id = $1 and agent_id = $2 and owner_address = $3 and status = 'open'
@@ -817,6 +908,7 @@ export class PostgresTradePositionStore implements TradePositionStore {
          and auto_exit_reason is not distinct from $14::text
          and auto_exit_at is not distinct from $15::timestamptz
          and auto_exit_note is not distinct from $16::text
+         and session_generation = $${expectedGenerationParam}::integer
        returning ${POSITION_COLUMNS}`,
       [input.positionId, input.agentId, ownerKey(input.ownerAddress), expected.lastQuoteWei?.toString(10) ?? null,
         expected.lastQuoteBalance?.toString(10) ?? null, expected.lastQuoteRoute,
@@ -825,9 +917,9 @@ export class PostgresTradePositionStore implements TradePositionStore {
         expected.crashRefQuoteWei?.toString(10) ?? null, expected.crashRefBalance?.toString(10) ?? null,
         expected.crashRefAtMs === null ? null : new Date(expected.crashRefAtMs), expected.crashRefRoute,
         expected.autoExitReason, expected.autoExitAtMs === null ? null : new Date(expected.autoExitAtMs), expected.autoExitNote,
-        ...actionParams],
+        ...actionParams, writerGeneration, expectedGeneration],
     );
-    return result.rows[0] === undefined ? null : rowToPosition(result.rows[0]);
+    return rebasing || result.rows[0] === undefined ? null : rowToPosition(result.rows[0]);
   }
 
   async clearCrashEvidenceForAgent(ownerAddress: Address, agentId: string, sql: SqlClient = this.#sql): Promise<number> {
@@ -840,6 +932,34 @@ export class PostgresTradePositionStore implements TradePositionStore {
          auto_exit_note = case when auto_exit_reason = 'crash-stop' then null else auto_exit_note end
        where owner_address = $1 and agent_id = $2 and status = 'open' returning id`,
       [ownerKey(ownerAddress), agentId],
+    );
+    return result.rows.length;
+  }
+
+  async rebaseRenewalEvidenceForAgent(ownerAddress: Address, agentId: string, generation: number, sql: SqlClient = this.#sql): Promise<boolean> {
+    if (!Number.isSafeInteger(generation) || generation < 0) return false;
+    await sql.query(
+      `/* tradePositions.rebaseRenewalEvidence */ update trade_positions set
+         session_generation = greatest(session_generation, $3::integer),
+         crash_pending_since = null, crash_pending_kind = null, crash_ref_quote_wei = null,
+         crash_ref_balance = null, crash_ref_at = null, crash_ref_route = null,
+         auto_exit_reason = case when auto_exit_reason = 'session-expiring' then null else auto_exit_reason end,
+         auto_exit_at = case when auto_exit_reason = 'session-expiring' then null else auto_exit_at end,
+         auto_exit_note = case when auto_exit_reason = 'session-expiring' then null else auto_exit_note end
+       where owner_address = $1 and agent_id = $2 and status = 'open'`,
+      [ownerKey(ownerAddress), agentId, generation],
+    );
+    return true;
+  }
+
+  async clearSessionExpiringMarkers(input: { readonly ownerAddress: Address; readonly agentId: string; readonly beforeMs?: number }, sql: SqlClient = this.#sql): Promise<number> {
+    const result = await sql.query<{ readonly id: string }>(
+      `/* tradePositions.clearSessionExpiringMarkers */ update trade_positions set
+         auto_exit_reason = null, auto_exit_at = null, auto_exit_note = null
+       where owner_address = $1 and agent_id = $2 and status = 'open' and auto_exit_reason = 'session-expiring'
+         and ($3::timestamptz is null or auto_exit_at < $3::timestamptz)
+       returning id`,
+      [ownerKey(input.ownerAddress), input.agentId, input.beforeMs === undefined ? null : new Date(input.beforeMs)],
     );
     return result.rows.length;
   }
@@ -928,6 +1048,7 @@ function rowToPosition(row: PositionRow): TradePositionRecord {
     crashRefBalance: row.crash_ref_balance === null || row.crash_ref_balance === undefined ? null : BigInt(row.crash_ref_balance),
     crashRefAtMs: epoch(row.crash_ref_at), crashRefRoute: row.crash_ref_route ?? null,
     autoExitReason: autoExitReason(row.auto_exit_reason), autoExitAtMs: epoch(row.auto_exit_at), autoExitNote: row.auto_exit_note ?? null,
+    sessionGeneration: row.session_generation ?? 0,
   };
 }
 function fillStatus(value: string): TradeFillStatus {

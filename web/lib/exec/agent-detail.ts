@@ -347,6 +347,7 @@ export type AgentDetailView = {
   readonly hireSizingName: string | null;
   readonly walletAddress: string;
   readonly sessionPublicKey: string | null;
+  readonly renewalPending?: boolean;
   /**
    * When the on-chain session's authority ends, unix SECONDS, or `null` when
    * no session is on record. The owner DTO already carried this inside the
@@ -566,6 +567,7 @@ function parseOwner(payload: unknown): {
   status: string;
   walletAddress: string;
   session: Row | null;
+  pendingRenewal: Row | null;
   httpRuntimeProfile: string;
   hireSizingName: string | null;
   armedBudgetWei: string | null;
@@ -588,6 +590,7 @@ function parseOwner(payload: unknown): {
     armedBudgetWei: typeof row(data["hireSizing"])?.["openNativeBudgetWei"] === "string"
       ? String(row(data["hireSizing"])?.["openNativeBudgetWei"]) : null,
     session: data["session"] === null ? null : row(data["session"]),
+    pendingRenewal: row(data["pendingRenewal"]),
   };
 }
 
@@ -931,6 +934,7 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
+    renewalPending: owner.pendingRenewal !== null,
     sessionExpiresAt: sessionExpiresAt(session),
     provisioning,
     actionDisabledReason: provisioning ? "This agent is still being hired. Finish the on-chain grant, or cancel the hire." : null,
@@ -1264,6 +1268,7 @@ function mapLpAgentDetail(
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
+    renewalPending: owner.pendingRenewal !== null,
     sessionExpiresAt: sessionExpiresAt(session),
     provisioning,
     actionDisabledReason: provisioning ? "This agent is still being hired. Finish the on-chain grant, or cancel the hire." : null,
@@ -1616,6 +1621,7 @@ export function mapAgentDetail(
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey,
+    renewalPending: owner.pendingRenewal !== null,
     sessionExpiresAt: sessionExpiresAt(owner.session),
     provisioning,
     actionDisabledReason: provisioning ? "This agent is still being hired. Finish the on-chain grant, or cancel the hire." : null,

@@ -703,6 +703,31 @@ async function recordedKeys(h: Harness): Promise<readonly string[]> {
 /* -------------------------------------------------------------------------- */
 
 describe("lp sagas: happy paths", () => {
+  it("[F8] reads one coherent executing session tuple per LP submission", async () => {
+    const protect = await createLpHarness();
+    let protectReads = 0;
+    const protectRead = protect.agentStore.readExecutingSession.bind(protect.agentStore);
+    protect.agentStore.readExecutingSession = async (owner, id) => {
+      protectReads += 1;
+      return protectRead(owner, id);
+    };
+    scriptExit(protect);
+    assert.equal((await runLpProtect(protect.deps, POSITION_ID)).status, "completed");
+    assert.equal(protectReads, protect.provider.submitted.length);
+
+    const rotate = await createLpHarness();
+    let rotateReads = 0;
+    const rotateRead = rotate.agentStore.readExecutingSession.bind(rotate.agentStore);
+    rotate.agentStore.readExecutingSession = async (owner, id) => {
+      rotateReads += 1;
+      return rotateRead(owner, id);
+    };
+    scriptRotate(rotate);
+    assert.equal((await runLpRotate(rotateDeps(rotate), POSITION_ID)).status, "completed");
+    assert.equal(rotateReads, rotate.provider.submitted.length);
+    assert.equal(rotate.provider.submitted.length, 3);
+  });
+
   it("protect completes [zap-out, sweep-token] and closes the position (basis reset)", async () => {
     const h = await createLpHarness();
     scriptExit(h);

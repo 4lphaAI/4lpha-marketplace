@@ -9,6 +9,19 @@ const emptyCoverage: AccountCoverage = { state: "empty", reasons: ["none"] };
 const payload: { data: AccountPortfolio } = { data: { generatedAt: 1, asOf: null, ownerAddress: OWNER_A, wallets: [], assets: [], agents: [], venus: null, totals: { walletUsdMicros: "0", deployedUsdMicros: "0", totalUsdMicros: "0", grossLpPnlUsdMicros: null, grossLpPnlBps: null, eligibleLpBasisNativeWei: null }, coverage: { universe: "known-assets", wallet: emptyCoverage, deployed: emptyCoverage, total: emptyCoverage, pnl: emptyCoverage, truncated: { agents: false, wallets: false, tokens: false, walletTokenPairs: false, positions: false } } } };
 
 describe("Account browser boundary", () => {
+  it("[F7] accepts both legacy agent rows and the optional v2 session row", () => {
+    const baseAgent = {
+      id: "renewable", status: "armed", httpRuntimeProfile: "trade-v1", walletAddress: OWNER_A,
+      attention: "none", gas: null,
+      holdings: { method: "none", state: "empty", reason: "none", valueUsdMicros: null, venusReference: null, held: false },
+      pnl: { method: "none", coverage: "unsupported", reason: "unsupported-profile", eligibleBasisNativeWei: null,
+        markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null, basisSources: [], excluded: [] },
+    } as const;
+    expect(accountPortfolioForOwner({ data: { ...payload.data, agents: [baseAgent] } }, OWNER_A)).not.toBeNull();
+    expect(accountPortfolioForOwner({ data: { ...payload.data, agents: [{ ...baseAgent, session: { expiresAt: 1, renewable: true } }] } }, OWNER_A)).not.toBeNull();
+    expect(accountPortfolioForOwner({ data: { ...payload.data, agents: [{ ...baseAgent, session: { expiresAt: -1, renewable: true } }] } }, OWNER_A)).toBeNull();
+  });
+
   it("refuses a still-valid cookie response after the connected wallet changes", () => {
     expect(accountPortfolioForOwner(payload, OWNER_A)).not.toBeNull();
     expect(accountPortfolioForOwner(payload, OWNER_B)).toBeNull();

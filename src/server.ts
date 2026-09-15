@@ -154,6 +154,7 @@ import {
   type AgentStatus,
   type AgentStore,
   type PendingGrant,
+  type PendingRenewal,
   type ArmPlanOutcome,
   type SessionFacts,
 } from "./store/agents.js";
@@ -194,6 +195,8 @@ import {
   parseExecuteRequest,
   parseHireParams,
   parseOwnerActionEnvelope,
+  parseRenewSessionParams,
+  parseCancelRenewalParams,
   parseTradeRequest,
   type TradeRequest,
   type HireParams,
@@ -237,6 +240,8 @@ import {
   grantsVenusMarket,
   nativeReserveFloor,
   tradeSessionSpec,
+  APPROVE_SELECTOR,
+  type TokenGrant,
   venusMeterReserve,
   walletNativeFloorWei,
   LENDING_DUST_USDT_WEI,
@@ -286,7 +291,7 @@ import { pinnedTokens, positionView, runView, tradeSummary } from "./trade/view.
 import { validateSessionSpec } from "./core/session.js";
 import type { GrantEvidenceReader } from "./wallet/grantEvidence.js";
 import { grantDigest } from "./wallet/grantEvidence.js";
-import { convergeProvisioning } from "./wallet/provisioning.js";
+import { assessRenewalQuiescence, authorityObserved, buildPendingOnChainRevoke, convergeProvisioning, convergeRenewal } from "./wallet/provisioning.js";
 import type { VenusSettingsStore } from "./store/venusSettings.js";
 import type { VenusObservationStore } from "./store/venusObservations.js";
 import {
@@ -1039,6 +1044,14 @@ export type ErrorCode =
   | "universe_too_small"
   | "capital_too_small"
   | "trade_not_ready"
+  | "renewal_pending"
+  | "renewal_cancelled_unresolved"
+  | "renewal_cancelled"
+  | "renewal_gone"
+  | "renewal_busy"
+  | "renewal_unsupported_kind"
+  | "renewal_universe_unavailable"
+  | "renewal_underfunded"
   | "paused"
   | "halted"
   | "revoked"
@@ -1193,7 +1206,7 @@ function defaultTradeConfig(chainId: number): TradeRuntimeConfig {
  * UNCHANGED from Phase 2 (PHASE2.1 R6); the read-derived manager gets exactly
  * it, plus the explicit `manager === token` check at the call site.
  */
-type ErrorStatus = 400 | 401 | 403 | 404 | 409 | 410 | 413 | 429 | 500 | 503;
+type ErrorStatus = 400 | 401 | 402 | 403 | 404 | 409 | 410 | 413 | 429 | 500 | 503;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1707,7 +1720,7 @@ export function createServer(deps: ServerDeps): Hono {
           ...(deps.keyStoreReader === undefined ? {} : { keyStoreReader: deps.keyStoreReader }),
           ...(deps.balanceReader === undefined ? {} : { balanceReader: deps.balanceReader }),
           now: nowMs,
-        }, { declaredWallets }, signal);
+        }, { declaredWallets, ...(c.req.header("x-account-view") === "2" ? { accountViewVersion: 2 as const } : {}) }, signal);
       } catch (cause) {
         // The ONE declared-wallet verdict that refuses: the KeyStore answered,
         // and the address is registered to a key that does not derive this
@@ -2909,6 +2922,401 @@ export function createServer(deps: ServerDeps): Hono {
       }, meta: { durable: deps.agentStore.durable } });
     });
 
+    const renewalQuiescence = async (agent: AgentRecord) => assessRenewalQuiescence(agent, {
+      ...(deps.tradeAgent === undefined ? {} : { tradeIntents: deps.tradeAgent.intents }),
+      ...(deps.lp === undefined ? {} : { lpSequences: deps.lp.store }),
+      journal: deps.journal,
+    });
+
+    const renewalCoverage = async (agent: AgentRecord, pending: PendingRenewal): Promise<{ readonly ok: boolean; readonly token?: Address }> => {
+      if (pending.sizing.sizingPreset !== "trade-v1") return { ok: true };
+      const tradeAgent = deps.tradeAgent;
+      if (tradeAgent === undefined) return { ok: false };
+      const allowed = new Set(pending.sessionSpec.allowedCalls
+        .filter((rule) => rule.selector === APPROVE_SELECTOR && rule.to !== undefined)
+        .map((rule) => rule.to!.toLowerCase()));
+      const capped = new Set(pending.sessionSpec.spendCaps.filter((cap) => cap.token !== undefined).map((cap) => cap.token!.toLowerCase()));
+      const [positions, unsettled] = await Promise.all([
+        tradeAgent.positions.list(agent.ownerAddress, agent.id),
+        tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id),
+      ]);
+      const held = [...positions.filter((row) => row.status === "open").map((row) => row.token), ...unsettled.map((row) => row.token)];
+      const missing = held.find((token) => !allowed.has(token.toLowerCase()) || !capped.has(token.toLowerCase()));
+      return missing === undefined ? { ok: true } : { ok: false, token: missing };
+    };
+
+    const renewalPendingView = (pending: PendingRenewal, now: number): Record<string, unknown> => ({
+      grantDigest: pending.grantDigest,
+      renewActionId: pending.renewActionId,
+      sessionAddress: pending.sessionAddress,
+      sessionPublicKey: pending.sessionPublicKey,
+      accountKeyHash: pending.accountKeyHash,
+      keyStoreKeyId: pending.keyStoreKeyId,
+      expiresAt: pending.expiresAt,
+      permissions: {
+        calls: pending.permissions.calls.map((row) => ({
+          ...(!("to" in row) ? {} : { to: row.to }),
+          ...(!("signature" in row) ? {} : { signature: row.signature }),
+        })),
+        spend: pending.permissions.spend.map((row) => ({
+          ...(row.token === undefined ? {} : { token: row.token }), period: row.period, limit: row.limit.toString(10),
+        })),
+      },
+      funding: pending.funding,
+      sizing: pending.sizing,
+      phase: pending.cancelRequestedAtSec === undefined ? pending.phase : "cancelled",
+      ...(pending.grantAttempt === undefined ? {} : { grantAttempt: pending.grantAttempt }),
+      ...(pending.cancelRequestedAtSec === undefined ? {} : {
+        cancelRequestedAtSec: pending.cancelRequestedAtSec,
+        cancelReason: pending.cancelReason,
+        ...(pending.coverageLossToken === undefined ? {} : { coverageLossToken: pending.coverageLossToken }),
+        authorityObserved: pending.authorityObserved === true,
+      }),
+      createdAtSec: pending.createdAtSec,
+      observedAtSec: now,
+      previous: { publicKey: pending.previous.publicKey, expiry: pending.previous.expiry },
+    });
+
+    const permissionView = (permissions: import("./core/session.js").ProviderPermissions): Record<string, unknown> => ({
+      calls: permissions.calls.map((row) => ({
+        ...(!("to" in row) ? {} : { to: row.to }),
+        ...(!("signature" in row) ? {} : { signature: row.signature }),
+      })),
+      spend: permissions.spend.map((row) => ({
+        ...(row.token === undefined ? {} : { token: row.token }), period: row.period, limit: row.limit.toString(10),
+      })),
+    });
+
+    const prepareRenewal = async (agent: AgentRecord, ttlSec: number, signal?: AbortSignal): Promise<{
+      readonly spec: import("./core/types.js").SessionSpec;
+      readonly permissions: import("./core/session.js").ProviderPermissions;
+      readonly funding: import("./store/agents.js").FundingRequirement;
+      readonly sessionKey: Hex;
+      readonly sessionAddress: Address;
+      readonly sessionPublicKey: Hex;
+      readonly sizing: PendingRenewal["sizing"];
+      readonly previous: PendingRenewal["previous"];
+      readonly expiresAt: number;
+      readonly universe?: Record<string, unknown>;
+    }> => {
+      const facts = agent.sessionFacts;
+      if (facts === null) throw new ConflictError("The agent has no granted session.");
+      const sizingName = facts.hireSizing?.name ?? (agent.httpRuntimeProfile === "trade-v1" ? "trade-v1" : agent.httpRuntimeProfile === "lp-v1" ? "lp-v1" : null);
+      if (sizingName === "lending-v1" || sizingName === null) throw new ConflictError("This agent kind is not renewable in v1.", "renewal_unsupported_kind");
+      const expiresAt = nowSec() + ttlSec;
+      let spec: import("./core/types.js").SessionSpec;
+      let universe: Record<string, unknown> | undefined;
+      if (facts.hireSizing?.name === "trade-v1") {
+        const tradeAgent = deps.tradeAgent;
+        if (tradeAgent === undefined || !tradeAgent.readiness.ready) throw new ConflictError("Trading universe is unavailable.", "renewal_universe_unavailable");
+        const settingsRow = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+        if (settingsRow === null) throw new ConflictError("Trading settings are unavailable.", "renewal_universe_unavailable");
+        const parsedSettings = parseTradeSettings(settingsRow.params);
+        if (!parsedSettings.ok) throw new ConflictError("Trading settings are invalid.", "renewal_universe_unavailable");
+        let pinned: readonly PinnedCandidate[];
+        try { pinned = await cachedPin(parsedSettings.value.effective.executionModel, agent.walletAddress, signal); }
+        catch { throw new ConflictError("Trading universe is unavailable.", "renewal_universe_unavailable"); }
+        const [positions, unsettled] = await Promise.all([
+          tradeAgent.positions.list(agent.ownerAddress, agent.id),
+          tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id),
+        ]);
+        const held: Address[] = [];
+        const heldSeen = new Set<string>();
+        for (const token of [...positions.filter((row) => row.status === "open").map((row) => row.token), ...unsettled.map((row) => row.token)]) {
+          let normalized: Address;
+          try { normalized = getAddress(token); } catch { throw new ConflictError("A held trade token is malformed.", "renewal_universe_unavailable"); }
+          if (!heldSeen.has(normalized.toLowerCase())) { heldSeen.add(normalized.toLowerCase()); held.push(normalized); }
+        }
+        if (held.length > 25) throw new ConflictError("The held trade universe exceeds 25 tokens.", "renewal_universe_unavailable");
+        const selected = [...held];
+        const selectedSet = new Set(selected.map((token) => token.toLowerCase()));
+        for (const candidate of pinned) {
+          if (selected.length >= 25) break;
+          if (!selectedSet.has(candidate.address.toLowerCase())) { selected.push(candidate.address); selectedSet.add(candidate.address.toLowerCase()); }
+        }
+        if (pinned.length < 5 || selected.length < 5) throw new ConflictError("The trading universe is below the minimum pin.", "renewal_universe_unavailable");
+        const currentTokens = new Set(pinnedTokens(facts).map((token) => token.toLowerCase()));
+        const added = selected.filter((token) => !currentTokens.has(token.toLowerCase()));
+        const nativeCaps = facts.spec.spendCaps.filter((cap) => cap.token === undefined);
+        if (nativeCaps.length === 0) throw new ConflictError("The native session cap is unavailable.", "renewal_universe_unavailable");
+        const generated = tradeSessionSpec({
+          venues: trade.venues,
+          ...(trade.feeTreasury === undefined ? {} : { treasury: trade.feeTreasury }),
+          tokens: added.map((token): TokenGrant => ({ token })), nativeCaps, expiresAt, nowSeconds: nowSec(),
+        });
+        const finalSet = new Set(selected.map((token) => token.toLowerCase()));
+        const keptCalls = facts.spec.allowedCalls.filter((rule) =>
+          !(rule.selector === APPROVE_SELECTOR && rule.to !== undefined) || finalSet.has(rule.to.toLowerCase()));
+        const addedCalls = generated.allowedCalls.filter((rule) =>
+          rule.selector === APPROVE_SELECTOR && rule.to !== undefined && added.some((token) => token.toLowerCase() === rule.to!.toLowerCase()));
+        const keptCaps = facts.spec.spendCaps.filter((cap) => cap.token === undefined || finalSet.has(cap.token.toLowerCase()));
+         const addedCaps = generated.spendCaps.filter((cap) => cap.token !== undefined && added.some((token) => token.toLowerCase() === cap.token!.toLowerCase()));
+         spec = { ...facts.spec, allowedCalls: [...keptCalls, ...addedCalls], spendCaps: [...keptCaps, ...addedCaps], expiresAt };
+         const grantedTokens = new Set(spec.allowedCalls
+           .filter((rule) => rule.selector === APPROVE_SELECTOR && rule.to !== undefined)
+           .map((rule) => rule.to!.toLowerCase()));
+         const cappedTokens = new Set(spec.spendCaps.filter((cap) => cap.token !== undefined).map((cap) => cap.token!.toLowerCase()));
+         if (held.some((token) => !grantedTokens.has(token.toLowerCase()) || !cappedTokens.has(token.toLowerCase()))) {
+           throw new ConflictError("A held trade token cannot be sold by the renewal spec.", "renewal_universe_unavailable");
+         }
+         const capDayWei = nativeCaps.find((cap) => cap.period === "day")?.limit;
+        if (capDayWei === undefined) throw new ConflictError("The native day cap is unavailable.", "renewal_universe_unavailable");
+        const sized = checkTradeSizing({ capDayWei, entryWei: BigInt(parsedSettings.value.effective.entryWei), maxOpenPositions: parsedSettings.value.effective.maxOpenPositions, grantedTokenCount: selected.length, platformFeeBps: tradeAgent.feeBps });
+        if (!sized.ok) throw new TradeCapitalTooSmallError(sized.minimumCapWei);
+        universe = { tokens: selected, held: held.length, pinned: pinned.length, dropped: [...currentTokens].filter((token) => !finalSet.has(token)) };
+      } else {
+        spec = { ...facts.spec, expiresAt };
+      }
+      const permissions = validateSessionSpec(spec, { nowSeconds: nowSec(), walletAddress: agent.walletAddress, keyStoreAddress: config.keyStore });
+      const sessionKey = generatePrivateKey();
+      const sessionAccount = privateKeyToAccount(sessionKey);
+      const sessionPublicKey = sessionAccount.publicKey;
+      const sessionAddress = sessionAccount.address;
+       const observedFunding = await hire!.evidence.readFunding(agent.walletAddress, hire!.grantGasHeadroomWei, nowSec(), signal);
+       // AUDIT A1 (SESSION-RENEWAL R2.5): the requirement is the evidence reader's
+       // observed one — registrations counted from the KeyStore's listed keys —
+       // never an assumption that the wallet is still registered.
+       const funding: import("./store/agents.js").FundingRequirement = observedFunding;
+      if (funding.balanceWei === null) throw new Error("The agent wallet balance could not be read.");
+      if (BigInt(funding.balanceWei) < BigInt(funding.requiredWei)) {
+        throw new ConflictError("The agent wallet is underfunded for the renewal grant.", "renewal_underfunded");
+      }
+      const previousAddress = getAddress(publicKeyToAddress(facts.publicKey));
+      return {
+        spec, permissions, funding, sessionKey, sessionAddress, sessionPublicKey,
+        sizing: {
+          openNativeBudgetWei: facts.hireSizing?.openNativeBudgetWei ?? "0",
+          capDayWei: (facts.spec.spendCaps.find((cap) => cap.token === undefined && cap.period === "day")?.limit ?? 0n).toString(10),
+          sizingPreset: sizingName,
+          sizingPresetVersion: 1 as const,
+        },
+        previous: { publicKey: facts.publicKey, keyStoreKeyId: keccak256(facts.publicKey), accountKeyHash: accountKeyHashForAddress(previousAddress), expiry: facts.expiry },
+        expiresAt,
+        ...(universe === undefined ? {} : { universe }),
+      };
+    };
+
+    const renewalResponse = (agent: AgentRecord, draft: Awaited<ReturnType<typeof prepareRenewal>>, renewActionId: Hex): Record<string, unknown> => ({
+      permissions: permissionView(draft.permissions), expiry: draft.expiresAt, sessionPublicKey: draft.sessionPublicKey,
+      sessionAddress: draft.sessionAddress, grantDigest: grantDigest({ permissions: draft.permissions, expiresAt: draft.expiresAt, walletAddress: agent.walletAddress, sessionAddress: draft.sessionAddress }),
+      funding: draft.funding, previous: { publicKey: draft.previous.publicKey, expiry: draft.previous.expiry, expired: draft.previous.expiry <= nowSec() },
+      renewActionId,
+      ...(draft.universe === undefined ? {} : { universe: draft.universe }),
+    });
+
+    const convergeRenewalFor = (agent: AgentRecord, signal?: AbortSignal) => convergeRenewal({
+      store: deps.agentStore, evidence: hire!.evidence, ownerAddress: agent.ownerAddress, agentId: agent.id,
+      keyStore: config.keyStore, nowSec: nowSec(), checkQuiescent: async () => {
+        const latest = await deps.agentStore.getAgent(agent.ownerAddress, agent.id);
+        return latest === null ? { quiescent: false, reason: "agent disappeared" } : renewalQuiescence(latest);
+      },
+      checkCoverage: async (pending) => {
+        const latest = await deps.agentStore.getAgent(agent.ownerAddress, agent.id);
+        return latest === null ? { ok: false } : renewalCoverage(latest, pending);
+      },
+      ...(deps.tradeAgent === undefined ? {} : { rebaseTradeEvidence: async (owner: Address, id: string, generation: number) => {
+        const fenced = await deps.tradeAgent!.settingsStore.withEntryFence(owner, id, (sql) => deps.tradeAgent!.positions.rebaseRenewalEvidenceForAgent(owner, id, generation, sql));
+        return fenced.kind === "allowed" && fenced.value;
+      } }),
+      readK2Revocation: async (pending) => {
+        const result = await readFinalizedSessionRevocation({ chainId: config.chainId, keyStoreAddress: config.keyStore, wallet: pending.walletAddress, keyId: pending.keyStoreKeyId, expectedPublicKey: pending.sessionPublicKey, observedAtMs: nowMs(), ...(deps.keyStoreReader === undefined ? {} : { reader: deps.keyStoreReader }), ...(signal === undefined ? {} : { signal }) });
+        return result.kind;
+      }, ...(signal === undefined ? {} : { signal }),
+    });
+
+    app.get("/agents/:id/session/renew/preview", async (c) => {
+      const id = c.req.param("id");
+      const auth = await authorizeAccountRead(c, id);
+      if (auth.kind !== "ok") return auth.response;
+      const agent = await deps.agentStore.getAgent(auth.owner.ownerAddress, id);
+      if (agent === null) return fail(c, 404, "not_found");
+      const quiescent = await renewalQuiescence(agent);
+      const sizingName = agent.sessionFacts?.hireSizing?.name ?? (agent.httpRuntimeProfile === "trade-v1" ? "trade-v1" : agent.httpRuntimeProfile === "lp-v1" ? "lp-v1" : null);
+      const eligible = agent.sessionFacts !== null && agent.sessionFacts.expiry <= nowSec()
+        && (agent.status === "armed" || agent.status === "paused") && agent.pendingGrant === null
+        && agent.pendingRenewal === null && agent.sessionRevocation === null
+        && sizingName !== null && sizingName !== "lending-v1";
+       if (!eligible) return c.json({ data: { eligible: false, reason: sizingName === null || sizingName === "lending-v1" ? "renewal_unsupported_kind" : "session_not_expired", funding: null, previous: { expiry: agent.sessionFacts?.expiry ?? null, expired: agent.sessionFacts !== null && agent.sessionFacts.expiry <= nowSec() }, quiescent } });
+      try {
+        const draft = await prepareRenewal(agent, 604_800, c.req.raw.signal);
+        return c.json({ data: { eligible: true, funding: draft.funding, previous: { expiry: draft.previous.expiry, expired: true }, quiescent, ...(draft.universe === undefined ? {} : { universe: draft.universe }) } });
+      } catch (error) {
+         if (error instanceof ConflictError) return c.json({ data: { eligible: false, reason: error.code ?? "renewal_universe_unavailable", funding: null, previous: { expiry: agent.sessionFacts?.expiry ?? null, expired: agent.sessionFacts !== null && agent.sessionFacts.expiry <= nowSec() }, quiescent } });
+         if (error instanceof TradeCapitalTooSmallError) return c.json({ data: { eligible: false, reason: "capital_too_small", funding: null, previous: { expiry: agent.sessionFacts?.expiry ?? null, expired: agent.sessionFacts !== null && agent.sessionFacts.expiry <= nowSec() }, quiescent } });
+        return fail(c, 503, "evidence_unreadable");
+      }
+    });
+
+    app.post("/agents/:id/session/renew", async (c) => {
+      const id = c.req.param("id");
+      const body = await readJsonBody(c, maxBodyBytes);
+      if (body.kind === "error") return body.response;
+      const envelope = parseOwnerActionEnvelope(body.value);
+      if (!envelope.ok || requireBinding(envelope.value, "renewSession", id) !== null) return fail(c, 401, "owner_auth_failed");
+      const actionId = ownerActionIdempotencyKey(envelope.value.signed) as Hex;
+      const initial = await deps.agentStore.getAgentById(id);
+      if (initial === null || initial.ownerAddress.toLowerCase() !== envelope.value.signed.owner.toLowerCase()) return fail(c, 404, "not_found");
+      const priorPending = initial.pendingRenewal;
+      const priorHistory = initial.sessionFacts?.renewalHistory?.find((row) => row.renewActionId.toLowerCase() === actionId.toLowerCase());
+      if (priorPending?.renewActionId.toLowerCase() === actionId.toLowerCase()) {
+        const verified = await verifyOwnerAction(envelope.value, verifyOptions()).catch(() => null);
+        if (verified === null) return fail(c, 401, "owner_auth_failed");
+        if (priorPending.cancelRequestedAtSec !== undefined) {
+          return c.json({ error: { code: "renewal_cancelled" }, data: { ...renewalPendingView(priorPending, nowSec()), ...(priorPending.authorityObserved === true ? { onChainRevoke: buildPendingOnChainRevoke(priorPending, config.keyStore) } : {}) } }, 409);
+        }
+        return c.json({ data: { ...renewalPendingView(priorPending, nowSec()), renewActionId: actionId }, meta: { replayed: true } });
+      }
+      if (priorPending !== null && priorPending !== undefined) {
+        const code = priorPending.cancelRequestedAtSec === undefined ? "renewal_pending" : "renewal_cancelled_unresolved";
+        return c.json({ error: { code }, data: { grantDigest: priorPending.grantDigest, ...(priorPending.authorityObserved === true ? { onChainRevoke: buildPendingOnChainRevoke(priorPending, config.keyStore) } : {}) } }, 409);
+      }
+      if (priorHistory !== undefined) return c.json({ data: { agent: agentOwnerView(initial), renewActionId: actionId }, meta: { replayed: true } });
+      const outcome = (initial.renewalOutcomes ?? []).find((row) => row.renewActionId.toLowerCase() === actionId.toLowerCase());
+      if (outcome !== undefined && outcome.outcome !== "completed") return fail(c, 410, "renewal_gone");
+      if (outcome?.outcome === "completed") return c.json({ data: { agent: agentOwnerView(initial), renewActionId: actionId }, meta: { replayed: true } });
+      let owner: OwnerAuthResult;
+      try { owner = await authorizeOwnerAction(envelope.value, { ...verifyOptions(), nonceStore: deps.nonceStore }); }
+      catch (error) { return error instanceof OwnerAuthError ? fail(c, 401, "owner_auth_failed") : fail(c, 500, "internal_error"); }
+      const params = parseRenewSessionParams(envelope.value.params);
+      if (!params.ok) return fail(c, 400, "invalid_request", params.message);
+      const agent = await deps.agentStore.getAgent(owner.ownerAddress, id);
+      if (agent === null) return fail(c, 404, "not_found");
+      if (agent.sessionFacts === null || agent.sessionFacts.expiry > nowSec()) return fail(c, 409, "renewal_pending", "Renewal opens when the session ends.");
+      const busy = await renewalQuiescence(agent);
+      if (!busy.quiescent) return fail(c, 409, "renewal_busy", busy.reason);
+      try {
+        const draft = await prepareRenewal(agent, params.value.ttlSec, c.req.raw.signal);
+        const pending: PendingRenewal = {
+          version: 1, recoveredOwner: agent.ownerAddress, walletAddress: agent.walletAddress,
+          sessionAddress: draft.sessionAddress, sessionPublicKey: draft.sessionPublicKey,
+          accountKeyHash: accountKeyHashForAddress(draft.sessionAddress), keyStoreKeyId: keccak256(draft.sessionPublicKey),
+          sessionSpec: draft.spec, permissions: draft.permissions,
+          grantDigest: grantDigest({ permissions: draft.permissions, expiresAt: draft.expiresAt, walletAddress: agent.walletAddress, sessionAddress: draft.sessionAddress }),
+          expiresAt: draft.expiresAt, sizing: draft.sizing, funding: draft.funding, createdAtSec: nowSec(), keyStoreVerdictAtS1: "verified",
+          renewActionId: actionId, previous: draft.previous, phase: "granting",
+        };
+        const created = await deps.agentStore.createPendingRenewalCas({ ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion, nowSec: nowSec(), pendingRenewal: pending, sessionKey: draft.sessionKey, checkQuiescent: async () => {
+          const latest = await deps.agentStore.getAgent(agent.ownerAddress, agent.id);
+          return latest === null ? { quiescent: false, reason: "agent disappeared" } : renewalQuiescence(latest);
+        } });
+        if (created.kind === "conflict") {
+          const currentPending = created.agent?.pendingRenewal;
+          if (currentPending !== null && currentPending !== undefined) {
+            const code = currentPending.cancelRequestedAtSec === undefined ? "renewal_pending" : "renewal_cancelled_unresolved";
+            return c.json({ error: { code }, data: { grantDigest: currentPending.grantDigest } }, 409);
+          }
+          return fail(c, 409, "renewal_busy");
+        }
+        if (created.kind === "not_found") return fail(c, 404, "not_found");
+        return c.json({ data: renewalResponse(created.agent, draft, actionId), meta: { durable: deps.agentStore.durable } });
+      } catch (error) {
+        if (error instanceof ConflictError) return error.code === "renewal_underfunded"
+          ? fail(c, 402, "renewal_underfunded", error.message)
+          : fail(c, 409, error.code ?? "conflict", error.message);
+        if (error instanceof TradeCapitalTooSmallError) return fail(c, 400, "capital_too_small", error.message);
+        return fail(c, 503, "evidence_unreadable");
+      }
+    });
+
+    app.post("/agents/:id/session/renew/grant-attempt", async (c) => {
+      const id = c.req.param("id");
+      const body = await readJsonBody(c, maxBodyBytes);
+      if (body.kind === "error") return body.response;
+      const envelope = parseOwnerActionEnvelope(body.value);
+      if (!envelope.ok || requireBinding(envelope.value, "renewSession", id) !== null) return fail(c, 401, "owner_auth_failed");
+      if (paramsHash(envelope.value.signed.action, envelope.value.params).toLowerCase() !== envelope.value.signed.paramsHash.toLowerCase()) return fail(c, 401, "owner_auth_failed");
+      const agent = await deps.agentStore.getAgent(getAddress(envelope.value.signed.owner), id);
+      const pending = agent?.pendingRenewal;
+      if (agent === null || pending === null || pending === undefined || agent.ownerAddress.toLowerCase() !== envelope.value.signed.owner.toLowerCase()
+        || pending.renewActionId.toLowerCase() !== ownerActionIdempotencyKey(envelope.value.signed).toLowerCase()) return fail(c, 409, "conflict");
+      const attemptId = keccak256(stringToBytes(canonicalEncode({ purpose: "renewalGrantAttempt/v1", renewActionId: pending.renewActionId, ...(pending.lastGrantAttemptReset === undefined ? {} : { resetActionId: pending.lastGrantAttemptReset.resetActionId }) })));
+      const started = await deps.agentStore.startRenewalGrantAttemptCas({ ownerAddress: agent.ownerAddress, agentId: agent.id, expectedGrantDigest: pending.grantDigest, attemptId, startedAtSec: nowSec() });
+      if (started.kind === "conflict" || started.kind === "not_found") return fail(c, 409, "conflict");
+      return c.json({ data: { ...renewalPendingView(started.agent.pendingRenewal!, nowSec()), attemptId, mayInvoke: started.kind === "created" } });
+    });
+
+    app.post("/agents/:id/session/renew/grant-attempt/reset", async (c) => {
+      const id = c.req.param("id");
+      const body = await readJsonBody(c, maxBodyBytes);
+      if (body.kind === "error") return body.response;
+      const envelope = parseOwnerActionEnvelope(body.value);
+      if (!envelope.ok || requireBinding(envelope.value, "resetGrantAttempt", id) !== null) return fail(c, 401, "owner_auth_failed");
+      const params = envelope.value.params;
+      if (!isRecord(params) || Object.keys(params).length !== 1 || typeof params["attemptId"] !== "string" || !/^0x[0-9a-fA-F]{64}$/u.test(params["attemptId"] as string)) return fail(c, 400, "invalid_request");
+      if (paramsHash(envelope.value.signed.action, params).toLowerCase() !== envelope.value.signed.paramsHash.toLowerCase()) return fail(c, 401, "owner_auth_failed");
+      const resetActionId = ownerActionIdempotencyKey(envelope.value.signed) as Hex;
+      const matchesDurableReset = (agent: AgentRecord): boolean =>
+        agent.pendingRenewal?.lastGrantAttemptReset?.resetActionId.toLowerCase() === resetActionId.toLowerCase()
+        && agent.pendingRenewal.lastGrantAttemptReset.clearedAttemptId.toLowerCase() === (params["attemptId"] as string).toLowerCase();
+      const verifiedRow = async (): Promise<AgentRecord | null> => verifyOwnerAction(envelope.value, verifyOptions())
+        .then((verified) => deps.agentStore.getAgent(verified.ownerAddress, id)).catch(() => null);
+      const commitResetJournal = async (agent: AgentRecord): Promise<void> => {
+        const publicKey = agent.pendingRenewal?.sessionPublicKey ?? agent.sessionFacts?.publicKey;
+        await deps.journal.begin({
+          idempotencyKey: resetActionId,
+          agentId: agent.id,
+          ownerAddress: agent.ownerAddress,
+          kind: "grantAttemptReset",
+          ...(publicKey === undefined ? {} : { externalRef: { publicKey } }),
+        });
+        await deps.journal.markCommitted(resetActionId);
+      };
+      const prior = await deps.journal.get(resetActionId);
+      if (prior !== null) {
+        if (prior.kind !== "grantAttemptReset" || prior.agentId !== id || prior.state === "ROLLED_BACK" || prior.state === "UNKNOWN") return fail(c, 409, "conflict");
+        const agent = await verifiedRow();
+        if (agent === null || getAddress(prior.ownerAddress) !== getAddress(agent.ownerAddress) || !matchesDurableReset(agent)) return fail(c, 409, "conflict");
+        await deps.journal.markCommitted(resetActionId);
+        return c.json({ data: { ...renewalPendingView(agent.pendingRenewal!, nowSec()), idempotencyKey: resetActionId }, meta: { replayed: true } });
+      }
+      const repairCandidate = await verifiedRow();
+      if (repairCandidate !== null && matchesDurableReset(repairCandidate)) {
+        await commitResetJournal(repairCandidate);
+        return c.json({ data: { ...renewalPendingView(repairCandidate.pendingRenewal!, nowSec()), idempotencyKey: resetActionId }, meta: { replayed: true, repaired: true } });
+      }
+      const verified = await authorizeOwnerAction(envelope.value, { ...verifyOptions(), nonceStore: deps.nonceStore }).catch(() => null);
+      if (verified === null) return fail(c, 401, "owner_auth_failed");
+      const agent = await deps.agentStore.getAgent(verified.ownerAddress, id);
+      const pending = agent?.pendingRenewal;
+      if (agent === null || pending === null || pending === undefined) return fail(c, 409, "conflict");
+      const reset = await deps.agentStore.resetRenewalGrantAttemptCas({ ownerAddress: agent.ownerAddress, agentId: agent.id, expectedGrantDigest: pending.grantDigest, attemptId: params["attemptId"] as Hex, resetActionId, resetAtSec: nowSec() });
+      if (reset.kind === "conflict" || reset.kind === "not_found") return fail(c, 409, "conflict");
+      await commitResetJournal(reset.agent);
+      return c.json({ data: { ...renewalPendingView(reset.agent.pendingRenewal!, nowSec()), idempotencyKey: resetActionId } });
+    });
+
+    app.post("/agents/:id/session/renew/cancel", async (c) => {
+      const id = c.req.param("id");
+      const body = await readJsonBody(c, maxBodyBytes);
+      if (body.kind === "error") return body.response;
+      const envelope = parseOwnerActionEnvelope(body.value);
+      if (!envelope.ok || requireBinding(envelope.value, "cancelRenewal", id) !== null) return fail(c, 401, "owner_auth_failed");
+      const parsed = parseCancelRenewalParams(envelope.value.params);
+      if (!parsed.ok) return fail(c, 400, "invalid_request", parsed.message);
+      const cancelActionId = ownerActionIdempotencyKey(envelope.value.signed) as Hex;
+      const replayCandidate = await deps.agentStore.getAgentById(id);
+      if (replayCandidate !== null && replayCandidate.ownerAddress.toLowerCase() === envelope.value.signed.owner.toLowerCase()
+        && replayCandidate.pendingRenewal?.grantDigest.toLowerCase() === parsed.value.grantDigest.toLowerCase()
+        && replayCandidate.pendingRenewal.cancelActionId?.toLowerCase() === cancelActionId.toLowerCase()) {
+        const verified = await verifyOwnerAction(envelope.value, verifyOptions()).catch(() => null);
+        if (verified === null) return fail(c, 401, "owner_auth_failed");
+        const converged = await convergeRenewalFor(replayCandidate, c.req.raw.signal);
+        return c.json({ data: { ...(converged.agent?.pendingRenewal === null || converged.agent?.pendingRenewal === undefined ? {} : renewalPendingView(converged.agent.pendingRenewal, nowSec())), phase: "cancelled", ...(converged.onChainRevoke === undefined ? {} : { onChainRevoke: converged.onChainRevoke }) }, meta: { replayed: true } });
+      }
+      const owner = await authorizeOwnerAction(envelope.value, { ...verifyOptions(), nonceStore: deps.nonceStore }).catch(() => null);
+      if (owner === null) return fail(c, 401, "owner_auth_failed");
+      const agent = await deps.agentStore.getAgent(owner.ownerAddress, id);
+      const pending = agent?.pendingRenewal;
+      if (agent === null || pending === null || pending === undefined || pending.grantDigest.toLowerCase() !== parsed.value.grantDigest.toLowerCase()) return fail(c, 409, "conflict");
+      let observed = false;
+      try { observed = authorityObserved(pending, await hire!.evidence.readGrant(pending as unknown as PendingGrant, c.req.raw.signal)); } catch { observed = false; }
+      const result = await deps.agentStore.cancelPendingRenewalCas({ ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion, expectedGrantDigest: pending.grantDigest, nowSec: nowSec(), cancelActionId, outcome: "cancelled", reason: "owner", authorityObserved: observed });
+      if (result.kind === "conflict" || result.kind === "not_found") return fail(c, 409, "conflict");
+      const current = result.agent;
+      const converged = await convergeRenewalFor(current, c.req.raw.signal);
+      return c.json({ data: { ...renewalPendingView(converged.agent?.pendingRenewal ?? current.pendingRenewal!, nowSec()), phase: "cancelled", ...(converged.revocationRequired && converged.onChainRevoke === undefined ? {} : {}), ...(converged.onChainRevoke === undefined ? {} : { onChainRevoke: converged.onChainRevoke }) } });
+    });
+
     app.post("/agents/:id/session/grant-attempt", async (c) => {
       const id = c.req.param("id");
       const body = await readJsonBody(c, maxBodyBytes);
@@ -3100,6 +3508,16 @@ export function createServer(deps: ServerDeps): Hono {
         initial = await deps.agentStore.getAgent(ownerAddress, id);
       }
       if (initial === null) return fail(c, 404, "not_found");
+      let renewalState: Awaited<ReturnType<typeof convergeRenewal>> | undefined;
+      if (initial.pendingRenewal !== null && initial.pendingRenewal !== undefined) {
+        try {
+          renewalState = await convergeRenewalFor(initial, c.req.raw.signal);
+        } catch {
+          renewalState = { agent: initial, phase: "granting", missing: ["evidence-unreadable"], revocationRequired: false };
+        }
+        if (renewalState.agent === null) return fail(c, 404, "not_found");
+        initial = renewalState.agent;
+      }
       const evidenceSignal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(12_000)]);
       const cacheKey = `${ownerAddress.toLowerCase()}\0${id}`;
       if (["armed", "paused", "revoked"].includes(initial.status) && initial.sessionFacts !== null) {
@@ -3212,6 +3630,12 @@ export function createServer(deps: ServerDeps): Hono {
         return c.json({
           data: {
             ...provisioningView(current, nowSec()),
+            ...(current.pendingRenewal === null || current.pendingRenewal === undefined ? {} : {
+              pendingRenewal: renewalPendingView(current.pendingRenewal, nowSec()),
+              renewalPhase: renewalState?.phase ?? current.pendingRenewal.phase,
+              ...(renewalState?.quiescing === undefined ? {} : { quiescing: renewalState.quiescing }),
+              ...(renewalState?.onChainRevoke === undefined ? {} : { onChainRevoke: renewalState.onChainRevoke }),
+            }),
             sessionRegistration: { kind: registration.kind, checkedAtMs },
             ...(finalizedSessionRevocation === undefined ? {} : { finalizedSessionRevocation }),
           },
@@ -3389,6 +3813,9 @@ export function createServer(deps: ServerDeps): Hono {
 
   app.post("/agents/:id/revoke", (c) =>
     ownerMutation(c, c.req.param("id"), "revoke", "revoke", async ({ agent }) => {
+      if (agent.pendingRenewal !== null && agent.pendingRenewal !== undefined) {
+        throw new ConflictError("A renewal is pending; finish or cancel it first.", "renewal_pending");
+      }
       requireStatus(agent, ["armed", "paused"]);
       if (agent.sessionFacts?.hireSizing?.name === "trade-v1") {
         const tradeAgent = deps.tradeAgent;
@@ -3566,15 +3993,15 @@ export function createServer(deps: ServerDeps): Hono {
     // key material.
     let session: SessionRef;
     try {
-      session = await withSessionKey(deps.agentStore, agent, async (authority) =>
-        provider.restoreSession({
-          spec: facts.spec,
-          agent: authority,
-          walletAddress: agent.walletAddress,
-          publicKey: facts.publicKey,
-          expiresAt: facts.expiry,
-        }),
-      );
+      const executing = await deps.agentStore.readExecutingSession(agent.ownerAddress, agent.id);
+      if (executing === null) throw new ProviderError("Agent has no stored executing session.");
+      session = provider.restoreSession({
+        spec: executing.facts.spec,
+        agent: agentAuthorityFromPrivateKey(executing.key),
+        walletAddress: agent.walletAddress,
+        publicKey: executing.facts.publicKey,
+        expiresAt: executing.facts.expiry,
+      });
       await provider.preflightExecute({ session, calls });
     } catch (error) {
       const refusal = asPlaneError(error, "execute refused");
@@ -3976,6 +4403,9 @@ export function createServer(deps: ServerDeps): Hono {
     app.post("/agents/:id/trade/drain", async (c) => {
       if (tradeAgent === undefined || !tradeAgent.readiness.ready) return fail(c, 503, "trade_not_ready");
       return ownerMutation(c, c.req.param("id"), "tradeDrain", "tradeDrain", async ({ agent, params }) => {
+        if (agent.pendingRenewal !== null && agent.pendingRenewal !== undefined) {
+          throw new ConflictError("A renewal is pending; finish or cancel it first.", "renewal_pending");
+        }
         if (!isRecord(params) || Object.keys(params).length !== 0) {
           throw new BadRequestError("tradeDrain params must be exactly an empty object.");
         }
@@ -4549,7 +4979,7 @@ export function createServer(deps: ServerDeps): Hono {
       );
       if (error instanceof BadRequestError) return failBadRequest(c, error);
       if (error instanceof ConflictError) {
-        return fail(c, 409, "conflict", error.message);
+        return fail(c, 409, error.code ?? "conflict", error.message);
       }
       if (error instanceof TradeNotExecutableError) return fail(c, 409, "not_executable");
       if (error instanceof TradeCapitalTooSmallError) {
@@ -12926,7 +13356,9 @@ class LpSizingShortfallError extends BadRequestError {
     this.shortfallWei = shortfallWei;
   }
 }
-class ConflictError extends Error {}
+class ConflictError extends Error {
+  constructor(message: string, readonly code?: ErrorCode) { super(message); }
+}
 
 /** PHASE3.25 R6.1 — shared physical shift capacity for all three sizing seams. */
 export function shiftNativeSizingTerm(

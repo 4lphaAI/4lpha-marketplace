@@ -125,6 +125,7 @@ type AccountAgentView = {
   } | null;
   readonly holdings: { readonly method: "wallet-native-v1" | "wallet-known-erc20-v1" | "sellable-lp-exit-v1" | "owner-wide-venus-stored-net-v1" | "none"; readonly state: CoverageState; readonly reason: CoverageReason; readonly valueUsdMicros: string | null; readonly venusReference: "owner-wide" | null; readonly held: boolean };
   readonly pnl: { readonly method: "gross-lp-mark-plus-residue-to-declared-basis-v2" | "none"; readonly coverage: "full" | "partial" | "unsupported" | "unavailable"; readonly reason: CoverageReason; readonly eligibleBasisNativeWei: string | null; readonly markNativeWei: string | null; readonly pnlNativeWei: string | null; readonly pnlUsdMicros: string | null; readonly pnlBps: string | null; readonly basisSources: readonly ("owner-budget" | "imported")[]; readonly excluded: readonly ("relay-and-gas" | "wallet-residue" | "closed-lineages" | "prior-exits" | "external-cashflows" | "zero-basis-lineages")[] };
+  readonly session?: { readonly expiresAt: number | null; readonly renewable: boolean };
 };
 
 export type AccountPortfolioDeps = {
@@ -203,9 +204,20 @@ export type AccountPortfolioDeps = {
  */
 export type AccountPortfolioOptions = {
   readonly declaredWallets?: readonly Address[];
+  readonly accountViewVersion?: 2;
 };
 
 const MAX_DECLARED_WALLETS = 2;
+
+function accountSessionView(agent: AgentRecord, version: 2 | undefined, nowSec: number): AccountAgentView["session"] {
+  if (version !== 2) return undefined;
+  const facts = agent.sessionFacts;
+  const renewable = facts !== null && facts.expiry <= nowSec
+    && (agent.status === "armed" || agent.status === "paused")
+    && agent.sessionRevocation === null && agent.pendingRenewal == null
+    && facts.hireSizing?.name !== "lending-v1";
+  return { expiresAt: facts?.expiry ?? null, renewable };
+}
 
 const REASON_ORDER: readonly CoverageReason[] = ["none", "capacity", "dependency", "stale", "unpriced", "unreadable", "identity-conflict", "unsupported-profile", "zero-basis", "missing-mark", "held", "declared"];
 
@@ -742,6 +754,7 @@ export async function buildAccountPortfolio(owner: Address, deps: AccountPortfol
   const observationTimes: number[] = assets.filter((a) => a.status === "priced" && a.balanceAtomic !== "0" && a.pricedAt !== null).map((a) => a.pricedAt!);
   for (const agent of agents) {
     const rows = positionsByAgent.get(agent.id) ?? [];
+    const accountSession = accountSessionView(agent, options?.accountViewVersion, Math.floor(generatedAt / 1_000));
     // AGENT-GAS-ATTENTION §3.1 — computed ONCE per agent, from the native
     // balance this view already read, and shared by every branch below so the
     // three exit paths cannot report different health for the same wallet.
@@ -756,7 +769,7 @@ export async function buildAccountPortfolio(owner: Address, deps: AccountPortfol
         deployedComplete = false;
         pnlComplete = false;
         deployedIncomplete.add(agent.walletAddress.toLowerCase());
-        agentViews.push({ id: agent.id, status: agent.status, httpRuntimeProfile: agent.httpRuntimeProfile, walletAddress: agent.walletAddress, attention: attentionFor({ status: agent.status, gas, partialData: true }), gas, holdings: { method: "sellable-lp-exit-v1", state: "unavailable", reason: "dependency", valueUsdMicros: null, venusReference: null, held: false }, pnl: { method: "gross-lp-mark-plus-residue-to-declared-basis-v2", coverage: "unavailable", reason: "dependency", eligibleBasisNativeWei: null, markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null, basisSources: [], excluded: [...EXCLUDED] } });
+        agentViews.push({ id: agent.id, status: agent.status, httpRuntimeProfile: agent.httpRuntimeProfile, walletAddress: agent.walletAddress, attention: attentionFor({ status: agent.status, gas, partialData: true }), gas, holdings: { method: "sellable-lp-exit-v1", state: "unavailable", reason: "dependency", valueUsdMicros: null, venusReference: null, held: false }, pnl: { method: "gross-lp-mark-plus-residue-to-declared-basis-v2", coverage: "unavailable", reason: "dependency", eligibleBasisNativeWei: null, markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null, basisSources: [], excluded: [...EXCLUDED] }, ...(accountSession === undefined ? {} : { session: accountSession }) });
         continue;
       }
       let mark = 0n; let basis = 0n; let pnl = 0n; let valid = 0; let missing = 0; let zeroBasis = 0; const sources = new Set<"owner-budget" | "imported">(); let held = false;
@@ -802,10 +815,10 @@ export async function buildAccountPortfolio(owner: Address, deps: AccountPortfol
       const pnlUsd = bnbPrice === null || basis === 0n ? null : signedNativeUsd(pnlWithResidue, bnbPrice.micros);
       const pnlCoverage = rows.length === 0 ? "full" : basis === 0n ? "unavailable" : full ? "full" : "partial";
       const publishPnl = pnlCoverage === "full" && basis > 0n;
-      agentViews.push({ id: agent.id, status: agent.status, httpRuntimeProfile: agent.httpRuntimeProfile, walletAddress: agent.walletAddress, attention: attentionFor({ status: agent.status, gas, partialData: missing > 0 || zeroBasis > 0 }), gas, holdings: { method: "sellable-lp-exit-v1", state: rows.length === 0 ? "empty" : missing > 0 ? "partial" : "complete", reason: missing > 0 ? "missing-mark" : held ? "held" : "none", valueUsdMicros: valueUsd?.toString() ?? null, venusReference: null, held }, pnl: { method: "gross-lp-mark-plus-residue-to-declared-basis-v2", coverage: pnlCoverage, reason: missing > 0 ? "missing-mark" : zeroBasis > 0 ? "zero-basis" : residue.kind === "shared-wallet" ? "shared-wallet" : residue.kind === "unpriced" ? "unpriced" : held ? "held" : "none", eligibleBasisNativeWei: publishPnl ? basis.toString() : null, markNativeWei: publishPnl ? pnlMark.toString() : null, pnlNativeWei: publishPnl ? pnlWithResidue.toString() : null, pnlUsdMicros: publishPnl ? pnlUsd?.toString() ?? null : null, pnlBps: publishPnl ? ((pnlWithResidue * 10_000n) / basis).toString() : null, basisSources: publishPnl ? [...sources].sort() : [], excluded: residue.kind === "attributed" ? [...EXCLUDED_WITH_RESIDUE_COUNTED] : [...EXCLUDED] } });
+      agentViews.push({ id: agent.id, status: agent.status, httpRuntimeProfile: agent.httpRuntimeProfile, walletAddress: agent.walletAddress, attention: attentionFor({ status: agent.status, gas, partialData: missing > 0 || zeroBasis > 0 }), gas, holdings: { method: "sellable-lp-exit-v1", state: rows.length === 0 ? "empty" : missing > 0 ? "partial" : "complete", reason: missing > 0 ? "missing-mark" : held ? "held" : "none", valueUsdMicros: valueUsd?.toString() ?? null, venusReference: null, held }, pnl: { method: "gross-lp-mark-plus-residue-to-declared-basis-v2", coverage: pnlCoverage, reason: missing > 0 ? "missing-mark" : zeroBasis > 0 ? "zero-basis" : residue.kind === "shared-wallet" ? "shared-wallet" : residue.kind === "unpriced" ? "unpriced" : held ? "held" : "none", eligibleBasisNativeWei: publishPnl ? basis.toString() : null, markNativeWei: publishPnl ? pnlMark.toString() : null, pnlNativeWei: publishPnl ? pnlWithResidue.toString() : null, pnlUsdMicros: publishPnl ? pnlUsd?.toString() ?? null : null, pnlBps: publishPnl ? ((pnlWithResidue * 10_000n) / basis).toString() : null, basisSources: publishPnl ? [...sources].sort() : [], excluded: residue.kind === "attributed" ? [...EXCLUDED_WITH_RESIDUE_COUNTED] : [...EXCLUDED] }, ...(accountSession === undefined ? {} : { session: accountSession }) });
     } else {
       if (isLive(agent)) pnlComplete = false;
-      agentViews.push({ id: agent.id, status: agent.status, httpRuntimeProfile: agent.httpRuntimeProfile, walletAddress: agent.walletAddress, attention: attentionFor({ status: agent.status, gas, partialData: false }), gas, holdings: { method: agent.httpRuntimeProfile === "venus-v1" ? "owner-wide-venus-stored-net-v1" : "none", state: agent.status === "provisioning" ? "partial" : "empty", reason: agent.status === "provisioning" ? "dependency" : "none", valueUsdMicros: null, venusReference: agent.httpRuntimeProfile === "venus-v1" ? "owner-wide" : null, held: false }, pnl: { method: "none", coverage: isLive(agent) ? "unsupported" : "unavailable", reason: isLive(agent) ? "unsupported-profile" : "none", eligibleBasisNativeWei: null, markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null, basisSources: [], excluded: [] } });
+      agentViews.push({ id: agent.id, status: agent.status, httpRuntimeProfile: agent.httpRuntimeProfile, walletAddress: agent.walletAddress, attention: attentionFor({ status: agent.status, gas, partialData: false }), gas, holdings: { method: agent.httpRuntimeProfile === "venus-v1" ? "owner-wide-venus-stored-net-v1" : "none", state: agent.status === "provisioning" ? "partial" : "empty", reason: agent.status === "provisioning" ? "dependency" : "none", valueUsdMicros: null, venusReference: agent.httpRuntimeProfile === "venus-v1" ? "owner-wide" : null, held: false }, pnl: { method: "none", coverage: isLive(agent) ? "unsupported" : "unavailable", reason: isLive(agent) ? "unsupported-profile" : "none", eligibleBasisNativeWei: null, markNativeWei: null, pnlNativeWei: null, pnlUsdMicros: null, pnlBps: null, basisSources: [], excluded: [] }, ...(accountSession === undefined ? {} : { session: accountSession }) });
     }
   }
 

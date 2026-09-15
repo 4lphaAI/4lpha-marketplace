@@ -205,16 +205,6 @@ function asPlaneError(error: unknown, fallback: string): ExecutionPlaneError {
   return new ProviderError(sanitizeMessage(error instanceof Error ? error.message : fallback));
 }
 
-async function withSessionKey<T>(
-  store: AgentStore,
-  agent: AgentRecord,
-  use: (authority: ReturnType<typeof agentAuthorityFromPrivateKey>) => Promise<T>,
-): Promise<T> {
-  const sessionKey = await store.getAgentSessionKey(agent.ownerAddress, agent.id);
-  if (sessionKey === null) throw new ProviderError("Agent has no stored session key.");
-  return use(agentAuthorityFromPrivateKey(sessionKey));
-}
-
 function forbiddenSpenders(input: ExecuteTradeInput): ReadonlySet<string> {
   const values = new Set<string>([
     input.agent.walletAddress.toLowerCase(),
@@ -432,10 +422,12 @@ export async function executeTradeForAgent(input: ExecuteTradeInput): Promise<Ex
   const provider: WalletProvider = deps.providerRegistry.get(deps.chainId);
   let session: SessionRef;
   try {
-    session = await withSessionKey(deps.agentStore, agent, async (authority) => provider.restoreSession({
-      spec: facts.spec, agent: authority, walletAddress: agent.walletAddress,
-      publicKey: facts.publicKey, expiresAt: facts.expiry,
-    }));
+    const executing = await deps.agentStore.readExecutingSession(agent.ownerAddress, agent.id);
+    if (executing === null) throw new ProviderError("Agent has no stored executing session.");
+    session = provider.restoreSession({
+      spec: executing.facts.spec, agent: agentAuthorityFromPrivateKey(executing.key), walletAddress: agent.walletAddress,
+      publicKey: executing.facts.publicKey, expiresAt: executing.facts.expiry,
+    });
     await provider.preflightExecute({ session, calls });
   } catch (error) {
     return rollBack("session", asPlaneError(error, "trade refused").code);

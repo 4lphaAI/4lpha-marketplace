@@ -21,7 +21,7 @@ import {
 } from "viem";
 import { canonicalEncode } from "../auth/canonical.js";
 import type { ProviderPermissions } from "../core/session.js";
-import type { FundingRequirement, PendingGrant } from "../store/agents.js";
+import type { FundingRequirement, PendingGrant, PendingRenewal } from "../store/agents.js";
 import { MAX_KEYS_PER_WALLET, readSessionRegistration, verifyDeclaredWallet, type KeyStoreReader } from "../account/keyStoreReader.js";
 import { ACCOUNT_ABI, KEYSTORE_CONTROLLER_ABI } from "./abis.js";
 
@@ -129,7 +129,7 @@ function sortUnique<T>(rows: readonly T[], key: (row: T) => string): readonly T[
 type PermissionBounds = { readonly combined: number; readonly spend: number };
 const DEFAULT_BOUNDS: PermissionBounds = { combined: MAX_GRANT_PERMISSIONS, spend: MAX_ACCOUNT_SPEND_ROWS };
 const TRADE_BOUNDS: PermissionBounds = { combined: 145, spend: 70 };
-function evidenceBounds(pending: PendingGrant): PermissionBounds {
+function evidenceBounds(pending: PendingGrant | PendingRenewal): PermissionBounds {
   return pending.sizing.sizingPreset === "trade-v1" ? TRADE_BOUNDS : DEFAULT_BOUNDS;
 }
 
@@ -282,7 +282,7 @@ export function isKeyDoesNotExistRevert(error: unknown): boolean {
   return false;
 }
 
-export function assessGrantEvidence(pending: PendingGrant, evidence: GrantEvidenceSnapshot, nowSec: number): readonly ProvisioningMissing[] {
+export function assessGrantEvidence(pending: PendingGrant | PendingRenewal, evidence: GrantEvidenceSnapshot, nowSec: number): readonly ProvisioningMissing[] {
   if (nowSec >= pending.expiresAt) return ["expired"];
   try {
     if (evidence.relayKeys.length > MAX_RELAY_KEYS) return ["evidence-unreadable"];

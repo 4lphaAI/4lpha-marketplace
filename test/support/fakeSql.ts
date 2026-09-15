@@ -499,7 +499,8 @@ export class FakeSqlClient implements SqlClient {
           owner_address: params[1], wallet_address: params[2], custody_model: params[3],
           session_facts: null, session_revocation: null, session_key_ciphertext: params[4], caps: jsonbParam(params[5]),
           status: "provisioning", http_runtime_profile: params[6], erc8004_agent_id: params[7],
-          pending_grant: jsonbParam(params[8]), row_version: 1,
+           pending_grant: jsonbParam(params[8]), pending_renewal: null, pending_renewal_key: null,
+           renewal_cleanup_pending: false, renewal_outcomes: [], row_version: 1,
           created_at: params[9], updated_at: params[9],
         };
         this.#agents.set(id, row);
@@ -517,6 +518,83 @@ export class FakeSqlClient implements SqlClient {
         return [...this.#agents.values()]
           .filter((row) => row["status"] === "provisioning" && (params[0] === null || String(row["id"]) > String(params[0])))
           .sort((a, b) => String(a["id"]).localeCompare(String(b["id"]))).slice(0, Number(params[1])).map((row) => structuredClone(row));
+      case "agents.listRenewalWorker":
+        return [...this.#agents.values()]
+           .filter((row) => ((row["pending_renewal"] !== null && row["pending_renewal"] !== undefined) || row["renewal_cleanup_pending"] === true)
+             && (params[0] === null || String(row["id"]) > String(params[0])))
+          .sort((a, b) => String(a["id"]).localeCompare(String(b["id"]))).slice(0, Number(params[1])).map((row) => structuredClone(row));
+      case "agents.renewalCreate": {
+        const row = this.#agents.get(String(params[0]));
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])
+          || row["pending_grant"] !== null || row["pending_renewal"] !== null || row["session_revocation"] !== null) return [];
+        row["pending_renewal"] = jsonbParam(params[3]); row["pending_renewal_key"] = params[4];
+        row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[5];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalPhase": {
+        const row = this.#agents.get(String(params[0]));
+        const pending = row?.["pending_renewal"] as Record<string, unknown> | null | undefined;
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])
+          || pending === null || pending === undefined || pending["grantDigest"] !== params[5]) return [];
+        row["pending_renewal"] = jsonbParam(params[3]); row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[4];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalGrantAttemptStart":
+      case "agents.renewalGrantAttemptReset": {
+        const row = this.#agents.get(String(params[0]));
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])) return [];
+        row["pending_renewal"] = jsonbParam(params[3]); row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[4];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalCancel": {
+        const row = this.#agents.get(String(params[0]));
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])) return [];
+        row["pending_renewal"] = jsonbParam(params[3]); row["renewal_outcomes"] = jsonbParam(params[4]);
+        row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[5];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalCoverageCancel": {
+        const row = this.#agents.get(String(params[0]));
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])) return [];
+        row["pending_renewal"] = jsonbParam(params[3]); row["renewal_outcomes"] = jsonbParam(params[4]);
+        row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[5];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalRetire": {
+        const row = this.#agents.get(String(params[0]));
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])) return [];
+        row["pending_renewal"] = null; row["pending_renewal_key"] = null; row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[3];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalCleanup": {
+        const row = this.#agents.get(String(params[0]));
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])
+          || row["renewal_cleanup_pending"] !== true || row["pending_renewal"] !== null) return [];
+        row["renewal_cleanup_pending"] = false; row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[3];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalSwap": {
+        const row = this.#agents.get(String(params[0]));
+        const pending = row?.["pending_renewal"] as Record<string, unknown> | null | undefined;
+        if (row === undefined || row["owner_address"] !== params[1] || Number(row["row_version"]) !== Number(params[2])
+          || pending === null || pending === undefined || pending["grantDigest"] !== params[7]
+          || row["pending_renewal_key"] === null || row["pending_renewal_key"] === undefined) return [];
+        row["session_facts"] = jsonbParam(params[3]); row["session_key_ciphertext"] = params[4]; row["pending_renewal"] = null; row["pending_renewal_key"] = null;
+         row["renewal_outcomes"] = jsonbParam(params[5]); row["renewal_cleanup_pending"] = true; row["row_version"] = Number(row["row_version"]) + 1; row["updated_at"] = params[6];
+        return [structuredClone(row)];
+      }
+      case "agents.renewalCreateRead":
+      case "agents.renewalPhaseRead":
+      case "agents.renewalGrantAttemptRead":
+      case "agents.renewalGrantAttemptResetRead":
+      case "agents.renewalCancelRead":
+      case "agents.renewalCleanupRead":
+      case "agents.renewalRetireRead":
+        return this.#agentsGet(params);
+      case "agents.renewalSwapRead":
+        return this.#agentsGet(params);
+      case "agents.readExecutingSession":
+        return this.#agentsGet(params);
       case "agents.armProvisioning": {
         const row = this.#agents.get(String(params[0]));
         const pending = row?.["pending_grant"] as Record<string, unknown> | null | undefined;
@@ -597,7 +675,7 @@ export class FakeSqlClient implements SqlClient {
         const row = this.#agents.get(String(params[0]));
         if (row === undefined || row["owner_address"] !== params[1]
           || Number(row["row_version"]) !== Number(params[2]) || row["status"] !== "revoked"
-          || row["session_revocation"] !== null) return [];
+          || row["session_revocation"] !== null || row["pending_renewal"] !== null) return [];
         row["session_revocation"] = jsonbParam(params[3]);
         row["session_key_ciphertext"] = null;
         row["row_version"] = Number(row["row_version"]) + 1;
@@ -621,6 +699,7 @@ export class FakeSqlClient implements SqlClient {
       case "agents.transitionStatus": {
         const marker = this.#agents.get(String(params[0]))?.["pending_grant"];
         if (typeof marker === "object" && marker !== null && ("cancelRequestedAtSec" in marker || "cancelActionId" in marker)) return [];
+        if (params[4] === "revoked" && this.#agents.get(String(params[0]))?.["pending_renewal"] !== null) return [];
         const row = this.#agents.get(String(params[0]));
         if (row === undefined || row["owner_address"] !== params[1] || row["status"] !== params[2]
           || Number(row["row_version"]) !== Number(params[3])) return [];
@@ -644,6 +723,7 @@ export class FakeSqlClient implements SqlClient {
       case "agents.updateStatus": {
         const marker = this.#agents.get(String(params[0]))?.["pending_grant"];
         if (typeof marker === "object" && marker !== null && ("cancelRequestedAtSec" in marker || "cancelActionId" in marker)) return [];
+        if (params[2] === "revoked" && this.#agents.get(String(params[0]))?.["pending_renewal"] !== null) return [];
         return this.#agentsUpdate(params[0], params[1], (row) => {
           row["status"] = params[2];
           row["row_version"] = Number(row["row_version"]) + 1;
@@ -2751,7 +2831,7 @@ export class FakeSqlClient implements SqlClient {
       status: params[6],
       http_runtime_profile: params[7],
       erc8004_agent_id: params[8],
-      pending_grant: null,
+           pending_grant: null, pending_renewal: null, pending_renewal_key: null, renewal_cleanup_pending: false, renewal_outcomes: [],
       row_version: 1,
       session_key_ciphertext: null,
       created_at: params[9],

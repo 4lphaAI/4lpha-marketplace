@@ -31,6 +31,7 @@ type Props = {
   readonly hardRevoke: () => void;
   readonly sellNow: (positionId: string) => void;
   readonly saveSettings: (settings: TradeSettings) => Promise<void>;
+  readonly renewal?: React.ReactNode;
 };
 
 function compactAddress(value: string): string {
@@ -319,11 +320,12 @@ export function TradeAgentDetail(props: Props) {
     </div>
     {/* Below the hero, not inside its flex row: in the row it squeezed the title to "Tra…" (seen live 2026-09-15). */}
     <SessionExpiryNotice kind="trade" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={trade?.open.length ?? 0} />
+    {props.renewal}
     {message ? <div className="fl-trade-message" role="status">{message}</div> : null}
     {props.identityStatus}
     {recoveryRequired ? <div className="fl-trade-message fl-trade-message--warning" role="alert">
       <span>{sessionExpired ? "Session expired. Withdraw tokens from Account → Withdraw, then use Hard revoke before finishing removal." : `Removal is blocked by unresolved execution ${unresolved.map((intent) => intent.decisionId).join(", ") || "or an orphaned token"}. Hard revoke stops future authority but does not complete conversion to BNB.`}</span>
-      <span className="fl-trade-message__actions"><Button variant="danger" size="sm" disabled={busy || view?.sessionPublicKey === null} onClick={props.hardRevoke}>Hard revoke</Button><Button variant="secondary" size="sm" onClick={() => props.go("/account")}>Account recovery</Button></span>
+      <span className="fl-trade-message__actions"><Button variant="danger" size="sm" disabled={busy || view?.sessionPublicKey === null || view?.renewalPending === true} title={view?.renewalPending === true ? "Finish or cancel the pending renewal first." : undefined} onClick={props.hardRevoke}>Hard revoke</Button><Button variant="secondary" size="sm" onClick={() => props.go("/account")}>Account recovery</Button></span>
     </div> : null}
     <div className="fl-trade-metrics">
       <Metric label="Delegated" value={delegated} note="24h spend authority · not escrowed" />

@@ -176,6 +176,27 @@ export type LendingHireParams = {
 
 export type HireParams = GridHireParams | TradeHireParams | LendingHireParams;
 
+export type RenewSessionParams = { readonly ttlSec: number };
+
+export function parseRenewSessionParams(value: unknown): ParseResult<RenewSessionParams> {
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !Object.prototype.hasOwnProperty.call(value, "ttlSec")) {
+    return fail('Renewal params must contain exactly "ttlSec".');
+  }
+  const ttlSec = value["ttlSec"];
+  if (!Number.isSafeInteger(ttlSec) || (ttlSec as number) < 3_600 || (ttlSec as number) > 604_800) {
+    return fail('"ttlSec" must be an integer from 3600 through 604800.');
+  }
+  return { ok: true, value: { ttlSec: ttlSec as number } };
+}
+
+export function parseCancelRenewalParams(value: unknown): ParseResult<{ readonly grantDigest: Hex }> {
+  if (!isRecord(value) || Object.keys(value).length !== 1 || typeof value["grantDigest"] !== "string"
+    || !/^0x[0-9a-fA-F]{64}$/u.test(value["grantDigest"] as string)) {
+    return fail('Cancel renewal params must contain exactly one bytes32 grantDigest.');
+  }
+  return { ok: true, value: { grantDigest: value["grantDigest"] as Hex } };
+}
+
 const HIRE_PARAM_KEYS = ["walletAddress", "token", "capDayWei", "openNativeBudgetWei", "ttlSec", "sizingPreset"] as const;
 
 const LENDING_HIRE_PARAM_KEYS = [
@@ -944,6 +965,8 @@ export function agentRuntimeView(agent: AgentRecord): Record<string, unknown> {
         : {
             publicKey: agent.sessionFacts.publicKey,
             expiresAt: agent.sessionFacts.expiry,
+            ...(agent.sessionFacts.grantedAtSec === undefined ? {} : { grantedAtSec: agent.sessionFacts.grantedAtSec }),
+            ...(agent.sessionFacts.renewals === undefined ? {} : { renewals: agent.sessionFacts.renewals }),
           },
     updatedAt: agent.updatedAt,
   };
@@ -1069,17 +1092,29 @@ export function agentOwnerView(
         : {
             publicKey: agent.sessionFacts.publicKey,
             expiresAt: agent.sessionFacts.expiry,
+            ...(agent.sessionFacts.grantedAtSec === undefined ? {} : { grantedAtSec: agent.sessionFacts.grantedAtSec }),
+            ...(agent.sessionFacts.renewals === undefined ? {} : { renewals: agent.sessionFacts.renewals }),
             allowedCalls: agent.sessionFacts.spec.allowedCalls.map((rule) => ({
               ...(rule.to === undefined ? {} : { to: rule.to }),
               ...(rule.selector === undefined ? {} : { selector: rule.selector }),
             })),
-            spendCaps: agent.sessionFacts.spec.spendCaps.map((cap) => ({
-              limit: cap.limit.toString(10),
-              period: cap.period,
-              ...(cap.token === undefined ? {} : { token: cap.token }),
-            })),
-          },
-    createdAt: agent.createdAt,
+             spendCaps: agent.sessionFacts.spec.spendCaps.map((cap) => ({
+               limit: cap.limit.toString(10),
+               period: cap.period,
+               ...(cap.token === undefined ? {} : { token: cap.token }),
+             })),
+           },
+     ...(agent.pendingRenewal === null || agent.pendingRenewal === undefined ? {} : {
+       pendingRenewal: {
+         grantDigest: agent.pendingRenewal.grantDigest,
+         sessionAddress: agent.pendingRenewal.sessionAddress,
+         sessionPublicKey: agent.pendingRenewal.sessionPublicKey,
+         expiresAt: agent.pendingRenewal.expiresAt,
+         phase: agent.pendingRenewal.cancelRequestedAtSec === undefined ? agent.pendingRenewal.phase : "cancelled",
+         authorityObserved: agent.pendingRenewal.authorityObserved === true,
+       },
+     }),
+     createdAt: agent.createdAt,
     updatedAt: agent.updatedAt,
   };
 }

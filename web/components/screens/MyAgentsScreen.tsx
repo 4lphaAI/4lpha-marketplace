@@ -14,6 +14,8 @@ import { accountPortfolioForOwner, currentAccountRequest, displayablePnlUsdMicro
 import { canWithdraw, formatBnb, maxTokenWithdrawAtomic, tokenWithdrawShortfallWei, withdrawReserveBnb } from "@/lib/altana/withdraw";
 import { readSessionStorage, rememberReadExpiry, subscribeReadExpiry } from "@/lib/exec/read-session-window";
 import { RESOURCES } from "@/lib/design-resources";
+import { SessionExpiryChip } from "@/components/agent/SessionExpiry";
+import { SessionRenew } from "@/components/agent/SessionRenew";
 
 const RECOVERY_READ_HEADERS: Readonly<Record<string, string>> = {};
 
@@ -411,7 +413,7 @@ export function AccountScreenContent(props: {
           })}
         </section>}
         {rows.length === 0 && pendingRows.length > 0 ? null : rows.length === 0 ? <EmptyState icon="wallet" title={allRows.length === 0 ? "No agents found" : "No agents in service"} action={<Button variant="primary" onClick={() => props.go("/")}>Browse the marketplace</Button>}>{allRows.length === 0 ? "No owner-controlled agents are recorded for this wallet." : "No live or paused agents are currently in service."}</EmptyState> : <div className="fl-rows"><DenseRowHeader columns={["Agent", "PnL", ""]} />
-          {rows.map((row) => { const design = AGENTS.find((agent) => agent.id === row.id); const pnl = micros(displayablePnlUsdMicros(row)); const live = row.status === "armed"; const attention = row.attention === "gas-blocked" || row.attention === "gas-low"; return <div key={row.id} role="button" tabIndex={0} style={{ cursor: "pointer" }} title={`Open ${row.id}`} onClick={() => props.go(`/account/${row.id}`)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); props.go(`/account/${row.id}`); } }}><DenseRow name={design?.name ?? row.id} categoryId={design?.categoryId ?? "defi"} status={live ? "live" : "paused"} warning={attention} statusLabel={attention ? "Attention" : live ? "Live" : "Pause"} statusLine={attention ? (row.attention === "gas-blocked" ? "needs BNB for relay gas — standing by" : "low on BNB for relay gas") : `${row.httpRuntimeProfile} · ${row.holdings.state}`} value={money(pnl, "USD", null, true)} valueTone={pnl !== null && pnl > 0 ? "profit" : pnl !== null && pnl < 0 ? "loss" : undefined} valueSub={row.pnl.coverage === "full" ? "gross LP mark-to-basis" : row.pnl.reason} /></div>; })}
+          {rows.map((row) => { const design = AGENTS.find((agent) => agent.id === row.id); const pnl = micros(displayablePnlUsdMicros(row)); const live = row.status === "armed"; const expiredSession = row.session?.expiresAt !== null && row.session?.expiresAt !== undefined && Math.floor(Date.now() / 1_000) >= row.session.expiresAt; const attention = row.attention === "gas-blocked" || row.attention === "gas-low"; const renewalKind = row.httpRuntimeProfile === "trade-v1" ? "trade" : design?.categoryId === "grid" ? "grid" : "lp"; return <div key={row.id} role="button" tabIndex={0} style={{ cursor: "pointer" }} title={`Open ${row.id}`} onClick={() => props.go(`/account/${row.id}`)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); props.go(`/account/${row.id}`); } }}><DenseRow name={design?.name ?? row.id} categoryId={design?.categoryId ?? "defi"} status={live ? "live" : "paused"} warning={attention || expiredSession} statusLabel={attention ? "Attention" : expiredSession ? "Expired" : live ? "Live" : "Pause"} statusLine={attention ? (row.attention === "gas-blocked" ? "needs BNB for relay gas — standing by" : "low on BNB for relay gas") : `${row.httpRuntimeProfile} · ${row.holdings.state}`} value={money(pnl, "USD", null, true)} valueTone={pnl !== null && pnl > 0 ? "profit" : pnl !== null && pnl < 0 ? "loss" : undefined} valueSub={row.pnl.coverage === "full" ? "gross LP mark-to-basis" : row.pnl.reason} />{row.session?.renewable ? <div onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}><SessionRenew agentId={row.id} walletAddress={row.walletAddress} sessionExpiresAt={row.session.expiresAt} kind={renewalKind} /></div> : row.session ? <SessionExpiryChip expiresAt={row.session.expiresAt} nowMs={Date.now()} /> : null}</div>; })}
         </div>}
       </> : <PortfolioSkeleton />}
     <PoweredByAltana />
@@ -479,7 +481,7 @@ export function MyAgentsScreen({ go }: Props) {
       // "0 wallets observed" over a wallet holding real money. The address comes
       // from this browser's own passkey record.
       const query = walletAddress ? `?wallets=${encodeURIComponent(walletAddress)}` : "";
-      const response = await fetch(`/api/account/portfolio${query}`, { cache: "no-store" });
+      const response = await fetch(`/api/account/portfolio${query}`, { headers: { "x-account-view": "2" }, cache: "no-store" });
       if (!currentAccountRequest(generation, requestGeneration.current, requestedOwner, currentAddress.current)) return;
       if (response.status === 401) { setNeedsSignature(true); setPortfolio(null); return; }
       if (!response.ok) throw new Error("Portfolio service is temporarily unavailable.");
@@ -508,7 +510,7 @@ export function MyAgentsScreen({ go }: Props) {
       if (signedReadFallbackRequired(response.status)) {
         const signedRead = await signReadHeader("*");
         const query = walletAddress ? `?wallets=${encodeURIComponent(walletAddress)}` : "";
-        const fallback = await fetch(`/api/account/portfolio${query}`, { headers: { "x-owner-action": signedRead }, cache: "no-store" });
+        const fallback = await fetch(`/api/account/portfolio${query}`, { headers: { "x-owner-action": signedRead, "x-account-view": "2" }, cache: "no-store" });
         if (!fallback.ok) throw new Error("Wallet authorization was rejected.");
         const body = await fallback.json() as unknown;
         const accepted = ownerAddress ? accountPortfolioForOwner(body, ownerAddress) : null;

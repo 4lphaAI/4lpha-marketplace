@@ -350,6 +350,21 @@ function scriptMint(h: Harness, wbnbIsToken0: boolean, tokenId = 91n): void {
   });
 }
 
+it("[F8] reads one coherent executing session tuple for the grid-arm submission", async () => {
+  const h = await createArmHarness();
+  let reads = 0;
+  const original = h.agentStore.readExecutingSession.bind(h.agentStore);
+  h.agentStore.readExecutingSession = async (owner, id) => {
+    reads += 1;
+    return original(owner, id);
+  };
+  scriptMint(h, false);
+  const result = await runLpOpen(h.deps, armInput(false));
+  assert.equal(result.status, "completed");
+  assert.equal(h.provider.submitted.length, 1);
+  assert.equal(reads, h.provider.submitted.length);
+});
+
 /* -------------------------------------------------------------------------- */
 /* B1 — WHICH range the arm funds, in both orientations and at every tick     */
 /* -------------------------------------------------------------------------- */

@@ -59,6 +59,7 @@
  * never a re-read of `_nextId`).
  */
 import type { Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import {
   ExecutionPlaneError,
   ProviderError,
@@ -282,12 +283,19 @@ async function withSessionKey<T>(
   use: (
     authority: ReturnType<typeof agentAuthorityFromPrivateKey>,
     sessionPrivateKey: Hex,
+    executingFacts: NonNullable<AgentRecord["sessionFacts"]>,
   ) => Promise<T>,
+  executingSession?: NonNullable<Awaited<ReturnType<AgentStore["readExecutingSession"]>>>,
 ): Promise<T> {
-  let sessionKey: Hex | undefined = await store.getAgentSessionKey(agent.ownerAddress, agent.id) ?? undefined;
-  if (sessionKey === undefined) throw new ProviderError("Agent has no stored session key.");
+  const executing = executingSession ?? await store.readExecutingSession(agent.ownerAddress, agent.id);
+  if (executing === null) throw new ProviderError("Agent has no stored executing session.");
+  const suppliedFacts = agent.sessionFacts;
+  const keyPublicKey = privateKeyToAccount(executing.key).publicKey;
+  const facts = suppliedFacts !== null && suppliedFacts.publicKey.toLowerCase() === keyPublicKey.toLowerCase()
+    ? suppliedFacts : executing.facts;
+  let sessionKey: Hex | undefined = executing.key;
   try {
-    return await use(agentAuthorityFromPrivateKey(sessionKey), sessionKey);
+    return await use(agentAuthorityFromPrivateKey(sessionKey), sessionKey, facts);
   } finally {
     // JavaScript cannot zero immutable string storage. Drop this local
     // reference at the end of the narrow decrypted-key scope instead.
@@ -883,15 +891,19 @@ export async function runLpOpen(
   // (5a) EVERYTHING BEFORE THE SUBMIT (PHASE2.4 R3): a throw here provably
   // never reached a relay; the row and the sequence roll back.
   let session: SessionRef;
+  let executingSession: NonNullable<Awaited<ReturnType<AgentStore["readExecutingSession"]>>>;
   try {
-    session = await withSessionKey(deps.agentStore, deps.agent, async (authority) =>
+    const acquired = await deps.agentStore.readExecutingSession(deps.agent.ownerAddress, deps.agent.id);
+    if (acquired === null) throw new ProviderError("Agent has no stored executing session.");
+    executingSession = acquired;
+    session = await withSessionKey(deps.agentStore, deps.agent, async (authority, _sessionPrivateKey, executingFacts) =>
       deps.provider.restoreSession({
-        spec: facts.spec,
+        spec: executingFacts.spec,
         agent: authority,
         walletAddress: deps.agent.walletAddress,
-        publicKey: facts.publicKey,
-        expiresAt: facts.expiry,
-      }),
+        publicKey: executingFacts.publicKey,
+        expiresAt: executingFacts.expiry,
+      }), executingSession,
     );
     await deps.provider.preflightExecute({ session, calls });
   } catch (error) {
@@ -913,22 +925,22 @@ export async function runLpOpen(
     receipt = await withSessionKey(
       deps.agentStore,
       deps.agent,
-      async (authority, sessionPrivateKey) => {
+      async (authority, sessionPrivateKey, executingFacts) => {
         const restored = deps.provider.restoreSession({
-          spec: facts.spec,
+          spec: executingFacts.spec,
           agent: authority,
           walletAddress: deps.agent.walletAddress,
-          publicKey: facts.publicKey,
-          expiresAt: facts.expiry,
+          publicKey: executingFacts.publicKey,
+          expiresAt: executingFacts.expiry,
         });
         return submitPreparedLp.call(deps.provider, {
           journalIdempotencyKey: key,
           expectedBindingVersion: 0,
           sessionPrivateKey,
           walletAddress: deps.agent.walletAddress,
-          persistedSession: facts,
+          persistedSession: executingFacts,
           restoredSessionPublicKey: restored.publicKey,
-          restoredSessionExpiry: facts.expiry,
+          restoredSessionExpiry: executingFacts.expiry,
           calls,
           expectedExecutionDataHash: finalCalls.value.executionDataHash,
           bind: async (request) => {
@@ -941,6 +953,7 @@ export async function runLpOpen(
           },
         });
       },
+      executingSession,
     );
   } catch (error) {
     if (isProvenPreBindStagedLpError(error)) {

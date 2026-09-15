@@ -1,4 +1,5 @@
 import type { AtomicRotateReceipt, AtomicRotateReceiptIdentity } from "./atomicRotateReceipt.js";
+import { privateKeyToAccount } from "viem/accounts";
 /**
  * LP saga runner (PHASE3-SPEC body "Sagas" + "Sequence journal"; Revision 2
  * items 9–17, 23, 27–28, 31–32; PHASE3-REVIEW R4/R5/R6/R7/R10, OQ2/OQ3).
@@ -1093,14 +1094,19 @@ async function withSessionKey<T>(
   use: (
     authority: ReturnType<typeof agentAuthorityFromPrivateKey>,
     sessionPrivateKey: Hex,
+    executingFacts: NonNullable<AgentRecord["sessionFacts"]>,
   ) => Promise<T>,
+  executingSession?: NonNullable<Awaited<ReturnType<AgentStore["readExecutingSession"]>>>,
 ): Promise<T> {
-  let sessionKey: Hex | undefined = await store.getAgentSessionKey(agent.ownerAddress, agent.id) ?? undefined;
-  if (sessionKey === undefined) {
-    throw new ProviderError("Agent has no stored session key.");
-  }
+  const executing = executingSession ?? await store.readExecutingSession(agent.ownerAddress, agent.id);
+  if (executing === null) throw new ProviderError("Agent has no stored executing session.");
+  const suppliedFacts = agent.sessionFacts;
+  const keyPublicKey = privateKeyToAccount(executing.key).publicKey;
+  const facts = suppliedFacts !== null && suppliedFacts.publicKey.toLowerCase() === keyPublicKey.toLowerCase()
+    ? suppliedFacts : executing.facts;
+  let sessionKey: Hex | undefined = executing.key;
   try {
-    return await use(agentAuthorityFromPrivateKey(sessionKey), sessionKey);
+    return await use(agentAuthorityFromPrivateKey(sessionKey), sessionKey, facts);
   } finally {
     // JavaScript cannot zero immutable string storage. Drop this local
     // reference at the end of the narrow decrypted-key scope instead.
@@ -2178,15 +2184,19 @@ async function driveSequence(input: DriveInput): Promise<LpSagaRunResult> {
     // (5a) EVERYTHING BEFORE THE SUBMIT, in its own block (PHASE2.4 R3).
     // A throw here provably never reached a relay: the row rolls back.
     let session: SessionRef;
+    let executingSession: NonNullable<Awaited<ReturnType<AgentStore["readExecutingSession"]>>>;
     try {
-      session = await withSessionKey(deps.agentStore, deps.agent, async (authority) =>
+      const acquired = await deps.agentStore.readExecutingSession(deps.agent.ownerAddress, deps.agent.id);
+      if (acquired === null) throw new ProviderError("Agent has no stored executing session.");
+      executingSession = acquired;
+      session = await withSessionKey(deps.agentStore, deps.agent, async (authority, _sessionPrivateKey, executingFacts) =>
         deps.provider.restoreSession({
-          spec: facts.spec,
+          spec: executingFacts.spec,
           agent: authority,
           walletAddress: deps.agent.walletAddress,
-          publicKey: facts.publicKey,
-          expiresAt: facts.expiry,
-        }),
+          publicKey: executingFacts.publicKey,
+          expiresAt: executingFacts.expiry,
+        }), executingSession,
       );
       await deps.provider.preflightExecute({ session, calls });
     } catch (error) {
@@ -2249,22 +2259,22 @@ async function driveSequence(input: DriveInput): Promise<LpSagaRunResult> {
         throw new ProviderError("Wallet provider lacks the mandatory staged LP capability.");
       }
       const stagedSubmit = { provider: { executeViaSession: (_request: Record<string, never>) => withSessionKey(
-        deps.agentStore, deps.agent, async (authority, sessionPrivateKey) => {
+        deps.agentStore, deps.agent, async (authority, sessionPrivateKey, executingFacts) => {
           const restored = deps.provider.restoreSession({
-            spec: facts.spec,
+            spec: executingFacts.spec,
             agent: authority,
             walletAddress: deps.agent.walletAddress,
-            publicKey: facts.publicKey,
-            expiresAt: facts.expiry,
+            publicKey: executingFacts.publicKey,
+            expiresAt: executingFacts.expiry,
           });
           return submitPreparedLp.call(deps.provider, {
             journalIdempotencyKey: key,
             expectedBindingVersion: 0,
             sessionPrivateKey,
             walletAddress: deps.agent.walletAddress,
-            persistedSession: facts,
+            persistedSession: executingFacts,
             restoredSessionPublicKey: restored.publicKey,
-            restoredSessionExpiry: facts.expiry,
+            restoredSessionExpiry: executingFacts.expiry,
             calls,
             expectedExecutionDataHash: finalCalls.value.executionDataHash,
             bind: async (request) => {
@@ -2279,7 +2289,7 @@ async function driveSequence(input: DriveInput): Promise<LpSagaRunResult> {
               };
             },
           });
-        },
+        }, executingSession,
       ) } };
       // Keep the ambiguity window shaped as one provider operation. This is an
       // owned local facade over the staged Porto path above, not the legacy

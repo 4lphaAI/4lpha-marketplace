@@ -7,7 +7,8 @@ import { parseAccountReadSessionSecret, verifyAccountReadSession } from "../src/
 import { resolveDomainSalt } from "../src/auth/ownerAuth.js";
 import type { KeyStoreReader } from "../src/account/keyStoreReader.js";
 import type { GrantEvidenceReader } from "../src/wallet/grantEvidence.js";
-import { tradeSessionSpec } from "../src/ops/policy.js";
+import { grantsTokenSell, tradeSessionSpec } from "../src/ops/policy.js";
+import { buildPancakeSell } from "../src/ops/pancake.js";
 import { MemoryAgentStore, type AgentStore } from "../src/store/agents.js";
 import { MemoryExecutionJournal } from "../src/store/journal.js";
 import { MemoryNonceStore, type NonceStore, type ProvisionClaimLease } from "../src/store/nonces.js";
@@ -928,6 +929,103 @@ describe("trading-agent owner routes", () => {
       "maxOpenPositions", "name", "ok", "openNativeBudgetWei", "platformFeeBps",
       "platformFeePerEntryWei", "platformFeeTotalWei", "tradeRelayFeePerSubmitWei", "version",
     ]);
+  });
+
+  it("[F5] builds an expiry-renewed trade spec held-first, with kept and added entries and sellable held calls", async () => {
+    const f = await fixture();
+    const id = "trade-renewal-s2";
+    const currentSpec = tradeSessionSpec({ venues: f.venues, tokens: [{ token: TOKENS[0]! }],
+      nativeCaps: [{ limit: CAP, period: "day" }], expiresAt: NOW_SEC - 1, nowSeconds: NOW_SEC - 3_600 });
+    await f.store.createAgent({ id, ownerAddress: ownerAccount.address, walletAddress: WALLET,
+      custodyModel: "passkey", status: "armed", httpRuntimeProfile: "unbound-v1", caps: { dailyNativeWei: CAP },
+      sessionFacts: { spec: currentSpec, permissions: { calls: [], spend: [] }, publicKey: LEGACY_PUBLIC_KEY,
+        expiry: NOW_SEC - 1, hireSizing: { name: "trade-v1", version: 1, openNativeBudgetWei: "0" } } });
+    await f.settingsStore.put({ agentId: id, ownerAddress: ownerAccount.address,
+      params: DEFAULT_TRADE_SETTINGS, digest: tradeSettingsDigest(DEFAULT_TRADE_SETTINGS) });
+    for (const [index, token] of [TOKENS[4]!, TOKENS[4]!, TOKENS[5]!].entries()) {
+      await f.positions.open({ positionId: `held-${index}`, agentId: id, ownerAddress: ownerAccount.address,
+        token, route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 10n,
+        fillStatus: "verified", openedAt: NOW_SEC * 1_000 });
+    }
+    const action = await signOwnerAction("renewSession", { ttlSec: 3_600 },
+      { agentId: id, chainId: 56, network: "mainnet" });
+    const response = await post(f.harness, `/agents/${id}/session/renew`, action);
+    assert.equal(response.status, 200, response.text);
+    const universe = (response.body["data"] as { universe: { tokens: readonly Address[]; held: number; pinned: number } }).universe;
+    assert.equal(universe.held, 2);
+    assert.equal(universe.pinned, TOKENS.length);
+    assert.deepEqual(new Set(universe.tokens.slice(0, 2).map((token) => token.toLowerCase())), new Set([TOKENS[4]!.toLowerCase(), TOKENS[5]!.toLowerCase()]));
+    assert.equal(new Set(universe.tokens.map((token) => token.toLowerCase())).size, universe.tokens.length);
+
+    const pending = (await f.store.getAgent(ownerAccount.address, id))?.pendingRenewal;
+    assert.notEqual(pending, null);
+    assert.notEqual(pending, undefined);
+    const renewedSpec = pending!.sessionSpec;
+    assert.equal(renewedSpec.expiresAt, NOW_SEC + 3_600);
+    assert.deepEqual(renewedSpec.spendCaps.filter((cap) => cap.token === undefined), currentSpec.spendCaps.filter((cap) => cap.token === undefined));
+    assert.deepEqual(renewedSpec.allowedCalls.filter((rule) => rule.to?.toLowerCase() === TOKENS[0]!.toLowerCase()),
+      currentSpec.allowedCalls.filter((rule) => rule.to?.toLowerCase() === TOKENS[0]!.toLowerCase()));
+
+    const finalTokens = renewedSpec.allowedCalls
+      .filter((rule) => rule.selector === "approve(address,uint256)" && rule.to !== undefined)
+      .map((rule) => rule.to!);
+    assert.deepEqual(new Set(finalTokens.map((token) => token.toLowerCase())), new Set(universe.tokens.map((token) => token.toLowerCase())));
+    const currentTokens = new Set(currentSpec.spendCaps.filter((cap) => cap.token !== undefined).map((cap) => cap.token!.toLowerCase()));
+    const addedTokens = finalTokens.filter((token) => !currentTokens.has(token.toLowerCase()));
+    const generatedAdded = tradeSessionSpec({ venues: f.venues, tokens: addedTokens.map((token) => ({ token })),
+      nativeCaps: currentSpec.spendCaps.filter((cap) => cap.token === undefined), expiresAt: renewedSpec.expiresAt, nowSeconds: NOW_SEC });
+    assert.deepEqual(renewedSpec.allowedCalls.filter((rule) => rule.selector === "approve(address,uint256)"
+      && rule.to !== undefined && !currentTokens.has(rule.to.toLowerCase())),
+      generatedAdded.allowedCalls.filter((rule) => rule.selector === "approve(address,uint256)"));
+    assert.deepEqual(renewedSpec.spendCaps.filter((cap) => cap.token !== undefined && !currentTokens.has(cap.token.toLowerCase())),
+      generatedAdded.spendCaps.filter((cap) => cap.token !== undefined));
+
+    for (const token of [TOKENS[4]!, TOKENS[5]!]) {
+      assert.equal(grantsTokenSell(renewedSpec, token), true);
+      const sell = buildPancakeSell({ router: f.venues.pancakeRouterV2!, wbnb: f.venues.wbnb!, token,
+        amountInWei: 10n, minOutWei: 1n, recipient: WALLET, deadline: BigInt(NOW_SEC + 120) });
+      assert.deepEqual(sell.slice(0, 2).map((call) => call.to), [token, token]);
+      assert.equal(sell[2]?.to, f.venues.pancakeRouterV2);
+    }
+
+    const small = await fixture({ dataMode: "small" });
+    const smallId = "trade-renewal-pin-small";
+    const smallSpec = tradeSessionSpec({ venues: small.venues, tokens: [{ token: TOKENS[0]! }],
+      nativeCaps: [{ limit: CAP, period: "day" }], expiresAt: NOW_SEC - 1, nowSeconds: NOW_SEC - 3_600 });
+    await small.store.createAgent({ id: smallId, ownerAddress: ownerAccount.address, walletAddress: WALLET,
+      custodyModel: "passkey", status: "armed", httpRuntimeProfile: "unbound-v1", caps: { dailyNativeWei: CAP },
+      sessionFacts: { spec: smallSpec, permissions: { calls: [], spend: [] }, publicKey: LEGACY_PUBLIC_KEY,
+        expiry: NOW_SEC - 1, hireSizing: { name: "trade-v1", version: 1, openNativeBudgetWei: "0" } } });
+    await small.settingsStore.put({ agentId: smallId, ownerAddress: ownerAccount.address,
+      params: DEFAULT_TRADE_SETTINGS, digest: tradeSettingsDigest(DEFAULT_TRADE_SETTINGS) });
+    const tooSmall = await post(small.harness, `/agents/${smallId}/session/renew`, await signOwnerAction("renewSession", { ttlSec: 3_600 },
+      { agentId: smallId, chainId: 56, network: "mainnet" }));
+    assert.equal(tooSmall.status, 409, tooSmall.text);
+    assert.equal((tooSmall.body as { error: { code: string } }).error.code, "renewal_universe_unavailable");
+    assert.equal((await small.store.getAgent(ownerAccount.address, smallId))?.pendingRenewal, null);
+  });
+
+  it("[F8] reads one coherent executing session tuple for each trade submission", async () => {
+    const f = await fixture();
+    const id = "trade-read-session-once";
+    await seedTradeAgent(f, id);
+    assert.equal((await f.store.bindHttpRuntimeProfile(ownerAccount.address, id, "trade-v1")).kind, "updated");
+    await f.store.putAgentSessionKey(ownerAccount.address, id, `0x${"11".repeat(32)}` as Hex);
+    await f.settingsStore.put({ agentId: id, ownerAddress: ownerAccount.address,
+      params: DEFAULT_TRADE_SETTINGS, digest: tradeSettingsDigest(DEFAULT_TRADE_SETTINGS) });
+    let reads = 0;
+    const original = f.harness.agentStore.readExecutingSession.bind(f.harness.agentStore);
+    f.harness.agentStore.readExecutingSession = async (owner, agentId) => {
+      reads += 1;
+      return original(owner, agentId);
+    };
+    const response = await call(f.harness, `/agents/${id}/trade`, { method: "POST", body: {
+      decisionId: "trade-read-session-once", venue: "pancake", side: "buy", token: TOKENS[0],
+      amountWei: "1000", minOutWei: "995", quotedOutWei: "1000",
+    } });
+    assert.equal(response.status, 200, response.text);
+    assert.equal(f.harness.provider.executeCalls.length, 1);
+    assert.equal(reads, f.harness.provider.executeCalls.length);
   });
 
   it("blocks settings while any other journal row is PENDING", async () => {

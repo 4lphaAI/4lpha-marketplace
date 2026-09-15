@@ -6,6 +6,7 @@ import type { AgentRecord } from "../src/store/agents.js";
 import {
   MemoryTradePositionStore,
   PostgresTradePositionStore,
+  type TradeEvidenceExpected,
   type TradePositionStore,
   type TradeRunInput,
 } from "../src/store/tradePositions.js";
@@ -15,10 +16,13 @@ import {
   type TradeSettingsStore,
 } from "../src/store/tradeSettings.js";
 import type { SqlClient, SqlResult } from "../src/store/sql.js";
+import { createPgSqlClient } from "../src/store/sql.js";
+import { localPostgres } from "./support/localPostgres.js";
 
 const OWNER_A = "0x1111111111111111111111111111111111111111" as Address;
 const OWNER_B = "0x2222222222222222222222222222222222222222" as Address;
 const TOKEN = "0x3333333333333333333333333333333333333333" as Address;
+const NOW = 1_900_000_000_000;
 
 type Row = Record<string, unknown>;
 
@@ -238,6 +242,61 @@ async function positionStores(): Promise<readonly TradePositionStore[]> {
 }
 
 describe("trade position and run stores", () => {
+  it("[F4] rejects generation regression, applies equal writers, and rebases newer writers", { timeout: 120_000 }, async (t) => {
+    const cluster = await localPostgres();
+    if (cluster === null) { t.skip("PostgreSQL 17 binaries unavailable; no external database fallback"); return; }
+    const sql = await createPgSqlClient(cluster.url);
+    const postgres = await PostgresTradePositionStore.create(sql, () => NOW);
+    t.after(async () => { await postgres.close(); await cluster.close(); });
+    const stores: readonly TradePositionStore[] = [new MemoryTradePositionStore(() => NOW), postgres];
+    for (const [index, store] of stores.entries()) {
+      const id = `generation-${index}`;
+      await store.open({ positionId: id, agentId: "generation-agent", ownerAddress: OWNER_A, token: TOKEN,
+        route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 100n, fillStatus: "verified", openedAt: NOW,
+        sessionGeneration: 1 });
+      const initial: TradeEvidenceExpected = {
+        sessionGeneration: 1, lastQuoteWei: null, lastQuoteBalance: null, lastQuoteRoute: null, lastQuoteAtMs: null,
+        crashPendingSinceMs: null, crashPendingKind: null, crashRefQuoteWei: null, crashRefBalance: null,
+        crashRefAtMs: null, crashRefRoute: null, autoExitReason: null, autoExitAtMs: null, autoExitNote: null,
+      };
+      const regression = await store.recordCrashEvidence({ ownerAddress: OWNER_A, agentId: "generation-agent", positionId: id,
+        expected: initial, action: { kind: "marker", reason: "crash-stop", atMs: NOW + 1, note: "stale" }, writerGeneration: 0 });
+      assert.equal(regression, null, `store ${index} must reject an older-generation writer`);
+      assert.equal((await store.get(OWNER_A, "generation-agent", id))?.sessionGeneration, 1);
+      assert.equal((await store.get(OWNER_A, "generation-agent", id))?.autoExitReason, null);
+
+      const armed = await store.recordCrashEvidence({ ownerAddress: OWNER_A, agentId: "generation-agent", positionId: id,
+        expected: initial, action: { kind: "arm", pendingKind: "collapse", pendingSinceMs: NOW + 2,
+          reference: { quoteWei: 100n, balance: 100n, routeKey: "v2", atMs: NOW + 1 } }, writerGeneration: 1 });
+      assert.equal(armed?.crashPendingKind, "collapse");
+      const armedExpected: TradeEvidenceExpected = { ...initial, crashPendingSinceMs: NOW + 2, crashPendingKind: "collapse",
+        crashRefQuoteWei: 100n, crashRefBalance: 100n, crashRefAtMs: NOW + 1, crashRefRoute: "v2" };
+      const newer = await store.recordCrashEvidence({ ownerAddress: OWNER_A, agentId: "generation-agent", positionId: id,
+        expected: armedExpected, action: { kind: "marker", reason: "crash-stop", atMs: NOW + 3, note: "must not confirm old arm" }, writerGeneration: 2 });
+      assert.equal(newer, null, "a newer cycle rebases instead of applying an old observation");
+      const rebased = await store.get(OWNER_A, "generation-agent", id);
+      assert.equal(rebased?.sessionGeneration, 2);
+      assert.equal(rebased?.crashPendingKind, null);
+      assert.equal(rebased?.autoExitReason, null);
+
+      const marked = await store.recordCrashEvidence({ ownerAddress: OWNER_A, agentId: "generation-agent", positionId: id,
+        expected: { ...initial, sessionGeneration: 2 }, action: { kind: "marker", reason: "crash-stop", atMs: NOW + 4, note: "current" }, writerGeneration: 2 });
+      assert.equal(marked?.autoExitReason, "crash-stop");
+      const markedExpected: TradeEvidenceExpected = { ...initial, sessionGeneration: 2,
+        autoExitReason: "crash-stop", autoExitAtMs: NOW + 4, autoExitNote: "current" };
+      const expiring = await store.recordCrashEvidence({ ownerAddress: OWNER_A, agentId: "generation-agent", positionId: id,
+        expected: markedExpected, action: { kind: "marker", reason: "session-expiring", atMs: NOW + 5, note: "old expiry" }, writerGeneration: 2 });
+      assert.equal(expiring?.autoExitReason, "session-expiring");
+      const clearedByNewer = await store.recordCrashEvidence({ ownerAddress: OWNER_A, agentId: "generation-agent", positionId: id,
+        expected: { ...initial, sessionGeneration: 2, autoExitReason: "session-expiring", autoExitAtMs: NOW + 5, autoExitNote: "old expiry" },
+        action: { kind: "clear" }, writerGeneration: 3 });
+      assert.equal(clearedByNewer, null);
+      const final = await store.get(OWNER_A, "generation-agent", id);
+      assert.equal(final?.sessionGeneration, 3);
+      assert.equal(final?.autoExitReason, null);
+    }
+  });
+
   it("round-trips every position lifecycle field with owner isolation", async () => {
     for (const store of await positionStores()) {
       const opened = await store.open({ positionId: "p1", agentId: "a1", ownerAddress: OWNER_A, token: TOKEN,

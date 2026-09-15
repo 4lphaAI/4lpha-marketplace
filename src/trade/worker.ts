@@ -95,7 +95,7 @@ export type TradeWorkerDeps = {
   readonly agentStore: Pick<AgentStore, "getAgentById">;
   readonly settingsStore: Pick<TradeSettingsStore, "get" | "listTradeAgentsForWorker" | "listTradeAgentsForProjection" | "withEntryFence">;
   readonly positions: Pick<TradePositionStore,
-    "get" | "list" | "listOpen" | "open" | "closePosition" | "recordSellRefusal" | "resolveFill" | "recordQuote" | "recordCrashEvidence" | "incrementNoPrice" | "resetNoPrice" | "markOrphaned" | "insertRun">;
+    "get" | "list" | "listOpen" | "open" | "closePosition" | "recordSellRefusal" | "resolveFill" | "recordQuote" | "recordCrashEvidence" | "clearSessionExpiringMarkers" | "incrementNoPrice" | "resetNoPrice" | "markOrphaned" | "insertRun">;
   readonly intents: Pick<TradeIntentStore, "create" | "listUnsettled" | "markSubmitted" | "markProjected" | "markRolledBack">;
   readonly journal: Pick<ExecutionJournal, "get">;
   readonly dataPlane: TradeDataPlaneReads;
@@ -225,6 +225,7 @@ function routeKey(venue: PricedPosition["venue"], route: TradePositionRecord["ro
 
 function evidenceExpected(position: TradePositionRecord): TradeEvidenceExpected {
   return {
+    sessionGeneration: position.sessionGeneration ?? 0,
     lastQuoteWei: position.lastQuoteWei,
     lastQuoteBalance: position.lastQuoteBalance,
     lastQuoteRoute: position.lastQuoteRoute,
@@ -415,6 +416,7 @@ async function projectIntent(
         openedAt: intent.createdAt,
         entryTxHash: txHash,
         crashBasisVerified: fill.receiptAttributable === true,
+        sessionGeneration: agent.sessionFacts?.generation ?? 0,
       });
     }
     await deps.intents.markProjected(agent.ownerAddress, agent.id, intent.decisionId);
@@ -581,6 +583,7 @@ async function persistExitEvidence(
       positionId: position.positionId,
       expected: evidenceExpected(position),
       action: evidenceAction(evidence),
+      writerGeneration: agent.sessionFacts?.generation ?? 0,
     }, sql)) !== null;
   });
   return fenced.kind === "allowed" && fenced.value;
@@ -606,11 +609,13 @@ async function persistQuoteTelemetry(
       pnlBps: decisionPnlBps,
       atMs,
       expected: {
+        sessionGeneration: item.position.sessionGeneration ?? 0,
         lastQuoteWei: item.position.lastQuoteWei,
         lastQuoteBalance: item.position.lastQuoteBalance,
         lastQuoteRoute: item.position.lastQuoteRoute,
         lastQuoteAtMs: item.position.lastQuoteAtMs,
       },
+      sessionGeneration: agent.sessionFacts?.generation ?? 0,
     });
     if (recorded === null) observe(counts, { stage: "sell", code: "telemetry-unavailable", token: item.position.token });
   } catch {
@@ -628,7 +633,7 @@ async function runExits(
   draining: boolean,
   signal?: AbortSignal,
 ): Promise<void> {
-  const open = await deps.positions.listOpen(agent.ownerAddress, agent.id);
+  let open = await deps.positions.listOpen(agent.ownerAddress, agent.id);
   const ordered = [...open].sort((left, right) =>
     Number(right.exitRequestedAt !== null) - Number(left.exitRequestedAt !== null)
     || left.openedAt - right.openedAt);
@@ -639,7 +644,18 @@ async function runExits(
     .map((intent) => intent.positionId));
   const sessionExpiresAtMs = agent.sessionFacts?.expiry === undefined || agent.sessionFacts === null
     ? null : agent.sessionFacts.expiry * 1_000;
-  const remaining = sessionExpiresAtMs === null ? null : sessionExpiresAtMs - agent.createdAt;
+  const clampBasisMs = agent.sessionFacts?.grantedAtSec === undefined
+    ? agent.createdAt
+    : agent.sessionFacts.grantedAtSec * 1_000;
+  if (open.some((position) => position.autoExitReason === "session-expiring"
+    && position.autoExitAtMs !== null && position.autoExitAtMs < clampBasisMs)) {
+    const cleared = await deps.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async (sql) => {
+      await deps.positions.clearSessionExpiringMarkers({ ownerAddress: agent.ownerAddress, agentId: agent.id, beforeMs: clampBasisMs }, sql);
+      return deps.positions.listOpen(agent.ownerAddress, agent.id, sql);
+    });
+    if (cleared.kind === "allowed") open = cleared.value;
+  }
+  const remaining = sessionExpiresAtMs === null ? null : sessionExpiresAtMs - clampBasisMs;
   const safeRemaining = remaining !== null && Number.isFinite(remaining) && remaining > 0
     ? remaining : MAX_TRADE_SESSION_SECONDS * 1_000;
   const sessionExitLeadMs = Math.min(SESSION_EXIT_LEAD_MS, safeRemaining / 4);
@@ -750,7 +766,8 @@ async function runEntry(
   const facts = agent.sessionFacts;
   if (facts === null) throw new Error("Agent session facts are unavailable.");
   const expiryMs = facts.expiry * 1_000;
-  const remaining = expiryMs - agent.createdAt;
+  const clampBasisMs = facts.grantedAtSec === undefined ? agent.createdAt : facts.grantedAtSec * 1_000;
+  const remaining = expiryMs - clampBasisMs;
   const safeRemaining = Number.isFinite(remaining) && remaining > 0
     ? remaining : MAX_TRADE_SESSION_SECONDS * 1_000;
   const entryCutoffMs = Math.min(SESSION_ENTRY_CUTOFF_MS, safeRemaining / 2);

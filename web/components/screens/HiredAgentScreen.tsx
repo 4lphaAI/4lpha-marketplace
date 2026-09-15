@@ -24,6 +24,7 @@ import { LendingAgentDetail } from "@/components/agent/LendingAgentDetail";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
 import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
 import { SessionExpiryChip, SessionExpiryNotice, sessionExpiry, sessionPillOverride, useSessionClock } from "@/components/agent/SessionExpiry";
+import { SessionRenew } from "@/components/agent/SessionRenew";
 import {
   EMPTY_REMOVE_PROGRESS,
   advanceRemoveAttempt,
@@ -1139,7 +1140,14 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   });
 
   const runRemove = () => perform(async () => {
-    let current = view;
+    if (view?.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
+    }
+    const refreshed = await detail.refresh();
+    if (refreshed?.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
+    }
+    let current = refreshed ?? view;
     let localProgress = progress;
     let localFinalizedRevocation = finalizedRevocation;
     for (let step = 0; step < MAX_REMOVE_STEPS && current !== null; step += 1) {
@@ -1358,10 +1366,17 @@ export function HiredAgentScreen({ agentId, go }: Props) {
 
   const runTradeRemove = () => perform(async () => {
     if (view === null) return;
+    if (view.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
+    }
+    const refreshed = await detail.refresh();
+    if (refreshed?.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
+    }
     if (owner.passkey === null || view.sessionPublicKey === null) {
       throw new Error("Removing this agent needs the passkey that owns its wallet.");
     }
-    let currentView = view;
+    let currentView = refreshed ?? view;
     if (view.status === "revoked") {
       const current = await detail.refreshTrade();
       if (current !== null && (current.open.length > 0 || current.pendingIntents.length > 0)) {
@@ -1413,15 +1428,19 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     if (view === null || owner.passkey === null || view.sessionPublicKey === null) {
       throw new Error("Hard revoke needs the passkey that owns this wallet.");
     }
-    if (view.status === "armed") {
+    const current = await detail.refresh() ?? view;
+    if (current.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before revoking the session.");
+    }
+    if (current.status === "armed") {
       setMessage("Hard revoke: pausing the worker before revoking session authority…");
       await mutate("pause", "/pause", {});
     }
     setMessage("Hard revoke: approve the on-chain session-key revocation. This does not guarantee conversion of remaining tokens to BNB.");
     const result = await (await import("@/lib/altana/client")).revokeAgentSession({
       record: owner.passkey,
-      ownerViewWalletAddress: view.walletAddress as `0x${string}`,
-      sessionPublicKey: view.sessionPublicKey as `0x${string}`,
+      ownerViewWalletAddress: current.walletAddress as `0x${string}`,
+      sessionPublicKey: current.sessionPublicKey as `0x${string}`,
     });
     if (result.status === "FAILED") throw new Error("Hard revoke failed on-chain; no successful removal is being reported.");
     const evidence = await readRegistration();
@@ -1488,6 +1507,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       hardRevoke={() => { if (window.confirm("Hard revoke session authority now? Remaining tokens may not be converted to BNB and must be handled through Account recovery.")) void runTradeHardRevoke(); }}
       sellNow={sellNow}
       saveSettings={saveTradeSettings}
+       renewal={<SessionRenew agentId={agentId} walletAddress={view?.walletAddress ?? ""} sessionExpiresAt={view?.sessionExpiresAt} kind="trade" readHeaders={detail.readHeaders} refresh={detail.refresh} />}
     />;
   }
 
@@ -1547,6 +1567,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       onAbandon={() => {
         if (window.confirm("Abandon this sequence? Whatever it already freed stays in the wallet.")) void abandonBlocker();
       }}
+       renewal={<SessionRenew agentId={agentId} walletAddress={view?.walletAddress ?? ""} sessionExpiresAt={view?.sessionExpiresAt} kind="lp" readHeaders={detail.readHeaders} refresh={detail.refresh} />}
     />;
   }
 
@@ -1567,6 +1588,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
               <AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." />
             </div>
             <SessionExpiryNotice kind="grid" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={view?.grid.liveRows ?? 0} />
+            <SessionRenew agentId={agentId} walletAddress={view?.walletAddress ?? ""} sessionExpiresAt={view?.sessionExpiresAt} kind="grid" readHeaders={detail.readHeaders} refresh={detail.refresh} />
             {statusMessage ? <span role="status" style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>{statusMessage}</span> : null}
             {identityStatus}
             {removeCallsId !== undefined ? (

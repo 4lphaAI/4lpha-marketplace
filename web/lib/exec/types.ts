@@ -104,6 +104,7 @@ export type AccountPortfolio = {
       readonly basisSources: readonly ("owner-budget" | "imported")[];
       readonly excluded: readonly ("relay-and-gas" | "wallet-residue" | "closed-lineages" | "prior-exits" | "external-cashflows" | "zero-basis-lineages")[];
     };
+    readonly session?: { readonly expiresAt: number | null; readonly renewable: boolean };
   }[];
   readonly assets: readonly {
     readonly kind: "native" | "erc20";

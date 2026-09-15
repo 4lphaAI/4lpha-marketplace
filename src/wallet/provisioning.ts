@@ -1,6 +1,9 @@
 import { encodeFunctionData, getAddress, type Address, type Hex } from "viem";
-import { hasProvisioningCancellation, type AgentRecord, type AgentStore, type PendingGrant, type SessionFacts } from "../store/agents.js";
+import { hasProvisioningCancellation, type AgentRecord, type AgentStore, type PendingGrant, type PendingRenewal, type SessionFacts, type RenewalQuiescenceCheck } from "../store/agents.js";
 import type { TradeSettingsStore } from "../store/tradeSettings.js";
+import type { TradeIntentStore } from "../store/tradeIntents.js";
+import { isTerminalLpSequence, type LpSequenceStore } from "../store/lpSequences.js";
+import type { ExecutionJournal } from "../store/journal.js";
 import { ACCOUNT_ABI, KEYSTORE_ABI } from "./abis.js";
 import {
   assessGrantEvidence,
@@ -28,14 +31,14 @@ export type ProvisioningConvergence = {
   readonly activationError?: "wallet_in_use" | "settings_conflict";
 };
 
-function authorityObserved(pending: PendingGrant, evidence: GrantEvidenceSnapshot): boolean {
+export function authorityObserved(pending: PendingGrant | PendingRenewal, evidence: GrantEvidenceSnapshot): boolean {
   const account = evidence.accountKey !== null;
   const relay = evidence.relayKeys.some((key) => key.hash.toLowerCase() === pending.accountKeyHash.toLowerCase());
   const keyStore = evidence.keyStore.kind === "registered" || evidence.keyStore.kind === "invalid";
   return account || relay || keyStore;
 }
 
-export function buildPendingOnChainRevoke(pending: PendingGrant, keyStore: Address): PendingRevokeInstructions {
+export function buildPendingOnChainRevoke(pending: PendingGrant | PendingRenewal, keyStore: Address): PendingRevokeInstructions {
   const wallet = getAddress(pending.walletAddress);
   return {
     state: "pending_owner_broadcast",
@@ -55,6 +58,45 @@ export function buildPendingOnChainRevoke(pending: PendingGrant, keyStore: Addre
       },
     ],
   };
+}
+
+export type RenewalQuiescenceDeps = {
+  readonly tradeIntents?: Pick<TradeIntentStore, "listUnsettled">;
+  readonly lpSequences?: Pick<LpSequenceStore, "listSequences">;
+  readonly journal?: Pick<ExecutionJournal, "listNonTerminal" | "listUnknownForAgent">;
+};
+
+/** The persisted-record inventory used at both renewal admission and swap. */
+export async function assessRenewalQuiescence(
+  agent: AgentRecord,
+  deps: RenewalQuiescenceDeps,
+): Promise<{ readonly quiescent: boolean; readonly reason?: string }> {
+  const name = agent.sessionFacts?.hireSizing?.name;
+  const tradeKind = name === "trade-v1" || name === undefined && agent.httpRuntimeProfile === "trade-v1";
+  const lpKind = name === "grid-v1" || name === "grid-shift-v1" || name === "lp-v1"
+    || name === undefined && agent.httpRuntimeProfile === "lp-v1";
+  if (tradeKind) {
+    if (deps.tradeIntents === undefined) return { quiescent: false, reason: "trade intents are unavailable" };
+    const unsettled = await deps.tradeIntents.listUnsettled(agent.ownerAddress, agent.id);
+    if (unsettled.length > 0) return { quiescent: false, reason: `finishing a trade intent ${unsettled[0]!.decisionId}` };
+  }
+  if (lpKind) {
+    if (deps.lpSequences === undefined) return { quiescent: false, reason: "LP sequences are unavailable" };
+    const sequences = await deps.lpSequences.listSequences(agent.ownerAddress, agent.id);
+    const active = sequences.find((sequence) => !isTerminalLpSequence(sequence.state, sequence.recoveryState));
+    if (active !== undefined) return { quiescent: false, reason: `finishing a rotate: ${active.sequenceId} (${active.state})` };
+  }
+  if (deps.journal !== undefined) {
+    const pending = (await deps.journal.listNonTerminal()).find((row) => row.agentId === agent.id);
+    if (pending !== undefined) return { quiescent: false, reason: `journal ${pending.state}: ${pending.idempotencyKey}` };
+    const unknown = (await deps.journal.listUnknownForAgent(agent.id))[0];
+    if (unknown !== undefined) return { quiescent: false, reason: `journal UNKNOWN: ${unknown.idempotencyKey}` };
+  }
+  const claim = agent.sessionFacts?.armPlan?.claim;
+  if (claim !== null && claim !== undefined && claim.outcome === null) {
+    return { quiescent: false, reason: `arm claim ${claim.actionId} is unfinished` };
+  }
+  return { quiescent: true };
 }
 
 /** Caller-independent public-evidence convergence shared by GET and the worker. */
@@ -213,4 +255,163 @@ export async function convergeProvisioning(input: {
     revocationRequired: false,
     ...(armed.failure === "wallet_in_use" ? { activationError: "wallet_in_use" as const } : {}),
   };
+}
+
+export type RenewalConvergence = {
+  readonly agent: AgentRecord | null;
+  readonly phase: "granting" | "observed" | "quiescing" | "done" | "cancelled";
+  readonly missing: readonly ProvisioningMissing[];
+  readonly quiescing?: string;
+  readonly revocationRequired: boolean;
+  readonly retired?: boolean;
+  readonly onChainRevoke?: PendingRevokeInstructions;
+};
+
+/** Caller-independent renewal convergence, shared by the owner read and sweep. */
+export async function convergeRenewal(input: {
+  readonly store: AgentStore;
+  readonly evidence: GrantEvidenceReader;
+  readonly ownerAddress: Address;
+  readonly agentId: string;
+  readonly keyStore: Address;
+  readonly nowSec: number;
+  readonly checkQuiescent?: RenewalQuiescenceCheck;
+  readonly checkCoverage?: (pending: PendingRenewal) => Promise<{ readonly ok: boolean; readonly token?: import("viem").Address }>;
+  readonly rebaseTradeEvidence?: (ownerAddress: Address, agentId: string, generation: number) => Promise<boolean>;
+  readonly readK2Revocation?: (pending: PendingRenewal) => Promise<"invalid" | "missing" | "registered" | "unreadable">;
+  readonly signal?: AbortSignal;
+}): Promise<RenewalConvergence> {
+  let agent = await input.store.getAgent(input.ownerAddress, input.agentId);
+  if (agent === null) return { agent: null, phase: "granting", missing: [], revocationRequired: false };
+  let pending = agent.pendingRenewal;
+  if (pending === null || pending === undefined) return { agent, phase: "done", missing: [], revocationRequired: false };
+
+  const revoke = (current: AgentRecord, observed: boolean): RenewalConvergence => ({
+    agent: current,
+    phase: "cancelled",
+    missing: [],
+    revocationRequired: observed,
+    ...(observed ? { onChainRevoke: buildPendingOnChainRevoke(current.pendingRenewal!, input.keyStore) } : {}),
+  });
+
+  let snapshot: GrantEvidenceSnapshot | null = null;
+  try {
+    snapshot = await input.evidence.readGrant(pending as unknown as PendingGrant, input.signal);
+  } catch {
+    snapshot = null;
+  }
+  const observed = pending.authorityObserved === true
+    || (snapshot !== null && authorityObserved(pending, snapshot));
+  if (pending.cancelRequestedAtSec !== undefined) {
+    if (observed && pending.authorityObserved !== true) {
+      const marked = await input.store.markPendingRenewalPhaseCas({
+        ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+        expectedGrantDigest: pending.grantDigest, phase: pending.phase, authorityObserved: true,
+      });
+      if (marked.kind === "updated" || marked.kind === "same") agent = marked.agent;
+      pending = agent.pendingRenewal ?? pending;
+    }
+    const canReadRevocation = input.readK2Revocation !== undefined
+      && (pending.authorityObserved === true || input.nowSec >= pending.expiresAt);
+    if (canReadRevocation) {
+      const verdict = await input.readK2Revocation!(pending);
+      if (verdict === "invalid" || (verdict === "missing" && input.nowSec >= pending.expiresAt)) {
+        const retired = await input.store.retirePendingRenewalCas({
+          ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+          expectedGrantDigest: pending.grantDigest,
+        });
+        if (retired.kind === "updated" || retired.kind === "same") return { agent: retired.agent, phase: "cancelled", missing: [], revocationRequired: false, retired: true };
+      }
+    }
+    return revoke(agent, pending.authorityObserved === true || observed);
+  }
+
+  if (input.nowSec >= pending.expiresAt) {
+    const cancelled = await input.store.cancelPendingRenewalCas({
+      ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+      expectedGrantDigest: pending.grantDigest, nowSec: input.nowSec, cancelActionId: pending.renewActionId,
+      outcome: "expired", reason: "expired", authorityObserved: observed,
+    });
+    if (cancelled.kind === "updated" || cancelled.kind === "same") return revoke(cancelled.agent, observed);
+    return revoke(agent, observed);
+  }
+
+  if (snapshot === null) return { agent, phase: pending.phase === "granting" ? "granting" : "observed", missing: ["evidence-unreadable"], revocationRequired: false };
+  const missing = assessGrantEvidence(pending, snapshot, input.nowSec);
+  if (observed && pending.authorityObserved !== true) {
+    const marked = await input.store.markPendingRenewalPhaseCas({
+      ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+      expectedGrantDigest: pending.grantDigest, phase: "observed", authorityObserved: true,
+    });
+    if (marked.kind === "updated" || marked.kind === "same") {
+      agent = marked.agent;
+      pending = agent.pendingRenewal ?? pending;
+    }
+  }
+  if (missing.length !== 0) return { agent, phase: pending.phase === "observed" ? "observed" : "granting", missing, revocationRequired: false };
+
+  const observedPhase = await input.store.markPendingRenewalPhaseCas({
+    ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+    expectedGrantDigest: pending.grantDigest, phase: "observed",
+  });
+  if (observedPhase.kind === "updated" || observedPhase.kind === "same") {
+    agent = observedPhase.agent;
+    pending = agent.pendingRenewal ?? pending;
+  }
+  const quiescent = await input.checkQuiescent?.();
+  if (quiescent !== undefined && !quiescent.quiescent) {
+    const phase = await input.store.markPendingRenewalPhaseCas({
+      ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+      expectedGrantDigest: pending.grantDigest, phase: "quiescing",
+    });
+    if (phase.kind === "updated" || phase.kind === "same") agent = phase.agent;
+    return { agent, phase: "quiescing", missing: [], quiescing: quiescent.reason ?? "waiting for persisted work to settle", revocationRequired: false };
+  }
+
+  const ready = await input.store.markPendingRenewalPhaseCas({
+    ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+    expectedGrantDigest: pending.grantDigest, phase: "ready",
+  });
+  if (ready.kind === "updated" || ready.kind === "same") {
+    agent = ready.agent;
+    pending = agent.pendingRenewal ?? pending;
+  }
+  const facts = agent.sessionFacts;
+  if (facts === null) return { agent, phase: "quiescing", missing: ["evidence-unreadable"], revocationRequired: false };
+  const generation = (facts.generation ?? 0) + 1;
+  const history = [...(facts.renewalHistory ?? []), {
+    renewActionId: pending.renewActionId, grantDigest: pending.grantDigest, completedAtSec: input.nowSec,
+  }].slice(-8);
+  const sessionFacts: SessionFacts = {
+    spec: pending.sessionSpec,
+    permissions: pending.permissions,
+    publicKey: pending.sessionPublicKey,
+    expiry: pending.expiresAt,
+    ...(facts.hireSizing === undefined ? {} : { hireSizing: facts.hireSizing }),
+    ...(facts.provisionActionId === undefined ? {} : { provisionActionId: facts.provisionActionId }),
+    ...(facts.hireRunId === undefined ? {} : { hireRunId: facts.hireRunId }),
+    generation,
+    grantedAtSec: input.nowSec,
+    renewActionId: pending.renewActionId,
+    renewalHistory: history,
+    renewals: (facts.renewals ?? history.length - 1) + 1,
+    ...(facts.armPlan === undefined ? {} : { armPlan: facts.armPlan }),
+  };
+  const swapped = await input.store.swapSessionCas({
+    ownerAddress: agent.ownerAddress, agentId: agent.id, expectedRowVersion: agent.rowVersion,
+    expectedGrantDigest: pending.grantDigest, sessionFacts,
+    ...(input.checkQuiescent === undefined ? {} : { checkQuiescent: input.checkQuiescent }),
+    ...(input.checkCoverage === undefined ? {} : { checkCoverage: () => input.checkCoverage!(pending) }),
+    ...(input.rebaseTradeEvidence === undefined || pending.sizing.sizingPreset !== "trade-v1" ? {} : {
+      prepareEvidence: () => input.rebaseTradeEvidence!(agent.ownerAddress, agent.id, generation),
+    }),
+    nowSec: input.nowSec,
+  });
+  if (swapped.kind === "updated" || swapped.kind === "same") return { agent: swapped.agent, phase: "done", missing: [], revocationRequired: false };
+  if (swapped.kind === "cancelled") {
+    const cancelled = swapped.agent.pendingRenewal;
+    return revoke(swapped.agent, cancelled?.authorityObserved === true || observed);
+  }
+  const current = await input.store.getAgent(input.ownerAddress, input.agentId);
+  return { agent: current, phase: "quiescing", missing: [], quiescing: "the renewal changed concurrently; retrying", revocationRequired: false };
 }

@@ -86,6 +86,8 @@ export type OwnerActionType =
   | "provisionAgent"
   | "cancelProvisioning"
   | "resetGrantAttempt"
+  | "renewSession"
+  | "cancelRenewal"
   | "lpOpen"
   | "lpSettings"
   | "lpExit"
@@ -201,6 +203,8 @@ const OWNER_ACTIONS: ReadonlySet<string> = new Set<OwnerActionType>([
   "provisionAgent",
   "cancelProvisioning",
   "resetGrantAttempt",
+  "renewSession",
+  "cancelRenewal",
   "lpOpen",
   "lpSettings",
   "lpExit",

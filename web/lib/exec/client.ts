@@ -51,8 +51,8 @@ async function forward(
 }
 
 /** Owner-signed read: the base64url envelope rides the x-owner-action header. */
-export function execOwnerRead(path: string, ownerActionHeader: string): Promise<ExecResponse> {
-  return forward(path, { method: "GET", headers: { "x-owner-action": ownerActionHeader } });
+export function execOwnerRead(path: string, ownerActionHeader: string, headers: Record<string, string> = {}): Promise<ExecResponse> {
+  return forward(path, { method: "GET", headers: { "x-owner-action": ownerActionHeader, ...headers } });
 }
 
 /** Exact accepted Trading S1, scoped only to its own hire-session continuation. */
@@ -61,8 +61,8 @@ export function execProvisionContinuationRead(path: string, provisionActionHeade
 }
 
 /** Account-only read session; the bearer is minted by the execution plane. */
-export function execAccountRead(path: string, bearer: string): Promise<ExecResponse> {
-  return forward(path, { method: "GET", headers: { authorization: `Bearer ${bearer}` } });
+export function execAccountRead(path: string, bearer: string, headers: Record<string, string> = {}): Promise<ExecResponse> {
+  return forward(path, { method: "GET", headers: { authorization: `Bearer ${bearer}`, ...headers } });
 }
 
 /**

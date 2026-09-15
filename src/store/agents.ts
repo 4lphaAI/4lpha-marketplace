@@ -120,6 +120,20 @@ export type SessionFacts = {
   /** Browser run correlation; authority remains the accepted provision action. */
   readonly hireRunId?: string;
   readonly armPlan?: SessionArmPlan;
+  /** Renewal evidence generation; legacy rows read as generation zero. */
+  readonly generation?: number;
+  /** The grant time used by the trade exit clamp for this session. */
+  readonly grantedAtSec?: number;
+  /** Durable renewal completion identity. */
+  readonly renewActionId?: Hex;
+  /** Last eight completed renewal identities. */
+  readonly renewalHistory?: readonly {
+    readonly renewActionId: Hex;
+    readonly grantDigest: Hex;
+    readonly completedAtSec: number;
+  }[];
+  /** Count exposed to the owner view without exposing the history array. */
+  readonly renewals?: number;
 };
 
 export type FundingRequirement = {
@@ -211,6 +225,48 @@ export type PendingGrant = {
   readonly cancelActionId?: Hex;
 };
 
+/** The second, sealed grant slot used while an expired session is renewed. */
+export type PendingRenewal = {
+  readonly version: 1;
+  readonly recoveredOwner: Address;
+  readonly walletAddress: Address;
+  readonly sessionAddress: Address;
+  readonly sessionPublicKey: Hex;
+  readonly accountKeyHash: Hex;
+  readonly keyStoreKeyId: Hex;
+  readonly sessionSpec: SessionSpec;
+  readonly permissions: ProviderPermissions;
+  readonly grantDigest: Hex;
+  readonly expiresAt: number;
+  readonly sizing: PendingGrant["sizing"];
+  readonly funding: FundingRequirement;
+  readonly createdAtSec: number;
+  readonly keyStoreVerdictAtS1: "verified" | "not-registered";
+  readonly renewActionId: Hex;
+  readonly previous: {
+    readonly publicKey: Hex;
+    readonly keyStoreKeyId: Hex;
+    readonly accountKeyHash: Hex;
+    readonly expiry: number;
+  };
+  readonly phase: "granting" | "observed" | "quiescing" | "ready";
+  readonly grantAttempt?: PendingGrant["grantAttempt"];
+  readonly lastGrantAttemptReset?: PendingGrant["lastGrantAttemptReset"];
+  readonly cancelRequestedAtSec?: number;
+  readonly cancelActionId?: Hex;
+  readonly cancelReason?: "owner" | "expired" | "renewal_coverage_lost";
+  readonly coverageLossToken?: Address;
+  /** Set once public evidence has shown any K2 authority on chain. */
+  readonly authorityObserved?: true;
+};
+
+export type RenewalOutcome = {
+  readonly renewActionId: Hex;
+  readonly grantDigest: Hex;
+  readonly outcome: "completed" | "cancelled" | "expired";
+  readonly atSec: number;
+};
+
 /** Off-chain execution caps. Extensible; empty is valid. */
 export type AgentCaps = {
   /** Optional off-chain ceiling on native spend per rolling day, in wei. */
@@ -255,6 +311,12 @@ export type AgentRecord = {
   readonly erc8004Identity?: StoredIdentity;
   /** Pending browser grant intent; present only while status is provisioning. */
   readonly pendingGrant: PendingGrant | null;
+  /** Present while K2 is being granted, quiesced, or retired after cancel. */
+  readonly pendingRenewal?: PendingRenewal | null;
+  /** Set by the swap until the worker has run the post-swap marker cleanup. */
+  readonly renewalCleanupPending?: boolean;
+  /** Durable replay outcomes retained for 90 days. */
+  readonly renewalOutcomes?: readonly RenewalOutcome[];
   /** First-wins authority CAS token; informational identity writes have a separate revision. */
   readonly rowVersion: number;
   /** Epoch ms. */
@@ -308,6 +370,18 @@ export type ProvisioningCasResult = {
   readonly retired?: boolean;
   readonly failure?: "not_found" | "state_changed" | "wallet_in_use";
 };
+
+export type RenewalCasResult =
+  | { readonly kind: "updated"; readonly agent: AgentRecord }
+  | { readonly kind: "same"; readonly agent: AgentRecord }
+  | { readonly kind: "cancelled"; readonly agent: AgentRecord }
+  | { readonly kind: "conflict"; readonly agent?: AgentRecord }
+  | { readonly kind: "not_found" };
+
+export type RenewalQuiescenceCheck = () => Promise<{
+  readonly quiescent: boolean;
+  readonly reason?: string;
+}>;
 
 export type ConfirmSessionRevokedInput = {
   readonly ownerAddress: Address;
@@ -393,6 +467,11 @@ export interface AgentStore {
     readonly limit: number;
     readonly signal?: AbortSignal;
   }): Promise<{ readonly rows: readonly AgentRecord[]; readonly hasMore: boolean }>;
+  listPendingRenewals(input: {
+    readonly afterId: string | null;
+    readonly limit: number;
+    readonly signal?: AbortSignal;
+  }): Promise<{ readonly rows: readonly AgentRecord[]; readonly hasMore: boolean }>;
   armProvisioningAgent(input: {
     readonly ownerAddress: Address;
     readonly agentId: string;
@@ -415,6 +494,76 @@ export interface AgentStore {
     readonly resetActionId: Hex;
     readonly resetAtSec: number;
   }): Promise<GrantAttemptResetCasResult>;
+  createPendingRenewalCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedRowVersion: number;
+    readonly nowSec: number;
+    readonly pendingRenewal: PendingRenewal;
+    readonly sessionKey: Hex;
+    readonly checkQuiescent?: RenewalQuiescenceCheck;
+  }): Promise<RenewalCasResult>;
+  markPendingRenewalPhaseCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex;
+    readonly phase: PendingRenewal["phase"];
+    readonly authorityObserved?: boolean;
+  }): Promise<RenewalCasResult>;
+  startRenewalGrantAttemptCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedGrantDigest: Hex;
+    readonly attemptId: Hex;
+    readonly startedAtSec: number;
+  }): Promise<GrantAttemptCasResult>;
+  resetRenewalGrantAttemptCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedGrantDigest: Hex;
+    readonly attemptId: Hex;
+    readonly resetActionId: Hex;
+    readonly resetAtSec: number;
+  }): Promise<GrantAttemptResetCasResult>;
+  cancelPendingRenewalCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex;
+    readonly nowSec: number;
+    readonly cancelActionId: Hex;
+    readonly outcome: "cancelled" | "expired";
+    readonly reason: "owner" | "expired" | "renewal_coverage_lost";
+    readonly authorityObserved?: boolean;
+  }): Promise<RenewalCasResult>;
+  clearRenewalCleanup(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedRowVersion: number;
+  }): Promise<RenewalCasResult>;
+  retirePendingRenewalCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex;
+  }): Promise<RenewalCasResult>;
+  swapSessionCas(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex;
+    readonly sessionFacts: SessionFacts;
+    readonly checkQuiescent?: RenewalQuiescenceCheck;
+    readonly checkCoverage?: () => Promise<{ readonly ok: boolean; readonly token?: Address }>;
+    readonly prepareEvidence?: () => Promise<boolean>;
+    readonly nowSec?: number;
+  }): Promise<RenewalCasResult>;
+  readExecutingSession(ownerAddress: Address, id: string): Promise<{
+    readonly facts: SessionFacts;
+    readonly key: Hex;
+    readonly generation: number;
+  } | null>;
   claimArmPlanCas(input: {
     readonly ownerAddress: Address;
     readonly agentId: string;
@@ -769,6 +918,7 @@ function openKey(stored: StoredKey, masterKey: Buffer | null): Hex {
 type MemoryAgent = {
   record: AgentRecord;
   key: StoredKey | undefined;
+  renewalKey: StoredKey | undefined;
 };
 
 /**
@@ -811,6 +961,9 @@ export class MemoryAgentStore implements AgentStore {
       httpRuntimeProfile: input.httpRuntimeProfile ?? "unbound-v1",
       erc8004AgentId: input.erc8004AgentId ?? null,
       pendingGrant: null,
+      pendingRenewal: null,
+      renewalCleanupPending: false,
+      renewalOutcomes: [],
       rowVersion: 1,
       createdAt: at,
       updatedAt: at,
@@ -824,7 +977,7 @@ export class MemoryAgentStore implements AgentStore {
       if (blocker !== null) {
         throw new AgentWalletInUseError(blocker.id);
       }
-      this.#agents.set(input.id, { record: structuredClone(record), key: undefined });
+      this.#agents.set(input.id, { record: structuredClone(record), key: undefined, renewalKey: undefined });
       return structuredClone(record);
     });
   }
@@ -846,6 +999,9 @@ export class MemoryAgentStore implements AgentStore {
       httpRuntimeProfile: input.record.httpRuntimeProfile ?? "lp-v1",
       erc8004AgentId: input.record.erc8004AgentId ?? null,
       pendingGrant,
+      pendingRenewal: null,
+      renewalCleanupPending: false,
+      renewalOutcomes: [],
       rowVersion: 1,
       createdAt: at,
       updatedAt: at,
@@ -863,6 +1019,7 @@ export class MemoryAgentStore implements AgentStore {
       this.#agents.set(input.record.id, {
         record: structuredClone(record),
         key: sealKey(input.sessionKey, this.#masterKey),
+        renewalKey: undefined,
       });
       return structuredClone(record);
     });
@@ -1026,6 +1183,264 @@ export class MemoryAgentStore implements AgentStore {
     return { kind: "cleared", agent: structuredClone(entry.record) };
   }
 
+  async createPendingRenewalCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly nowSec: number; readonly pendingRenewal: PendingRenewal; readonly sessionKey: Hex;
+    readonly checkQuiescent?: RenewalQuiescenceCheck;
+  }): Promise<RenewalCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      if (entry === undefined) return { kind: "not_found" };
+      const facts = entry.record.sessionFacts;
+      if (entry.record.rowVersion !== input.expectedRowVersion || facts === null
+        || (entry.record.status !== "armed" && entry.record.status !== "paused")
+        || entry.record.pendingGrant !== null || entry.record.pendingRenewal != null
+        || entry.record.sessionRevocation !== null || facts.expiry > input.nowSec
+        || facts.hireSizing?.name === "lending-v1") {
+        return { kind: "conflict", agent: structuredClone(entry.record) };
+      }
+      const quiescent = await input.checkQuiescent?.();
+      if (quiescent !== undefined && !quiescent.quiescent) {
+        return { kind: "conflict", agent: structuredClone(entry.record) };
+      }
+      entry.record = structuredClone({
+        ...entry.record,
+        pendingRenewal: structuredClone(input.pendingRenewal),
+        rowVersion: entry.record.rowVersion + 1,
+        updatedAt: this.#now(),
+      });
+      entry.renewalKey = sealKey(input.sessionKey, this.#masterKey);
+      return { kind: "updated", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async markPendingRenewalPhaseCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex; readonly phase: PendingRenewal["phase"];
+    readonly authorityObserved?: boolean;
+  }): Promise<RenewalCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const pending = entry?.record.pendingRenewal;
+      if (entry === undefined || pending === null || pending === undefined
+        || entry.record.rowVersion !== input.expectedRowVersion
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined) {
+        return { kind: "conflict", ...(entry === undefined ? {} : { agent: structuredClone(entry.record) }) };
+      }
+      if (pending.phase === input.phase && (input.authorityObserved !== true || pending.authorityObserved === true)) {
+        return { kind: "same", agent: structuredClone(entry.record) };
+      }
+      entry.record = structuredClone({
+        ...entry.record,
+        pendingRenewal: {
+          ...pending,
+          phase: input.phase,
+          ...(input.authorityObserved === true ? { authorityObserved: true as const } : {}),
+        },
+        rowVersion: entry.record.rowVersion + 1,
+        updatedAt: this.#now(),
+      });
+      return { kind: "updated", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async startRenewalGrantAttemptCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedGrantDigest: Hex;
+    readonly attemptId: Hex; readonly startedAtSec: number;
+  }): Promise<GrantAttemptCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const pending = entry?.record.pendingRenewal;
+      if (entry === undefined || pending === null || pending === undefined
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined) return { kind: "conflict" };
+      if (pending.grantAttempt !== undefined) {
+        return pending.grantAttempt.attemptId.toLowerCase() === input.attemptId.toLowerCase()
+          ? { kind: "same", agent: structuredClone(entry.record) }
+          : { kind: "conflict" };
+      }
+      entry.record = structuredClone({ ...entry.record,
+        pendingRenewal: { ...pending, grantAttempt: { version: 1, attemptId: input.attemptId, startedAtSec: input.startedAtSec } },
+        rowVersion: entry.record.rowVersion + 1, updatedAt: this.#now() });
+      return { kind: "created", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async resetRenewalGrantAttemptCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedGrantDigest: Hex;
+    readonly attemptId: Hex; readonly resetActionId: Hex; readonly resetAtSec: number;
+  }): Promise<GrantAttemptResetCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const pending = entry?.record.pendingRenewal;
+      if (entry === undefined || pending === null || pending === undefined
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined) return { kind: "conflict" };
+      if (pending.lastGrantAttemptReset?.resetActionId.toLowerCase() === input.resetActionId.toLowerCase()
+        && pending.lastGrantAttemptReset.clearedAttemptId.toLowerCase() === input.attemptId.toLowerCase()
+        && pending.grantAttempt === undefined) return { kind: "same", agent: structuredClone(entry.record) };
+      if (pending.grantAttempt?.attemptId.toLowerCase() !== input.attemptId.toLowerCase()) return { kind: "conflict" };
+      const { grantAttempt: _cleared, ...rest } = pending;
+      entry.record = structuredClone({ ...entry.record,
+        pendingRenewal: { ...rest, lastGrantAttemptReset: { version: 1, resetActionId: input.resetActionId,
+          clearedAttemptId: input.attemptId, resetAtSec: input.resetAtSec } },
+        rowVersion: entry.record.rowVersion + 1, updatedAt: this.#now() });
+      return { kind: "cleared", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async cancelPendingRenewalCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex; readonly nowSec: number; readonly cancelActionId: Hex;
+    readonly outcome: "cancelled" | "expired"; readonly reason: "owner" | "expired" | "renewal_coverage_lost";
+    readonly authorityObserved?: boolean;
+  }): Promise<RenewalCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const pending = entry?.record.pendingRenewal;
+      if (entry === undefined || pending === null || pending === undefined
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || entry.record.rowVersion !== input.expectedRowVersion) {
+        return { kind: "conflict", ...(entry === undefined ? {} : { agent: structuredClone(entry.record) }) };
+      }
+      if (pending.cancelRequestedAtSec !== undefined) return { kind: "same", agent: structuredClone(entry.record) };
+      const outcomes = [...(entry.record.renewalOutcomes ?? [])].filter((row) => input.nowSec - row.atSec <= 90 * 24 * 60 * 60);
+      outcomes.push({ renewActionId: pending.renewActionId, grantDigest: pending.grantDigest, outcome: input.outcome, atSec: input.nowSec });
+      entry.record = structuredClone({ ...entry.record,
+        pendingRenewal: { ...pending, cancelRequestedAtSec: input.nowSec, cancelActionId: input.cancelActionId,
+          cancelReason: input.reason, ...(input.authorityObserved === true ? { authorityObserved: true as const } : {}) },
+        renewalOutcomes: outcomes,
+        rowVersion: entry.record.rowVersion + 1, updatedAt: this.#now() });
+      return { kind: "updated", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async retirePendingRenewalCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex;
+  }): Promise<RenewalCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const pending = entry?.record.pendingRenewal;
+      if (entry === undefined || pending === null || pending === undefined
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || entry.record.rowVersion !== input.expectedRowVersion) {
+        return { kind: "conflict", ...(entry === undefined ? {} : { agent: structuredClone(entry.record) }) };
+      }
+      if (pending.cancelRequestedAtSec === undefined) return { kind: "conflict", agent: structuredClone(entry.record) };
+      entry.record = structuredClone({ ...entry.record, pendingRenewal: null,
+        rowVersion: entry.record.rowVersion + 1, updatedAt: this.#now() });
+      entry.renewalKey = undefined;
+      return { kind: "updated", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async swapSessionCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex; readonly sessionFacts: SessionFacts;
+    readonly checkQuiescent?: RenewalQuiescenceCheck;
+    readonly checkCoverage?: () => Promise<{ readonly ok: boolean; readonly token?: Address }>;
+    readonly prepareEvidence?: () => Promise<boolean>;
+    readonly nowSec?: number;
+  }): Promise<RenewalCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      const pending = entry?.record.pendingRenewal;
+      const currentFacts = entry?.record.sessionFacts;
+      if (entry === undefined || pending === null || pending === undefined || currentFacts === null || currentFacts === undefined
+        || entry.record.rowVersion !== input.expectedRowVersion
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined || entry.renewalKey === undefined) {
+        return { kind: "conflict", ...(entry === undefined ? {} : { agent: structuredClone(entry.record) }) };
+      }
+      const quiescent = await input.checkQuiescent?.();
+      if (quiescent !== undefined && !quiescent.quiescent) return { kind: "conflict", agent: structuredClone(entry.record) };
+      const coverage = await input.checkCoverage?.();
+      if (coverage !== undefined && !coverage.ok) {
+        const atSec = input.nowSec ?? Math.floor(this.#now() / 1_000);
+        const outcomes = [...(entry.record.renewalOutcomes ?? [])].filter((row) => atSec - row.atSec <= 90 * 24 * 60 * 60);
+        outcomes.push({ renewActionId: pending.renewActionId, grantDigest: pending.grantDigest, outcome: "cancelled", atSec });
+        entry.record = structuredClone({ ...entry.record, pendingRenewal: { ...pending,
+          cancelRequestedAtSec: atSec, cancelActionId: pending.renewActionId, cancelReason: "renewal_coverage_lost",
+          ...(coverage.token === undefined ? {} : { coverageLossToken: coverage.token }) },
+          renewalOutcomes: outcomes, rowVersion: entry.record.rowVersion + 1, updatedAt: this.#now() });
+        return { kind: "cancelled", agent: structuredClone(entry.record) };
+      }
+      const currentGeneration = currentFacts.generation ?? 0;
+      if ((input.sessionFacts.generation ?? -1) !== currentGeneration + 1) {
+        return { kind: "conflict", agent: structuredClone(entry.record) };
+      }
+      if (input.prepareEvidence !== undefined && !await input.prepareEvidence()) {
+        return { kind: "conflict", agent: structuredClone(entry.record) };
+      }
+      const sessionFacts: SessionFacts = {
+        ...structuredClone(input.sessionFacts),
+        generation: currentGeneration + 1,
+        ...(currentFacts.armPlan === undefined ? {} : { armPlan: structuredClone(currentFacts.armPlan) }),
+      };
+      const outcomes = [...(entry.record.renewalOutcomes ?? [])].filter((row) => input.sessionFacts.grantedAtSec === undefined || input.sessionFacts.grantedAtSec - row.atSec <= 90 * 24 * 60 * 60);
+      outcomes.push({ renewActionId: pending.renewActionId, grantDigest: pending.grantDigest, outcome: "completed", atSec: input.sessionFacts.grantedAtSec ?? Math.floor(this.#now() / 1_000) });
+      const key = openKey(entry.renewalKey, this.#masterKey);
+      entry.key = sealKey(key, this.#masterKey);
+      entry.renewalKey = undefined;
+      entry.record = structuredClone({ ...entry.record, sessionFacts, pendingRenewal: null,
+        renewalCleanupPending: true, renewalOutcomes: outcomes, rowVersion: entry.record.rowVersion + 1, updatedAt: this.#now() });
+      return { kind: "updated", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async clearRenewalCleanup(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+  }): Promise<RenewalCasResult> {
+    const initial = this.#owned(input.ownerAddress, input.agentId);
+    if (initial === undefined) return { kind: "not_found" };
+    return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
+      const entry = this.#owned(input.ownerAddress, input.agentId);
+      if (entry === undefined) return { kind: "not_found" };
+      if (entry.record.renewalCleanupPending !== true) return { kind: "same", agent: structuredClone(entry.record) };
+      if (entry.record.rowVersion !== input.expectedRowVersion || entry.record.pendingRenewal != null) {
+        return { kind: "conflict", agent: structuredClone(entry.record) };
+      }
+      entry.record = structuredClone({ ...entry.record, renewalCleanupPending: false,
+        rowVersion: entry.record.rowVersion + 1, updatedAt: this.#now() });
+      return { kind: "updated", agent: structuredClone(entry.record) };
+    });
+  }
+
+  async readExecutingSession(ownerAddress: Address, id: string): Promise<{
+    readonly facts: SessionFacts; readonly key: Hex; readonly generation: number;
+  } | null> {
+    const entry = this.#owned(ownerAddress, id);
+    if (entry === undefined || entry.record.sessionFacts === null || entry.key === undefined) return null;
+    const facts = structuredClone(entry.record.sessionFacts);
+    return { facts, key: openKey(entry.key, this.#masterKey), generation: facts.generation ?? 0 };
+  }
+
+  async listPendingRenewals(input: { readonly afterId: string | null; readonly limit: number; readonly signal?: AbortSignal }) {
+    input.signal?.throwIfAborted();
+    assertWorkerLimit(input.limit);
+    const rows = [...this.#agents.values()].map((entry) => entry.record)
+       .filter((row) => (row.pendingRenewal != null || row.renewalCleanupPending === true)
+         && (input.afterId === null || row.id > input.afterId))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    return { rows: structuredClone(rows.slice(0, input.limit)), hasMore: rows.length > input.limit };
+  }
+
   async confirmSessionRevokedCas(input: ConfirmSessionRevokedInput): Promise<ConfirmSessionRevokedResult> {
     input.signal?.throwIfAborted();
     const initial = this.#owned(input.ownerAddress, input.agentId);
@@ -1034,6 +1449,7 @@ export class MemoryAgentStore implements AgentStore {
       input.signal?.throwIfAborted();
       const entry = this.#owned(input.ownerAddress, input.agentId);
       if (entry === undefined) return { kind: "not_found" };
+      if (entry.record.pendingRenewal != null) return { kind: "conflict" };
       const stored = parseSessionRevocationEvidence(entry.record.sessionRevocation);
       const incoming = parseSessionRevocationEvidence(input.evidence);
       if (stored !== null && incoming !== null && sameRevocationIdentity(stored, incoming)
@@ -1161,7 +1577,8 @@ export class MemoryAgentStore implements AgentStore {
       const entry = this.#owned(input.ownerAddress, input.agentId);
       if (entry === undefined || entry.record.status !== input.expectedStatus
         || entry.record.rowVersion !== input.expectedRowVersion
-        || hasProvisioningCancellation(entry.record.pendingGrant)) return null;
+        || hasProvisioningCancellation(entry.record.pendingGrant)
+        || (entry.record.pendingRenewal != null && input.status === "revoked")) return null;
       return this.#mutate(input.ownerAddress, input.agentId, (record) => ({ ...record, status: input.status }));
     });
   }
@@ -1194,7 +1611,8 @@ export class MemoryAgentStore implements AgentStore {
     if (initial === undefined) return null;
     return this.#withWalletFence(initial.record.ownerAddress, initial.record.walletAddress, async () => {
       const current = this.#owned(ownerAddress, id)?.record;
-      if (current === undefined || hasProvisioningCancellation(current.pendingGrant)) return null;
+      if (current === undefined || hasProvisioningCancellation(current.pendingGrant)
+        || (current.pendingRenewal != null && status === "revoked")) return null;
       return this.#mutate(ownerAddress, id, (record) => ({ ...record, status }));
     });
   }
@@ -1372,6 +1790,10 @@ type AgentRow = {
   erc8004_identity?: unknown;
   identity_absent?: boolean;
   pending_grant: unknown;
+  pending_renewal: unknown;
+  renewal_outcomes: unknown;
+  renewal_cleanup_pending?: boolean;
+  pending_renewal_key?: string | null;
   row_version: number;
   created_at: Date;
   updated_at: Date;
@@ -1379,7 +1801,7 @@ type AgentRow = {
 
 type WalletOccupantRow = AgentRow & { session_key_present: boolean };
 
-const AGENT_COLUMNS = "id, owner_address, wallet_address, custody_model, session_facts, session_revocation, (session_facts is null and session_revocation is null) as session_state_empty, caps, status, http_runtime_profile, erc8004_agent_id, erc8004_identity, (erc8004_identity is null) as identity_absent, pending_grant, row_version, created_at, updated_at";
+const AGENT_COLUMNS = "id, owner_address, wallet_address, custody_model, session_facts, session_revocation, (session_facts is null and session_revocation is null) as session_state_empty, caps, status, http_runtime_profile, erc8004_agent_id, erc8004_identity, (erc8004_identity is null) as identity_absent, pending_grant, pending_renewal, renewal_outcomes, renewal_cleanup_pending, row_version, created_at, updated_at";
 
 type HealthRow = {
   executor: string;
@@ -1404,6 +1826,10 @@ const AGENTS_DDL = `
     http_runtime_profile text not null default 'unbound-v1',
     erc8004_agent_id text,
     pending_grant jsonb,
+    pending_renewal jsonb,
+    pending_renewal_key bytea,
+    renewal_outcomes jsonb not null default '[]'::jsonb,
+    renewal_cleanup_pending boolean not null default false,
     row_version integer not null default 1,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
@@ -1429,6 +1855,13 @@ const AGENTS_ROW_VERSION_MIGRATION_DDL = `
 
 const AGENTS_SESSION_REVOCATION_MIGRATION_DDL = `
   alter table agents add column if not exists session_revocation jsonb
+`;
+
+const AGENTS_RENEWAL_MIGRATION_DDL = `
+  alter table agents add column if not exists pending_renewal jsonb;
+  alter table agents add column if not exists pending_renewal_key bytea;
+  alter table agents add column if not exists renewal_outcomes jsonb not null default '[]'::jsonb;
+  alter table agents add column if not exists renewal_cleanup_pending boolean not null default false
 `;
 
 const AGENTS_OWNER_INDEX_DDL = `
@@ -1491,6 +1924,7 @@ export class PostgresAgentStore implements AgentStore {
     await sql.query(AGENTS_PENDING_GRANT_MIGRATION_DDL);
     await sql.query(AGENTS_ROW_VERSION_MIGRATION_DDL);
     await sql.query(AGENTS_SESSION_REVOCATION_MIGRATION_DDL);
+    await sql.query(AGENTS_RENEWAL_MIGRATION_DDL);
     await sql.query(AGENTS_OWNER_INDEX_DDL);
     await sql.query(EXECUTOR_HEALTH_DDL);
     return new PostgresAgentStore(sql, masterKey, now, revocationContext);
@@ -1506,6 +1940,7 @@ export class PostgresAgentStore implements AgentStore {
       sessionFacts: input.sessionFacts ?? null, sessionRevocation: null, caps: input.caps ?? null, status,
       httpRuntimeProfile: input.httpRuntimeProfile ?? "unbound-v1",
       erc8004AgentId: input.erc8004AgentId ?? null, pendingGrant: null,
+       pendingRenewal: null, renewalCleanupPending: false, renewalOutcomes: [],
       rowVersion: 1, createdAt: at.getTime(), updatedAt: at.getTime(),
     };
     const result = await this.#sql.transaction(async (tx) => {
@@ -1522,8 +1957,8 @@ export class PostgresAgentStore implements AgentStore {
       return tx.query<AgentRow>(
         `/* agents.create */
          insert into agents
-            (id, owner_address, wallet_address, custody_model, session_facts, session_revocation, caps, status, http_runtime_profile, erc8004_agent_id, pending_grant, row_version, created_at, updated_at)
-         values ($1, $2, $3, $4, $5::jsonb, null, $6::jsonb, $7, $8, $9, null, 1, $10, $10)
+             (id, owner_address, wallet_address, custody_model, session_facts, session_revocation, caps, status, http_runtime_profile, erc8004_agent_id, pending_grant, pending_renewal, renewal_outcomes, renewal_cleanup_pending, row_version, created_at, updated_at)
+          values ($1, $2, $3, $4, $5::jsonb, null, $6::jsonb, $7, $8, $9, null, null, '[]'::jsonb, false, 1, $10, $10)
          on conflict (id) do nothing
          returning ${AGENT_COLUMNS}`,
         [input.id, owner, wallet, input.custodyModel,
@@ -1557,7 +1992,7 @@ export class PostgresAgentStore implements AgentStore {
       caps: input.record.caps ?? null, status: "provisioning",
       httpRuntimeProfile: input.record.httpRuntimeProfile ?? "lp-v1",
       erc8004AgentId: input.record.erc8004AgentId ?? null,
-      pendingGrant, rowVersion: 1, createdAt: at.getTime(), updatedAt: at.getTime(),
+       pendingGrant, pendingRenewal: null, renewalCleanupPending: false, renewalOutcomes: [], rowVersion: 1, createdAt: at.getTime(), updatedAt: at.getTime(),
     };
     const result = await this.#sql.transaction(async (tx) => {
       await tx.query(`/* agents.walletFence */ select pg_advisory_xact_lock(hashtext($1))`,
@@ -1578,8 +2013,8 @@ export class PostgresAgentStore implements AgentStore {
       return tx.query<AgentRow>(
         `/* agents.createProvisioning */
          insert into agents
-           (id, owner_address, wallet_address, custody_model, session_facts, session_revocation, session_key_ciphertext, caps, status, http_runtime_profile, erc8004_agent_id, pending_grant, row_version, created_at, updated_at)
-         values ($1, $2, $3, $4, null, null, $5, $6::jsonb, 'provisioning', $7, $8, $9::jsonb, 1, $10, $10)
+            (id, owner_address, wallet_address, custody_model, session_facts, session_revocation, session_key_ciphertext, caps, status, http_runtime_profile, erc8004_agent_id, pending_grant, pending_renewal, renewal_outcomes, renewal_cleanup_pending, row_version, created_at, updated_at)
+          values ($1, $2, $3, $4, null, null, $5, $6::jsonb, 'provisioning', $7, $8, $9::jsonb, null, '[]'::jsonb, false, 1, $10, $10)
          on conflict (id) do nothing
          returning ${AGENT_COLUMNS}`,
         [input.record.id, owner, wallet, input.record.custodyModel, ciphertext,
@@ -1649,6 +2084,19 @@ export class PostgresAgentStore implements AgentStore {
        select ${AGENT_COLUMNS}
        from agents
        where status = 'provisioning' and ($1::text is null or id > $1)
+       order by id asc limit $2`,
+      [input.afterId, input.limit + 1],
+      { ...(input.signal === undefined ? {} : { signal: input.signal }), timeoutMs: 5_000 },
+    );
+    return { rows: result.rows.slice(0, input.limit).map(rowToRecord), hasMore: result.rows.length > input.limit };
+  }
+
+  async listPendingRenewals(input: { readonly afterId: string | null; readonly limit: number; readonly signal?: AbortSignal }) {
+    assertWorkerLimit(input.limit);
+    const result = await this.#sql.query<AgentRow>(
+      `/* agents.listRenewalWorker */
+       select ${AGENT_COLUMNS} from agents
+        where (pending_renewal is not null or renewal_cleanup_pending = true) and ($1::text is null or id > $1)
        order by id asc limit $2`,
       [input.afterId, input.limit + 1],
       { ...(input.signal === undefined ? {} : { signal: input.signal }), timeoutMs: 5_000 },
@@ -1880,6 +2328,310 @@ export class PostgresAgentStore implements AgentStore {
     });
   }
 
+  async createPendingRenewalCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly nowSec: number; readonly pendingRenewal: PendingRenewal; readonly sessionKey: Hex;
+    readonly checkQuiescent?: RenewalQuiescenceCheck;
+  }): Promise<RenewalCasResult> {
+    if (this.#masterKey === null) throw new Error("Refusing to persist a renewal key without encryption configured; set EXECUTION_MASTER_KEY.");
+    const owner = ownerKey(input.ownerAddress);
+    const ciphertext = encryptSecret(input.sessionKey, this.#masterKey);
+    const before = await this.getAgent(input.ownerAddress, input.agentId);
+    if (before === null) return { kind: "not_found" };
+    return this.#sql.transaction(async (tx) => {
+      await tx.query(`/* agents.walletFence */ select pg_advisory_xact_lock(hashtext($1))`, [`${owner}|${before.walletAddress.toLowerCase()}`]);
+      const selected = await tx.query<AgentRow>(
+        `/* agents.renewalCreateRead */ select ${AGENT_COLUMNS} from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const facts = current.sessionFacts;
+      if (current.rowVersion !== input.expectedRowVersion || facts === null
+        || (current.status !== "armed" && current.status !== "paused")
+        || current.pendingGrant !== null || current.pendingRenewal != null
+        || current.sessionRevocation !== null || facts.expiry > input.nowSec
+        || facts.hireSizing?.name === "lending-v1") return { kind: "conflict", agent: current } as const;
+      const quiescent = await input.checkQuiescent?.();
+      if (quiescent !== undefined && !quiescent.quiescent) return { kind: "conflict", agent: current } as const;
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalCreate */ update agents
+         set pending_renewal = $4::jsonb, pending_renewal_key = decode($5, 'base64'),
+             row_version = row_version + 1, updated_at = $6
+         where id = $1 and owner_address = $2 and row_version = $3
+           and pending_grant is null and pending_renewal is null and session_revocation is null
+         returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, input.expectedRowVersion, encodeJsonbParam(input.pendingRenewal), ciphertext, new Date(this.#now())],
+      );
+      return updated.rows[0] === undefined
+        ? { kind: "conflict", agent: current } as const
+        : { kind: "updated", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async markPendingRenewalPhaseCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex; readonly phase: PendingRenewal["phase"];
+    readonly authorityObserved?: boolean;
+  }): Promise<RenewalCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    return this.#sql.transaction(async (tx) => {
+      const selected = await tx.query<AgentRow>(
+        `/* agents.renewalPhaseRead */ select ${AGENT_COLUMNS} from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const pending = current.pendingRenewal;
+      if (pending === null || pending === undefined || current.rowVersion !== input.expectedRowVersion
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined) return { kind: "conflict", agent: current } as const;
+      if (pending.phase === input.phase && (input.authorityObserved !== true || pending.authorityObserved === true)) return { kind: "same", agent: current } as const;
+      const next = { ...pending, phase: input.phase, ...(input.authorityObserved === true ? { authorityObserved: true as const } : {}) };
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalPhase */ update agents set pending_renewal = $4::jsonb,
+           row_version = row_version + 1, updated_at = $5
+         where id = $1 and owner_address = $2 and row_version = $3 and pending_renewal->>'grantDigest' = $6
+         returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, input.expectedRowVersion, encodeJsonbParam(next), new Date(this.#now()), input.expectedGrantDigest],
+      );
+      return updated.rows[0] === undefined ? { kind: "conflict", agent: current } as const : { kind: "updated", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async startRenewalGrantAttemptCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedGrantDigest: Hex;
+    readonly attemptId: Hex; readonly startedAtSec: number;
+  }): Promise<GrantAttemptCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    return this.#sql.transaction(async (tx) => {
+      const selected = await tx.query<AgentRow>(
+        `/* agents.renewalGrantAttemptRead */ select ${AGENT_COLUMNS} from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const pending = current.pendingRenewal;
+      if (pending === null || pending === undefined || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined) return { kind: "conflict" } as const;
+      if (pending.grantAttempt !== undefined) return pending.grantAttempt.attemptId.toLowerCase() === input.attemptId.toLowerCase()
+        ? { kind: "same", agent: current } as const : { kind: "conflict" } as const;
+      const next = { ...pending, grantAttempt: { version: 1 as const, attemptId: input.attemptId, startedAtSec: input.startedAtSec } };
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalGrantAttemptStart */ update agents set pending_renewal = $4::jsonb,
+          row_version = row_version + 1, updated_at = $5 where id = $1 and owner_address = $2 and row_version = $3 returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, current.rowVersion, encodeJsonbParam(next), new Date(this.#now())],
+      );
+      return updated.rows[0] === undefined ? { kind: "conflict" } as const : { kind: "created", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async resetRenewalGrantAttemptCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedGrantDigest: Hex;
+    readonly attemptId: Hex; readonly resetActionId: Hex; readonly resetAtSec: number;
+  }): Promise<GrantAttemptResetCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    return this.#sql.transaction(async (tx) => {
+      const selected = await tx.query<AgentRow>(
+        `/* agents.renewalGrantAttemptResetRead */ select ${AGENT_COLUMNS} from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const pending = current.pendingRenewal;
+      if (pending === null || pending === undefined || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined) return { kind: "conflict" } as const;
+      if (pending.lastGrantAttemptReset?.resetActionId.toLowerCase() === input.resetActionId.toLowerCase()
+        && pending.lastGrantAttemptReset.clearedAttemptId.toLowerCase() === input.attemptId.toLowerCase()
+        && pending.grantAttempt === undefined) return { kind: "same", agent: current } as const;
+      if (pending.grantAttempt?.attemptId.toLowerCase() !== input.attemptId.toLowerCase()) return { kind: "conflict" } as const;
+      const { grantAttempt: _cleared, ...rest } = pending;
+      const next = { ...rest, lastGrantAttemptReset: { version: 1 as const, resetActionId: input.resetActionId, clearedAttemptId: input.attemptId, resetAtSec: input.resetAtSec } };
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalGrantAttemptReset */ update agents set pending_renewal = $4::jsonb,
+          row_version = row_version + 1, updated_at = $5 where id = $1 and owner_address = $2 and row_version = $3 returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, current.rowVersion, encodeJsonbParam(next), new Date(this.#now())],
+      );
+      return updated.rows[0] === undefined ? { kind: "conflict" } as const : { kind: "cleared", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async cancelPendingRenewalCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex; readonly nowSec: number; readonly cancelActionId: Hex;
+    readonly outcome: "cancelled" | "expired"; readonly reason: "owner" | "expired" | "renewal_coverage_lost";
+    readonly authorityObserved?: boolean;
+  }): Promise<RenewalCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    const before = await this.getAgent(input.ownerAddress, input.agentId);
+    if (before === null) return { kind: "not_found" };
+    return this.#sql.transaction(async (tx) => {
+      await tx.query(`/* agents.walletFence */ select pg_advisory_xact_lock(hashtext($1))`, [`${owner}|${before.walletAddress.toLowerCase()}`]);
+      const selected = await tx.query<AgentRow>(
+        `/* agents.renewalCancelRead */ select ${AGENT_COLUMNS} from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const pending = current.pendingRenewal;
+      if (pending === null || pending === undefined || current.rowVersion !== input.expectedRowVersion
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()) return { kind: "conflict", agent: current } as const;
+      if (pending.cancelRequestedAtSec !== undefined) return { kind: "same", agent: current } as const;
+      const outcomes = [...(current.renewalOutcomes ?? [])].filter((row) => input.nowSec - row.atSec <= 90 * 24 * 60 * 60);
+      outcomes.push({ renewActionId: pending.renewActionId, grantDigest: pending.grantDigest, outcome: input.outcome, atSec: input.nowSec });
+      const next = { ...pending, cancelRequestedAtSec: input.nowSec, cancelActionId: input.cancelActionId, cancelReason: input.reason,
+        ...(input.authorityObserved === true ? { authorityObserved: true as const } : {}) };
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalCancel */ update agents set pending_renewal = $4::jsonb, renewal_outcomes = $5::jsonb,
+          row_version = row_version + 1, updated_at = $6 where id = $1 and owner_address = $2 and row_version = $3 returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, input.expectedRowVersion, encodeJsonbParam(next), encodeJsonbParam(outcomes), new Date(this.#now())],
+      );
+      return updated.rows[0] === undefined ? { kind: "conflict", agent: current } as const : { kind: "updated", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async retirePendingRenewalCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex;
+  }): Promise<RenewalCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    const before = await this.getAgent(input.ownerAddress, input.agentId);
+    if (before === null) return { kind: "not_found" };
+    return this.#sql.transaction(async (tx) => {
+      await tx.query(`/* agents.walletFence */ select pg_advisory_xact_lock(hashtext($1))`, [`${owner}|${before.walletAddress.toLowerCase()}`]);
+      const selected = await tx.query<AgentRow>(`/* agents.renewalRetireRead */ select ${AGENT_COLUMNS} from agents where id = $1 and owner_address = $2 for update`, [input.agentId, owner]);
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const pending = current.pendingRenewal;
+      if (pending === null || pending === undefined || current.rowVersion !== input.expectedRowVersion
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec === undefined) return { kind: "conflict", agent: current } as const;
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalRetire */ update agents set pending_renewal = null, pending_renewal_key = null,
+          row_version = row_version + 1, updated_at = $4 where id = $1 and owner_address = $2 and row_version = $3 returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, input.expectedRowVersion, new Date(this.#now())],
+      );
+      return updated.rows[0] === undefined ? { kind: "conflict", agent: current } as const : { kind: "updated", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async swapSessionCas(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+    readonly expectedGrantDigest: Hex; readonly sessionFacts: SessionFacts; readonly checkQuiescent?: RenewalQuiescenceCheck;
+    readonly checkCoverage?: () => Promise<{ readonly ok: boolean; readonly token?: Address }>;
+    readonly prepareEvidence?: () => Promise<boolean>;
+    readonly nowSec?: number;
+  }): Promise<RenewalCasResult> {
+    const masterKey = this.#masterKey;
+    if (masterKey === null) throw new Error("A master key is required to swap a persisted renewal key.");
+    const owner = ownerKey(input.ownerAddress);
+    const before = await this.getAgent(input.ownerAddress, input.agentId);
+    if (before === null) return { kind: "not_found" };
+    return this.#sql.transaction(async (tx) => {
+      await tx.query(`/* agents.walletFence */ select pg_advisory_xact_lock(hashtext($1))`, [`${owner}|${before.walletAddress.toLowerCase()}`]);
+      const selected = await tx.query<AgentRow & { pending_renewal_key: string | null }>(
+        `/* agents.renewalSwapRead */ select ${AGENT_COLUMNS}, encode(pending_renewal_key, 'base64') as pending_renewal_key from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      const pending = current.pendingRenewal;
+      const currentFacts = current.sessionFacts;
+      if (pending === null || pending === undefined || currentFacts === null || source.pending_renewal_key === null
+        || source.pending_renewal_key === undefined || current.rowVersion !== input.expectedRowVersion
+        || pending.grantDigest.toLowerCase() !== input.expectedGrantDigest.toLowerCase()
+        || pending.cancelRequestedAtSec !== undefined) return { kind: "conflict", agent: current } as const;
+      const quiescent = await input.checkQuiescent?.();
+      if (quiescent !== undefined && !quiescent.quiescent) return { kind: "conflict", agent: current } as const;
+      const coverage = await input.checkCoverage?.();
+      if (coverage !== undefined && !coverage.ok) {
+        const atSec = input.nowSec ?? Math.floor(this.#now() / 1_000);
+        const outcomes = [...(current.renewalOutcomes ?? [])].filter((row) => atSec - row.atSec <= 90 * 24 * 60 * 60);
+        outcomes.push({ renewActionId: pending.renewActionId, grantDigest: pending.grantDigest, outcome: "cancelled", atSec });
+        const next = { ...pending, cancelRequestedAtSec: atSec, cancelActionId: pending.renewActionId, cancelReason: "renewal_coverage_lost" as const,
+          ...(coverage.token === undefined ? {} : { coverageLossToken: coverage.token }) };
+        const cancelled = await tx.query<AgentRow>(
+          `/* agents.renewalCoverageCancel */ update agents set pending_renewal = $4::jsonb, renewal_outcomes = $5::jsonb,
+             row_version = row_version + 1, updated_at = $6
+           where id = $1 and owner_address = $2 and row_version = $3 and pending_renewal->>'grantDigest' = $7
+           returning ${AGENT_COLUMNS}`,
+          [input.agentId, owner, input.expectedRowVersion, encodeJsonbParam(next), encodeJsonbParam(outcomes), new Date(this.#now()), input.expectedGrantDigest],
+        );
+        return cancelled.rows[0] === undefined ? { kind: "conflict", agent: current } as const : { kind: "cancelled", agent: rowToRecord(cancelled.rows[0]) } as const;
+      }
+      const currentGeneration = currentFacts.generation ?? 0;
+      if ((input.sessionFacts.generation ?? -1) !== currentGeneration + 1) return { kind: "conflict", agent: current } as const;
+      if (input.prepareEvidence !== undefined && !await input.prepareEvidence()) return { kind: "conflict", agent: current } as const;
+      const sessionFacts: SessionFacts = {
+        ...structuredClone(input.sessionFacts), generation: currentGeneration + 1,
+        ...(currentFacts.armPlan === undefined ? {} : { armPlan: structuredClone(currentFacts.armPlan) }),
+      };
+      const outcomes = [...(current.renewalOutcomes ?? [])].filter((row) => (input.sessionFacts.grantedAtSec ?? Math.floor(this.#now() / 1_000)) - row.atSec <= 90 * 24 * 60 * 60);
+      outcomes.push({ renewActionId: pending.renewActionId, grantDigest: pending.grantDigest, outcome: "completed", atSec: input.sessionFacts.grantedAtSec ?? Math.floor(this.#now() / 1_000) });
+      const sessionKey = decryptSecret(source.pending_renewal_key, masterKey) as Hex;
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalSwap */ update agents set session_facts = $4::jsonb, session_key_ciphertext = $5,
+          pending_renewal = null, pending_renewal_key = null, renewal_outcomes = $6::jsonb,
+          renewal_cleanup_pending = true,
+          row_version = row_version + 1, updated_at = $7 where id = $1 and owner_address = $2 and row_version = $3
+          and pending_renewal->>'grantDigest' = $8 and pending_renewal_key is not null returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, input.expectedRowVersion, encodeJsonbParam(sessionFacts), encryptSecret(sessionKey, masterKey), encodeJsonbParam(outcomes), new Date(this.#now()), input.expectedGrantDigest],
+      );
+      return updated.rows[0] === undefined ? { kind: "conflict", agent: current } as const : { kind: "updated", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async clearRenewalCleanup(input: {
+    readonly ownerAddress: Address; readonly agentId: string; readonly expectedRowVersion: number;
+  }): Promise<RenewalCasResult> {
+    const owner = ownerKey(input.ownerAddress);
+    const before = await this.getAgent(input.ownerAddress, input.agentId);
+    if (before === null) return { kind: "not_found" };
+    return this.#sql.transaction(async (tx) => {
+      await tx.query(`/* agents.walletFence */ select pg_advisory_xact_lock(hashtext($1))`, [`${owner}|${before.walletAddress.toLowerCase()}`]);
+      const selected = await tx.query<AgentRow>(
+        `/* agents.renewalCleanupRead */ select ${AGENT_COLUMNS} from agents where id = $1 and owner_address = $2 for update`,
+        [input.agentId, owner],
+      );
+      const source = selected.rows[0];
+      if (source === undefined) return { kind: "not_found" } as const;
+      const current = rowToRecord(source);
+      if (current.renewalCleanupPending !== true) return { kind: "same", agent: current } as const;
+      if (current.rowVersion !== input.expectedRowVersion || current.pendingRenewal != null) return { kind: "conflict", agent: current } as const;
+      const updated = await tx.query<AgentRow>(
+        `/* agents.renewalCleanup */ update agents set renewal_cleanup_pending = false,
+           row_version = row_version + 1, updated_at = $4
+         where id = $1 and owner_address = $2 and row_version = $3 and renewal_cleanup_pending = true and pending_renewal is null
+         returning ${AGENT_COLUMNS}`,
+        [input.agentId, owner, input.expectedRowVersion, new Date(this.#now())],
+      );
+      return updated.rows[0] === undefined ? { kind: "conflict", agent: current } as const : { kind: "updated", agent: rowToRecord(updated.rows[0]) } as const;
+    });
+  }
+
+  async readExecutingSession(ownerAddress: Address, id: string): Promise<{
+    readonly facts: SessionFacts; readonly key: Hex; readonly generation: number;
+  } | null> {
+    const masterKey = this.#masterKey;
+    if (masterKey === null) throw new Error("A master key is required to read a persisted session key.");
+    const result = await this.#sql.query<AgentRow & { session_key_ciphertext: string | null }>(
+      `/* agents.readExecutingSession */ select ${AGENT_COLUMNS}, session_key_ciphertext from agents where id = $1 and owner_address = $2`,
+      [id, ownerKey(ownerAddress)],
+    );
+    const row = result.rows[0];
+    if (row === undefined || row.session_key_ciphertext === null || row.session_facts === null) return null;
+    const facts = rowToRecord(row).sessionFacts;
+    if (facts === null) return null;
+    return { facts, key: decryptSecret(row.session_key_ciphertext, masterKey) as Hex, generation: facts.generation ?? 0 };
+  }
+
   async confirmSessionRevokedCas(input: ConfirmSessionRevokedInput): Promise<ConfirmSessionRevokedResult> {
     input.signal?.throwIfAborted();
     const owner = ownerKey(input.ownerAddress);
@@ -1899,6 +2651,7 @@ export class PostgresAgentStore implements AgentStore {
       const source = selected.rows[0];
       if (source === undefined) return { kind: "not_found" } as const;
       const current = rowToRecord(source);
+      if (current.pendingRenewal != null) return { kind: "conflict" } as const;
       const stored = parseSessionRevocationEvidence(
         source.session_revocation === null || source.session_revocation === undefined
           ? null
@@ -1990,6 +2743,7 @@ export class PostgresAgentStore implements AgentStore {
        update agents set status = $5, row_version = row_version + 1, updated_at = $6
        where id = $1 and owner_address = $2 and status = $3 and row_version = $4
          and not coalesce(pending_grant ?| array['cancelRequestedAtSec', 'cancelActionId'], false)
+         and (pending_renewal is null or $5 <> 'revoked')
        returning ${AGENT_COLUMNS}`,
       [input.agentId, ownerKey(input.ownerAddress), input.expectedStatus, input.expectedRowVersion, input.status, new Date(this.#now())],
       );
@@ -2046,6 +2800,7 @@ export class PostgresAgentStore implements AgentStore {
        update agents set status = $3, row_version = row_version + 1, updated_at = $4
        where id = $1 and owner_address = $2
          and not coalesce(pending_grant ?| array['cancelRequestedAtSec', 'cancelActionId'], false)
+         and (pending_renewal is null or $3 <> 'revoked')
        returning ${AGENT_COLUMNS}`,
       [id, ownerKey(ownerAddress), status, new Date(this.#now())],
       );
@@ -2280,6 +3035,15 @@ function rowToRecord(row: AgentRow): AgentRecord {
       row.pending_grant === null
         ? null
         : (decodeJsonb(row.pending_grant) as PendingGrant),
+    pendingRenewal:
+      row.pending_renewal === null || row.pending_renewal === undefined
+        ? null
+        : (decodeJsonb(row.pending_renewal) as PendingRenewal),
+    renewalCleanupPending: row.renewal_cleanup_pending === true,
+    renewalOutcomes:
+      row.renewal_outcomes === null || row.renewal_outcomes === undefined
+        ? []
+        : (decodeJsonb(row.renewal_outcomes) as readonly RenewalOutcome[]),
     rowVersion: row.row_version,
     createdAt: row.created_at.getTime(),
     updatedAt: row.updated_at.getTime(),
