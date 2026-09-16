@@ -28,10 +28,11 @@ type Props = {
   readonly refresh: () => Promise<unknown>;
   readonly togglePause: () => void;
   readonly remove: () => void;
-  readonly hardRevoke: () => void;
   readonly sellNow: (positionId: string) => void;
   readonly saveSettings: (settings: TradeSettings) => Promise<void>;
-  readonly renewal?: React.ReactNode;
+  /** The renewal control: the button sits left of Edit, the status is one mono line under the hero (operator, 2026-09-16). */
+  readonly renewalButton?: React.ReactNode;
+  readonly renewalStatus?: React.ReactNode;
 };
 
 function compactAddress(value: string): string {
@@ -294,6 +295,10 @@ export function TradeAgentDetail(props: Props) {
   const summary = trade?.summary;
   const gross = summary?.grossDeltaWei ?? null;
   const grossTone = gross === null ? "normal" : BigInt(gross) < 0n ? "loss" : "profit";
+  // The percent under the dollar figure: gross delta over the hire's open budget (the same basis the grid pages use), signed, two decimals.
+  const grossPercent = gross === null || view?.armedBudgetWei === null || view?.armedBudgetWei === undefined || BigInt(view.armedBudgetWei) <= 0n
+    ? undefined
+    : bps((BigInt(gross) * 10_000n / BigInt(view.armedBudgetWei)).toString(10), true);
   const nowMs = useSessionClock();
   const draining = trade?.lifecycle?.draining === true;
   // An armed agent whose session has expired is not live: nothing it decides
@@ -303,9 +308,6 @@ export function TradeAgentDetail(props: Props) {
   const status = pill?.status ?? (view?.status === "armed" ? "live" : "paused");
   const statusLabel = view === null ? "—" : draining ? "draining" : pill?.label ?? (["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined);
   const unresolved = trade?.pendingIntents ?? [];
-  const sessionExpired = sessionExpiry(view?.sessionExpiresAt, nowMs).state === "expired"
-    && (view?.status === "armed" || view?.status === "paused");
-  const recoveryRequired = sessionExpired || unresolved.length > 0 || (trade?.open ?? []).some((position) => position.status === "orphaned");
   return <div className="fl-shell fl-hired-agent-page fl-trade-detail-page">
     <Button variant="ghost" size="sm" icon={<Icon name="chevron-right" size={14} style={{ transform: "rotate(180deg)" }} />} onClick={() => props.go("/account")}>My agents</Button>
     <div className="fl-trade-hero">
@@ -313,6 +315,7 @@ export function TradeAgentDetail(props: Props) {
       <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
       <div className="fl-hired-actions">
         {signedOut ? <Button variant="primary" onClick={() => void props.signIn()}>Sign in to view</Button> : null}
+        {props.renewalButton}
         <Button variant={editing ? "primary" : "secondary"} icon={<Icon name="settings" size={15} />} disabled={busy || settings === null || draining || unresolved.length > 0} onClick={() => setEditing((value) => !value)}>{editing ? "Editing" : "Edit"}</Button>
         <Button variant="secondary" icon={<Icon name="pause" size={15} />} disabled={busy || view === null || (view.status !== "armed" && view.status !== "paused") || draining} onClick={props.togglePause}>{view?.status === "paused" ? "Resume" : "Pause"}</Button>
         <Button variant="danger" icon={<Icon name="revoke" size={15} />} disabled={busy || view === null || props.removed} onClick={props.remove}>{props.removed ? "Removed" : view?.status === "revoked" ? "Finish removal" : draining ? "Removing" : "Remove"}</Button>
@@ -320,19 +323,15 @@ export function TradeAgentDetail(props: Props) {
     </div>
     {/* Below the hero, not inside its flex row: in the row it squeezed the title to "Tra…" (seen live 2026-09-15). */}
     <SessionExpiryNotice kind="trade" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={trade?.open.length ?? 0} />
-    {props.renewal}
+    {props.renewalStatus}
     {message ? <div className="fl-trade-message" role="status">{message}</div> : null}
     {props.identityStatus}
-    {recoveryRequired ? <div className="fl-trade-message fl-trade-message--warning" role="alert">
-      <span>{sessionExpired ? "Session expired. Withdraw tokens from Account → Withdraw, then use Hard revoke before finishing removal." : `Removal is blocked by unresolved execution ${unresolved.map((intent) => intent.decisionId).join(", ") || "or an orphaned token"}. Hard revoke stops future authority but does not complete conversion to BNB.`}</span>
-      <span className="fl-trade-message__actions"><Button variant="danger" size="sm" disabled={busy || view?.sessionPublicKey === null || view?.renewalPending === true} title={view?.renewalPending === true ? "Finish or cancel the pending renewal first." : undefined} onClick={props.hardRevoke}>Hard revoke</Button><Button variant="secondary" size="sm" onClick={() => props.go("/account")}>Account recovery</Button></span>
-    </div> : null}
     <div className="fl-trade-metrics">
-      <Metric label="Delegated" value={delegated} note="24h spend authority · not escrowed" />
+      <Metric label="Delegated" value={delegated} />
       <Metric label="Execution model" value={settings?.executionModel ?? "—"} note={settings === null ? undefined : `LLM model: ${tradeModelLabel(settings.primaryModel).replace(/^Auto:\s*/u, "")}`} credit={settings === null ? undefined : <ZeroGCredit />} />
-      <Metric label="PnL since hire" value={fiat(gross, usdRate, true)} tone={grossTone} note={summary?.grossComplete ? "gross · relay costs excluded" : summary?.grossReason ?? "gross · relay costs excluded"} />
+      <Metric label="PnL since hire" value={fiat(gross, usdRate, true)} tone={grossTone} note={summary?.grossComplete ? grossPercent : summary?.grossReason ?? undefined} />
       <Metric label="Win rate" value={summary?.winRateBps === null || summary?.winRateBps === undefined ? "—" : bps(summary.winRateBps)} note={`${summary?.wins ?? "—"}/${summary?.closedTrades ?? 0} wins · gross`} />
-      <Metric label="Open positions" value={`${summary?.openPositions ?? 0} / ${summary?.maxOpenPositions ?? settings?.maxOpenPositions ?? "—"}`} note={summary?.maxOpenPositions === null || summary?.maxOpenPositions === undefined ? undefined : `${Math.max(0, summary.maxOpenPositions - summary.openPositions)} slot${summary.maxOpenPositions - summary.openPositions === 1 ? "" : "s"} free`} />
+      <Metric label="Open positions" value={`${summary?.openPositions ?? 0} / ${summary?.maxOpenPositions ?? settings?.maxOpenPositions ?? "—"}`} />
     </div>
     {editing && settings !== null ? <EditPanel key={`${settings.name}:${settings.primaryModel}:${settings.fallbackModel}`} initial={settings} busy={busy} onCancel={() => setEditing(false)} onSave={props.saveSettings} /> : <>
       <div className="fl-trade-tabs">{(["Open Positions", "Closed Positions", "Run log"] as const).map((item) => <button key={item} type="button" className={tab === item ? "is-active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>

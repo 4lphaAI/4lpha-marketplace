@@ -90,7 +90,10 @@ export default defineRailway(() => {
   };
   const llm = {
     TRADE_LLM_BASE_URL: "https://router-api.0g.ai/v1",
-    TRADE_LLM_MODEL: "0gm-1.0-35b-a3b",
+    // Two slots (2026-09-16): the daemon runs every agent on the primary and
+    // falls back to the second on a failed or off-schema answer.
+    TRADE_LLM_MODEL: "qwen3.7-flash",
+    TRADE_LLM_FALLBACK_MODEL: "0gm-1.0-35b-a3b",
   };
 
   // The lending venue, pinned by address rather than discovered. Both the API
@@ -263,27 +266,44 @@ export default defineRailway(() => {
   // refuses (R3.6) — changing a band or a tolerance is therefore a new digest
   // AND a new strategy version on TermiX, not a quiet variable edit.
   //
-  // const quant = service("quant-worker", {
-  //   source,
-  //   build: servicesImage,
-  //   deploy: {
-  //     startCommand: "node --import tsx scripts/quant-worker.ts",
-  //     restartPolicyType: "ALWAYS",
-  //   },
-  //   env: {
-  //     ...plane,
-  //     QUANT_ENABLED: "true",
-  //     QUANT_AGENT_ID: "<the TermiX agent id for 4lpha>",
-  //     QUANT_STRATEGY_ID: "<the listed strategy id>",
-  //     QUANT_API_BASE_URL: "https://platform-backend.prod.termix.live",
-  //     QUANT_PARAMS_DIGEST: "<keccak of the resolved params; boot refuses on a mismatch>",
-  //     // Optional; the defaults are the cleared ones (band 700 bps, 3 levels,
-  //     // 10 U min clip, 50 bps edge, 50/50 bps tolerances, 50 bps impact).
-  //     // QUANT_WORKER_INTERVAL_MS: "60000",   // floor 30000, ceiling 600000
-  //     QUANT_ENVELOPE_KEY: preserve(),
-  //     QUANT_API_KEY: preserve(),
-  //   },
-  // });
+  // LIVE since 2026-09-16 (gate 3 submitted: strategy cmu3uiys20lh2v001fv68jbto
+  // "Grid Agent by 4lpha (WBNB/U)", PENDING_REVIEW; gate 2 key registered for
+  // agent cmts7ra5uhegyue01o61kdyo1). The economics below are the Revision 14.5
+  // block (symmetric B2, tiers 10:250,30:200, 5 U clip, live-gas fee model);
+  // their digest is the one `config-check` prints for exactly these values.
+  // `QUANT_ENVELOPE_KEY` is the PRODUCTION seed generated 2026-09-16 (its X25519
+  // public half is the key registered with TermiX) and `QUANT_API_KEY` is the
+  // linked web-account key "4lpha-quant-worker"; both are set once in Railway.
+  const quant = service("quant-worker", {
+    source,
+    build: servicesImage,
+    deploy: {
+      startCommand: "node --import tsx scripts/quant-worker.ts",
+      restartPolicyType: "ALWAYS",
+    },
+    env: {
+      ...plane,
+      QUANT_ENABLED: "true",
+      QUANT_AGENT_ID: "cmts7ra5uhegyue01o61kdyo1",
+      QUANT_STRATEGY_ID: "cmu3uiys20lh2v001fv68jbto",
+      QUANT_API_BASE_URL: "https://platform-backend.prod.termix.live",
+      QUANT_RPC_URL: "https://bsc-dataseed.bnbchain.org",
+      QUANT_SEED_MODE: "symmetric",
+      QUANT_RECENTER_MODE: "both",
+      QUANT_MIN_CLIP_U_WEI: "5000000000000000000",
+      QUANT_BAND_TIERS_BPS: "10:250,30:200",
+      QUANT_ENTRY_TOL_BPS: "40",
+      QUANT_EXIT_TOL_BPS: "10",
+      QUANT_MIN_NET_EDGE_BPS: "25",
+      QUANT_RELAY_FEE_PER_SUBMIT_WEI: "30000000000000",
+      QUANT_RELAY_GAS_UNITS: "300000",
+      QUANT_RELAY_FEE_PAD_BPS: "15000",
+      QUANT_MIN_TERM_DAYS: "7",
+      QUANT_PARAMS_DIGEST: "0x3748f223a1c9e350f8a0ab1d3561baf20712ba1213d4bf7767faa173e8a32911",
+      QUANT_ENVELOPE_KEY: preserve(),
+      QUANT_API_KEY: preserve(),
+    },
+  });
 
   const identity = service("identity-worker", {
     source,
@@ -347,6 +367,6 @@ export default defineRailway(() => {
   });
 
   return project("4lpha-execution", {
-    resources: [db, api, lp, trade, lending, identity, web],
+    resources: [db, api, lp, trade, lending, identity, quant, web],
   });
 });

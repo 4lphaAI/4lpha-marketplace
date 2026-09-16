@@ -51,6 +51,7 @@ import { HiredAgentScreen, requotesLabel } from "./HiredAgentScreen";
 const metric = (value: string) => ({ value, reason: null });
 const view: AgentDetailView = {
   hireSizingName: "grid-shift-v1",
+  armedBudgetWei: "50000000000000000",
   id: "owner-exact-agent-92",
   status: "armed",
   walletAddress: "0x2222222222222222222222222222222222222222",
@@ -446,6 +447,7 @@ describe("Hired agent detail provenance", () => {
         ...view,
         httpRuntimeProfile: "unbound-v1",
         hireSizingName: "trade-v1",
+        armedBudgetWei: "50000000000000000",
       },
       market: null,
       trade: {
@@ -477,6 +479,7 @@ describe("Hired agent detail provenance", () => {
         ...view,
         httpRuntimeProfile: "lp-v1",
         hireSizingName: "lp-v1",
+        armedBudgetWei: "50000000000000000",
         lp: {
           model: "sigma",
           pool: {
@@ -551,10 +554,11 @@ describe("Hired agent detail provenance", () => {
 
   it("pins the restricted editor, exact closed columns, and terminal recovery copy", () => {
     const source = readFileSync(join(process.cwd(), "components/trade/TradeAgentDetail.tsx"), "utf8");
-    for (const forbidden of ["Agent name", "BNB per entry", "Total capital", "Min market cap", "Max market cap", "Gas priority", "Show advanced settings"]) {
+    // 2026-09-16: the expired-recovery banner (Hard revoke + Account recovery) and the three tile subtitles are gone by the operator's ruling; Remove takes the hard path itself when the session is dead.
+    for (const forbidden of ["Agent name", "BNB per entry", "Total capital", "Min market cap", "Max market cap", "Gas priority", "Show advanced settings", "Hard revoke", "Account recovery", "24h spend authority", "slots free", "relay costs excluded"]) {
       expect(source).not.toContain(forbidden);
     }
-    for (const required of ["No re-entry", "Take profit", "Stop loss", "Max holding time", "Slippage tolerance", "Primary model", "Fallback model", "Exit reason", "Held", "Entry / exit", "Transactions", "Realised", "Hard revoke", "Account recovery", "does not complete conversion to BNB"]) {
+    for (const required of ["No re-entry", "Take profit", "Stop loss", "Max holding time", "Slippage tolerance", "Primary model", "Fallback model", "Exit reason", "Held", "Entry / exit", "Transactions", "Realised", "renewalButton", "renewalStatus"]) {
       expect(source).toContain(required);
     }
     expect(source).not.toContain("<span>Fees</span>");

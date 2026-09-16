@@ -200,7 +200,7 @@ describe("TRADING-AGENT prompts and transport", () => {
     assert.equal(keyReads, 1);
     assert.deepEqual(await llm.complete(buildEntryPrompt({
       model: "sigma", candidates: [candidate], owner: { instructions: null, skillMarkdown: null },
-    })), { content: "{\"decisions\":[]}", model: "0gm-1.0-35b-a3b" });
+    })), { content: "{\"decisions\":[]}", model: "qwen3.7-flash" });
     assert.equal(keyReads, 1);
     assert.equal(Object.hasOwn(requestBody ?? {}, "response_format"), false);
     assert.equal(authorization, "Bearer sk-or-v1-secret");

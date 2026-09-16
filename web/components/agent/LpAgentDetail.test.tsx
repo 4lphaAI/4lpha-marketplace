@@ -21,6 +21,7 @@ function baseView(): AgentDetailView {
     status: "armed",
     httpRuntimeProfile: "lp-v1",
     hireSizingName: "lp-v1",
+    armedBudgetWei: "50000000000000000",
     walletAddress: "0x2222222222222222222222222222222222222222",
     sessionPublicKey: `0x${"33".repeat(64)}`,
     sessionExpiresAt: null,

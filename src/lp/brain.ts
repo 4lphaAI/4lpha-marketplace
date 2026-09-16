@@ -92,10 +92,15 @@ function buildPrompt(
 
 async function completeWithFallback(
   llmFor: (modelId: string) => TradeLlm,
-  brain: LpBrainSettings,
+  chosen: LpBrainSettings,
   prompt: readonly OpenRouterMessage[],
   signal?: AbortSignal,
+  override?: { readonly primary: string; readonly fallback?: string },
 ): Promise<{ readonly content: string; readonly model: string }> {
+  // The daemon override wins over the owner's choice (2026-09-16: two slots, so
+  // an override keeps a real fallback; one slot = the same model in both roles).
+  const brain = override === undefined ? chosen
+    : { ...chosen, primaryModel: override.primary, fallbackModel: override.fallback ?? override.primary };
   try {
     return await llmFor(brain.primaryModel).complete(prompt, signal);
   } catch (error) {
@@ -110,6 +115,7 @@ export function createLpBrainTransport(input: {
   readonly baseUrl?: string;
   readonly timeoutMs?: number;
   readonly modelOverride?: string;
+  readonly fallbackOverride?: string;
 }): (
   kind: "range",
   context: Record<string, unknown>,
@@ -118,7 +124,7 @@ export function createLpBrainTransport(input: {
 ) => Promise<unknown | null> {
   const cache = new Map<string, TradeLlm>();
   const llmFor = (modelId: string): TradeLlm => {
-    const chosen = input.modelOverride?.trim() ? input.modelOverride.trim() : modelId;
+    const chosen = modelId;
     const cached = cache.get(chosen);
     if (cached !== undefined) return cached;
     const client = createTradeLlm({
@@ -134,7 +140,10 @@ export function createLpBrainTransport(input: {
 
   return async (_kind, context, brain, signal) => {
     const prompt = buildPrompt(context, brain);
-    const reply = await completeWithFallback(llmFor, brain, prompt, signal);
+    const primaryOverride = input.modelOverride?.trim() ?? "";
+    const fallbackOverride = input.fallbackOverride?.trim() ?? "";
+    const reply = await completeWithFallback(llmFor, brain, prompt, signal,
+      primaryOverride === "" ? undefined : { primary: primaryOverride, ...(fallbackOverride === "" ? {} : { fallback: fallbackOverride }) });
     return parseClosedReply(reply.content);
   };
 }

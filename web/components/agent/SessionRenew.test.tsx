@@ -69,9 +69,9 @@ async function mount(overrides: Partial<React.ComponentProps<typeof SessionRenew
 }
 
 describe("SessionRenew", () => {
-  it("states that renewal opens when the session ends", () => {
+  it("renders nothing before the session ends (no button, no line)", () => {
     const html = renderToStaticMarkup(<SessionRenew agentId="agent" walletAddress="0x2222222222222222222222222222222222222222" sessionExpiresAt={NOW + 3_600} kind="trade" />);
-    expect(html).toContain("Renewal opens when the session ends.");
+    expect(html).toBe("");
   });
 
   it("[F12] reconciles a grant error once and offers convergence when evidence is observed", async () => {

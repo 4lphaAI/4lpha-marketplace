@@ -30,7 +30,10 @@ export type TradeSettings = {
  * on both sides. The old 0G product's other three names are HTTP 404 today.
  */
 export const TRADE_LLM_MODELS = [
-  { id: "0gm-1.0-35b-a3b", label: "Auto: OGM-1.0-35B-A3B" },
+  { id: "qwen3.7-flash", label: "Auto: Qwen3.7 Flash" },
+  { id: "0gm-1.0-35b-a3b", label: "OGM-1.0-35B-A3B" },
+  { id: "qwen-flash", label: "Qwen Flash" },
+  { id: "qwen3.5-flash", label: "Qwen3.5 Flash" },
   { id: "qwen3-vl-30b", label: "Qwen3 VL 30B" },
   { id: "glm-5.3-flash", label: "GLM-5.3 Flash" },
   { id: "qwen3.8-flash", label: "Qwen3.8 Flash" },
@@ -43,7 +46,7 @@ export function tradeModelLabel(id: TradeLlmModelId): string {
 }
 
 export function tradeModelId(label: string): TradeLlmModelId {
-  return TRADE_LLM_MODELS.find((model) => model.label === label)?.id ?? "0gm-1.0-35b-a3b";
+  return TRADE_LLM_MODELS.find((model) => model.label === label)?.id ?? "qwen3.7-flash";
 }
 
 export const MAX_GRANTED_TOKENS = 25;

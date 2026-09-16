@@ -95,6 +95,7 @@ async function main(): Promise<void> {
     : required(process.env, "OPENROUTER_API_KEY");
   const llmBaseUrl = process.env["TRADE_LLM_BASE_URL"]?.trim() ?? "";
   const llmModel = process.env["TRADE_LLM_MODEL"]?.trim() ?? "";
+  const llmFallbackModel = process.env["TRADE_LLM_FALLBACK_MODEL"]?.trim() ?? "";
   const dataPlaneUrl = required(process.env, "DATA_PLANE_URL");
   const dataPlaneToken = process.env["DATA_PLANE_TOKEN"]?.trim() ?? "";
   const keyStore = getAddress(BNB.keyStore);
@@ -123,10 +124,11 @@ async function main(): Promise<void> {
   const provider = new AltanaProvider({ network: BNB, rpcUrls });
   assertReconcileGuardCoversSubmitWindow(provider);
   // One client per model id, memoised: the settings choose the model, and
-  // TRADE_LLM_MODEL only overrides which id the whole daemon may use at all.
+  // TRADE_LLM_MODEL (+ TRADE_LLM_FALLBACK_MODEL) overrides which ids the whole
+  // daemon may use at all — resolved per role inside the worker, not here.
   const llmCache = new Map<string, ReturnType<typeof createTradeLlm>>();
   const llmFor = (modelId: string) => {
-    const id = llmModel === "" ? modelId : llmModel;
+    const id = modelId;
     const cached = llmCache.get(id);
     if (cached !== undefined) return cached;
     const client = createTradeLlm({
@@ -167,6 +169,7 @@ async function main(): Promise<void> {
   const deps: TradeWorkerDeps = {
     platformFeeBps: trade.feeBps ?? 0,
     agentStore, settingsStore, positions, intents, journal, dataPlane, provider, llmFor, executor,
+    ...(llmModel === "" ? {} : { modelOverride: { primary: llmModel, ...(llmFallbackModel === "" ? {} : { fallback: llmFallbackModel }) } }),
     executorDeps, readiness, rpcUrls, routeReader,
     verdictCache: createWorkerVerdictCache(),
     // AGENT-GAS-ATTENTION §2.2 — through the PROVIDER's chain-id-verified

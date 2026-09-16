@@ -106,6 +106,13 @@ export type TradeWorkerDeps = {
    * rather than holding a single daemon-wide client.
    */
   readonly llmFor: (modelId: string) => TradeLlm;
+  /**
+   * The daemon-wide override (TRADE_LLM_MODEL / TRADE_LLM_FALLBACK_MODEL): when
+   * set it replaces every agent's primary — and, with a fallback slot, its
+   * fallback — so the operator who pays the router key bounds the models
+   * (2026-09-16: two slots, so an override keeps a real fallback).
+   */
+  readonly modelOverride?: { readonly primary: string; readonly fallback?: string };
   readonly executor: TradeExecutor;
   readonly executorDeps: unknown;
   readonly readiness: Pick<TradeReadiness, "ready" | "allowlistAvailable" | "bstocksAddresses">;
@@ -1004,12 +1011,16 @@ async function processAgent(
  * model that already answered.
  */
 async function completeWithFallback(
-  deps: Pick<TradeWorkerDeps, "llmFor">,
-  settings: { readonly primaryModel: string; readonly fallbackModel: string },
+  deps: Pick<TradeWorkerDeps, "llmFor" | "modelOverride">,
+  chosen: { readonly primaryModel: string; readonly fallbackModel: string },
   prompt: readonly OpenRouterMessage[],
   signal?: AbortSignal,
   observeCall?: (event: Omit<TradeRunEvent, "stage" | "elapsedMs">) => void,
 ): Promise<{ readonly content: string; readonly model: string }> {
+  // The override wins over the owner's choice; a one-slot override (no fallback
+  // slot) behaves as before — the same model in both roles, so no second call.
+  const settings = deps.modelOverride === undefined ? chosen
+    : { primaryModel: deps.modelOverride.primary, fallbackModel: deps.modelOverride.fallback ?? deps.modelOverride.primary };
   try {
     observeCall?.({ code: "request", model: settings.primaryModel });
     const result = await deps.llmFor(settings.primaryModel).complete(prompt, signal);

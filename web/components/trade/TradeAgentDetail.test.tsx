@@ -145,7 +145,7 @@ describe("the session clock on the trade page (2026-09-15)", () => {
       expect(host.querySelector(".fl-status")?.className).toContain("fl-status--danger");
       expect(host.querySelector('[data-session-expiry="expired"]')?.textContent).toBe("Session expired");
       expect(host.querySelector('[role="alert"]')?.textContent).toBe("Session expired — the agent can't trade or sell. Withdraw tokens from Account, or hire again.");
-      expect(host.textContent).toContain("Hard revoke");
+      expect(host.textContent).not.toContain("Hard revoke");
     } finally { await done(); }
   });
 

@@ -268,6 +268,27 @@ describe("LP brain transport -> range fence", () => {
     assert.doesNotMatch(prompt, /"action"|"reason"/u);
   });
 
+  it("runs the daemon override in both roles: the primary slot first, the fallback slot on a failed answer (2026-09-16)", async () => {
+    const models: string[] = [];
+    const transport = createLpBrainTransport({
+      readKey: () => "test-key",
+      modelOverride: "qwen3.7-flash",
+      fallbackOverride: "0gm-1.0-35b-a3b",
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+        models.push(body.model ?? "");
+        if (body.model === "qwen3.7-flash") return new Response("router down", { status: 503 });
+        return new Response(JSON.stringify({ choices: [{ message: { content: "{\"holdInstead\":true}" } }] }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const proposal = await transport("range", { currentTick: 0, tickSpacing: 50, maxTickWidth: 10_000, priorWidthTicks: 1_000 }, BRAIN);
+    assert.deepEqual(proposal, { holdInstead: true });
+    // The owner's own primary/fallback (BRAIN) never reach the router; a one-slot override would have retried the same model.
+    assert.deepEqual(models, ["qwen3.7-flash", "0gm-1.0-35b-a3b"]);
+  });
+
   it("accepts a hold reply without retaining a reason", async () => {
     const proposal = await transportReply('{"holdInstead":true}', [])(
       "range",

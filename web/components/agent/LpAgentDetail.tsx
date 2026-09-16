@@ -46,7 +46,8 @@ type Props = {
   onRemove: () => void;
   onResolve: () => void;
   onAbandon: () => void;
-  readonly renewal?: React.ReactNode;
+  readonly renewalButton?: React.ReactNode;
+  readonly renewalStatus?: React.ReactNode;
 };
 const short = (v: string) => v.length < 14 ? v : `${v.slice(0, 6)}…${v.slice(-4)}`;
 const unavailable = (reason: string): DetailMetric => ({ value: null, reason });
@@ -376,7 +377,7 @@ export function LpAgentDetail(props: Props) {
           </div>
           <GasNotice gas={view?.gas} walletAddress={view?.walletAddress} />
           <SessionExpiryNotice kind="lp" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={openLpCount} />
-          {props.renewal}
+          {props.renewalStatus}
 
           {props.message ? <p role="status">
             {props.message}
@@ -392,6 +393,7 @@ export function LpAgentDetail(props: Props) {
 
         {props.signedOut ? <Button onClick={() => void detail.signIn()}>Sign in to view</Button> : null}
 
+        {props.renewalButton}
         <Button variant="secondary" disabled title={LP_EDIT_TITLE}>Edit</Button>
 
         <Button

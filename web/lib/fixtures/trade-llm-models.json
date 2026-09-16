@@ -1,7 +1,19 @@
 [
   {
+    "id": "qwen3.7-flash",
+    "label": "Auto: Qwen3.7 Flash"
+  },
+  {
     "id": "0gm-1.0-35b-a3b",
-    "label": "Auto: OGM-1.0-35B-A3B"
+    "label": "OGM-1.0-35B-A3B"
+  },
+  {
+    "id": "qwen-flash",
+    "label": "Qwen Flash"
+  },
+  {
+    "id": "qwen3.5-flash",
+    "label": "Qwen3.5 Flash"
   },
   {
     "id": "qwen3-vl-30b",

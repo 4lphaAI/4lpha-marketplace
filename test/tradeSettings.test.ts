@@ -81,8 +81,8 @@ describe("trade settings codec", () => {
     if (!parsed.ok) return;
     assert.equal(Object.hasOwn(parsed.value.raw, "crashProtection"), false);
     assert.equal(parsed.value.effective.crashProtection, false);
-    assert.equal(tradeSettingsDigest(parsed.value.raw), "0xb34733da23bd5e68c2254b4a2657c502d620d8cdbf3dfe52e62548841e57b007");
-    assert.equal(tradeSettingsDigest(DEFAULT_TRADE_SETTINGS), "0x74ea4a3c9914e6acdc7416ca5baeda0955d2f79db74e6407e05d8d196ffdf91e");
+    assert.equal(tradeSettingsDigest(parsed.value.raw), "0x7cafe05bfc722149e95a810584313332b3ea28f774cb98b0234747cd03ba9f63");
+    assert.equal(tradeSettingsDigest(DEFAULT_TRADE_SETTINGS), "0xffc2f80941f258f3964d75961094b5e82759dd33211c61a86f033c62b5fe01ef");
     assert.notEqual(tradeSettingsDigest(parsed.value.raw), tradeSettingsDigest(DEFAULT_TRADE_SETTINGS));
     assert.equal(immutableTradeSettingChange(parsed.value.effective, { ...parsed.value.effective, crashProtection: true }), null);
   });

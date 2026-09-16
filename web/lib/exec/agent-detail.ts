@@ -345,6 +345,8 @@ export type AgentDetailView = {
   readonly status: string;
   readonly httpRuntimeProfile?: string;
   readonly hireSizingName: string | null;
+  /** The hire's open native budget in wei (`hireSizing.openNativeBudgetWei`) — the basis every gross percent is measured against. */
+  readonly armedBudgetWei: string | null;
   readonly walletAddress: string;
   readonly sessionPublicKey: string | null;
   readonly renewalPending?: boolean;
@@ -931,6 +933,7 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
     status: owner.status,
     httpRuntimeProfile: owner.httpRuntimeProfile,
     hireSizingName: owner.hireSizingName,
+    armedBudgetWei: owner.armedBudgetWei,
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
@@ -1265,6 +1268,7 @@ function mapLpAgentDetail(
     status: owner.status,
     httpRuntimeProfile: owner.httpRuntimeProfile,
     hireSizingName: owner.hireSizingName,
+    armedBudgetWei: owner.armedBudgetWei,
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
@@ -1618,6 +1622,7 @@ export function mapAgentDetail(
     status: owner.status,
     httpRuntimeProfile: owner.httpRuntimeProfile,
     hireSizingName: owner.hireSizingName,
+    armedBudgetWei: owner.armedBudgetWei,
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey,

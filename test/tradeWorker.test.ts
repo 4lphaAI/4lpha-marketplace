@@ -774,6 +774,27 @@ describe("TRADING-AGENT primary/fallback model (operator 2026-09-03)", () => {
     await runTradeWorkerOnce(deps, {});
     assert.deepEqual(asked, ["glm-5.3-flash", "0gm-1.0-35b-a3b"]);
   });
+
+  it("runs the daemon override in both roles (2026-09-16): the primary slot, then the fallback slot — never the owner's choice", async () => {
+    const asked: string[] = [];
+    const answer = { content: JSON.stringify({ decisions: [] }), model: "x" };
+    const h = await harness({
+      settings: settings({ primaryModel: "glm-5.3-flash", fallbackModel: "qwen3-vl-30b" }),
+    });
+    const deps = {
+      ...h.deps,
+      modelOverride: { primary: "qwen3.7-flash", fallback: "0gm-1.0-35b-a3b" },
+      llmFor: (modelId: string): TradeLlm => ({
+        async complete() {
+          asked.push(modelId);
+          if (modelId === "qwen3.7-flash") throw new Error("router down");
+          return answer;
+        },
+      }),
+    };
+    await runTradeWorkerOnce(deps, {});
+    assert.deepEqual(asked, ["qwen3.7-flash", "0gm-1.0-35b-a3b"]);
+  });
 });
 
 it("records ordered, sanitized model and execution observations without changing the trade", async () => {

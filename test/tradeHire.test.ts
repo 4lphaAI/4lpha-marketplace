@@ -22,7 +22,7 @@ describe("TRADING-AGENT R5/C29 hire wire", () => {
       settings: DEFAULT_TRADE_SETTINGS };
     assert.equal(parseHireParams(value).ok, true);
     assert.equal(paramsHash("provisionAgent", value),
-      "0x89c17e2504a4af32bdb4e24e2299e5c48d966793a5d4b75289e82b6ce5c81839");
+      "0xf1f956688927e7f4c8b0adf2c0a7c14c7316edb2678a3a0e03e0ab7eeefd47a2");
     assert.equal(parseHireParams({ ...value, template: "trade" }).ok, false);
   });
 

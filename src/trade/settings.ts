@@ -61,14 +61,14 @@ export const DEFAULT_TRADE_SETTINGS: TradeSettings = {
   gasPriority: "standard",
   instructions: null,
   skillMarkdown: null,
-  primaryModel: "0gm-1.0-35b-a3b",
-  fallbackModel: "qwen3-vl-30b",
+  primaryModel: "qwen3.7-flash",
+  fallbackModel: "0gm-1.0-35b-a3b",
   crashProtection: true,
 };
 
 // TRADING-AGENT R5: a literal, not a self-computed constant, catches default drift.
 export const DEFAULT_TRADE_SETTINGS_DIGEST: Hex =
-  "0x74ea4a3c9914e6acdc7416ca5baeda0955d2f79db74e6407e05d8d196ffdf91e";
+  "0xffc2f80941f258f3964d75961094b5e82759dd33211c61a86f033c62b5fe01ef";
 
 export type TradeSettingsParseResult =
   | { readonly ok: true; readonly value: { readonly raw: TradeSettingsRaw; readonly effective: EffectiveTradeSettings } }

@@ -24,7 +24,7 @@ import { LendingAgentDetail } from "@/components/agent/LendingAgentDetail";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
 import { AttentionChip, GasNotice, gasAttention } from "@/components/agent/GasNotice";
 import { SessionExpiryChip, SessionExpiryNotice, sessionExpiry, sessionPillOverride, useSessionClock } from "@/components/agent/SessionExpiry";
-import { SessionRenew } from "@/components/agent/SessionRenew";
+import { useSessionRenew } from "@/components/agent/SessionRenew";
 import {
   EMPTY_REMOVE_PROGRESS,
   advanceRemoveAttempt,
@@ -1457,6 +1457,9 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   // with a dead session is "expired", not "Live" (2026-09-15).
   const nowMs = useSessionClock();
   const sessionPill = sessionPillOverride(sessionExpiry(view?.sessionExpiresAt, nowMs), view?.status);
+  // One renewal control for every kind: the button sits left of Edit, the status is one mono line under the hero (operator, 2026-09-16).
+  const renewal = useSessionRenew({ agentId, walletAddress: view?.walletAddress ?? "", sessionExpiresAt: view?.sessionExpiresAt, kind: trading ? "trade" : lpAgent ? "lp" : "grid", readHeaders: detail.readHeaders, refresh: detail.refresh });
+  const sessionDead = sessionExpiry(view?.sessionExpiresAt, nowMs).state === "expired" && (view?.status === "armed" || view?.status === "paused");
   const status = sessionPill?.status ?? (view?.status === "armed" ? "live" : "paused");
   const statusLabel = view === null ? "—" : sessionPill?.label ?? (["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined);
   const actionsDisabled = busy || view === null || view.provisioning || removed;
@@ -1503,11 +1506,15 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       signIn={detail.signIn}
       refresh={detail.refreshTrade}
       togglePause={() => void togglePause()}
-      remove={() => { if (window.confirm("Remove this agent? It will resume if paused, exit every open position to BNB, then revoke the session key.")) void runTradeRemove(); }}
-      hardRevoke={() => { if (window.confirm("Hard revoke session authority now? Remaining tokens may not be converted to BNB and must be handled through Account recovery.")) void runTradeHardRevoke(); }}
+      remove={() => {
+        // An expired session cannot sell: Remove revokes the key outright and the owner withdraws what is left from Account (the old Hard revoke, folded in 2026-09-16).
+        if (sessionDead) { if (window.confirm("The session has expired, so the agent cannot sell. Remove will revoke the session key now; any tokens left stay in the wallet — withdraw them from Account.")) void runTradeHardRevoke(); return; }
+        if (window.confirm("Remove this agent? It will resume if paused, exit every open position to BNB, then revoke the session key.")) void runTradeRemove();
+      }}
       sellNow={sellNow}
       saveSettings={saveTradeSettings}
-       renewal={<SessionRenew agentId={agentId} walletAddress={view?.walletAddress ?? ""} sessionExpiresAt={view?.sessionExpiresAt} kind="trade" readHeaders={detail.readHeaders} refresh={detail.refresh} />}
+      renewalButton={renewal.button}
+      renewalStatus={renewal.status}
     />;
   }
 
@@ -1567,7 +1574,8 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       onAbandon={() => {
         if (window.confirm("Abandon this sequence? Whatever it already freed stays in the wallet.")) void abandonBlocker();
       }}
-       renewal={<SessionRenew agentId={agentId} walletAddress={view?.walletAddress ?? ""} sessionExpiresAt={view?.sessionExpiresAt} kind="lp" readHeaders={detail.readHeaders} refresh={detail.refresh} />}
+      renewalButton={renewal.button}
+      renewalStatus={renewal.status}
     />;
   }
 
@@ -1588,7 +1596,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
               <AttentionChip state={gasAttention(view?.gas)} title="This agent needs BNB for relay gas." />
             </div>
             <SessionExpiryNotice kind="grid" expiresAt={view?.sessionExpiresAt} nowMs={nowMs} status={view?.status} open={view?.grid.liveRows ?? 0} />
-            <SessionRenew agentId={agentId} walletAddress={view?.walletAddress ?? ""} sessionExpiresAt={view?.sessionExpiresAt} kind="grid" readHeaders={detail.readHeaders} refresh={detail.refresh} />
+            {renewal.status}
             {statusMessage ? <span role="status" style={{ font: "var(--type-mono-xs)", color: "var(--text-subtle)" }}>{statusMessage}</span> : null}
             {identityStatus}
             {removeCallsId !== undefined ? (
@@ -1606,6 +1614,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
         </div>
         <div className="fl-hired-actions" style={{ display: "flex", gap: 8 }}>
           {detail.state === "signed-out" || detail.state === "auth-expired" ? <Button variant="primary" onClick={() => void detail.signIn()}>Sign in to view</Button> : null}
+          {renewal.button}
           <Button variant="secondary" icon={<Icon name="settings" size={15} />} disabled={actionsDisabled} onClick={edit}>Edit</Button>
           <Button variant="secondary" icon={<Icon name="pause" size={15} />} disabled={actionsDisabled || (view?.status !== "armed" && view?.status !== "paused")} onClick={() => void togglePause()}>Pause</Button>
           {view?.provisioning

@@ -5,14 +5,19 @@ import { TRADE_MODEL_PRESETS } from "./sizing.js";
 import { TRADE_DOCTRINE } from "./doctrine.js";
 import { FEATURE_PROMPT_GUIDANCE } from "./features.js";
 
-// The LLM layer is 0G Compute and the ONLY model this product uses is 0G’s own
-// 0gm-1.0-35b-a3b: measured 1.6 s per entry call against 12–16 s for glm-5.x,
-// which also spend most of the completion on reasoning tokens. The default is
-// the 0G model so a missing TRADE_LLM_MODEL can never reach a costlier one.
-export const DEFAULT_TRADE_LLM_MODEL = "0gm-1.0-35b-a3b";
+// The LLM layer is 0G Compute. The default is Alibaba's qwen3.7-flash on the 0G
+// router (operator, 2026-09-16): 1 M context, $0.158/$0.635 per M tokens against
+// 0gm's $0.437/$2.62, measured 2.6 s per closed-schema entry call with thinking
+// off (9.2 s and an empty decision list with it on; 0gm 0.9 s on the same
+// prompt). 0gm-1.0-35b-a3b stays as the default fallback. A missing
+// TRADE_LLM_MODEL can never reach a costlier model.
+export const DEFAULT_TRADE_LLM_MODEL = "qwen3.7-flash";
 // Measured on the 0G router 2026-09-03 with the real entry prompt: 0gm 2.8 s,
 // qwen3-vl-30b 1.9 s, glm-5.3-flash 23.5 s, qwen3.8-flash 29.4 s. The two flash
 // models reason before answering, so a 20 s ceiling timed both of them out.
+// 2026-09-16, same prompt shape: qwen-flash 1.3 s (no thinking mode); qwen3.5-flash
+// 41 s and 4 093 reasoning tokens with thinking on, 2.8 s off; qwen3.7-flash 9.2 s
+// on, 2.6 s off — thinking is switched off for every qwen3* id, as for 0gm.
 export const TRADE_LLM_TIMEOUT_MS = 45_000;
 
 /**
@@ -22,7 +27,10 @@ export const TRADE_LLM_TIMEOUT_MS = 45_000;
  * HTTP 404 and are gone. `web/lib/trade.ts` mirrors this list, pinned by a test.
  */
 export const TRADE_LLM_MODELS = [
-  { id: "0gm-1.0-35b-a3b", label: "Auto: OGM-1.0-35B-A3B" },
+  { id: "qwen3.7-flash", label: "Auto: Qwen3.7 Flash" },
+  { id: "0gm-1.0-35b-a3b", label: "OGM-1.0-35B-A3B" },
+  { id: "qwen-flash", label: "Qwen Flash" },
+  { id: "qwen3.5-flash", label: "Qwen3.5 Flash" },
   { id: "qwen3-vl-30b", label: "Qwen3 VL 30B" },
   { id: "glm-5.3-flash", label: "GLM-5.3 Flash" },
   { id: "qwen3.8-flash", label: "Qwen3.8 Flash" },
@@ -375,9 +383,10 @@ export function createTradeLlm(input: CreateTradeLlmInput): TradeLlm {
           // unless thinking is disabled (measured 2026-09-03: 12 s and an empty
           // body with it on, 1.2 s and a valid answer with it off). Ported from
           // `D:\4lpha-0G\lib\copilot\router.ts`; every other provider ignores it.
+          // The qwen3* ids do the same (2026-09-16: qwen3.5-flash 41 s → 2.8 s).
           body: JSON.stringify({
             model, messages, stream: false, temperature: 0.35,
-            ...(model.toLowerCase().startsWith("0gm-")
+            ...(/^(0gm-|qwen3)/u.test(model.toLowerCase())
               ? { chat_template_kwargs: { enable_thinking: false } }
               : {}),
           }),

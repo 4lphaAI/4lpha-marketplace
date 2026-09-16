@@ -337,6 +337,7 @@ async function main(): Promise<void> {
   const llmKey = (process.env["TRADE_LLM_API_KEY"]?.trim() || process.env["OPENROUTER_API_KEY"]?.trim() || "");
   const llmBaseUrl = process.env["TRADE_LLM_BASE_URL"]?.trim() ?? "";
   const llmModel = process.env["TRADE_LLM_MODEL"]?.trim() ?? "";
+  const llmFallbackModel = process.env["TRADE_LLM_FALLBACK_MODEL"]?.trim() ?? "";
   const brainTransport =
     llmKey === ""
       ? undefined
@@ -344,6 +345,7 @@ async function main(): Promise<void> {
           readKey: () => llmKey,
           ...(llmBaseUrl === "" ? {} : { baseUrl: llmBaseUrl }),
           ...(llmModel === "" ? {} : { modelOverride: llmModel }),
+          ...(llmFallbackModel === "" ? {} : { fallbackOverride: llmFallbackModel }),
         });
 
   const dryRun = flag("dry-run");

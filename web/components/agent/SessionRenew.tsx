@@ -152,7 +152,15 @@ function revokeInstructions(value: unknown): RevokeInstructions | null {
   return calls.length === row["calls"].length ? { chainId: row["chainId"], calls } : null;
 }
 
-export function SessionRenew(props: SessionRenewProps): React.ReactElement | null {
+export type SessionRenewSlots = { readonly button: React.ReactElement | null; readonly status: React.ReactElement | null };
+
+/**
+ * The renewal control in two slots (operator, 2026-09-16: "nút Renew đặt bên trái
+ * Edit, bỏ panel"): ONE button for the page's action row and ONE mono line under
+ * the hero. No preview step — Renew signs at once; the plane refuses an
+ * underfunded or ineligible request and the line says why.
+ */
+export function useSessionRenew(props: SessionRenewProps): SessionRenewSlots {
   const owner = useOwnerActions();
   const [preview, setPreview] = React.useState<SessionPayload["data"] | null>(null);
   const [pending, setPending] = React.useState<RenewalData | null>(null);
@@ -304,26 +312,47 @@ export function SessionRenew(props: SessionRenewProps): React.ReactElement | nul
     finally { setBusy(false); }
   }, [owner, pending, readSession]);
 
-  if (props.sessionExpiresAt === null || props.sessionExpiresAt === undefined) return null;
+  const none: SessionRenewSlots = { button: null, status: null };
+  if (props.sessionExpiresAt === null || props.sessionExpiresAt === undefined) return none;
+  if (!expired(props.sessionExpiresAt) && pending === null && step === "idle") return none;
 
-  if (props.kind === "trade" || props.kind === "grid" || props.kind === "lp") {
-    if (!expired(props.sessionExpiresAt) && step === "idle") return <p data-testid="renewal-before-expiry" style={{ color: "var(--text-subtle)", font: "var(--type-mono-xs)" }}>Renewal opens when the session ends.</p>;
-  }
-  if (!expired(props.sessionExpiresAt) && pending === null && step === "idle") return null;
+  const mono = (text: React.ReactNode, tone = "var(--text-subtle)", role: "status" | "alert" = "status") =>
+    <span role={role} data-session-renew={step} style={{ font: "var(--type-mono-xs)", color: tone }}>{text}</span>;
+  const instructions = step === "cancelled" ? revokeInstructions(pending?.onChainRevoke) : null;
+  const revokable = step === "cancelled" && (pending?.authorityObserved === true || instructions !== null);
+  const cancelButton = <Button key="cancel" variant="ghost" disabled={busy} onClick={() => void cancel()}>Cancel renewal</Button>;
 
-  return <section data-testid="session-renew" style={{ margin: "12px 0", padding: 14, border: "1px solid var(--border-card)", borderRadius: "var(--radius-md)", background: "var(--surface-card)" }}>
-    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-      <div><strong>Renew session</strong><div style={{ color: "var(--text-subtle)", fontSize: 12, marginTop: 4 }}>{preview?.universe?.tokens ? `${preview.universe.tokens.length} tokens · ${preview.universe.held ?? 0} held kept · ${(preview.universe.dropped ?? []).length} dropped` : "Seven days · two passkey prompts"}</div></div>
-      {step === "idle" ? <Button size="sm" onClick={() => { setStep("preview"); void readSession(); }}>Renew</Button> : null}
-    </div>
-    {step === "preview" ? <div style={{ marginTop: 12 }}><p>Funding required: {preview?.funding?.requiredWei ?? "unavailable"} wei. Preview the trade universe, then sign the renewal.</p><Button size="sm" disabled={busy} onClick={() => void start()}>Sign renewal</Button></div> : null}
-    {step === "signing" ? <p role="status" style={{ marginTop: 12 }}>Waiting for the renewal signature…</p> : null}
-    {step === "granting" ? <p role="status" style={{ marginTop: 12 }}>Granting the new session key…</p> : null}
-    {step === "retry" ? <div style={{ marginTop: 12 }}><p role="status">Retrying the pending renewal — the reserved key expires {pending?.expiry === undefined ? "on an unavailable date" : `${dateText(pending.expiry)} (${remainingText(pending.expiry)})`}. Each retry signs one more grant of the same key.</p><Button size="sm" disabled={busy} onClick={() => void start()}>Retry grant</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>Cancel renewal</Button></div> : null}
-    {step === "retryExpired" ? <p role="status" style={{ marginTop: 12 }}>{message ?? (pending?.expiry === undefined ? "Retry closed." : `Retry closed: the reserved key expires ${dateText(pending.expiry)}; a fresh renewal opens after that.`)}</p> : null}
-    {step === "converging" ? <div style={{ marginTop: 12 }}><p role="status">Converging: {preview?.renewalPhase ?? pending?.phase ?? "granting"}{preview?.quiescing ? ` · ${preview.quiescing}` : ""}</p><Button size="sm" variant="ghost" disabled={busy} onClick={() => void cancel()}>Cancel renewal</Button></div> : null}
-    {step === "done" ? <p role="status" style={{ marginTop: 12 }}>Session renewed until {completedExpiresAt === null ? "the recorded expiry" : dateText(completedExpiresAt)}.</p> : null}
-    {step === "cancelled" ? <div style={{ marginTop: 12 }}><p role="status">Renewal cancelled. The agent remains on its expired session.</p>{pending?.coverageLossToken === undefined ? null : <p>Coverage changed; retry after resolving {pending.coverageLossToken}.</p>}{pending?.authorityObserved === true || revokeInstructions(pending?.onChainRevoke) !== null ? <><p>Revoke the new key to retire the cancelled renewal.</p>{(() => { const instructions = revokeInstructions(pending?.onChainRevoke); return instructions === null ? null : <ol>{instructions.calls.map((call, index) => <li key={`${call.to}-${index}`}><span>{call.note}</span><br /><code>{call.to}</code><br /><code>{call.data}</code></li>)}</ol>; })()}<Button size="sm" disabled={busy} onClick={() => void revokeNewKey()}>Revoke new key</Button></> : pending?.cancelReason === "owner" ? <Button size="sm" disabled={busy} onClick={() => void start()}>Retry renewal</Button> : null}</div> : null}
-    {message ? <p role="alert" style={{ color: "var(--loss)", marginTop: 10 }}>{message}</p> : null}
-  </section>;
+  const button = step === "idle" ? <Button variant="primary" onClick={() => void start()}>Renew</Button>
+    : step === "signing" || step === "granting" || step === "converging"
+      ? <>{<Button disabled>Renewing…</Button>}{step === "converging" ? cancelButton : null}</>
+      : step === "retry" ? <>{<Button variant="primary" disabled={busy} onClick={() => void start()}>Retry grant</Button>}{cancelButton}</>
+        : step === "cancelled"
+          ? revokable ? <Button variant="danger" disabled={busy} onClick={() => void revokeNewKey()}>Revoke new key</Button>
+            : pending?.cancelReason === "owner" ? <Button variant="primary" disabled={busy} onClick={() => void start()}>Retry renewal</Button> : null
+          : null;
+
+  const status = step === "signing" ? mono("Waiting for the renewal signature…")
+    : step === "granting" ? mono("Granting the new session key — the relay can take up to five minutes…")
+      : step === "converging" ? mono(`Converging: ${preview?.renewalPhase ?? pending?.phase ?? "granting"}${preview?.quiescing ? ` · ${preview.quiescing}` : ""}`)
+        : step === "retry" ? mono(`The new key was not granted yet — the reserved key expires ${pending?.expiry === undefined ? "on an unavailable date" : `${dateText(pending.expiry)} (${remainingText(pending.expiry)})`}. Each retry signs one more grant of the same key.`)
+          : step === "retryExpired" ? mono(message ?? (pending?.expiry === undefined ? "Retry closed." : `Retry closed: the reserved key expires ${dateText(pending.expiry)}; a fresh renewal opens after that.`))
+            : step === "done" ? mono(`Session renewed until ${completedExpiresAt === null ? "the recorded expiry" : dateText(completedExpiresAt)}.`)
+              : step === "cancelled" ? mono(<>
+                Renewal cancelled. The agent remains on its expired session.
+                {pending?.coverageLossToken === undefined ? null : ` Coverage changed; retry after resolving ${pending.coverageLossToken}.`}
+                {revokable ? " Revoke the new key to retire the cancelled renewal." : null}
+                {instructions === null ? null : instructions.calls.map((call, index) => <React.Fragment key={`${call.to}-${index}`}><br />{call.note} · <code>{call.to}</code> · <code>{call.data}</code></React.Fragment>)}
+              </>)
+                : null;
+  const alert = message !== null && step !== "retryExpired" ? mono(message, "var(--danger)", "alert") : null;
+  return {
+    button,
+    status: status === null && alert === null ? null : <>{status}{status !== null && alert !== null ? <br /> : null}{alert}</>,
+  };
+}
+
+/** The two slots stacked — for tests and for any page without an action row. */
+export function SessionRenew(props: SessionRenewProps): React.ReactElement | null {
+  const { button, status } = useSessionRenew(props);
+  return button === null && status === null ? null : <>{button}{status}</>;
 }

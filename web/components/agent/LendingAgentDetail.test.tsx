@@ -103,6 +103,7 @@ const agentView = {
   id: "lending-agent-01", status: "armed", provisioning: false,
   walletAddress: "0x9999999999999999999999999999999999999999",
   hireSizingName: "lending-v1", sessionPublicKey: null, sessionExpiresAt: null,
+  armedBudgetWei: "50000000000000000",
 } as unknown as AgentDetailView;
 
 function detailStub(
