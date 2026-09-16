@@ -145,6 +145,12 @@ async function main(): Promise<void> {
         `[quant-worker] cycle jobs=${report.jobsSeen} actions=${report.actions} `
         + `holds=${report.holds} errors=${report.errors}`,
       );
+      // The per-job notes are `<jobId>:<code>[:<detail>]` strings the worker
+      // already composes (hold codes, refusal causes, no-gas shortfalls) — the
+      // only way to see WHY a job is held from a log stream with no DB access.
+      if ((report.holds > 0 || report.errors > 0) && report.notes.length > 0) {
+        console.log(`[quant-worker] notes ${sanitizeMessage(report.notes.join(" "))}`);
+      }
     } catch (error) {
       console.error(
         `[quant-worker] cycle failed: ${sanitizeMessage(
