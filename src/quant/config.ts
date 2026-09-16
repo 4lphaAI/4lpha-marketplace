@@ -19,14 +19,20 @@ export type QuantEnv = Readonly<Record<string, string | undefined>>;
 /* Pinned venue facts (spec §2.1, §4.3)                                       */
 /* -------------------------------------------------------------------------- */
 
-/** United Stables — Altana's $1 stable, 18 decimals. The quant settlement token. */
+/**
+ * The quant settlement token: Binance-Peg USDC, 18 decimals. Re-pinned
+ * 2026-09-16 from United Stables (`0xcE24…6666`) after the production
+ * worker's boot check caught TermiX's `quant.token` change (FINDINGS bn-6);
+ * the self-test transport serves a stored block, so only production sees it.
+ * The `u`/`U` names stay as the code's word for "the settlement token".
+ */
 export const QUANT_U_56: Address = getAddress(
-  "0xcE24439F2D9C6a2289F741120FE202248B666666",
+  "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
 );
 
-/** The ONE V2 pair the whole strategy trades, cross-checked at boot. */
+/** The ONE V2 pair the whole strategy trades (USDC/WBNB), cross-checked at boot. */
 export const QUANT_U_WBNB_PAIR_56: Address = getAddress(
-  "0x108752b2a22c731ede3edac2205c63ae553e221a",
+  "0xd99c7f6c65857ac913a8f880a4cb84032ab2fc5b",
 );
 
 /** PancakeSwap V2 factory, for the `getPair` cross-check. */

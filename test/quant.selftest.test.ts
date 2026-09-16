@@ -124,7 +124,7 @@ describe("serializeGrantedSession — the SDK's serializeSession shape", () => {
           signature: "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
         }],
         spend: [{
-          token: getAddress("0xcE24439F2D9C6a2289F741120FE202248B666666"),
+          token: getAddress("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"),
           limit: 10n * E18, period: "day",
         }],
       },

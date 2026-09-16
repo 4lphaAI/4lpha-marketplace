@@ -346,7 +346,7 @@ describe("quant admission (A1..A8)", () => {
       permissions: { calls: { to: string; signature: string }[] };
     };
     session.permissions.calls.push({
-      to: "0xcE24439F2D9C6a2289F741120FE202248B666666",
+      to: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
       signature: "transfer(address,uint256)",
     });
     const { input } = admissionInput({ session });
@@ -546,6 +546,6 @@ describe("quant chain admission (A8)", () => {
     });
     assert.equal(verdict.ok, false);
     if (verdict.ok) return;
-    assert.ok(verdict.code.startsWith("session-chain-refused:0xce24"), verdict.code);
+    assert.ok(verdict.code.startsWith("session-chain-refused:0x8ac7"), verdict.code);
   });
 });

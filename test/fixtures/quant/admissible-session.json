@@ -23,7 +23,7 @@
           "signature": "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"
         },
         {
-          "to": "0xcE24439F2D9C6a2289F741120FE202248B666666",
+          "to": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
           "signature": "approve(address,uint256)"
         },
         {
@@ -33,7 +33,7 @@
       ],
       "spend": [
         {
-          "token": "0xcE24439F2D9C6a2289F741120FE202248B666666",
+          "token": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
           "limit": { "$bigint": "40000000000000000000" },
           "period": "day"
         },

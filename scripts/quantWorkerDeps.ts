@@ -112,6 +112,12 @@ export async function assertQuantBoot(input: {
   if (getAddress(block.data.u) !== getAddress(config.u)) {
     throw new Error("Boot refused: the venue block's U address is not the pinned constant.");
   }
+  // Every clip, tier threshold and cap in this plane is an 18-decimal wei
+  // amount (USDC-REPIN review, MEDIUM): a settlement token with any other
+  // decimal count would silently mis-scale them, so the boot refuses it.
+  if (block.data.uDecimals !== 18) {
+    throw new Error("Boot refused: the settlement token does not have 18 decimals.");
+  }
   if (block.data.tradableTokens.length !== 1) {
     throw new Error("Boot refused: the tradable set is not exactly one token.");
   }
@@ -120,6 +126,9 @@ export async function assertQuantBoot(input: {
     || getAddress(token.address) !== getAddress(config.wbnb)
     || token.priceRoute !== "direct") {
     throw new Error("Boot refused: the tradable token is not WBNB with a direct route.");
+  }
+  if (token.decimals !== 18) {
+    throw new Error("Boot refused: the tradable token does not have 18 decimals.");
   }
   const venues = block.data.venueAllowlist.map((address) => getAddress(address).toLowerCase());
   if (!venues.includes(getAddress(config.router).toLowerCase())) {

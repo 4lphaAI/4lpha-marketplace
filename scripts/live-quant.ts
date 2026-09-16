@@ -745,8 +745,8 @@ async function commandSelfTest(args: Args, context: Context): Promise<void> {
   console.log(
     "About to GRANT a self-test session from the operator wallet (costs gas).\n"
     + `  wallet:      ${wallet.address}\n`
-    + `  allocation:  ${allocationU} U · daily cap ${allocationU} U · term ${termDays} d\n`
-    + `  mid:         ${mid.toString(10)} (U wei per WBNB)\n`
+    + `  allocation:  ${allocationU} USDC · daily cap ${allocationU} USDC · term ${termDays} d\n`
+    + `  mid:         ${mid.toString(10)} (USDC wei per WBNB)\n`
     + `  blocks:      finalized ${finalized.number} latest ${latest} lag ${latest - finalized.number}\n`
     + `  caps/day:    U ${allocationUWei.toString(10)} · WBNB ${wbnbDayCapWei.toString(10)} · native ${nativeDayCapWei.toString(10)} wei\n`
     + `  ladder:      ${ladder.levels} level(s), clip ${ladder.clipUWei.toString(10)} U wei, buy[1] ${(ladder.buyPrice[1] ?? 0n).toString(10)}, sell[1] ${(ladder.sellPrice[1] ?? 0n).toString(10)}\n`
