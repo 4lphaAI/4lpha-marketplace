@@ -54,6 +54,14 @@ const NOW_SEC = 1_800_000_000 - 5 * 86_400;
 const fixture = JSON.parse(
   readFileSync(new URL("./fixtures/quant/admissible-session.json", import.meta.url), "utf8"),
 ) as { session: Record<string, unknown> };
+const wizardFixture = JSON.parse(
+  readFileSync(new URL("./fixtures/quant/wizard-session-shape.json", import.meta.url), "utf8"),
+) as {
+  permissions: {
+    calls: { to: string }[];
+    spend: { token?: string; limit: { $bigint: string }; period: string }[];
+  };
+};
 const WALLET = getAddress(String(fixture.session["walletAddress"]));
 const PUBLIC_KEY = String(fixture.session["publicKey"]) as Hex;
 const KEY_HASH = accountKeyHashForAddress(publicKeyToAddress(PUBLIC_KEY));
@@ -127,6 +135,8 @@ function makeHarness(options: {
   readonly gasPriceWei?: bigint;
   readonly wbnbCapWei?: bigint;
   readonly nativeCapWei?: bigint;
+  readonly wizardShape?: boolean;
+  readonly routerCanExecute?: boolean;
 } = {}): Harness {
   const store = options.store ?? new MemoryQuantJobStore();
   const journal = new MemoryExecutionJournal();
@@ -147,8 +157,14 @@ function makeHarness(options: {
   };
 
   const session = structuredClone(fixture.session) as {
-    permissions: { spend: { token?: string; limit: { $bigint: string } }[] };
+    permissions: {
+      calls: { to: string; signature?: string }[];
+      spend: { token?: string; limit: { $bigint: string }; period: string }[];
+    };
   };
+  if (options.wizardShape) {
+    session.permissions = structuredClone(wizardFixture.permissions);
+  }
   for (const cap of session.permissions.spend) {
     if (options.wbnbCapWei !== undefined && cap.token?.toLowerCase() === QUANT_WBNB_56.toLowerCase()) {
       cap.limit = { $bigint: options.wbnbCapWei.toString(10) };
@@ -327,7 +343,10 @@ function makeHarness(options: {
     chainAdmission: {
       async isValidKey() { return true; },
       async accountKeys() { return [{ keyHash: KEY_HASH, isSuperAdmin: false }]; },
-      async canExecute() { return true; },
+      async canExecute(_wallet: Address, _keyHash: Hex, target: Address) {
+        return options.routerCanExecute !== false
+          || target.toLowerCase() !== QUANT_ROUTER_56.toLowerCase();
+      },
     },
     intervalMs: 60_000,
     nowMs: () => clock.nowMs,
@@ -355,6 +374,40 @@ describe("quant worker — arm", () => {
     assert.equal(levels[0]?.buyPriceE18, BUY_1);
     assert.equal(levels[0]?.sellPriceE18, SELL_1);
     assert.equal(levels[0]?.state, "armed-quote");
+    const params = JSON.parse(job!.paramsJson!) as Record<string, unknown>;
+    assert.deepEqual(params["admissionEvidence"], {
+      grantShape: "selector-scoped", platformTargets: [],
+    });
+  });
+
+  it("BC-S194: admits the wizard whole-contract shape after all A8 probes pass", async () => {
+    const harness = makeHarness({ wizardShape: true });
+    const report = await cycle(harness);
+    assert.equal(report.errors, 0);
+    const job = await harness.store.getJob(JOB);
+    assert.equal(job?.status, "armed");
+    const params = JSON.parse(job!.paramsJson!) as Record<string, unknown>;
+    assert.deepEqual(params["admissionEvidence"], {
+      grantShape: "whole-contract",
+      platformTargets: [
+        "0x51895229e12f9876011789b04f8698af06ccd6da",
+        "0x8004a169fb4a3325136eb29fa0ceb6d2e539a432",
+        "0x9c01845705b3078aa2e8cff7520a6376fd766de5",
+        "0xea4daa3100a767e86fded867729ae7446476eba6",
+      ],
+    });
+  });
+
+  it("BC-S194: holds the wizard shape when the router A8 probe is declined", async () => {
+    const harness = makeHarness({ wizardShape: true, routerCanExecute: false });
+    const report = await cycle(harness);
+    assert.ok(
+      report.notes.includes(`${JOB}:session-chain-refused:${QUANT_ROUTER_56.toLowerCase()}`),
+      report.notes.join(","),
+    );
+    assert.equal((await harness.store.getJob(JOB))?.status, "discovered");
+    assert.equal((await harness.store.getJob(JOB))?.holdCode, "session-chain-refused");
+    assert.equal(harness.chain.submissions, 0);
   });
 
   it("PERSISTS the ciphertext, so discovery does not consume the only copy", async () => {
@@ -595,6 +648,11 @@ describe("quant worker — holds", () => {
     assert.ok(report.notes.includes(`${JOB}:recentered:up`), report.notes.join(","));
     assert.equal(harness.chain.submissions, 0, "re-seeding is scheduled, not submitted in the recenter fence");
     assert.equal((await harness.store.listLevels(JOB))[1]?.seedPending, true);
+    const afterRecenter = await harness.store.getJob(JOB);
+    const paramsJson = JSON.parse(afterRecenter!.paramsJson!) as Record<string, unknown>;
+    assert.deepEqual(paramsJson["admissionEvidence"], {
+      grantShape: "selector-scoped", platformTargets: [],
+    });
   });
 
   it("HOLDS `no-gas` when the wallet cannot cover the buy AND its exit", async () => {

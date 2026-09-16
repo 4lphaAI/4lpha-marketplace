@@ -19,20 +19,14 @@
  * ─── WHY `validateSessionSpec` IS NOT SUFFICIENT (REVIEW7 condition 7) ─────
  *
  * It ACCEPTS a target-only rule (`{ to }` with no selector), which permits
- * EVERY function on that contract — including `transfer` on U. A2/A4 below are
- * therefore enforced INDEPENDENTLY and on the 4-byte selector, and a
- * target-only rule on U or WBNB is refused by A4 rather than waved through.
+ * EVERY function on that contract — including `transfer` on U. A4 therefore
+ * classifies the entire calls array independently: either the parent's
+ * selector-scoped shape or the wizard's whole-contract shape over the pinned
+ * venue and platform targets. A8 remains positive capability evidence only.
  *
  * ─── THE HONEST AUTHORITY SENTENCE (R3.2 C4) ───────────────────────────────
  *
- * A leaked admitted key CAN divert up to the U day cap and the WBNB day cap
- * per day to any recipient, through the router's `to` argument — a `CallRule`
- * cannot constrain an argument (FINDINGS (h)). It CANNOT call `transfer`,
- * cannot reach any other contract, and stops at expiry or revoke. Our builder
- * always sets `to = tradingWallet`; that is a property of the BUILDER, not of
- * the key. A8's chain checks are POSITIVE checks only — they cannot enumerate
- * grants the live account holds beyond the descriptor, and nothing here claims
- * anything about those.
+ * The trading executor builds only USDC/WBNB approvals and PancakeSwap V2 swaps, with swap proceeds sent to your task wallet. The wizard grants broader permissions: whole-contract access to those contracts and four platform identity and commerce contracts. A stolen session key or compromised executor could directly transfer USDC/WBNB, redirect swap proceeds, or invoke platform functions. Applicable on-chain spend limits, expiry and revocation constrain that authority, but spend caps do not bound every identity or commerce action. Encrypted storage reduces key-exposure risk; it does not remove it, and pausing our worker does not revoke a stolen key. Loss could include the task wallet's entire funded trading balance.
  */
 import { getAddress, isAddress, keccak256, stringToHex, toFunctionSelector } from "viem";
 import type { Address, Hex } from "viem";
@@ -76,13 +70,30 @@ export const QUANT_KNOWN_SIGNATURES: readonly string[] = [
 /**
  * The ONE router selector this strategy tolerates.
  *
- * A one-entry set, widened by a spec revision only. Anything else on the
- * router is `session-excess-grant` — which is what makes §1's "the agent
- * cannot transfer" a CHECKED property rather than a hope.
+ * A one-entry set for the selector-scoped shape, widened by a spec revision
+ * only. Whole-contract wizard permissions are handled by the separate pinned
+ * target set below.
  */
 export const TOLERATED_ROUTER_SELECTORS: ReadonlySet<string> = new Set([
   SWAP_EXACT_TOKENS_FOR_TOKENS_SIGNATURE,
 ]);
+
+/**
+ * Fixed platform targets tolerated by the Agent.family whole-contract shape.
+ * Provenance: installed @altananetwork/sdk 0.7.0,
+ * node_modules/@altananetwork/sdk/dist/erc8183.js:24 (`ERC8183_ADDRESSES[56]`),
+ * plus the ERC-8004 registry pinned in CLAUDE.md. Widened by a spec revision only.
+ */
+export const TOLERATED_PLATFORM_TARGETS_56: ReadonlySet<Address> = new Set([
+  "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" as Address,
+  "0xEa4DAa3100A767e86FDed867729ae7446476EBA6" as Address,
+  "0x51895229E12F9876011789B04f8698af06cCD6DA" as Address,
+  "0x9C01845705b3078Aa2e8cfF7520a6376FD766dE5" as Address,
+]);
+
+const TOLERATED_PLATFORM_TARGET_KEYS: ReadonlySet<string> = new Set(
+  [...TOLERATED_PLATFORM_TARGETS_56].map((target) => target.toLowerCase()),
+);
 
 const VALID_PERIODS: ReadonlySet<string> = new Set<SpendPeriod>([
   "minute", "hour", "day", "week", "month", "year",
@@ -398,6 +409,9 @@ export type QuantAdmissionInput = {
 
 export type QuantAdmissionOk = {
   readonly ok: true;
+  readonly grantShape: "selector-scoped" | "whole-contract";
+  /** Sorted, unique, lowercased platform targets actually present. */
+  readonly platformTargets: readonly Address[];
   /** The smallest WBNB cap limit across every period row (R6.3's `Lmin`). */
   readonly wbnbCapMinLimitWei: bigint;
   /** Persisted per job; the only chunk a residual may close below (R7.2). */
@@ -493,6 +507,17 @@ function selectorOf(signature: string | undefined): string | null {
   }
 }
 
+function resolvedSelector(signature: string): {
+  readonly canonical: string | null;
+  readonly selector: string | null;
+} {
+  const canonical = canonicalSignature(signature);
+  return {
+    canonical,
+    selector: canonical === null ? null : selectorOf(canonical),
+  };
+}
+
 const APPROVE_SELECTOR = toFunctionSelector(APPROVE_SIGNATURE).toLowerCase();
 const SWAP_SELECTOR = toFunctionSelector(
   SWAP_EXACT_TOKENS_FOR_TOKENS_SIGNATURE,
@@ -503,7 +528,8 @@ const SWAP_SELECTOR = toFunctionSelector(
  * {@link buildChainAdmissionChecks} and runs separately.
  *
  * Enforced INDEPENDENTLY of `validateSessionSpec` (REVIEW7 condition 7), which
- * accepts a target-only rule and therefore cannot substitute for A4.
+ * accepts a target-only rule and therefore cannot substitute for A4's
+ * session-wide shape classification.
  */
 export function assertQuantSessionAdmissible(
   input: QuantAdmissionInput,
@@ -545,31 +571,53 @@ export function assertQuantSessionAdmissible(
     if (session.expiry > jobExpirySec + 300) return refuse("session-expiry-mismatch");
   }
 
-  /* A4 — every rule's target and selector, before A2's presence check. */
+  /* A4 — classify the entire calls array before walking any rule. */
+  const hasWholeContractRule = session.permissions.calls.some(
+    (rule) => rule.signature === undefined,
+  );
+  const hasSelectorScopedRule = session.permissions.calls.some(
+    (rule) => rule.signature !== undefined,
+  );
+  if (hasWholeContractRule && hasSelectorScopedRule) {
+    return refuse("session-excess-grant:mixed-shape");
+  }
+  const grantShape: QuantAdmissionOk["grantShape"] = hasWholeContractRule
+    ? "whole-contract" : "selector-scoped";
   let hasSwap = false;
   let hasApproveU = false;
   let hasApproveWbnb = false;
+  const platformTargets = new Set<string>();
   for (const rule of session.permissions.calls) {
     if (rule.to === undefined) return refuse("session-excess-grant:unbound");
     const target = rule.to.toLowerCase();
-    const selector = selectorOf(rule.signature);
-    if (target !== routerKey && target !== uKey && target !== wbnbKey) {
+    const isPlatformTarget = TOLERATED_PLATFORM_TARGET_KEYS.has(target);
+    if (target !== routerKey && target !== uKey && target !== wbnbKey && !isPlatformTarget) {
       return refuse(`session-excess-grant:${target}`);
     }
-    // A rule with NO function constraint permits EVERY function on that
-    // contract — `transfer` on U included. `validateSessionSpec` accepts it;
-    // this does not.
-    if (selector === null) return refuse(`session-excess-grant:${target}:any`);
+    if (grantShape === "whole-contract") {
+      if (rule.signature !== undefined) return refuse("session-excess-grant:mixed-shape");
+      if (isPlatformTarget) platformTargets.add(target);
+      if (target === routerKey) hasSwap = true;
+      else if (target === uKey) hasApproveU = true;
+      else if (target === wbnbKey) hasApproveWbnb = true;
+      continue;
+    }
+    const signature = rule.signature;
+    if (signature === undefined) return refuse("session-excess-grant:mixed-shape");
+    const resolved = resolvedSelector(signature);
+    const selector = resolved.selector;
+    const selectorText = selector ?? signature;
     if (target === routerKey) {
-      if (rule.signature === undefined
-        || !TOLERATED_ROUTER_SELECTORS.has(canonicalSignature(rule.signature) ?? "")) {
-        return refuse(`session-excess-grant:${target}:${selector}`);
+      if (resolved.canonical === null
+        || selector === null
+        || !TOLERATED_ROUTER_SELECTORS.has(resolved.canonical)) {
+        return refuse(`session-excess-grant:${target}:${selectorText}`);
       }
       if (selector === SWAP_SELECTOR) hasSwap = true;
       continue;
     }
-    if (selector !== APPROVE_SELECTOR) {
-      return refuse(`session-excess-grant:${target}:${selector}`);
+    if (isPlatformTarget || selector !== APPROVE_SELECTOR) {
+      return refuse(`session-excess-grant:${target}:${selectorText}`);
     }
     if (target === uKey) hasApproveU = true;
     else hasApproveWbnb = true;
@@ -642,7 +690,13 @@ export function assertQuantSessionAdmissible(
     }
   }
 
-  return { ok: true, wbnbCapMinLimitWei: lmin, residualThresholdWei: minSell };
+  return {
+    ok: true,
+    grantShape,
+    platformTargets: [...platformTargets].sort() as Address[],
+    wbnbCapMinLimitWei: lmin,
+    residualThresholdWei: minSell,
+  };
 }
 
 /* -------------------------------------------------------------------------- */

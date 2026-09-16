@@ -941,6 +941,10 @@ async function admitJob(
     paramsJson: JSON.stringify({
       ...params,
       paramsSchema: "r14",
+      admissionEvidence: {
+        grantShape: admissible.grantShape,
+        platformTargets: admissible.platformTargets,
+      },
       minClipUWei: params.minClipUWei.toString(10),
       relayFeePerSubmitWei: params.relayFeePerSubmitWei.toString(10),
       relayGasUnits: params.relayGasUnits.toString(10),

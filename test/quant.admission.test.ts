@@ -21,6 +21,7 @@ import {
   projectGrantedPermissions,
   runChainAdmissionChecks,
   specDigest,
+  TOLERATED_PLATFORM_TARGETS_56,
   TOLERATED_ROUTER_SELECTORS,
 } from "../src/quant/admission.js";
 import { QUANT_STRATEGY_DEFAULTS, QUANT_U_56, QUANT_ROUTER_56, QUANT_WBNB_56 } from "../src/quant/config.js";
@@ -39,12 +40,35 @@ const admissible = JSON.parse(
   readFileSync(new URL("./fixtures/quant/admissible-session.json", import.meta.url), "utf8"),
 ) as { session: Record<string, unknown> };
 
+const wizardShape = JSON.parse(
+  readFileSync(new URL("./fixtures/quant/wizard-session-shape.json", import.meta.url), "utf8"),
+) as { permissions: { calls: { to: string }[]; spend: unknown[] } };
+
 const serialized = readFileSync(
   new URL("./fixtures/quant/bnbagent-serialized-session.json", import.meta.url), "utf8",
 );
 
 function plaintextOf(session: unknown): string {
   return JSON.stringify(session);
+}
+
+function wizardSession(): Record<string, unknown> {
+  const session = structuredClone(admissible.session);
+  session["permissions"] = structuredClone(wizardShape.permissions);
+  return session;
+}
+
+function wizardSelectorScopedSession(): Record<string, unknown> {
+  const session = wizardSession() as unknown as {
+    permissions: { calls: { to: string; signature?: string }[]; spend: unknown[] };
+  };
+  session.permissions.calls = session.permissions.calls.map((rule) => ({
+    to: rule.to,
+    signature: rule.to.toLowerCase() === QUANT_ROUTER_56.toLowerCase()
+      ? "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"
+      : "approve(address,uint256)",
+  }));
+  return session as unknown as Record<string, unknown>;
 }
 
 const LADDER = (() => {
@@ -229,6 +253,14 @@ describe("quant projection", () => {
         index === 0 ? { ...cap, limit: cap.limit + 1n } : cap),
     };
     assert.notEqual(permissionsDigest(parsed.permissions), permissionsDigest(widened));
+    const wizardParsed = parseSessionPlaintext(plaintextOf(wizardSession()));
+    assert.equal(wizardParsed.ok, true);
+    if (!wizardParsed.ok) return;
+    assert.notEqual(
+      permissionsDigest(parsed.permissions),
+      permissionsDigest(wizardParsed.session.permissions),
+      "a re-grant with the wizard's different shape changes the descriptor digest",
+    );
   });
 
   it("spec digests differ when the projection differs", () => {
@@ -296,7 +328,162 @@ describe("quant admission (A1..A8)", () => {
     }
   });
 
-  it("refuses a TARGET-ONLY rule, which validateSessionSpec accepts (condition 7)", () => {
+  it("ADMITS the wizard whole-contract shape and records its platform targets", () => {
+    const { input } = admissionInput({ session: wizardSession() });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.code);
+    if (!verdict.ok) return;
+    assert.equal(verdict.grantShape, "whole-contract");
+    assert.deepEqual(
+      verdict.platformTargets,
+      [...TOLERATED_PLATFORM_TARGETS_56].map((target) => target.toLowerCase()).sort(),
+    );
+  });
+
+  it("refuses an unknown whole-contract target from the wizard shape", () => {
+    const session = wizardSession() as unknown as {
+      permissions: { calls: { to: string }[] };
+    };
+    const unknown = "0x55d398326f99059fF775485246999027B3197955";
+    session.permissions.calls.push({ to: unknown });
+    const { input } = admissionInput({ session });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, false);
+    if (verdict.ok) return;
+    assert.equal(verdict.code, `session-excess-grant:${unknown.toLowerCase()}`);
+  });
+
+  it("refuses an explicit transfer selector on U in the scoped shape", () => {
+    const session = structuredClone(admissible.session) as {
+      permissions: { calls: { to: string; signature: string }[] };
+    };
+    session.permissions.calls.push({
+      to: QUANT_U_56,
+      signature: toFunctionSelector("transfer(address,uint256)"),
+    });
+    const { input } = admissionInput({ session });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, false);
+    if (verdict.ok) return;
+    assert.equal(verdict.code, `session-excess-grant:${QUANT_U_56.toLowerCase()}:0xa9059cbb`);
+  });
+
+  it("refuses a selector-bound platform target", () => {
+    const session = wizardSelectorScopedSession() as unknown as {
+      permissions: { calls: { to: string; signature?: string }[] };
+    };
+    const platform = [...TOLERATED_PLATFORM_TARGETS_56][0]!;
+    const rule = session.permissions.calls.find(
+      (candidate) => candidate.to.toLowerCase() === platform.toLowerCase(),
+    );
+    assert.ok(rule);
+    const { input } = admissionInput({ session });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, false);
+    if (verdict.ok) return;
+    assert.equal(
+      verdict.code,
+      `session-excess-grant:${platform.toLowerCase()}:0x095ea7b3`,
+    );
+  });
+
+  it("refuses mixed shapes across targets and for one target in either order", () => {
+    const base = structuredClone(admissible.session) as {
+      permissions: { calls: { to: string; signature?: string }[] };
+    };
+    const scoped = base.permissions.calls;
+    const wholeU = { to: QUANT_U_56 };
+    for (const calls of [
+      [wholeU, ...scoped],
+      [...scoped, wholeU],
+      [
+        { to: QUANT_U_56 },
+        ...scoped.filter((rule) => rule.to.toLowerCase() !== QUANT_U_56.toLowerCase()),
+      ],
+      [
+        ...scoped.filter((rule) => rule.to.toLowerCase() !== QUANT_U_56.toLowerCase()),
+        { to: QUANT_U_56 },
+      ],
+    ]) {
+      const session = structuredClone(admissible.session) as {
+        permissions: { calls: { to: string; signature?: string }[] };
+      };
+      session.permissions.calls = calls;
+      const { input } = admissionInput({ session });
+      const verdict = assertQuantSessionAdmissible(input);
+      assert.equal(verdict.ok, false);
+      if (verdict.ok) continue;
+      assert.equal(verdict.code, "session-excess-grant:mixed-shape");
+    }
+  });
+
+  it("refuses the wizard shape when its router rule is removed", () => {
+    const session = wizardSession() as unknown as {
+      permissions: { calls: { to: string }[] };
+    };
+    session.permissions.calls = session.permissions.calls.filter(
+      (rule) => rule.to.toLowerCase() !== QUANT_ROUTER_56.toLowerCase(),
+    );
+    const { input } = admissionInput({ session });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, false);
+    if (verdict.ok) return;
+    assert.equal(verdict.code, "session-missing-grant:swap");
+  });
+
+  it("pins the four checksummed platform targets and their provenance set", () => {
+    assert.equal(TOLERATED_PLATFORM_TARGETS_56.size, 4);
+    assert.deepEqual([...TOLERATED_PLATFORM_TARGETS_56], [
+      "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+      "0xEa4DAa3100A767e86FDed867729ae7446476EBA6",
+      "0x51895229E12F9876011789B04f8698af06cCD6DA",
+      "0x9C01845705b3078Aa2e8cfF7520a6376FD766dE5",
+    ]);
+  });
+
+  it("admits target-bound four-byte approve and swap selectors end to end", () => {
+    const session = structuredClone(admissible.session) as {
+      permissions: { calls: { to: string; signature: string }[] };
+    };
+    session.permissions.calls = session.permissions.calls.map((rule) => ({
+      to: rule.to,
+      signature: toFunctionSelector(rule.signature),
+    }));
+    const { input } = admissionInput({ session });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, true, verdict.ok ? "" : verdict.code);
+    if (!verdict.ok) return;
+    assert.equal(verdict.grantShape, "selector-scoped");
+  });
+
+  it("refuses a malformed present selector using the raw constraint", () => {
+    const session = structuredClone(admissible.session) as {
+      permissions: { calls: { to: string; signature: string }[] };
+    };
+    session.permissions.calls[0]!.signature = "malformed selector";
+    const { input } = admissionInput({ session });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, false);
+    if (verdict.ok) return;
+    assert.equal(
+      verdict.code,
+      `${"session-excess-grant:"}${QUANT_ROUTER_56.toLowerCase()}:malformed selector`,
+    );
+  });
+
+  it("keeps the defensive unbound refusal when the predicate is called directly", () => {
+    const session = structuredClone(admissible.session) as {
+      permissions: { calls: { to?: string; signature?: string }[] };
+    };
+    session.permissions.calls[0] = { signature: "approve(address,uint256)" };
+    const { input } = admissionInput({ session });
+    const verdict = assertQuantSessionAdmissible(input);
+    assert.equal(verdict.ok, false);
+    if (verdict.ok) return;
+    assert.equal(verdict.code, "session-excess-grant:unbound");
+  });
+
+  it("refuses a mixed target-only rule, which validateSessionSpec accepts (condition 7)", () => {
     const session = structuredClone(admissible.session) as {
       permissions: { calls: { to: string; signature?: string }[] };
     };
@@ -322,8 +509,7 @@ describe("quant admission (A1..A8)", () => {
     const verdict = assertQuantSessionAdmissible(input);
     assert.equal(verdict.ok, false);
     if (verdict.ok) return;
-    assert.ok(verdict.code.startsWith("session-excess-grant:"), verdict.code);
-    assert.ok(verdict.code.endsWith(":any"), verdict.code);
+    assert.equal(verdict.code, "session-excess-grant:mixed-shape");
   });
 
   it("refuses ANY target outside {router, U, WBNB}", () => {
@@ -341,7 +527,7 @@ describe("quant admission (A1..A8)", () => {
     assert.ok(verdict.code.startsWith("session-excess-grant:0x55d3"), verdict.code);
   });
 
-  it("refuses `transfer` on U — this is what makes 'cannot transfer' a CHECK", () => {
+  it("refuses an explicit `transfer` selector on U in the scoped shape", () => {
     const session = structuredClone(admissible.session) as {
       permissions: { calls: { to: string; signature: string }[] };
     };

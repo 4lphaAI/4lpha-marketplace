@@ -658,6 +658,24 @@ describe("R14 admitted parameter schemas", () => {
     assert.equal(missingSchema, null, "R14-shaped data cannot fall through to legacy parsing");
   });
 
+  it("BC-S200: ignores admission evidence for the R14 digest and re-derivation", async () => {
+    const context = await fixture();
+    const raw = JSON.parse(context.job.paramsJson!) as Record<string, unknown>;
+    const withEvidence = await admittedParams({
+      ...context.job,
+      paramsJson: JSON.stringify({
+        ...raw,
+        admissionEvidence: {
+          grantShape: "whole-contract",
+          platformTargets: ["0x51895229e12f9876011789b04f8698af06ccd6da"],
+        },
+      }),
+    }, QUANT_STRATEGY_DEFAULTS);
+    const withoutEvidence = await admittedParams(context.job, QUANT_STRATEGY_DEFAULTS);
+    assert.deepEqual(withEvidence, withoutEvidence);
+    assert.equal(context.job.paramsDigest, ADMITTED_PARAMS_DIGEST);
+  });
+
   it("recovers the built B2 scalar projection with its own static fee", async () => {
     const context = await partialExitFixture();
     const parsed = admittedParams({

@@ -109,6 +109,30 @@ function requireFlag(args: Args, name: string): string {
   return value;
 }
 
+type AdmissionEvidence = {
+  readonly grantShape: "selector-scoped" | "whole-contract";
+  readonly platformTargets: readonly string[];
+};
+
+function admissionEvidenceFromParamsJson(paramsJson: string | null): AdmissionEvidence | null {
+  if (paramsJson === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(paramsJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const evidence = (parsed as Record<string, unknown>)["admissionEvidence"];
+    if (typeof evidence !== "object" || evidence === null || Array.isArray(evidence)) return null;
+    const record = evidence as Record<string, unknown>;
+    const grantShape = record["grantShape"];
+    const platformTargets = record["platformTargets"];
+    if ((grantShape !== "selector-scoped" && grantShape !== "whole-contract")
+      || !Array.isArray(platformTargets)
+      || platformTargets.some((target) => typeof target !== "string")) return null;
+    return { grantShape, platformTargets };
+  } catch {
+    return null;
+  }
+}
+
 function yesLive(args: Args): boolean {
   return args.flags.get("yes-live") === true;
 }
@@ -240,6 +264,7 @@ async function commandStatus(args: Args, context: Context): Promise<void> {
     const admitted = admittedParams(job, context.config.params);
     const statusParams = admitted ?? context.config.params;
     const admittedBand = admitted !== null && "bandBps" in admitted ? admitted.bandBps : "-";
+    const admissionEvidence = admissionEvidenceFromParamsJson(job.paramsJson);
     console.log(
       `\njob ${job.quantJobId}  status=${job.status}  hold=${job.holdCode ?? "-"}\n`
       + `  wallet=${job.tradingWallet} allocation=${job.allocationUWei} `
@@ -254,6 +279,8 @@ async function commandStatus(args: Args, context: Context): Promise<void> {
       + `next=${job.lastRecenterAtMs === null ? (job.admittedAtMs ?? 0) + statusParams.recenterCooldownSec * 1000 : job.lastRecenterAtMs + statusParams.recenterCooldownSec * 1000}\n`
       + `  wire=${job.wireState} accounting=${job.accountingState} epoch=${job.accountingEpoch ?? "-"} `
       + `accountingRev=${job.accountingRev} params=${statusParams.seedMode}/${statusParams.recenterMode} band=${admittedBand}\n`
+      + `  grantShape=${admissionEvidence?.grantShape ?? "unknown"} `
+      + `platformTargets=${admissionEvidence === null ? "unknown" : JSON.stringify(admissionEvidence.platformTargets)}\n`
       + `  paramsDigest=${job.paramsDigest ?? "-"}\n`
       + `  wbnbCapMin=${job.wbnbCapMinLimitWei} residualThreshold=${job.residualThresholdWei}`,
     );
