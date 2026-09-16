@@ -295,10 +295,12 @@ export function TradeAgentDetail(props: Props) {
   const summary = trade?.summary;
   const gross = summary?.grossDeltaWei ?? null;
   const grossTone = gross === null ? "normal" : BigInt(gross) < 0n ? "loss" : "profit";
-  // The percent under the dollar figure: gross delta over the hire's open budget (the same basis the grid pages use), signed, two decimals.
-  const grossPercent = gross === null || view?.armedBudgetWei === null || view?.armedBudgetWei === undefined || BigInt(view.armedBudgetWei) <= 0n
+  // The percent under the dollar figure: gross delta over the DELEGATED capital — the session's daily native cap, which is
+  // what a trade hire pins (its `openNativeBudgetWei` is 0; the grid pages measure against their armed budget instead).
+  const basisWei = view?.dailyNativeLimit.rawWei ?? null;
+  const grossPercent = gross === null || basisWei === null || BigInt(basisWei) <= 0n
     ? undefined
-    : bps((BigInt(gross) * 10_000n / BigInt(view.armedBudgetWei)).toString(10), true);
+    : bps((BigInt(gross) * 10_000n / BigInt(basisWei)).toString(10), true);
   const nowMs = useSessionClock();
   const draining = trade?.lifecycle?.draining === true;
   // An armed agent whose session has expired is not live: nothing it decides

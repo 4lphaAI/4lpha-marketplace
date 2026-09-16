@@ -162,3 +162,22 @@ describe("the session clock on the trade page (2026-09-15)", () => {
     } finally { await none.done(); }
   });
 });
+
+describe("the compact tiles (operator, 2026-09-16)", () => {
+  async function render(v: AgentDetailView, t: TradeView): Promise<{ readonly host: HTMLDivElement; readonly done: () => Promise<void> }> {
+    const host = document.createElement("div"), root = createRoot(host);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ data: {} }) })));
+    await act(async () => root.render(<TradeAgentDetail {...props(v, t)} />));
+    return { host, done: async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); } };
+  }
+  it("shows the gross percent over the delegated cap and none of the retired subtitles", async () => {
+    const { host, done } = await render(
+      view({ dailyNativeLimit: { value: "0.05 BNB", reason: null, bnb: "0.05 BNB", rawWei: "50000000000000000" } }),
+      trade(1, { summary: { grossDeltaWei: "1250000000000000", grossComplete: true, grossReason: null, wins: 1, winRateBps: 5_000, closedTrades: 2, openPositions: 1, maxOpenPositions: 4, observedAt: null } }),
+    );
+    try {
+      expect(host.textContent).toContain("+2.5%");
+      for (const gone of ["24h spend authority", "slots free", "relay costs excluded", "Hard revoke", "Account recovery"]) expect(host.textContent).not.toContain(gone);
+    } finally { await done(); }
+  });
+});

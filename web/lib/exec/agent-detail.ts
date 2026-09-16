@@ -637,6 +637,7 @@ function dailyLimit(session: Row | null, nowMs: number, tokenSnapshot: unknown):
     reason: null,
     note: `period: day · ${expired ? "recorded expired ceiling" : `expires ${new Date(expiry * 1_000).toISOString()}`}. The agent may treat the whole wallet balance of both pool tokens as working capital.`,
     bnb: primary,
+    rawWei: limit,
     ...(usdOnly === null ? {} : { usd: usdOnly })
   };
 }
