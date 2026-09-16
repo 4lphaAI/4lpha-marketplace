@@ -63,7 +63,8 @@ function bnbUsdRate(view: AgentDetailView | null): number | null {
   const rawBnb = view?.dailyNativeLimit.bnb?.replace(/[^0-9.]/gu, "") ?? "";
   const rawUsd = view?.dailyNativeLimit.usd?.replace(/[^0-9.]/gu, "") ?? "";
   const native = Number(rawBnb), usd = Number(rawUsd);
-  return Number.isFinite(native) && native > 0 && Number.isFinite(usd) ? usd / native : null;
+  // No fresh WBNB price ⇒ no `usd` text ⇒ no rate: the tiles fall back to BNB amounts instead of printing "$0.00" (seen live 2026-09-16).
+  return rawUsd !== "" && Number.isFinite(native) && native > 0 && Number.isFinite(usd) && usd > 0 ? usd / native : null;
 }
 
 function fiat(wei: string | null, rate: number | null, signed = false): string {

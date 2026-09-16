@@ -180,4 +180,16 @@ describe("the compact tiles (operator, 2026-09-16)", () => {
       for (const gone of ["24h spend authority", "slots free", "relay costs excluded", "Hard revoke", "Account recovery"]) expect(host.textContent).not.toContain(gone);
     } finally { await done(); }
   });
+
+  it("falls back to the BNB amount, never $0.00, when the delegated tile carries no fresh USD price", async () => {
+    const { host, done } = await render(
+      view({ dailyNativeLimit: { value: "0.05 BNB", reason: null, bnb: "0.05 BNB", rawWei: "50000000000000000" } }),
+      trade(0, { summary: { grossDeltaWei: "-1075000000000000", grossComplete: true, grossReason: null, wins: 1, winRateBps: 2_500, closedTrades: 4, openPositions: 0, maxOpenPositions: 4, observedAt: null } }),
+    );
+    try {
+      expect(host.textContent).not.toContain("$0.00");
+      expect(host.textContent).toContain("BNB");
+      expect(host.textContent).toContain("-2.15%");
+    } finally { await done(); }
+  });
 });
