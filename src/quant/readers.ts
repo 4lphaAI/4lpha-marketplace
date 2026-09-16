@@ -15,6 +15,8 @@
  */
 import {
   createPublicClient,
+  decodeFunctionResult,
+  encodeFunctionData,
   fallback,
   getAddress,
   http,
@@ -90,6 +92,7 @@ export type QuantReserves = {
   readonly reserve0: bigint;
   readonly reserve1: bigint;
   readonly token0: Address;
+  readonly blockHash?: Hex;
 };
 
 /**
@@ -99,10 +102,14 @@ export type QuantReserves = {
  */
 export interface QuantChainReader {
   chainId(): Promise<number>;
+  /** The live RPC gas estimate used only by the quant decision path. */
+  gasPriceWei(): Promise<bigint>;
   finalizedBlock(): Promise<QuantBlock>;
   latestBlockNumber(): Promise<bigint>;
   blockAt(blockNumber: bigint): Promise<QuantBlock>;
   reservesAt(pair: Address, blockNumber: bigint): Promise<QuantReserves>;
+  /** Hash-pinned EIP-1898 reads; optional for legacy offline harnesses. */
+  readonly reservesAtHash?: (pair: Address, blockHash: Hex) => Promise<QuantReserves>;
   pairToken0(pair: Address): Promise<Address>;
   getPair(factory: Address, tokenA: Address, tokenB: Address): Promise<Address>;
   /** `getAmountsOut` at an EXPLICIT height (R3.9). */
@@ -112,8 +119,16 @@ export interface QuantChainReader {
     amountInWei: bigint,
     blockNumber: bigint,
   ): Promise<bigint>;
+  readonly quoteV2AtHash?: (
+    router: Address,
+    path: readonly Address[],
+    amountInWei: bigint,
+    blockHash: Hex,
+  ) => Promise<bigint>;
   tokenBalanceAt(token: Address, account: Address, blockNumber?: bigint): Promise<bigint>;
+  readonly tokenBalanceAtHash?: (token: Address, account: Address, blockHash: Hex) => Promise<bigint>;
   nativeBalanceAt(account: Address, blockNumber?: bigint): Promise<bigint>;
+  readonly nativeBalanceAtHash?: (account: Address, blockHash: Hex) => Promise<bigint>;
   getTransaction(hash: Hex): Promise<{
     readonly hash: Hex;
     readonly to: Address | null;
@@ -149,8 +164,17 @@ export function createQuantChainReader(input: {
     ...(input.signal === undefined ? {} : { fetchOptions: { signal: input.signal } }),
   }));
   const client = createPublicClient({ chain: bsc, transport: fallback(transports) });
+  const hashRef = (blockHash: Hex) => ({ blockHash, requireCanonical: true as const });
+  async function hashCall(to: Address, data: Hex, blockHash: Hex): Promise<Hex> {
+    const result = await client.request({
+      method: "eth_call",
+      params: [{ to, data }, hashRef(blockHash)],
+    });
+    return result as Hex;
+  }
   return {
     async chainId() { return client.getChainId(); },
+    async gasPriceWei() { return client.getGasPrice(); },
     async finalizedBlock() {
       const block = await client.getBlock({ blockTag: "finalized" });
       return { number: block.number, hash: block.hash, timestampSec: block.timestamp };
@@ -175,6 +199,27 @@ export function createQuantChainReader(input: {
         token0: getAddress(token0),
       };
     },
+    async reservesAtHash(pair, blockHash) {
+      const [reserveRaw, tokenRaw] = await Promise.all([
+        hashCall(
+          getAddress(pair),
+          encodeFunctionData({ abi: V2_PAIR_ABI, functionName: "getReserves" }),
+          blockHash,
+        ),
+        hashCall(
+          getAddress(pair),
+          encodeFunctionData({ abi: V2_PAIR_ABI, functionName: "token0" }),
+          blockHash,
+        ),
+      ]);
+      const reserves = decodeFunctionResult({
+        abi: V2_PAIR_ABI, functionName: "getReserves", data: reserveRaw,
+      });
+      const token0 = decodeFunctionResult({
+        abi: V2_PAIR_ABI, functionName: "token0", data: tokenRaw,
+      });
+      return { reserve0: BigInt(reserves[0]), reserve1: BigInt(reserves[1]), token0: getAddress(token0), blockHash };
+    },
     async pairToken0(pair) {
       return getAddress(await client.readContract({
         address: getAddress(pair), abi: V2_PAIR_ABI, functionName: "token0",
@@ -198,6 +243,22 @@ export function createQuantChainReader(input: {
       if (out === undefined) throw new Error("Pancake V2 returned no output amount.");
       return out;
     },
+    async quoteV2AtHash(router, path, amountInWei, blockHash) {
+      const raw = await hashCall(
+        getAddress(router),
+        encodeFunctionData({
+          abi: V2_ROUTER_QUOTER_ABI, functionName: "getAmountsOut",
+          args: [amountInWei, path.map((token) => getAddress(token))],
+        }),
+        blockHash,
+      );
+      const amounts = decodeFunctionResult({
+        abi: V2_ROUTER_QUOTER_ABI, functionName: "getAmountsOut", data: raw,
+      });
+      const out = amounts.at(-1);
+      if (out === undefined) throw new Error("Pancake V2 returned no output amount.");
+      return out;
+    },
     async tokenBalanceAt(token, account, blockNumber) {
       return client.readContract({
         address: getAddress(token), abi: ERC20_BALANCE_ABI, functionName: "balanceOf",
@@ -205,11 +266,30 @@ export function createQuantChainReader(input: {
         ...(blockNumber === undefined ? {} : { blockNumber }),
       });
     },
+    async tokenBalanceAtHash(token, account, blockHash) {
+      const raw = await hashCall(
+        getAddress(token),
+        encodeFunctionData({
+          abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [getAddress(account)],
+        }),
+        blockHash,
+      );
+      return decodeFunctionResult({
+        abi: ERC20_BALANCE_ABI, functionName: "balanceOf", data: raw,
+      });
+    },
     async nativeBalanceAt(account, blockNumber) {
       return client.getBalance({
         address: getAddress(account),
         ...(blockNumber === undefined ? {} : { blockNumber }),
       });
+    },
+    async nativeBalanceAtHash(account, blockHash) {
+      const raw = await client.request({
+        method: "eth_getBalance",
+        params: [getAddress(account), hashRef(blockHash)],
+      });
+      return BigInt(raw as Hex);
     },
     async getTransaction(hash) {
       try {

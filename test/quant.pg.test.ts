@@ -20,7 +20,7 @@
  *
  * The DDL and its additive migrations; `discoverJob`, `updateJobWire`,
  * `replaceEnvelope`, `admitJob` (win AND conflict), `getJob`, `listJobs`,
- * `listWorkableJobs`, `setJobStatus`, `listLevels`, `insertIntent` (win AND
+ * `listWorkableJobs`, transition methods, `listLevels`, `insertIntent` (win AND
  * the blocked/stale conflicts), `markActionSubmitted`, `abortIntent`,
  * `setActionState`, `settleAction` (settle, idempotent no-op, and the
  * OWNERSHIP conflict), `retireLevel`, `openEpoch`, `currentEpoch`,
@@ -64,6 +64,8 @@ const WALLET = getAddress("0x9BB0aB9dCEF83F0b39a4bE3EBE7a1c9D6d5c1111");
 const KEY = `0x04${"ab".repeat(64)}` as Hex;
 const DIGEST = `0x${"11".repeat(32)}` as Hex;
 const TX = `0x${"ee".repeat(32)}` as Hex;
+const HASH2 = `0x${"22".repeat(32)}` as Hex;
+const B2_JOB = "quant-pg-b2-job";
 
 function command(executable: string, args: readonly string[]): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -165,7 +167,8 @@ async function dropAll(sql: SqlClient): Promise<void> {
   await sql.query(
     `drop table if exists quant_jobs, quant_levels, quant_actions,
        quant_receipt_ownership, quant_epochs, quant_observations,
-       quant_indexer_trades, quant_reports, quant_runs cascade`,
+       quant_indexer_trades, quant_reports, quant_runs, quant_recenters,
+       quant_seed_events, quant_quant_migrations cascade`,
   );
 }
 
@@ -245,6 +248,10 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
     const levels = await store.listLevels(JOB);
     assert.equal(levels.length, 2);
     assert.equal(levels[0]?.buyPriceE18, 688n * U);
+    assert.equal((await store.getJob(JOB))?.anchorE18, 740n * U);
+    assert.equal((await store.getJob(JOB))?.ladderGen, 0);
+    assert.equal((await store.listRecenters(JOB)).length, 0);
+    assert.equal((await store.listSeedEvents(JOB)).length, 0);
 
     /* ---- admit (conflict): the CAS is on the version AND the status ------ */
     const second = await store.admitJob({
@@ -261,7 +268,7 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
     // The prices did NOT move: there is no statement that can update them.
     assert.equal((await store.listLevels(JOB))[0]?.buyPriceE18, 688n * U);
 
-    /* ---- listWorkableJobs + setJobStatus --------------------------------- */
+    /* ---- listWorkableJobs + transition methods --------------------------- */
     assert.equal((await store.listWorkableJobs("strategy-1")).length, 1);
     // QUANT-SELFTEST R2: another strategy sees nothing; a wire refresh never re-labels.
     assert.equal((await store.listWorkableJobs("other")).length, 0);
@@ -271,9 +278,11 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
       dailyCapUWei: 1n, termDays: 1, startedAtMs: 1, endsAtMs: 2, sessionExpiresAtMs: 3, revokedAtMs: null, nowMs: 5,
     }), null);
     assert.equal((await store.getJob(JOB))?.strategyId, "strategy-1");
-    await store.setJobStatus({ quantJobId: JOB, status: "paused", nowMs: clock });
-    assert.equal((await store.listWorkableJobs("strategy-1")).length, 0);
-    await store.setJobStatus({ quantJobId: JOB, status: "armed", holdCode: null, nowMs: clock });
+    assert.equal(await store.pauseJob({ quantJobId: JOB, nowMs: clock }), true);
+    // BC-S127 / R10.15: paused jobs remain in the recovery queue; the worker
+    // recovers truth while the pause still blocks new decisions.
+    assert.equal((await store.listWorkableJobs("strategy-1")).length, 1);
+    assert.equal(await store.resumeJob({ quantJobId: JOB, nowMs: clock }), true);
     assert.equal((await store.getJob(JOB))?.holdCode, null);
 
     /* ---- the fence, and every method bound to its transaction ------------ */
@@ -334,10 +343,13 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
         triggerBlock1: 210n, triggerBlock2: 211n, deadlineSec: 1_800_000_601,
         callsJson: '[{"to":"0x1"}]', note: '{"v":1}', impactBps: 4,
         preUWei: 30n * U, preWbnbWei: 0n, preNativeWei: 10n ** 16n,
-        basisUWei: 0n, baseAtCycleStartWei: 0n, nowMs: clock,
+        basisUWei: 0n, baseAtCycleStartWei: 0n,
+        gasPriceWei: 50_000_000n, feeEstWei: 30_000_000_000_000n, nowMs: clock,
       }),
     );
     assert.equal(intent.kind, "ok");
+    assert.equal((await store.getAction("pg-key-1"))?.gasPriceWei, 50_000_000n);
+    assert.equal((await store.getAction("pg-key-1"))?.feeEstWei, 30_000_000_000_000n);
     assert.equal((await store.listLevels(JOB))[0]?.state, "blocked");
     assert.equal((await store.listNonTerminalActions(JOB)).length, 1);
 
@@ -353,6 +365,7 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
       });
     });
     assert.equal(blockedAgain.kind, "conflict", "a blocked level takes no second intent");
+    assert.equal(await store.getAction("pg-key-2"), null, "a failed level CAS leaves no action row");
 
     /* ---- abortIntent (win) restores the level ---------------------------- */
     const action = await store.getAction("pg-key-1");
@@ -377,7 +390,8 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
         triggerBlock1: 210n, triggerBlock2: 211n, deadlineSec: 1_800_000_602,
         callsJson: "[]", note: "", impactBps: 4,
         preUWei: 30n * U, preWbnbWei: 0n, preNativeWei: 10n ** 16n,
-        basisUWei: 0n, baseAtCycleStartWei: 0n, nowMs: clock,
+        basisUWei: 0n, baseAtCycleStartWei: 0n,
+        gasPriceWei: 50_000_000n, feeEstWei: 30_000_000_000_000n, nowMs: clock,
       }),
     );
     const pending = await store.getAction("pg-key-3");
@@ -521,6 +535,150 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
     assert.equal(secondReport.notesApplied, 3);
     assert.equal((await store.listReports(JOB)).length, 2);
     assert.equal((await store.getJob(JOB))?.reportAttempts, 2);
+
+    /* ---- Revision 13 B2 fence/evidence path ------------------------------ */
+    await store.discoverJob({
+      quantJobId: B2_JOB, envelopeId: "b2-envelope", envelopeJson: "{}", strategyId: "b2", nowMs: clock,
+    });
+    const b2Wired = await store.updateJobWire({
+      quantJobId: B2_JOB, strategyId: "b2", tradingWallet: WALLET,
+      allocationUWei: 60n * U, dailyCapUWei: 60n * U, termDays: 30,
+      startedAtMs: clock, endsAtMs: clock + 30 * 86_400_000,
+      sessionExpiresAtMs: 1_900_000_000_000, revokedAtMs: null, nowMs: clock,
+    });
+    assert.notEqual(b2Wired, null);
+    const b2 = await store.admitJob({
+      quantJobId: B2_JOB, expectedRowVersion: b2Wired!.rowVersion,
+      sessionPublicKey: KEY, sessionExpiry: 1_900_000_000,
+      permissionsDigest: DIGEST, projectionDigest: DIGEST,
+      wbnbCapMinLimitWei: 2n * 10n ** 17n, residualThresholdWei: 10n ** 15n,
+      paramsJson: "{}", paramsDigest: DIGEST, p0E18: 200n * U, armBlock: 300n,
+      armBlockHash: DIGEST,
+      levels: [
+        { levelIndex: 1, buyPriceE18: 100n * U, sellPriceE18: 110n * U },
+        { levelIndex: 2, buyPriceE18: 100n * U, sellPriceE18: 120n * U },
+      ],
+      clipUWei: 30n * U, idleUWei: 0n, baselineUWei: 60n * U,
+      baselineWbnbWei: 0n, baselineNativeWei: 10n ** 16n,
+      recenterBudget: 30, nowMs: clock,
+    });
+    assert.equal(b2.kind, "ok");
+    const firstB2Observation = await store.acceptObservation({
+      quantJobId: B2_JOB,
+      observation: { blockNumber: 301n, blockHash: DIGEST, observedAtMs: clock, midE18: 300n * U },
+      intervalMs: 1,
+    });
+    const secondB2Observation = await store.acceptObservation({
+      quantJobId: B2_JOB,
+      observation: { blockNumber: 302n, blockHash: HASH2, observedAtMs: clock + 1, midE18: 300n * U },
+      intervalMs: 1,
+    });
+    assert.equal(firstB2Observation.accepted && secondB2Observation.accepted, true);
+    const b2Recenter = await store.withQuantFence(B2_JOB, async (fence) => fence.recenterLadder({
+      quantJobId: B2_JOB, expectedGeneration: 0, observationBlock: 302n,
+      observationHash: HASH2, observationAtMs: clock + 1, side: "up",
+      newAnchorE18: 300n * U,
+      newBuyPrice: [300n * U, 270n * U, 300n * U],
+      newSellPrice: [0n, 280n * U, 330n * U],
+      cause: "up:mid>top", nowMs: clock + 86_400_001, reseed: true,
+      expectedWallet: WALLET, expectedProcessDigest: DIGEST,
+    }));
+    assert.equal(b2Recenter.kind, "ok");
+    const refusal = await store.withQuantFence(B2_JOB, async (fence) => fence.recordLevelOutcome({
+      quantJobId: B2_JOB, levelIndex: 2, holdCode: "seed-price-drift", seedCounted: true,
+      acceptedBlock: 302n, acceptedHash: HASH2, acceptedAtMs: clock + 1,
+      ladderGen: 1, expectedProcessDigest: DIGEST, nowMs: clock + 86_400_002,
+    }));
+    assert.equal(refusal.kind, "ok");
+    const sameBlock = await store.withQuantFence(B2_JOB, async (fence) => fence.recordLevelOutcome({
+      quantJobId: B2_JOB, levelIndex: 2, holdCode: "seed-price-drift", seedCounted: true,
+      acceptedBlock: 302n, acceptedHash: HASH2, acceptedAtMs: clock + 1,
+      ladderGen: 1, expectedProcessDigest: DIGEST, nowMs: clock + 86_400_003,
+    }));
+    assert.equal(sameBlock.kind, "ok");
+    const b2Upper = (await store.listLevels(B2_JOB))[1]!;
+    const b2Seed = await store.withQuantFence(B2_JOB, async (fence) => fence.insertIntent({
+      journalKey: "pg-b2-seed", quantJobId: B2_JOB, levelIndex: 2, actionSeq: 1,
+      side: "buy", priorLevelState: b2Upper.state, expectedLevelRowVersion: b2Upper.rowVersion,
+      amountInWei: 30n * U, minOutWei: 1n, quoteOutWei: 1n, quoteBlock: 302n,
+      triggerBlock1: 302n, triggerBlock2: 302n, deadlineSec: 1_800_001_000,
+      callsJson: "[]", note: "seed", impactBps: 0, preUWei: 60n * U,
+      preWbnbWei: 0n, preNativeWei: 10n ** 16n, basisUWei: 0n,
+      baseAtCycleStartWei: 0n, ladderGen: 1,
+      evidence: { kind: "seed", accepted: 302n }, seedWindowCycles: 2,
+      requiredNativeWei: 1n, plannedWallet: WALLET, plannedProcessDigest: DIGEST,
+      planObservationBlock: 302n, planObservationHash: HASH2, planObservationAtMs: clock + 1,
+      plannedBuyPriceE18: 300n * U, plannedSellPriceE18: 330n * U, nowMs: clock + 86_400_004,
+    }));
+    assert.equal(b2Seed.kind, "ok");
+    const b2SeedAction = await store.getAction("pg-b2-seed");
+    const b2Claim = await store.markActionSubmitted({
+      journalKey: "pg-b2-seed", expectedRowVersion: b2SeedAction!.rowVersion,
+      submitFinalizedNumber: 303n, submitFinalizedHash: HASH2, nowMs: clock + 86_400_005,
+    });
+    assert.equal(b2Claim.kind, "ok");
+    await store.setActionState({
+      journalKey: "pg-b2-seed", state: "failed", failureCode: "pool", restoreLevel: true,
+      nowMs: clock + 86_400_006,
+    });
+    const b2Converted = await store.withQuantFence(B2_JOB, async (fence) => fence.convertSeed({
+      quantJobId: B2_JOB, levelIndex: 2, seedWindowCycles: 2, ladderGen: 1,
+      expectedProcessDigest: DIGEST, nowMs: clock + 86_400_007,
+    }));
+    assert.equal(b2Converted.kind, "ok");
+    assert.equal((await store.listSeedEvents(B2_JOB)).length, 2);
+    const b2BeforePublish = await store.getJob(B2_JOB);
+    assert.notEqual(b2BeforePublish, null);
+    const b2Published = await store.publishAccountingVerdict({
+      quantJobId: B2_JOB, expectedAccountingRev: b2BeforePublish!.accountingRev,
+      expectedEpoch: 1, expectedEpochHash: DIGEST, observationBlock: 302n,
+      observationHash: HASH2, admissible: true, evidenceJson: '{"pending":[]}',
+      nowMs: clock + 86_400_008,
+    });
+    assert.equal(b2Published.ok, true);
+    assert.equal((await store.getJob(B2_JOB))?.accountingEvidenceJson, '{"pending":[]}');
+
+    // A truth-only publication is bound to the revision and epoch, but not to
+    // the accepted-observation clock: paused jobs do not advance that clock.
+    await store.setAccountingState({
+      quantJobId: B2_JOB, state: "external-activity", epoch: 1,
+      evidenceJson: '{"external":true}', nowMs: clock + 86_400_009,
+    });
+    const staleTruth = await store.getJob(B2_JOB);
+    assert.notEqual(staleTruth, null);
+    const truthRebase = await store.acknowledgeExternal({
+      quantJobId: B2_JOB, startedBlock: 304n,
+      startedBlockHash: `0x${"33".repeat(32)}` as Hex,
+      baselineUWei: 60n * U, baselineWbnbWei: 0n, baselineNativeWei: 10n ** 16n,
+      nowMs: clock + 86_400_010,
+    });
+    assert.equal(truthRebase.kind, "ok");
+    const staleTruthResult = await store.publishTruthVerdict({
+      quantJobId: B2_JOB, expectedAccountingRev: staleTruth!.accountingRev,
+      expectedEpoch: 1, expectedEpochHash: DIGEST,
+      observationBlock: 302n, observationHash: HASH2, admissible: false,
+      evidenceJson: '{"block":"302","hash":"0x22"}', nowMs: clock + 86_400_011,
+    });
+    assert.deepEqual(staleTruthResult, { ok: false, reason: "reconcile-stale" });
+    assert.equal((await store.getJob(B2_JOB))?.accountingState, "ok");
+
+    // The JavaScript fence comparison is case-insensitive, while the SQL
+    // predicate is byte-exact. It must surface that post-read refusal as a
+    // conflict, not abort the whole transaction with an exception.
+    const mixedCaseHash = `0x${"ab".repeat(32)}` as Hex;
+    const mixedCaseAccepted = await store.acceptObservation({
+      quantJobId: B2_JOB,
+      observation: { blockNumber: 305n, blockHash: mixedCaseHash, observedAtMs: clock + 86_400_012, midE18: 300n * U },
+      intervalMs: 1,
+    });
+    assert.equal(mixedCaseAccepted.accepted, true);
+    const outcomeConflict = await store.withQuantFence(B2_JOB, async (fence) => fence.recordLevelOutcome({
+      quantJobId: B2_JOB, levelIndex: 1, holdCode: "cooldown", seedCounted: false,
+      acceptedBlock: 305n, acceptedHash: mixedCaseHash.toUpperCase() as Hex,
+      acceptedAtMs: clock + 86_400_012, ladderGen: 1,
+      expectedProcessDigest: DIGEST, nowMs: clock + 86_400_013,
+    }));
+    assert.equal(outcomeConflict.kind, "conflict");
 
     /* ---- runs ------------------------------------------------------------ */
     await store.recordRun({

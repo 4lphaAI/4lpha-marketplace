@@ -59,6 +59,8 @@ import { deriveKeypair, type QuantKeypair } from "./envelope.js";
 import type { QuantStrategyParams } from "./config.js";
 import type { QuantChainReader } from "./readers.js";
 import { callsDigest } from "./receipt.js";
+import { callsEqual } from "./receipt.js";
+import { buildPancakeTokenSwap } from "../ops/pancakeTokens.js";
 
 /* -------------------------------------------------------------------------- */
 /* Errors                                                                     */
@@ -68,6 +70,7 @@ export type QuantExecuteCode =
   | "envelope-missing"
   | "envelope-invalid"
   | "session-changed"
+  | "calls-mismatch"
   | "session-not-admissible"
   | "session-restore-unsupported"
   | "session-restore-refused"
@@ -102,6 +105,7 @@ const QUANT_EXECUTE_MESSAGES: Readonly<Record<QuantExecuteCode, string>> = Objec
   "envelope-missing": "No sealed session is stored for this job.",
   "envelope-invalid": "The stored envelope did not open.",
   "session-changed": "The granted session no longer matches the admitted one.",
+  "calls-mismatch": "The persisted action calls do not match the admitted task wallet.",
   "session-not-admissible": "The granted session is not admissible.",
   "session-restore-unsupported": "This provider cannot restore an externally granted session.",
   "session-restore-refused": "The granted session could not be restored.",
@@ -154,6 +158,25 @@ export type OpenedJobSession = {
   readonly walletAddress: Address;
 };
 
+function parsePersistedCalls(callsJson: string): readonly WalletCall[] | null {
+  try {
+    const value: unknown = JSON.parse(callsJson);
+    if (!Array.isArray(value)) return null;
+    return value.map((item) => {
+      if (typeof item !== "object" || item === null) throw new Error("calls");
+      const record = item as Record<string, unknown>;
+      if (typeof record["to"] !== "string") throw new Error("calls");
+      return {
+        to: getAddress(record["to"]),
+        value: BigInt(String(record["value"] ?? "0")),
+        data: String(record["data"] ?? "0x") as Hex,
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Open the persisted envelope, verify it is STILL the admitted session, and
  * build a live `SessionRef` — then drop everything else.
@@ -182,6 +205,9 @@ export async function withJobSession<T>(
   const plaintext = opened.session;
   if (job.sessionPublicKey === null
     || plaintext.publicKey.toLowerCase() !== job.sessionPublicKey.toLowerCase()) {
+    throw new QuantExecuteError("session-changed");
+  }
+  if (getAddress(plaintext.walletAddress).toLowerCase() !== getAddress(job.tradingWallet).toLowerCase()) {
     throw new QuantExecuteError("session-changed");
   }
   if (job.permissionsDigest === null
@@ -362,9 +388,25 @@ export async function submitQuantAction(
   let receipt: ExecutionReceipt;
   try {
     receipt = await withJobSession(deps, job, async (opened) => {
+      const rebuiltCalls = buildPancakeTokenSwap({
+        router: deps.venue.router,
+        tokenIn: input.tokenIn,
+        tokenOut: input.tokenIn.toLowerCase() === deps.venue.u.toLowerCase()
+          ? deps.venue.wbnb : deps.venue.u,
+        amountInWei: action.amountInWei,
+        minOutWei: action.minOutWei,
+        recipient: opened.walletAddress,
+        deadline: BigInt(action.deadlineSec),
+      });
+      const persistedCalls = parsePersistedCalls(action.callsJson);
+      if (persistedCalls === null || !callsEqual(input.calls, persistedCalls)
+        || !callsEqual(persistedCalls, rebuiltCalls)) {
+        throw new QuantExecuteError("calls-mismatch");
+      }
+      const requiredNativeWei = action.requiredNativeWei ?? input.requiredNativeWei;
       await deps.provider.preflightExecute({
         session: opened.session,
-        calls: input.calls,
+        calls: rebuiltCalls,
         ...(deps.signal === undefined ? {} : { signal: deps.signal }),
       });
       const meters = await checkQuantMeters({
@@ -373,7 +415,7 @@ export async function submitQuantAction(
         publicKey: opened.publicKey,
         tokenIn: input.tokenIn,
         amountInWei: action.amountInWei,
-        requiredNativeWei: input.requiredNativeWei,
+        requiredNativeWei,
         ...(deps.signal === undefined ? {} : { signal: deps.signal }),
       });
       if (!meters.ok) throw new QuantExecuteError(meters.code);
@@ -394,7 +436,7 @@ export async function submitQuantAction(
       // ─── FROM HERE EVERY THROW IS AMBIGUOUS ───────────────────────────────
       return deps.provider.executeViaSession({
         session: opened.session,
-        calls: input.calls,
+        calls: rebuiltCalls,
         bypassLocalPolicyCheck: false,
         ...(deps.signal === undefined ? {} : { signal: deps.signal }),
       });

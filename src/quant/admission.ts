@@ -47,8 +47,8 @@ import {
   SWAP_EXACT_TOKENS_FOR_TOKENS_SIGNATURE,
 } from "../ops/pancakeTokens.js";
 import { open, type QuantEnvelope, type QuantKeypair } from "./envelope.js";
-import type { QuantStrategyParams } from "./config.js";
-import { economicMinSellWei, feeEstInU, ceilDiv, BPS, E18 } from "./grid.js";
+import type { QuantGridParams } from "./config.js";
+import { armFloor, economicMinSellWei, feeEstInU, ceilDiv, BPS, E18, buyMinOut } from "./grid.js";
 import type {
   GrantedCallPermission,
   GrantedPermissions,
@@ -378,15 +378,21 @@ export type QuantAdmissionInput = {
   readonly job: {
     readonly tradingWalletAddress: Address;
     readonly sessionExpiresAtMs: number | null;
+    readonly allocationUWei?: bigint;
   };
   readonly ladder: {
     readonly levels: number;
+    readonly lowerLevels?: number;
+    readonly upperLevels?: number;
     readonly clipUWei: bigint;
     readonly buyPrice: readonly bigint[];
     readonly sellPrice: readonly bigint[];
     readonly midE18: bigint;
+    readonly minBuyPriceE18?: bigint;
+    readonly minSellPriceE18?: bigint;
   };
-  readonly params: QuantStrategyParams;
+  readonly params: QuantGridParams;
+  readonly gasPriceWei: bigint;
   readonly nowSeconds: number;
 };
 
@@ -399,6 +405,84 @@ export type QuantAdmissionOk = {
 };
 
 export type QuantAdmissionResult = QuantAdmissionOk | QuantAdmissionRefusal;
+
+/**
+ * Pure, shared ladder admission used at arm and re-centre. It deliberately
+ * knows only persisted sizing/cap facts; session identity and live authority
+ * remain separate checks.
+ */
+export function checkLadderAdmissible(input: {
+  readonly ladder: {
+    readonly levels: number;
+    readonly clipUWei: bigint;
+    readonly buyPrice: readonly bigint[];
+    readonly sellPrice: readonly bigint[];
+    readonly midE18: bigint;
+    readonly minSellPriceE18?: bigint;
+  };
+  readonly allocationUWei: bigint;
+  readonly dailyCapUWei: bigint;
+  readonly capRows: readonly { readonly token: Address | null; readonly limit: bigint }[];
+  readonly u: Address;
+  readonly wbnb: Address;
+  readonly impactBps: bigint;
+  readonly params: QuantGridParams;
+  readonly gasPriceWei: bigint;
+  readonly seedQuoteOutWei?: bigint;
+  readonly seedActionSeq?: number;
+}): { readonly ok: true; readonly wbnbCapMinLimitWei: bigint } | QuantAdmissionRefusal {
+  const floor = armFloor({
+    clipUWei: input.ladder.clipUWei, midE18: input.ladder.midE18,
+    impactBps: input.impactBps, params: input.params, gasPriceWei: input.gasPriceWei,
+  });
+  if (!floor.economic) return refuse("arm-uneconomic");
+  if (input.params.seedMode === "symmetric"
+    && input.dailyCapUWei < input.ladder.clipUWei * BigInt(input.ladder.levels)) {
+    return refuse("day-cap-too-small");
+  }
+  const uRows = input.capRows.filter((row) => row.token?.toLowerCase() === input.u.toLowerCase());
+  const wbnbRows = input.capRows.filter((row) => row.token?.toLowerCase() === input.wbnb.toLowerCase());
+  const requiredU = input.params.seedMode === "symmetric"
+    ? input.allocationUWei : input.ladder.clipUWei;
+  if (uRows.length === 0) return refuse("session-missing-cap:u");
+  if (uRows.some((row) => row.limit < requiredU)) return refuse("session-cap-too-small:u");
+  if (wbnbRows.length === 0) return refuse("session-missing-cap:wbnb");
+  const lmin = wbnbRows.reduce((smallest, row) => row.limit < smallest ? row.limit : smallest, wbnbRows[0]!.limit);
+  const minSell = economicMinSellWei({
+    sellPriceE18: input.ladder.minSellPriceE18 ?? input.ladder.sellPrice[input.ladder.levels] ?? 0n,
+    midE18: input.ladder.midE18, params: input.params, gasPriceWei: input.gasPriceWei,
+  });
+  if (minSell <= 0n || wbnbRows.some((row) => row.limit < minSell)) {
+    return refuse("session-cap-uneconomic:min-sell");
+  }
+  if (input.params.seedMode === "symmetric" && input.seedQuoteOutWei !== undefined) {
+    const seedMin = buyMinOut({
+      clipUWei: input.ladder.clipUWei,
+      buyPriceE18: input.ladder.buyPrice[0] ?? input.ladder.midE18,
+      levelIndex: input.ladder.levels, actionSeq: input.seedActionSeq ?? 1, params: input.params,
+    });
+    if (input.seedQuoteOutWei < seedMin) return refuse("seed-unexecutable");
+  }
+  const feeU = feeEstInU(input.params, input.ladder.midE18, input.gasPriceWei);
+  for (let index = 1; index <= input.ladder.levels; index += 1) {
+    const buyPrice = input.ladder.buyPrice[index];
+    const sellPrice = input.ladder.sellPrice[index];
+    if (buyPrice === undefined || sellPrice === undefined || buyPrice <= 0n || sellPrice <= buyPrice) {
+      return refuse("session-cap-uneconomic:ladder");
+    }
+    const baseWorst = (input.ladder.clipUWei * E18) / buyPrice;
+    if (baseWorst <= 0n) return refuse("session-cap-uneconomic:ladder");
+    const chunks = ceilDiv(baseWorst, lmin);
+    const chunk = ceilDiv(baseWorst, chunks);
+    if (chunk < 2n * minSell) return refuse(`session-cap-uneconomic:${index}:chunk`);
+    const proceeds = (chunk * sellPrice * (BPS - BigInt(input.params.exitTolBps))) / BPS / E18;
+    const basis = ceilDiv(chunk * buyPrice * (BPS + BigInt(input.params.entryTolBps)), BPS * E18);
+    const entry = ceilDiv(feeU * chunk, baseWorst);
+    const required = ceilDiv(basis * (BPS + BigInt(input.params.minNetEdgeBps)), BPS) + entry + feeU;
+    if (proceeds < required) return refuse(`session-cap-uneconomic:${index}:edge`);
+  }
+  return { ok: true, wbnbCapMinLimitWei: lmin };
+}
 
 function selectorOf(signature: string | undefined): string | null {
   if (signature === undefined) return null;
@@ -512,13 +596,15 @@ export function assertQuantSessionAdmissible(
   // relay rather than a refusal.
   if (nativeRows.length === 0) return refuse("session-missing-cap:native");
 
+  const requiredU = params.seedMode === "symmetric"
+    ? input.job.allocationUWei ?? ladder.clipUWei * BigInt(ladder.levels)
+    : ladder.clipUWei;
   for (const row of uRows) {
-    if (row.limit < ladder.clipUWei) return refuse(`session-cap-too-small:u:${row.period}`);
+    if (row.limit < requiredU) return refuse(`session-cap-too-small:u:${row.period}`);
   }
   const minSell = economicMinSellWei({
-    sellPriceE18: ladder.sellPrice[ladder.levels] ?? 0n,
-    midE18: ladder.midE18,
-    params,
+    sellPriceE18: ladder.minSellPriceE18 ?? ladder.sellPrice[ladder.levels] ?? 0n,
+    midE18: ladder.midE18, params, gasPriceWei: input.gasPriceWei,
   });
   if (minSell <= 0n) return refuse("session-cap-uneconomic:min-sell");
   for (const row of wbnbRows) {
@@ -530,11 +616,11 @@ export function assertQuantSessionAdmissible(
   );
   if (lmin <= 0n) return refuse("session-missing-cap:wbnb");
 
-  const feeU = feeEstInU(params, ladder.midE18);
+  const feeU = feeEstInU(params, ladder.midE18, input.gasPriceWei);
   for (let index = 1; index <= ladder.levels; index += 1) {
     const buyPrice = ladder.buyPrice[index];
     const sellPrice = ladder.sellPrice[index];
-    if (buyPrice === undefined || sellPrice === undefined || buyPrice <= 0n) {
+    if (buyPrice === undefined || sellPrice === undefined || buyPrice <= 0n || sellPrice <= buyPrice) {
       return refuse("session-cap-uneconomic:ladder");
     }
     const baseWorst = (ladder.clipUWei * E18) / buyPrice;

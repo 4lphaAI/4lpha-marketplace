@@ -9,7 +9,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { QUANT_STRATEGY_DEFAULTS, type QuantStrategyParams } from "../src/quant/config.js";
+import {
+  feeEstWei, QUANT_STRATEGY_DEFAULTS, type QuantAdmittedParams,
+} from "../src/quant/config.js";
 import {
   actionDeadlineSec,
   actionTag,
@@ -37,7 +39,10 @@ import {
 import { priceImpactBps } from "../src/trade/route.js";
 
 const U = 10n ** 18n;
-const PARAMS: QuantStrategyParams = QUANT_STRATEGY_DEFAULTS;
+const GAS_PRICE_WEI = 50_000_000n;
+const PARAMS: QuantAdmittedParams = Object.freeze({
+  ...QUANT_STRATEGY_DEFAULTS, minClipUWei: 10n * U, bandBps: 700,
+});
 
 /** The measured pool (memory `termix-quant-u-liquidity`): 113.57 WBNB / 84,140 U. */
 const RESERVE_WBNB = 113_570_000_000_000_000_000n;
@@ -234,12 +239,12 @@ describe("quant executable-price guards", () => {
       amountWei: base,
       baseAtCycleStartWei: base,
       basisUWei: 10n * U,
-      entryCostUWei: feeEstInU(PARAMS, 740n * E18),
+      entryCostUWei: feeEstInU(PARAMS, 740n * E18, GAS_PRICE_WEI),
       sellPriceE18: 752n * E18,
       midE18: 752n * E18,
       levelIndex: 1,
       actionSeq: 1,
-      params: PARAMS,
+      params: PARAMS, gasPriceWei: GAS_PRICE_WEI,
     });
     assert.equal(floor.floorWei, floor.levelFloorWei > floor.basisFloorWei
       ? floor.levelFloorWei : floor.basisFloorWei);
@@ -256,7 +261,8 @@ describe("quant executable-price guards", () => {
     const sellPriceE18 = 752n * E18;
     const floor = sellFloor({
       amountWei, baseAtCycleStartWei: amountWei, basisUWei: 0n, entryCostUWei: 0n,
-      sellPriceE18, midE18: sellPriceE18, levelIndex: 1, actionSeq: 1, params: PARAMS,
+      sellPriceE18, midE18: sellPriceE18, levelIndex: 1, actionSeq: 1,
+      params: PARAMS, gasPriceWei: GAS_PRICE_WEI,
     });
     const exact = amountWei * sellPriceE18 * (BPS - BigInt(PARAMS.exitTolBps));
     const truncated = exact / (BPS * E18);
@@ -268,8 +274,9 @@ describe("quant executable-price guards", () => {
     const base = 13_500_000_000_000_000n;
     const common = {
       amountWei: base, baseAtCycleStartWei: base, basisUWei: 10n * U,
-      entryCostUWei: feeEstInU(PARAMS, 740n * E18),
+      entryCostUWei: feeEstInU(PARAMS, 740n * E18, GAS_PRICE_WEI),
       sellPriceE18: 752n * E18, levelIndex: 1, actionSeq: 1, params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
     };
     const atLowMid = sellFloor({ ...common, midE18: 740n * E18 });
     const atHighMid = sellFloor({ ...common, midE18: 794n * E18 });
@@ -282,18 +289,31 @@ describe("quant executable-price guards", () => {
     );
   });
 
+  it("BC-S165: a gas spike raises the sell exit bound at the same quote", () => {
+    const base = 13_500_000_000_000_000n;
+    const common = {
+      amountWei: base, baseWei: base, baseAtCycleStartWei: base,
+      basisUWei: 10n * U, entryCostUWei: 30_000_000_000_000n,
+      sellPriceE18: 752n * E18, midE18: 752n * E18, levelIndex: 1,
+      actionSeq: 1, params: PARAMS,
+    };
+    const calm = sellFloor({ ...common, gasPriceWei: 50_000_000n });
+    const spike = sellFloor({ ...common, gasPriceWei: 200_000_000n });
+    assert.ok(spike.basisFloorWei > calm.basisFloorWei);
+  });
+
   it("pro-rates basis and entry cost across a partial exit", () => {
     const base = 12_000_000_000_000_000n;
     const half = base / 2n;
     const full = sellFloor({
       amountWei: base, baseAtCycleStartWei: base, basisUWei: 10n * U,
       entryCostUWei: 100n, sellPriceE18: 752n * E18, midE18: 752n * E18,
-      levelIndex: 1, actionSeq: 1, params: PARAMS,
+      levelIndex: 1, actionSeq: 1, params: PARAMS, gasPriceWei: GAS_PRICE_WEI,
     });
     const partial = sellFloor({
       amountWei: half, baseAtCycleStartWei: base, basisUWei: 10n * U,
       entryCostUWei: 100n, sellPriceE18: 752n * E18, midE18: 752n * E18,
-      levelIndex: 1, actionSeq: 1, params: PARAMS,
+      levelIndex: 1, actionSeq: 1, params: PARAMS, gasPriceWei: GAS_PRICE_WEI,
     });
     assert.ok(partial.levelFloorWei * 2n <= full.levelFloorWei + 2n);
     assert.ok(partial.basisFloorWei < full.basisFloorWei);
@@ -301,31 +321,52 @@ describe("quant executable-price guards", () => {
 });
 
 describe("quant cost floor", () => {
+  it("keeps the config and pure estimator entry points identical", () => {
+    for (const gas of [50_000_000n, 100_000_000n, 200_000_000n, 100_000_001n]) {
+      assert.equal(feeEst(PARAMS, gas), feeEstWei(PARAMS, gas));
+    }
+    assert.equal(feeEst(PARAMS, 50_000_000n), 30_000_000_000_000n);
+    assert.equal(feeEst(PARAMS, 100_000_000n), 45_000_000_000_000n);
+    assert.equal(feeEst(PARAMS, 200_000_000n), 90_000_000_000_000n);
+  });
+
+  it("pins the corrected 5 U / 250 bps gas boundaries", () => {
+    const params = Object.freeze({ ...QUANT_STRATEGY_DEFAULTS, bandBps: 250 });
+    const common = { clipUWei: 5n * U, midE18: 713n * E18, impactBps: 1n, params };
+    const floor = armFloor({ ...common, gasPriceWei: 50_000_000n });
+    assert.deepEqual([floor.gasBps, floor.requiredBps, floor.economic], [86n, 212n, true]);
+    const equality = armFloor({ ...common, gasPriceWei: 96_600_000n });
+    assert.deepEqual([equality.gasBps, equality.requiredBps, equality.economic], [124n, 250n, true]);
+    const refused = armFloor({ ...common, gasPriceWei: 97_000_000n });
+    assert.deepEqual([refused.gasBps, refused.requiredBps, refused.economic], [125n, 251n, false]);
+    const midCeiling = armFloor({ ...common, midE18: 1_030n * E18, gasPriceWei: 50_000_000n });
+    assert.deepEqual([midCeiling.gasBps, midCeiling.requiredBps], [124n, 250n]);
+  });
+
   it("uses the SAME 3x pad the native reservation uses (R3.5, REVIEW2 C8)", () => {
     const mid = midFromReserves(RESERVE_U, RESERVE_WBNB);
-    const floor = armFloor({ clipUWei: 10n * U, midE18: mid, impactBps: 4n, params: PARAMS });
-    // gasBps = ceilDiv(2 * 3 * fee * mid * BPS, clip * 1e18). At 10 U on the
-    // measured pool that is ~447 bps, which is exactly why the band default is
-    // 700 and not the body's 300.
-    assert.ok(floor.gasBps > 400n && floor.gasBps < 500n, `${floor.gasBps}`);
+    const floor = armFloor({ clipUWei: 10n * U, midE18: mid, impactBps: 4n, params: PARAMS, gasPriceWei: GAS_PRICE_WEI });
+    // At 0.05 gwei the R14 floor governs, so the two-submission gas term is
+    // much smaller than the historical static ×3 pad.
+    assert.ok(floor.gasBps > 40n && floor.gasBps < 50n, `${floor.gasBps}`);
     assert.equal(
       floor.gasBps,
-      ceilDiv(2n * 3n * PARAMS.relayFeePerSubmitWei * mid * BPS, 10n * U * E18),
+      ceilDiv(2n * feeEst(PARAMS, GAS_PRICE_WEI) * mid * BPS, 10n * U * E18),
     );
     assert.equal(floor.economic, true);
     assert.ok(floor.requiredBps <= BigInt(PARAMS.bandBps));
   });
 
-  it("refuses a 5 U clip on the same pool", () => {
+  it("admits a 5 U clip under the live R14 estimate", () => {
     const mid = midFromReserves(RESERVE_U, RESERVE_WBNB);
-    const floor = armFloor({ clipUWei: 5n * U, midE18: mid, impactBps: 2n, params: PARAMS });
-    assert.equal(floor.economic, false, `required ${floor.requiredBps} bps`);
+    const floor = armFloor({ clipUWei: 5n * U, midE18: mid, impactBps: 2n, params: PARAMS, gasPriceWei: GAS_PRICE_WEI });
+    assert.equal(floor.economic, true, `required ${floor.requiredBps} bps`);
   });
 
   it("gets CHEAPER in bps as the clip grows", () => {
     const mid = midFromReserves(RESERVE_U, RESERVE_WBNB);
-    const small = armFloor({ clipUWei: 10n * U, midE18: mid, impactBps: 4n, params: PARAMS });
-    const large = armFloor({ clipUWei: 100n * U, midE18: mid, impactBps: 40n, params: PARAMS });
+    const small = armFloor({ clipUWei: 10n * U, midE18: mid, impactBps: 4n, params: PARAMS, gasPriceWei: GAS_PRICE_WEI });
+    const large = armFloor({ clipUWei: 100n * U, midE18: mid, impactBps: 40n, params: PARAMS, gasPriceWei: GAS_PRICE_WEI });
     assert.ok(large.gasBps < small.gasBps);
   });
 
@@ -338,6 +379,7 @@ describe("quant cost floor", () => {
     if (!ladder.ok) return;
     const floor = armFloor({
       clipUWei: ladder.ladder.clipUWei, midE18: mid, impactBps: 4n, params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
     });
     assert.equal(typeof floor.economic, "boolean");
     assert.equal(ladder.ladder.clipUWei, 10n * U);
@@ -345,11 +387,11 @@ describe("quant cost floor", () => {
 
   it("prices the residual threshold from the DEEPEST level's sell price", () => {
     const mid = midFromReserves(RESERVE_U, RESERVE_WBNB);
-    const minSell = economicMinSellWei({ sellPriceE18: 700n * E18, midE18: mid, params: PARAMS });
+    const minSell = economicMinSellWei({ sellPriceE18: 700n * E18, midE18: mid, params: PARAMS, gasPriceWei: GAS_PRICE_WEI });
     assert.ok(minSell > 0n);
     // Selling exactly `minSell` at that price covers one fee plus the edge.
     const proceeds = (minSell * 700n * E18) / E18;
-    const feeU = feeEstInU(PARAMS, mid);
+    const feeU = feeEstInU(PARAMS, mid, GAS_PRICE_WEI);
     assert.ok(
       proceeds - (proceeds * BigInt(PARAMS.minNetEdgeBps)) / BPS >= feeU,
       `${proceeds} vs ${feeU}`,
@@ -415,9 +457,10 @@ describe("quant native reservation (R5.5 / R6.4 / BC21 / BC27)", () => {
       ],
       minCapLimitWei: cap,
       params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
     });
     // own = 1 + 2 exits; other holding = 1; other pending buy = 1 + 1.
-    assert.equal(required, feeEst(PARAMS) * 6n);
+    assert.equal(required, feeEst(PARAMS, GAS_PRICE_WEI) * 6n);
   });
 
   it("a SELL reserves ONE fee and nothing else — exits are never blocked", () => {
@@ -430,14 +473,16 @@ describe("quant native reservation (R5.5 / R6.4 / BC21 / BC27)", () => {
       ],
       minCapLimitWei: cap,
       params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
     });
-    assert.equal(required, feeEst(PARAMS));
+    assert.equal(required, feeEst(PARAMS, GAS_PRICE_WEI));
   });
 
   it("a wallet funded for exactly one fee cannot pass a BUY", () => {
-    const oneFee = feeEst(PARAMS);
+    const oneFee = feeEst(PARAMS, GAS_PRICE_WEI);
     const required = requiredNativeWei({
       side: "buy", ownBaseWei: cap, otherLevels: [], minCapLimitWei: cap, params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
     });
     assert.ok(required > oneFee, "the buy must also reserve its own exit");
   });
@@ -445,9 +490,11 @@ describe("quant native reservation (R5.5 / R6.4 / BC21 / BC27)", () => {
   it("grows with the ACTUAL inventory a favourable fill acquires (R6.4)", () => {
     const quoted = requiredNativeWei({
       side: "buy", ownBaseWei: cap, otherLevels: [], minCapLimitWei: cap, params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
     });
     const better = requiredNativeWei({
       side: "buy", ownBaseWei: cap * 3n, otherLevels: [], minCapLimitWei: cap, params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
     });
     assert.ok(better > quoted, "more WBNB is more exits");
   });

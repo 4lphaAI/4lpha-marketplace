@@ -25,8 +25,7 @@
  * own reserves at a finalized block, so the pool that triggers an action is the
  * pool the swap executes on and there is nothing to disagree with.
  */
-import { RELAY_FEE_PER_EXIT_WEI } from "../ops/relayFee.js";
-import type { QuantStrategyParams } from "./config.js";
+import type { QuantGridParams, QuantStrategyParams } from "./config.js";
 
 export const E18 = 10n ** 18n;
 export const BPS = 10_000n;
@@ -43,17 +42,48 @@ export function ceilDiv(numerator: bigint, denominator: bigint): bigint {
   return (numerator + denominator - 1n) / denominator;
 }
 
-/** The relay-fee estimate every economic decision uses (R5.6). */
-export function feeEst(params: Pick<QuantStrategyParams, "relayFeePerSubmitWei">): bigint {
+/** The R14 relay-fee estimate; gas is always supplied by the live caller. */
+export function feeEst(
+  params: Pick<QuantStrategyParams, "relayFeePerSubmitWei" | "relayGasUnits" | "relayFeePadBps">,
+  gasPriceWei: bigint,
+): bigint {
+  if (gasPriceWei <= 0n) throw new Error("A live fee estimate requires a positive gas price.");
+  const live = ceilDiv(
+    gasPriceWei * params.relayGasUnits * params.relayFeePadBps,
+    BPS,
+  );
+  return live > params.relayFeePerSubmitWei ? live : params.relayFeePerSubmitWei;
+}
+
+/** The historical B2/pre-B2 estimator, used only by historical recovery. */
+export function historicalFeeEst(
+  params: Pick<QuantGridParams, "relayFeePerSubmitWei">,
+): bigint {
   return 3n * params.relayFeePerSubmitWei;
 }
 
-/** One relay-fee estimate valued in U at `midE18`. */
+function feeEstForParams(params: QuantGridParams, gasPriceWei: bigint): bigint {
+  if (params.relayGasUnits === undefined || params.relayFeePadBps === undefined) {
+    return historicalFeeEst(params);
+  }
+  return feeEst(params as Pick<QuantStrategyParams, "relayFeePerSubmitWei" | "relayGasUnits" | "relayFeePadBps">, gasPriceWei);
+}
+
+/** One live relay-fee estimate valued in U at `midE18`. */
 export function feeEstInU(
-  params: Pick<QuantStrategyParams, "relayFeePerSubmitWei">,
+  params: QuantGridParams,
+  midE18: bigint,
+  gasPriceWei: bigint,
+): bigint {
+  return (feeEstForParams(params, gasPriceWei) * midE18) / E18;
+}
+
+/** Historical static-fee valuation, isolated from all R14 decision paths. */
+export function historicalFeeEstInU(
+  params: Pick<QuantGridParams, "relayFeePerSubmitWei">,
   midE18: bigint,
 ): bigint {
-  return (feeEst(params) * midE18) / E18;
+  return (historicalFeeEst(params) * midE18) / E18;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -79,6 +109,8 @@ export function midFromReserves(reserveUWei: bigint, reserveWbnbWei: bigint): bi
 
 export type QuantLadder = {
   readonly levels: number;
+  readonly lowerLevels: number;
+  readonly upperLevels: number;
   readonly clipUWei: bigint;
   /** The remainder of `allocation / levels`. Idle, recorded, never traded. */
   readonly idleUWei: bigint;
@@ -87,6 +119,8 @@ export type QuantLadder = {
   readonly buyPrice: readonly bigint[];
   /** Index 0 is unused; levels are 1..`levels`. */
   readonly sellPrice: readonly bigint[];
+  readonly minBuyPriceE18: bigint;
+  readonly minSellPriceE18: bigint;
 };
 
 export type LadderResult =
@@ -94,49 +128,108 @@ export type LadderResult =
   | { readonly ok: false; readonly code: "below-minimum" | "arm-degenerate" };
 
 /**
- * Build the ladder. Levels compound DOWN from `P0`; every level starts in U.
+ * Build the ladder. The legacy (`seedMode = none`) ladder compounds DOWN from
+ * `P0`. The symmetric ladder has `N - 1` lower cells and one upper cell whose
+ * buy line is the anchor (`h_0 = P0`); the upper cell is seeded by the worker.
  *
- * There is no arm swap. Consequence, disclosed in the listing methodology: in
- * a sustained uptrend the ladder never fills and the job ends flat in U, and
- * realized PnL comes from dip-and-recover cycles only. Seeding half the book in
- * WBNB at arm is a SECOND LISTING (OQ1), not a hidden branch of this one.
+ * `seedMode = none` has no arm swap: in a sustained uptrend it can end flat in
+ * U and realized PnL comes from dip-and-recover cycles. `seedMode = symmetric`
+ * instead marks the single upper cell for an ordinary, separately accounted
+ * seed buy; it uses the same builder, journal, meters and settlement path.
  */
 export function buildLadder(input: {
   readonly allocationUWei: bigint;
   readonly p0E18: bigint;
-  readonly params: QuantStrategyParams;
+  readonly params: QuantGridParams;
 }): LadderResult {
   const { allocationUWei, p0E18, params } = input;
   if (allocationUWei < params.minClipUWei) return { ok: false, code: "below-minimum" };
   if (p0E18 <= 0n) return { ok: false, code: "arm-degenerate" };
   const raw = allocationUWei / params.minClipUWei;
   const levels = Number(raw > BigInt(params.maxLevels) ? BigInt(params.maxLevels) : raw);
-  if (levels < 1) return { ok: false, code: "below-minimum" };
+  if (params.seedMode === "symmetric") {
+    if (levels < 2) return { ok: false, code: "below-minimum" };
+    if (levels > 3) return { ok: false, code: "arm-degenerate" };
+  } else if (levels < 1) return { ok: false, code: "below-minimum" };
   const clipUWei = allocationUWei / BigInt(levels);
   const buyPrice: bigint[] = [p0E18];
   const sellPrice: bigint[] = [0n];
   const band = BigInt(params.bandBps);
-  for (let index = 1; index <= levels; index += 1) {
+  const lowerLevels = params.seedMode === "symmetric"
+    ? levels - 1
+    : levels;
+  const upperLevels = params.seedMode === "symmetric" ? 1 : 0;
+  for (let index = 1; index <= lowerLevels; index += 1) {
     const previous = buyPrice[index - 1];
     if (previous === undefined) return { ok: false, code: "arm-degenerate" };
-    const next = (previous * (BPS - band)) / BPS; // floor
+    const next = (previous * (BPS - band)) / BPS;
     if (next <= 0n || next >= previous) return { ok: false, code: "arm-degenerate" };
     buyPrice.push(next);
-    const sell = ceilDiv(next * (BPS + band), BPS); // ceiling
+    const sell = ceilDiv(next * (BPS + band), BPS);
     if (sell <= next) return { ok: false, code: "arm-degenerate" };
     sellPrice.push(sell);
+  }
+  if (params.seedMode === "symmetric") {
+    const upperBuy = p0E18;
+    const upperSell = ceilDiv(upperBuy * (BPS + band), BPS);
+    if (upperBuy <= 0n || upperSell <= upperBuy) return { ok: false, code: "arm-degenerate" };
+    buyPrice.push(upperBuy);
+    sellPrice.push(upperSell);
+  }
+  const minBuyPriceE18 = buyPrice[lowerLevels] ?? 0n;
+  const minSellPriceE18 = sellPrice[lowerLevels] ?? 0n;
+  if (minBuyPriceE18 <= 0n || minSellPriceE18 <= 0n) {
+    return { ok: false, code: "arm-degenerate" };
   }
   return {
     ok: true,
     ladder: {
       levels,
+      lowerLevels,
+      upperLevels,
       clipUWei,
       idleUWei: allocationUWei - clipUWei * BigInt(levels),
       p0E18,
       buyPrice,
       sellPrice,
+      minBuyPriceE18,
+      minSellPriceE18,
     },
   };
+}
+
+/** Rebuild only price lines for an admitted ladder; sizing never changes. */
+export function rebuildLines(input: {
+  readonly anchorE18: bigint;
+  readonly levels: number;
+  readonly lower: number;
+  readonly params: QuantGridParams;
+}): { readonly buyPrice: readonly bigint[]; readonly sellPrice: readonly bigint[] } {
+  if (input.anchorE18 <= 0n || input.levels <= 0 || input.lower <= 0
+    || input.lower >= input.levels + 1) {
+    throw new Error("Invalid admitted ladder shape.");
+  }
+  const band = BigInt(input.params.bandBps);
+  const buyPrice: bigint[] = [input.anchorE18];
+  const sellPrice: bigint[] = [0n];
+  for (let index = 1; index <= input.lower; index += 1) {
+    const previous = buyPrice[index - 1]!;
+    const buy = (previous * (BPS - band)) / BPS;
+    buyPrice.push(buy);
+    sellPrice.push(ceilDiv(buy * (BPS + band), BPS));
+  }
+  if (input.params.seedMode === "symmetric") {
+    buyPrice.push(input.anchorE18);
+    sellPrice.push(ceilDiv(input.anchorE18 * (BPS + band), BPS));
+  } else {
+    for (let index = input.lower + 1; index <= input.levels; index += 1) {
+      const previous = buyPrice[index - 1]!;
+      const buy = (previous * (BPS - band)) / BPS;
+      buyPrice.push(buy);
+      sellPrice.push(ceilDiv(buy * (BPS + band), BPS));
+    }
+  }
+  return { buyPrice, sellPrice };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -154,21 +247,21 @@ export type ArmFloorResult = {
 /**
  * Is a clip of this size economic AT ALL on this pool?
  *
- * `gasBps` uses the SAME 3× pad the native reservation uses (R3.5, accepting
- * REVIEW2 C8): a 3× pad in the balance check with a 1× estimate in the floor
- * was inconsistent, and the inconsistency was in the direction that loses
- * money. Re-evaluated every cycle until `endsAt`, because pool depth moves.
+ * `gasBps` uses the same live fee estimate as the native reservation. Admission
+ * and re-centre admission supply the current RPC gas reading; later candidates
+ * refresh it before the intent claim.
  */
 export function armFloor(input: {
   readonly clipUWei: bigint;
   readonly midE18: bigint;
   readonly impactBps: bigint;
-  readonly params: QuantStrategyParams;
+  readonly params: QuantGridParams;
+  readonly gasPriceWei: bigint;
 }): ArmFloorResult {
   const { clipUWei, midE18, impactBps, params } = input;
   const gasBps = clipUWei <= 0n
     ? BPS * 100n
-    : ceilDiv(2n * feeEst(params) * midE18 * BPS, clipUWei * E18);
+    : ceilDiv(2n * feeEstForParams(params, input.gasPriceWei) * midE18 * BPS, clipUWei * E18);
   const requiredBps =
     2n * V2_FEE_BPS_PURE
     + BigInt(params.entryTolBps)
@@ -196,11 +289,12 @@ export function armFloor(input: {
 export function economicMinSellWei(input: {
   readonly sellPriceE18: bigint;
   readonly midE18: bigint;
-  readonly params: QuantStrategyParams;
+  readonly params: QuantGridParams;
+  readonly gasPriceWei: bigint;
 }): bigint {
   const { sellPriceE18, midE18, params } = input;
   if (sellPriceE18 <= 0n) return 0n;
-  const feeU = feeEstInU(params, midE18);
+  const feeU = feeEstInU(params, midE18, input.gasPriceWei);
   const net = BPS - BigInt(params.minNetEdgeBps);
   if (net <= 0n) return 0n;
   return ceilDiv(feeU * BPS * E18, sellPriceE18 * net);
@@ -236,6 +330,15 @@ export type TriggerEvidence = {
   readonly side: QuantTriggerSide;
 };
 
+export function advanceLatch<S extends string>(
+  previous: { readonly consecutive: number; readonly side: S | null },
+  side: S | null,
+): { readonly consecutive: number; readonly side: S | null } {
+  if (side === null) return { consecutive: 0, side: null };
+  if (previous.side !== side) return { consecutive: 1, side };
+  return { consecutive: previous.consecutive + 1, side };
+}
+
 /**
  * Advance the two-observation trigger latch (R2.0.1, adopted from the review's
  * OQ2 answer and reversing the body's single-reading proposal).
@@ -250,9 +353,7 @@ export function advanceTrigger(
   previous: TriggerEvidence,
   side: QuantTriggerSide,
 ): TriggerEvidence {
-  if (side === null) return { consecutive: 0, side: null };
-  if (previous.side !== side) return { consecutive: 1, side };
-  return { consecutive: previous.consecutive + 1, side };
+  return advanceLatch(previous, side);
 }
 
 /** Two consecutive readings, one worker interval apart, is the whole rule. */
@@ -306,7 +407,7 @@ export type BuyGuardInput = {
   readonly buyPriceE18: bigint;
   readonly levelIndex: number;
   readonly actionSeq: number;
-  readonly params: QuantStrategyParams;
+  readonly params: QuantGridParams;
 };
 
 /**
@@ -333,6 +434,8 @@ export function buyMinOut(input: BuyGuardInput): bigint {
 export type SellGuardInput = {
   /** The chunk being sold, in WBNB wei. */
   readonly amountWei: bigint;
+  /** Current remaining inventory; the denominator for remaining principal. */
+  readonly baseWei?: bigint;
   /** The cycle's total base at cycle start, for the pro-rata split. */
   readonly baseAtCycleStartWei: bigint;
   /** The cycle's U basis — the buy's measured `fill_in_wei`. */
@@ -344,7 +447,9 @@ export type SellGuardInput = {
   readonly midE18: bigint;
   readonly levelIndex: number;
   readonly actionSeq: number;
-  readonly params: QuantStrategyParams;
+  readonly params: QuantGridParams;
+  /** The same live gas read that priced this candidate intent. */
+  readonly gasPriceWei: bigint;
 };
 
 export type SellFloor = {
@@ -357,6 +462,42 @@ export type SellFloor = {
   /** The basis-derived floor, for evidence. */
   readonly basisFloorWei: bigint;
 };
+
+export type ExitShares = {
+  readonly closes: boolean;
+  readonly remainingBaseWei: bigint;
+  readonly basisShareUWei: bigint;
+  readonly entryShareUWei: bigint;
+};
+
+/**
+ * The one accounting split used by both sell admission and settlement.
+ * Principal is remaining-over-remaining; entry cost is cycle-total over the
+ * cycle's starting inventory. The closing chunk carries the exact principal
+ * remainder but only its own fraction of the cycle entry estimate.
+ */
+export function exitShares(input: {
+  readonly amountWei: bigint;
+  readonly baseWei: bigint;
+  readonly baseAtCycleStartWei: bigint;
+  readonly basisUWei: bigint;
+  readonly entryCostUWei: bigint;
+}): ExitShares {
+  if (input.amountWei <= 0n || input.baseWei <= 0n
+    || input.amountWei > input.baseWei || input.baseAtCycleStartWei <= 0n) {
+    throw new Error("Invalid exit share inputs.");
+  }
+  const remainingBaseWei = input.baseWei - input.amountWei;
+  const closes = remainingBaseWei < DUST_WEI;
+  const basisShareUWei = closes
+    ? input.basisUWei
+    : ceilDiv(input.basisUWei * input.amountWei, input.baseWei);
+  const entryShareUWei = ceilDiv(
+    input.entryCostUWei * (closes ? input.baseWei : input.amountWei),
+    input.baseAtCycleStartWei,
+  );
+  return { closes, remainingBaseWei, basisShareUWei, entryShareUWei };
+}
 
 /**
  * The SELL's floor: the HIGHER of the band's price and the actual basis plus
@@ -385,9 +526,13 @@ export function sellFloor(input: SellGuardInput): SellFloor {
   // kept for consistency, because the exception is what a later reader copies.
   const levelFloorWei =
     ceilDiv(amountWei * sellPriceE18 * (BPS - BigInt(params.exitTolBps)), BPS * E18);
-  const basisShare = ceilDiv(basisUWei * amountWei, baseAtCycleStartWei);
-  const entryShare = ceilDiv(entryCostUWei * amountWei, baseAtCycleStartWei);
-  const exitBoundU = feeEstInU(params, midE18);
+  const baseWei = input.baseWei ?? baseAtCycleStartWei;
+  const shares = exitShares({
+    amountWei, baseWei, baseAtCycleStartWei, basisUWei, entryCostUWei,
+  });
+  const basisShare = shares.basisShareUWei;
+  const entryShare = shares.entryShareUWei;
+  const exitBoundU = feeEstInU(params, midE18, input.gasPriceWei);
   const basisFloorWei =
     ceilDiv(basisShare * (BPS + BigInt(params.minNetEdgeBps)), BPS) + entryShare + exitBoundU;
   const floorWei = levelFloorWei > basisFloorWei ? levelFloorWei : basisFloorWei;
@@ -488,9 +633,10 @@ export function requiredNativeWei(input: {
   readonly ownBaseWei: bigint;
   readonly otherLevels: readonly LevelObligation[];
   readonly minCapLimitWei: bigint;
-  readonly params: QuantStrategyParams;
+  readonly params: QuantGridParams;
+  readonly gasPriceWei: bigint;
 }): bigint {
-  const fee = feeEst(input.params);
+  const fee = feeEstForParams(input.params, input.gasPriceWei);
   if (input.side === "sell") return fee;
   const cap = input.minCapLimitWei <= 0n ? 1n : input.minCapLimitWei;
   let submissions = 1n + ceilDiv(input.ownBaseWei, cap);
@@ -523,5 +669,5 @@ export function quantPriceImpactBps(fullOut: bigint, onePercentProbeOut: bigint)
   return ((noImpact - fullOut) * BPS) / noImpact;
 }
 
-/** The shipped relay-fee constant, re-exported so a caller sees its provenance. */
-export const QUANT_RELAY_FEE_PER_SUBMIT_WEI = RELAY_FEE_PER_EXIT_WEI;
+/** The R14 Quant default; the shared LP relay constant remains unchanged. */
+export const QUANT_RELAY_FEE_PER_SUBMIT_WEI = 30_000_000_000_000n;

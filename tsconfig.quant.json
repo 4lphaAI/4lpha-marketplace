@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/quant/**/*.ts",
+    "src/store/quantJobs.ts",
+    "src/store/journal.ts",
+    "src/ops/pancakeTokens.ts",
+    "src/core/types.ts",
+    "src/core/session.ts",
+    "src/wallet/altana.ts",
+    "src/deployment/workerSingleton.ts",
+    "test/support/moduleScan.ts",
+    "test/support/quantReceipts.ts",
+    "test/support/fakeSql.ts",
+    "test/quant.*.test.ts",
+    "test/demo.plane.test.ts",
+    "scripts/quant-worker.ts",
+    "scripts/quantWorkerDeps.ts",
+    "scripts/live-quant.ts"
+  ]
+}

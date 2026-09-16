@@ -27,6 +27,7 @@ import { E18, feeEst, requiredNativeWei } from "../src/quant/grid.js";
 import { runQuantWorkerOnce, type QuantWorkerDeps } from "../src/quant/worker.js";
 import { MemoryQuantTransport } from "../src/quant/termix.js";
 import type { QuantChainReader } from "../src/quant/readers.js";
+import type { QuantStrategyParams } from "../src/quant/config.js";
 import type { ExecutionReceipt, SessionRef, SpendInfoReading, WalletProvider } from "../src/core/types.js";
 import type { QuantJobRecord } from "../src/quant/types.js";
 import { accountKeyHashForAddress } from "../src/wallet/altana.js";
@@ -44,6 +45,7 @@ import { decodeFunctionData } from "viem";
 import { PANCAKE_V2_ROUTER_TOKENS_ABI } from "../src/ops/pancakeTokens.js";
 
 const U = 10n ** 18n;
+const GAS_PRICE_WEI = 50_000_000n;
 const JOB = "quant-job-scenario";
 const SEED = `0x${"88".repeat(32)}`;
 const KEYPAIR = deriveKeypair(SEED);
@@ -57,6 +59,8 @@ const PUBLIC_KEY = String(fixture.session["publicKey"]) as Hex;
 const KEY_HASH = accountKeyHashForAddress(publicKeyToAddress(PUBLIC_KEY));
 
 const P0 = 740n * E18;
+const SCENARIO_PARAMS = Object.freeze({ ...QUANT_STRATEGY_DEFAULTS, minClipUWei: 10n * U });
+const SCENARIO_ADMITTED_PARAMS = Object.freeze({ ...SCENARIO_PARAMS, bandBps: 700 });
 /** Level 1's buy price at the 700 bps default: floor(P0 * 9300 / 10000). */
 const BUY_1 = (P0 * 9_300n) / 10_000n;
 const SELL_1 = (BUY_1 * 10_700n + 9_999n) / 10_000n;
@@ -68,13 +72,35 @@ type Harness = {
   readonly chain: {
     mid: bigint;
     block: bigint;
+    balanceU: bigint;
+    balanceWbnb: bigint;
+    baselineHash: Hex | null;
     nativeBalance: bigint;
+    gasPriceWei: bigint;
+    gasPriceReadings: bigint[];
+    gasPriceFailure: boolean;
     submissions: number;
     receipts: Map<string, ReturnType<typeof buildPair>>;
     failNextSubmit: "throw" | "failed" | undefined;
   };
   clock: { nowMs: number };
 };
+
+class RebaseBeforeTruthStore extends MemoryQuantJobStore {
+  override async publishTruthVerdict(
+    input: Parameters<QuantJobStore["publishTruthVerdict"]>[0],
+  ): ReturnType<QuantJobStore["publishTruthVerdict"]> {
+    const rebased = await this.acknowledgeExternal({
+      quantJobId: input.quantJobId,
+      startedBlock: input.observationBlock + 1n,
+      startedBlockHash: `0x${"dd".repeat(32)}` as Hex,
+      baselineUWei: 31n * U, baselineWbnbWei: 0n, baselineNativeWei: 10n ** 16n,
+      nowMs: input.nowMs,
+    });
+    if (rebased.kind !== "ok") throw new Error("the test rebase did not win");
+    return super.publishTruthVerdict(input);
+  }
+}
 
 function jobRecord(overrides: Partial<QuantJobRecord> = {}): QuantJobRecord {
   return {
@@ -93,18 +119,44 @@ function jobRecord(overrides: Partial<QuantJobRecord> = {}): QuantJobRecord {
   };
 }
 
-function makeHarness(options: { readonly allocationUWei?: bigint } = {}): Harness {
-  const store = new MemoryQuantJobStore();
+function makeHarness(options: {
+  readonly allocationUWei?: bigint;
+  readonly params?: QuantStrategyParams;
+  readonly store?: MemoryQuantJobStore;
+  readonly hashBound?: boolean;
+  readonly gasPriceWei?: bigint;
+  readonly wbnbCapWei?: bigint;
+  readonly nativeCapWei?: bigint;
+} = {}): Harness {
+  const store = options.store ?? new MemoryQuantJobStore();
   const journal = new MemoryExecutionJournal();
   const clock = { nowMs: NOW_SEC * 1_000 };
   const chain = {
     mid: P0,
     block: 1_000n,
+    balanceU: 30n * U,
+    balanceWbnb: 0n,
+    baselineHash: null as Hex | null,
     nativeBalance: 10n ** 16n,
+    gasPriceWei: options.gasPriceWei ?? GAS_PRICE_WEI,
+    gasPriceReadings: [] as bigint[],
+    gasPriceFailure: false,
     submissions: 0,
     receipts: new Map<string, ReturnType<typeof buildPair>>(),
     failNextSubmit: undefined as unknown as "throw" | "failed" | undefined,
   };
+
+  const session = structuredClone(fixture.session) as {
+    permissions: { spend: { token?: string; limit: { $bigint: string } }[] };
+  };
+  for (const cap of session.permissions.spend) {
+    if (options.wbnbCapWei !== undefined && cap.token?.toLowerCase() === QUANT_WBNB_56.toLowerCase()) {
+      cap.limit = { $bigint: options.wbnbCapWei.toString(10) };
+    }
+    if (options.nativeCapWei !== undefined && cap.token === undefined) {
+      cap.limit = { $bigint: options.nativeCapWei.toString(10) };
+    }
+  }
 
   const transport = new MemoryQuantTransport({
     config: {
@@ -119,7 +171,7 @@ function makeHarness(options: { readonly allocationUWei?: bigint } = {}): Harnes
     inbox: [{
       envelopeId: "env-1",
       quantJobId: JOB,
-      ...seal(JSON.stringify(fixture.session), KEYPAIR.publicKey),
+      ...seal(JSON.stringify(session), KEYPAIR.publicKey),
     }],
     jobs: new Map([[JOB, jobRecord(
       options.allocationUWei === undefined ? {} : { allocationUWei: options.allocationUWei },
@@ -128,8 +180,12 @@ function makeHarness(options: { readonly allocationUWei?: bigint } = {}): Harnes
     reports: [],
   });
 
-  const reader: QuantChainReader = {
+  const readerBase: QuantChainReader = {
     async chainId() { return 56; },
+    async gasPriceWei() {
+      if (chain.gasPriceFailure) throw new Error("gas unavailable");
+      return chain.gasPriceReadings.shift() ?? chain.gasPriceWei;
+    },
     async finalizedBlock() {
       return {
         number: chain.block,
@@ -170,6 +226,22 @@ function makeHarness(options: { readonly allocationUWei?: bigint } = {}): Harnes
     async getTransaction(hash) { return chain.receipts.get(hash.toLowerCase())?.transaction ?? null; },
     async getReceipt(hash) { return chain.receipts.get(hash.toLowerCase())?.receipt ?? null; },
   };
+  const reader: QuantChainReader = options.hashBound
+    ? {
+      ...readerBase,
+      async tokenBalanceAtHash(token: Address, _wallet: Address, blockHash: Hex) {
+        if (chain.baselineHash === null) chain.baselineHash = blockHash;
+        const baseline = blockHash.toLowerCase() === chain.baselineHash.toLowerCase();
+        return token.toLowerCase() === QUANT_U_56.toLowerCase()
+          ? baseline ? 30n * U : chain.balanceU
+          : baseline ? 0n : chain.balanceWbnb;
+      },
+      async nativeBalanceAtHash(_wallet: Address, blockHash: Hex) {
+        if (chain.baselineHash === null) chain.baselineHash = blockHash;
+        return 10n ** 16n;
+      },
+    } as QuantChainReader
+    : readerBase as QuantChainReader;
 
   let nonce = 0n;
   const provider = {
@@ -184,10 +256,10 @@ function makeHarness(options: { readonly allocationUWei?: bigint } = {}): Harnes
     async preflightExecute() { /* the granted snapshot permits these calls */ },
     async readSpendInfos(): Promise<readonly SpendInfoReading[]> {
       return [
-        { token: null, period: "day", periodCode: 2, limitWei: 3n * 10n ** 15n, currentSpentWei: 0n },
+        { token: null, period: "day", periodCode: 2, limitWei: options.nativeCapWei ?? 3n * 10n ** 15n, currentSpentWei: 0n },
         { token: QUANT_U_56, period: "day", periodCode: 2, limitWei: 40n * U, currentSpentWei: 0n },
-        { token: QUANT_WBNB_56, period: "day", periodCode: 2, limitWei: 2n * 10n ** 17n, currentSpentWei: 0n },
-        { token: QUANT_WBNB_56, period: "minute", periodCode: 0, limitWei: 2n * 10n ** 17n, currentSpentWei: 0n },
+        { token: QUANT_WBNB_56, period: "day", periodCode: 2, limitWei: options.wbnbCapWei ?? 2n * 10n ** 17n, currentSpentWei: 0n },
+        { token: QUANT_WBNB_56, period: "minute", periodCode: 0, limitWei: options.wbnbCapWei ?? 2n * 10n ** 17n, currentSpentWei: 0n },
       ];
     },
     async executeViaSession(params: {
@@ -245,10 +317,10 @@ function makeHarness(options: { readonly allocationUWei?: bigint } = {}): Harnes
 
   const deps: QuantWorkerDeps = {
     store, journal, provider, reader, transport, keypair: KEYPAIR,
-    params: QUANT_STRATEGY_DEFAULTS,
+    params: options.params ?? SCENARIO_PARAMS,
     strategyId: "strategy-1",
     agentId: "agent-1",
-    paramsDigest: quantParamsDigest(QUANT_STRATEGY_DEFAULTS),
+    paramsDigest: quantParamsDigest(options.params ?? SCENARIO_PARAMS),
     venue: {
       router: QUANT_ROUTER_56, u: QUANT_U_56, wbnb: QUANT_WBNB_56, pair: QUANT_U_WBNB_PAIR_56,
     },
@@ -373,6 +445,8 @@ describe("quant worker — a full cycle", () => {
     assert.equal(action?.amountInWei, 10n * U);
     assert.equal(action?.state, "committed-unverified");
     assert.equal((await harness.store.listLevels(JOB))[0]?.state, "blocked");
+    assert.equal(action?.gasPriceWei, GAS_PRICE_WEI);
+    assert.equal(action?.feeEstWei, 30_000_000_000_000n);
   });
 
   it("SETTLES the buy on the next cycle's recovery and holds WBNB", async () => {
@@ -414,6 +488,25 @@ describe("quant worker — a full cycle", () => {
     await cycle(harness);
     assert.equal(harness.chain.submissions - before, 1);
   });
+
+  it("BC-S32/41/56: symmetric admission seeds its upper cell without a trigger", async () => {
+    const params: QuantStrategyParams = {
+      ...QUANT_STRATEGY_DEFAULTS,
+      seedMode: "symmetric",
+      maxLevels: 2,
+      recenterMode: "both",
+      recenterBudgetDays: 1,
+    };
+    const harness = makeHarness({ allocationUWei: 20n * U, params });
+    await cycle(harness); // admission
+    await cycle(harness); // upper seed
+    await cycle(harness); // settle the seed from the receipt
+    const levels = await harness.store.listLevels(JOB);
+    assert.equal(levels.length, 2);
+    assert.equal(levels[1]?.seedPending, false, "the confirmed seed is settled on the next recovery");
+    assert.equal((await harness.store.listActions(JOB))[0]?.evidenceKind, "seed");
+    assert.equal(harness.chain.submissions, 1);
+  });
 });
 
 describe("quant worker — holds", () => {
@@ -423,14 +516,99 @@ describe("quant worker — holds", () => {
     return harness;
   }
 
+  it("holds an unavailable gas price before acceptance without advancing evidence", async () => {
+    const harness = await armed();
+    harness.chain.mid = BUY_1 - E18;
+    await cycle(harness);
+    const beforeJob = await harness.store.getJob(JOB);
+    const beforeLevel = (await harness.store.listLevels(JOB))[0]!;
+    const observations = await harness.store.listObservations(JOB, 8);
+    assert.equal(Object.hasOwn(observations.at(-1) ?? {}, "gasPriceWei"), false);
+    harness.chain.gasPriceFailure = true;
+    const report = await cycle(harness);
+    const afterJob = await harness.store.getJob(JOB);
+    const afterLevel = (await harness.store.listLevels(JOB))[0]!;
+    assert.ok(report.notes.includes(`${JOB}:gas-price-unavailable`), report.notes.join(","));
+    assert.equal(afterJob?.lastAcceptedBlock, beforeJob?.lastAcceptedBlock);
+    assert.equal(afterLevel.triggerConsecutive, beforeLevel.triggerConsecutive);
+    assert.equal(harness.chain.submissions, 0);
+    harness.chain.gasPriceFailure = false;
+    await cycle(harness);
+    assert.equal(harness.chain.submissions, 1, "the next valid cycle may consume the preserved latch");
+  });
+
+  it("holds an implausible gas price before acceptance", async () => {
+    const harness = await armed();
+    harness.chain.mid = BUY_1 - E18;
+    harness.chain.gasPriceWei = 1_001n * 10n ** 9n;
+    const before = await harness.store.getJob(JOB);
+    const report = await cycle(harness);
+    const after = await harness.store.getJob(JOB);
+    assert.ok(report.notes.includes(`${JOB}:gas-price-implausible`), report.notes.join(","));
+    assert.equal(after?.lastAcceptedBlock, before?.lastAcceptedBlock);
+    assert.equal(harness.chain.submissions, 0);
+  });
+
+  it("refuses a higher pre-claim estimate without inserting or consuming the latch", async () => {
+    const harness = await armed();
+    harness.chain.mid = BUY_1 - E18;
+    await cycle(harness);
+    harness.chain.gasPriceReadings.push(GAS_PRICE_WEI, 100_000_000n);
+    const report = await cycle(harness);
+    const level = (await harness.store.listLevels(JOB))[0]!;
+    assert.ok(report.notes.includes(`${JOB}:gas-price-moved`), report.notes.join(","));
+    assert.equal((await harness.store.listActions(JOB)).length, 0);
+    assert.equal(level.triggerConsecutive, 2, "the pre-claim refusal preserves the latch");
+    assert.equal(harness.chain.submissions, 0);
+    harness.chain.gasPriceReadings.push(GAS_PRICE_WEI, GAS_PRICE_WEI);
+    await cycle(harness);
+    assert.equal(harness.chain.submissions, 1);
+  });
+
+  it("BC-S182: re-seeds with quoted WBNB under the CLI-shaped caps", async () => {
+    const params: QuantStrategyParams = {
+      ...QUANT_STRATEGY_DEFAULTS,
+      seedMode: "symmetric",
+      bandTiers: "10:250,30:200",
+      maxLevels: 2,
+      recenterMode: "both",
+      seedWindowCycles: 3,
+    };
+    const lowerBuy = (P0 * 9_750n) / 10_000n;
+    const nominalBase = (5n * U * E18) / lowerBuy;
+    const wbnbCap = nominalBase * 4n;
+    const nativeCap = 30_000_000_000_000n * 12n;
+    const harness = makeHarness({
+      allocationUWei: 10n * U, params, wbnbCapWei: wbnbCap, nativeCapWei: nativeCap,
+    });
+    await cycle(harness);
+    harness.chain.mid = P0 + 10n * E18;
+    await cycle(harness);
+    await cycle(harness);
+    await cycle(harness);
+    await cycle(harness); // conversion after the three counted refusals
+    assert.equal((await harness.store.listLevels(JOB))[1]?.seedPending, false);
+    harness.chain.mid = 800n * E18;
+    harness.clock.nowMs += 86_400_000;
+    await cycle(harness);
+    const report = await cycle(harness);
+    assert.ok(report.notes.includes(`${JOB}:recentered:up`), report.notes.join(","));
+    assert.equal(harness.chain.submissions, 0, "re-seeding is scheduled, not submitted in the recenter fence");
+    assert.equal((await harness.store.listLevels(JOB))[1]?.seedPending, true);
+  });
+
   it("HOLDS `no-gas` when the wallet cannot cover the buy AND its exit", async () => {
     const harness = await armed();
-    harness.chain.nativeBalance = 3n * 10n ** 14n; // exactly one FEE_EST
+    harness.chain.nativeBalance = 30_000_000_000_000n; // exactly one FEE_EST
     harness.chain.mid = BUY_1 - E18;
     await cycle(harness);
     const report = await cycle(harness);
     assert.equal(harness.chain.submissions, 0);
     assert.ok(report.notes.some((note) => note.endsWith(":no-gas")), report.notes.join(","));
+    assert.ok(
+      report.notes.some((note) => /balance=\d+ required=\d+ shortfall=\d+/u.test(note)),
+      report.notes.join(","),
+    );
   });
 
   it("HOLDS on a COOLDOWN rather than advancing state", async () => {
@@ -483,6 +661,29 @@ describe("quant worker — holds", () => {
     assert.ok(report.notes.includes("inbox-unavailable"));
     assert.equal(report.errors, 0);
   });
+
+  it("binds a paused truth verdict to its epoch when rebase wins first", async () => {
+    const harness = makeHarness({ store: new RebaseBeforeTruthStore(), hashBound: true });
+    await cycle(harness);
+    assert.equal(await harness.store.verifyCurrentEpoch({
+      quantJobId: JOB, verified: true, nowMs: harness.clock.nowMs,
+    }), true);
+    await harness.store.setAccountingState({
+      quantJobId: JOB, state: "external-activity", epoch: 1,
+      evidenceJson: '{"prior":true}', nowMs: harness.clock.nowMs,
+    });
+    assert.equal(await harness.store.pauseJob({ quantJobId: JOB, nowMs: harness.clock.nowMs }), true);
+    harness.chain.balanceU = 31n * U;
+
+    await cycle(harness);
+
+    const job = await harness.store.getJob(JOB);
+    assert.equal(job?.status, "paused");
+    assert.equal(job?.accountingState, "ok", "a stale truth result must not restore the restriction");
+    assert.equal(job?.accountingEpoch, 2);
+    assert.equal(job?.accountingEvidenceJson, null);
+    assert.equal(job?.holdCode, "reconcile-stale");
+  });
 });
 
 describe("quant worker — crash injection", () => {
@@ -529,7 +730,9 @@ describe("quant worker — crash injection", () => {
         amountInWei: 10n * U, minOutWei: 1n, quoteOutWei: 1n, quoteBlock: 1n,
         triggerBlock1: 1n, triggerBlock2: 1n, deadlineSec: 1, callsJson: "[]", note: "",
         impactBps: 0, preUWei: 0n, preWbnbWei: 0n, preNativeWei: 0n,
-        basisUWei: 0n, baseAtCycleStartWei: 0n, nowMs: harness.clock.nowMs,
+        basisUWei: 0n, baseAtCycleStartWei: 0n,
+        gasPriceWei: GAS_PRICE_WEI, feeEstWei: 30_000_000_000_000n,
+        nowMs: harness.clock.nowMs,
       }),
     );
     assert.equal((await harness.store.listLevels(JOB))[0]?.state, "blocked");
@@ -594,7 +797,7 @@ describe("quant worker — budgets and term end", () => {
 describe("quant worker — the native reservation reads OTHER levels' actions (R5.5, A1)", () => {
   /** The harness's smallest WBNB cap row, which is what `Lmin` resolves to. */
   const CAP = 2n * 10n ** 17n;
-  const FEE = feeEst(QUANT_STRATEGY_DEFAULTS);
+  const FEE = feeEst(SCENARIO_PARAMS, GAS_PRICE_WEI);
   /** Level 2's buy price on a two-level ladder: floor(BUY_1 × 9300 / 10000). */
   const BUY_2 = (BUY_1 * 9_300n) / 10_000n;
   /** A quote big enough that its inventory needs TWO exits at `CAP`. */
@@ -626,7 +829,9 @@ describe("quant worker — the native reservation reads OTHER levels' actions (R
         deadlineSec: Math.floor(harness.clock.nowMs / 1_000) + 600,
         callsJson: "[]", note: "", impactBps: 0,
         preUWei: 0n, preWbnbWei: 0n, preNativeWei: 0n,
-        basisUWei: 0n, baseAtCycleStartWei: 0n, nowMs: harness.clock.nowMs,
+        basisUWei: 0n, baseAtCycleStartWei: 0n,
+        gasPriceWei: GAS_PRICE_WEI, feeEstWei: 30_000_000_000_000n,
+        nowMs: harness.clock.nowMs,
       }),
     );
     await harness.journal.beginWithSpend({
@@ -654,7 +859,8 @@ describe("quant worker — the native reservation reads OTHER levels' actions (R
     ownBaseWei: CAP,
     otherLevels: [{ kind: "pending-buy", baseWei: PENDING_QUOTE_OUT }],
     minCapLimitWei: CAP,
-    params: QUANT_STRATEGY_DEFAULTS,
+    params: SCENARIO_ADMITTED_PARAMS,
+    gasPriceWei: GAS_PRICE_WEI,
   });
 
   it("charges a pending buy its EXITS, not one fee — the exact figure", () => {
@@ -701,13 +907,15 @@ describe("quant worker — the native reservation reads OTHER levels' actions (R
     const base = 3n * CAP;
     const chunk = CAP;
     const withSell = requiredNativeWei({
-      side: "buy", ownBaseWei: CAP, minCapLimitWei: CAP, params: QUANT_STRATEGY_DEFAULTS,
+      side: "buy", ownBaseWei: CAP, minCapLimitWei: CAP, params: SCENARIO_ADMITTED_PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
       otherLevels: [{ kind: "pending-sell", baseWei: base - chunk }],
     });
     // own 2 + (1 submission + 2 exits for the 2 caps still to leave) = 5.
     assert.equal(withSell, FEE * 5n);
     const asHolding = requiredNativeWei({
-      side: "buy", ownBaseWei: CAP, minCapLimitWei: CAP, params: QUANT_STRATEGY_DEFAULTS,
+      side: "buy", ownBaseWei: CAP, minCapLimitWei: CAP, params: SCENARIO_ADMITTED_PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
       otherLevels: [{ kind: "holding-base", baseWei: base }],
     });
     assert.equal(asHolding, FEE * 5n, "the chunk in flight pays for itself, once");

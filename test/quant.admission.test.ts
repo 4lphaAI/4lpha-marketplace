@@ -28,7 +28,8 @@ import { buildLadder, E18 } from "../src/quant/grid.js";
 import type { GrantedPermissions } from "../src/quant/types.js";
 
 const U = 10n ** 18n;
-const PARAMS = QUANT_STRATEGY_DEFAULTS;
+const GAS_PRICE_WEI = 50_000_000n;
+const PARAMS = Object.freeze({ ...QUANT_STRATEGY_DEFAULTS, minClipUWei: 10n * U, bandBps: 700 });
 // Two days before the fixture's expiry: a 30-day term bounds the projection's
 // maxSessionSeconds, so a "now" years earlier would fail validateSessionSpec
 // for a reason that has nothing to do with what these tests assert.
@@ -91,6 +92,7 @@ function admissionInput(overrides: {
         midE18: 740n * E18,
       },
       params: PARAMS,
+      gasPriceWei: GAS_PRICE_WEI,
       nowSeconds: NOW,
     },
   };
@@ -267,6 +269,7 @@ describe("quant admission (A1..A8)", () => {
         buyPrice: LADDER.buyPrice, sellPrice: LADDER.sellPrice, midE18: 740n * E18,
       },
       params: PARAMS, nowSeconds: NOW,
+      gasPriceWei: GAS_PRICE_WEI,
     });
     assert.equal(verdict.ok, false);
     if (verdict.ok) return;
@@ -448,7 +451,7 @@ describe("quant admission (A1..A8)", () => {
     };
     for (const cap of session.permissions.spend) {
       if (cap.token?.toLowerCase() === QUANT_WBNB_56.toLowerCase()) {
-        cap.limit = { $bigint: "1000000000000000" };
+        cap.limit = { $bigint: "10000000000000" };
       }
     }
     const { input } = admissionInput({ session });

@@ -20,6 +20,7 @@ import {
   QUANT_LOCK_CLASSID,
   type QuantJobStore,
 } from "../src/store/quantJobs.js";
+import type { QuantObservation } from "../src/quant/types.js";
 
 const WALLET = getAddress("0x9BB0aB9dCEF83F0b39a4bE3EBE7a1c9D6d5c1111");
 const JOB = "quant-job-1";
@@ -95,6 +96,8 @@ async function insertBuy(store: QuantJobStore, journalKey: string): Promise<void
       preNativeWei: 10n ** 16n,
       basisUWei: 0n,
       baseAtCycleStartWei: 0n,
+      gasPriceWei: 50_000_000n,
+      feeEstWei: 30_000_000_000_000n,
       nowMs: 2_000,
     }),
   );
@@ -157,6 +160,9 @@ describe("quant store — intents and the blocking CAS", () => {
     assert.equal(levels[0]?.state, "blocked");
     assert.equal(levels[0]?.priorState, "armed-quote");
     assert.equal(levels[0]?.actionSeq, 1);
+    const action = await store.getAction("key-1");
+    assert.equal(action?.gasPriceWei, 50_000_000n);
+    assert.equal(action?.feeEstWei, 30_000_000_000_000n);
     // BC13: the trigger latch resets on any action on the level.
     assert.equal(levels[0]?.triggerConsecutive, 0);
     assert.equal(levels[0]?.triggerSide, null);
@@ -397,6 +403,96 @@ describe("quant store — retirement (R7.3 / BC26)", () => {
 });
 
 describe("quant store — observations, reports and the fence", () => {
+  it("reports the actual non-live observation refusal cause", async () => {
+    const cases = [
+      {
+        reason: "paused" as const,
+        prepare: async (store: QuantJobStore) => {
+          await store.pauseJob({ quantJobId: JOB, nowMs: 1_300 });
+        },
+        processDigest: undefined,
+      },
+      {
+        reason: "wire-changed" as const,
+        prepare: async (store: QuantJobStore) => {
+          await store.updateJobWire({
+            quantJobId: JOB, strategyId: "strat-1", tradingWallet: WALLET,
+            allocationUWei: 31n * U, dailyCapUWei: 40n * U, termDays: 30,
+            startedAtMs: 1_000, endsAtMs: 9_000_000, sessionExpiresAtMs: 9_000_000,
+            revokedAtMs: null, nowMs: 1_300,
+          });
+        },
+        processDigest: undefined,
+      },
+      {
+        reason: "external-activity" as const,
+        prepare: async (store: QuantJobStore) => {
+          await store.setAccountingState({
+            quantJobId: JOB, state: "external-activity", epoch: 1,
+            evidenceJson: "{}", nowMs: 1_300,
+          });
+        },
+        processDigest: undefined,
+      },
+      {
+        reason: "params-changed" as const,
+        prepare: async (_store: QuantJobStore) => undefined,
+        processDigest: `0x${"aa".repeat(32)}` as Hex,
+      },
+      {
+        reason: "revoked" as const,
+        prepare: async (store: QuantJobStore) => {
+          await store.updateJobWire({
+            quantJobId: JOB, strategyId: "strat-1", tradingWallet: WALLET,
+            allocationUWei: 30n * U, dailyCapUWei: 40n * U, termDays: 30,
+            startedAtMs: 1_000, endsAtMs: 9_000_000, sessionExpiresAtMs: 9_000_000,
+            revokedAtMs: 1_300, nowMs: 1_300,
+          });
+        },
+        processDigest: undefined,
+      },
+      {
+        reason: "ended" as const,
+        prepare: async (store: QuantJobStore) => {
+          await store.updateJobWire({
+            quantJobId: JOB, strategyId: "strat-1", tradingWallet: WALLET,
+            allocationUWei: 30n * U, dailyCapUWei: 40n * U, termDays: 30,
+            startedAtMs: 1_000, endsAtMs: 1_300, sessionExpiresAtMs: 9_000_000,
+            revokedAtMs: null, nowMs: 1_300,
+          });
+        },
+        processDigest: undefined,
+      },
+    ] as const;
+    for (const item of cases) {
+      const store = await armedStore();
+      await item.prepare(store);
+      const accepted = await store.acceptObservation({
+        quantJobId: JOB,
+        observation: {
+          blockNumber: 101n, blockHash: DIGEST, observedAtMs: 2_000, midE18: 740n * U,
+        },
+        intervalMs: 1,
+        ...(item.processDigest === undefined ? {} : { processDigest: item.processDigest }),
+      });
+      assert.equal(accepted.accepted, false);
+      assert.equal(accepted.reason, item.reason);
+    }
+  });
+
+  it("can reset only the job latch for a re-centre no-op", async () => {
+    const store = await armedStore();
+    await store.withQuantFence(JOB, async (fence) => {
+      await fence.setLevelTrigger({ quantJobId: JOB, levelIndex: 1, consecutive: 2, side: "buy" });
+    });
+    await store.resetLatches(JOB, false);
+    const job = await store.getJob(JOB);
+    const level = (await store.listLevels(JOB))[0];
+    assert.equal(job?.recenterConsecutive, 0);
+    assert.equal(level?.triggerConsecutive, 2);
+    assert.equal(level?.triggerSide, "buy");
+  });
+
   it("keeps the last 8 observations and advances the job's height", async () => {
     const store = await armedStore();
     for (let index = 0; index < 12; index += 1) {
@@ -416,6 +512,22 @@ describe("quant store — observations, reports and the fence", () => {
     assert.equal(observations.length, 8);
     assert.equal(observations.at(-1)?.blockNumber, 111n);
     assert.equal((await store.getJob(JOB))?.lastObservedBlock, 111n);
+  });
+
+  it("BC-S181: memory observation persistence projects only canonical fields", async () => {
+    const store = await armedStore();
+    const observation = {
+      blockNumber: 300n,
+      blockHash: `0x${"aa".repeat(32)}` as Hex,
+      observedAtMs: 3_000,
+      midE18: 740n * U,
+      gasPriceWei: 50_000_000n,
+    } as unknown as QuantObservation;
+    await store.withQuantFence(JOB, async (fence) =>
+      fence.recordObservation({ quantJobId: JOB, observation }),
+    );
+    const stored = (await store.listObservations(JOB, 1)).at(-1)!;
+    assert.equal(Object.hasOwn(stored, "gasPriceWei"), false);
   });
 
   it("records EVERY report attempt, not just the last", async () => {

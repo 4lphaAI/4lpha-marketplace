@@ -31,7 +31,7 @@ import {
 import { buildLadder } from "../src/quant/grid.js";
 import {
   QUANT_ROUTER_56, QUANT_U_56, QUANT_WBNB_56,
-  resolveQuantEnabled, resolveQuantRuntimeConfig, resolveQuantStrategyParams, quantParamsDigest,
+  admittedQuantParams, resolveQuantEnabled, resolveQuantRuntimeConfig, resolveQuantStrategyParams, quantParamsDigest,
   type QuantEnv,
 } from "../src/quant/config.js";
 import { deriveKeypair, open, seal } from "../src/quant/envelope.js";
@@ -39,6 +39,7 @@ import { deriveKeypair, open, seal } from "../src/quant/envelope.js";
 const RELAY = "https://relay.altana.network";
 const WALLET = getAddress("0x561b561eF37874c8e61534bE9BaE52Eb6261DDc4");
 const E18 = 10n ** 18n;
+const GAS_PRICE_WEI = 50_000_000n;
 
 function baseEnv(overrides: QuantEnv = {}): QuantEnv {
   const params = resolveQuantStrategyParams({});
@@ -70,7 +71,10 @@ describe("self-test session spec (R2.10) — the wizard's shape", () => {
   it("projects and is ADMITTED by the production predicate on a 10 U job", () => {
     const params = resolveQuantStrategyParams({});
     const mid = 740n * E18;
-    const ladder = buildLadder({ allocationUWei: 10n * E18, p0E18: mid, params });
+    const admitted = admittedQuantParams(params, 10n * E18);
+    assert.ok("bandBps" in admitted);
+    if (!("bandBps" in admitted)) return;
+    const ladder = buildLadder({ allocationUWei: 10n * E18, p0E18: mid, params: admitted });
     assert.ok(ladder.ok);
     if (!ladder.ok) return;
     const agentKey = `0x${"22".repeat(32)}` as Hex;
@@ -98,7 +102,8 @@ describe("self-test session spec (R2.10) — the wizard's shape", () => {
         sessionExpiresAtMs: (now + 2 * 86_400) * 1_000,
       },
       router: QUANT_ROUTER_56, u: QUANT_U_56, wbnb: QUANT_WBNB_56,
-      params,
+      params: admitted,
+      gasPriceWei: GAS_PRICE_WEI,
       ladder: { ...ladder.ladder, midE18: mid },
       nowSeconds: now,
     });
@@ -221,6 +226,17 @@ describe("config — self-test mode is exclusive with production credentials", (
 });
 
 describe("QUANT-SELFTEST R2/R4/R5 — isolation, atomic claim, production parsers", () => {
+  it("BC-S169/S170/S184: rehearsal and status expose live tier/fee/capacity evidence", () => {
+    const source = readFileSync("scripts/live-quant.ts", "utf8");
+    for (const marker of ["tier:", "gas price:", "feeEst:", "max clip:", "gas_price_wei", "fee_est_wei", "fee_delta_wei"]) {
+      assert.ok(source.includes(marker), `CLI is missing ${marker}`);
+    }
+    assert.ok(source.includes("quantPriceImpactBps"));
+    assert.ok(source.includes("maxExecutableClipWei"));
+    assert.match(source, /const nativeDayCapWei = fee \* 12n/u);
+    assert.equal(source.includes("fee * 3n * 12n"), false);
+  });
+
   it("a worker lists only jobs of ITS strategy, and a wire refresh never re-labels a job", async () => {
     const { MemoryQuantJobStore } = await import("../src/store/quantJobs.js");
     const store = new MemoryQuantJobStore();

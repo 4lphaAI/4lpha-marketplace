@@ -18,6 +18,12 @@ export type QuantJobStatus =
   | "ended-unresolved"
   | "reported";
 
+export type QuantRecenterSide = "up" | "down";
+export type QuantSeedOutcome = "seeded" | "converted" | "retired";
+export type QuantWireState = "compatible" | "changed";
+export type QuantAccountingState = "ok" | "external-activity";
+export type QuantEvidenceKind = "crossing" | "seed";
+
 /**
  * Level states (spec §4.4, R2.2).
  *
@@ -78,13 +84,47 @@ export type QuantHoldCode =
   | "meter-unreadable"
   | "needs-operator"
   | "no-gas"
+  | "gas-price-unavailable"
+  | "gas-price-implausible"
+  | "gas-price-moved"
   | "no-native-grant"
   | "price-moved"
+  | "quote-stale"
   | "quote-unavailable"
   | "session-chain-refused"
   | "session-chain-unreadable"
   | "session-changed"
   | "session-not-admissible"
+  | "seed-price-drift"
+  | "seed-unexecutable"
+  | "seed-window-expired"
+  | "params-changed"
+  | "day-cap-too-small"
+  | "term-too-short"
+  | "wire-changed"
+  | "recenter-uneconomic"
+  | "recenter-cap-too-small"
+  | "recenter-budget-exhausted"
+  | "recenter-cooldown"
+  | "recenter-busy"
+  | "recenter-retired"
+  | "recenter-deferred"
+  | "recenter-noop"
+  | "recenter-conflict"
+  | "observation-not-accepted"
+  | "observation-unverified"
+  | "snapshot-unverified"
+  | "receipt-unfinalized"
+  | "receipt-noncanonical"
+  | "ancestor-noncanonical"
+  | "ancestor-missing"
+  | "params-unreadable"
+  | "baseline-unverified"
+  | "reconcile-structure"
+  | "reconcile-stale"
+  | "budget-changed"
+  | "reserve-changed"
+  | "store-conflict"
   | "stale-observation"
   | "u-budget-exhausted"
   | "wire-invalid";

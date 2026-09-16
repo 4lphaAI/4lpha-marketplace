@@ -25,10 +25,12 @@
  *   report               send the term-end notes now
  */
 import { BNB } from "@altananetwork/sdk";
-import { getAddress, type Hex } from "viem";
+import { getAddress, keccak256, type Hex } from "viem";
 import { sanitizeMessage } from "../src/core/errors.js";
 import { PORTO_V055_ORCHESTRATOR } from "../src/lp/preparedIntent.js";
 import {
+  admittedQuantParams,
+  feeEstWei,
   resolveQuantEnabled,
   resolveQuantRuntimeConfig,
   type QuantRuntimeConfig,
@@ -51,12 +53,17 @@ import {
   writeSelfTestFile,
   type QuantSelfTestFile,
 } from "../src/quant/selftest.js";
-import { armFloor, buildLadder, midFromReserves } from "../src/quant/grid.js";
+import {
+  armFloor, buildLadder, buyMinOut, midFromReserves, quantPriceImpactBps,
+  requiredNativeWei,
+} from "../src/quant/grid.js";
 import { assertQuantSessionAdmissible, parseSessionPlaintext, projectGrantedPermissions } from "../src/quant/admission.js";
 import { agentAuthorityFromPrivateKey, ownerAuthorityFromPrivateKey } from "../src/wallet/altana.js";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { existsSync } from "node:fs";
-import { retirementAllowed, verifyAndSettle, type QuantReconcileDeps } from "../src/quant/reconcile.js";
+import {
+  admittedParams, retirementAllowed, verifyAndSettle, type QuantReconcileDeps,
+} from "../src/quant/reconcile.js";
 import { createQuantJobStore, type QuantJobStore } from "../src/store/quantJobs.js";
 import { createJournal, type ExecutionJournal } from "../src/store/journal.js";
 import { AltanaProvider } from "../src/wallet/altana.js";
@@ -104,6 +111,12 @@ function requireFlag(args: Args, name: string): string {
 
 function yesLive(args: Args): boolean {
   return args.flags.get("yes-live") === true;
+}
+
+function formatGwei(wei: bigint): string {
+  const whole = wei / 1_000_000_000n;
+  const fraction = (wei % 1_000_000_000n).toString(10).padStart(9, "0").replace(/0+$/u, "");
+  return fraction === "" ? `${whole}` : `${whole}.${fraction}`;
 }
 
 type Context = {
@@ -224,23 +237,41 @@ async function commandStatus(args: Args, context: Context): Promise<void> {
   const jobs = await context.store.listJobs();
   for (const job of jobs) {
     if (only !== null && job.quantJobId !== only) continue;
+    const admitted = admittedParams(job, context.config.params);
+    const statusParams = admitted ?? context.config.params;
+    const admittedBand = admitted !== null && "bandBps" in admitted ? admitted.bandBps : "-";
     console.log(
       `\njob ${job.quantJobId}  status=${job.status}  hold=${job.holdCode ?? "-"}\n`
       + `  wallet=${job.tradingWallet} allocation=${job.allocationUWei} `
       + `dailyCap=${job.dailyCapUWei} levels=${job.levels} clip=${job.clipUWei} `
       + `idle=${job.idleUWei}\n`
       + `  P0=${job.p0E18} armBlock=${job.armBlock ?? "-"} `
-      + `lastObserved=${job.lastObservedBlock ?? "-"} stale=${job.staleObservations}\n`
+      + `anchor=${job.anchorE18} gen=${job.ladderGen} lastObserved=${job.lastObservedBlock ?? "-"} `
+      + `accepted=${job.lastAcceptedBlock ?? "-"}@${job.lastAcceptedAtMs ?? "-"} `
+      + `hash=${job.lastAcceptedHash ?? "-"} stale=${job.staleObservations}\n`
+      + `  recenter=${job.recenterConsecutive}/${job.recenterSide ?? "-"} `
+      + `recenters=${job.recenters}/${job.recenterBudget} last=${job.lastRecenterAtMs ?? "-"} `
+      + `next=${job.lastRecenterAtMs === null ? (job.admittedAtMs ?? 0) + statusParams.recenterCooldownSec * 1000 : job.lastRecenterAtMs + statusParams.recenterCooldownSec * 1000}\n`
+      + `  wire=${job.wireState} accounting=${job.accountingState} epoch=${job.accountingEpoch ?? "-"} `
+      + `accountingRev=${job.accountingRev} params=${statusParams.seedMode}/${statusParams.recenterMode} band=${admittedBand}\n`
+      + `  paramsDigest=${job.paramsDigest ?? "-"}\n`
       + `  wbnbCapMin=${job.wbnbCapMinLimitWei} residualThreshold=${job.residualThresholdWei}`,
     );
+    if (job.accountingEvidenceJson !== null) console.log(`  accountingEvidence=${job.accountingEvidenceJson}`);
     for (const level of await context.store.listLevels(job.quantJobId)) {
       console.log(
         `  level ${level.levelIndex} ${level.state}`
         + ` buy=${level.buyPriceE18} sell=${level.sellPriceE18}`
         + ` base=${level.baseWei} basis=${level.basisUWei}`
         + ` cycles=${level.cyclesClosed} realized=${level.realizedUWei}`
-        + ` residual=${level.residualWei} hold=${level.holdCode ?? "-"}`,
+        + ` residual=${level.residualWei} hold=${level.holdCode ?? "-"}`
+        + ` seed=${level.seedPending ? "pending" : "-"}/${level.seedRefusals}+${level.seedSubmissions}/${statusParams.seedWindowCycles}`
+        + ` outcome=${level.seedOutcome ?? "-"} note=${level.seedNote ?? level.seedLastCause ?? "-"}`,
       );
+    }
+    for (const recenter of await context.store.listRecenters(job.quantJobId)) {
+      console.log(`  recenter ${recenter.seq} ${recenter.direction} ${recenter.fromGen}->${recenter.toGen}`
+        + ` block=${recenter.blockNumber} anchor=${recenter.newAnchorE18} reseed=${recenter.reseedScheduled}`);
     }
     for (const action of await context.store.listActions(job.quantJobId)) {
       const entry = await context.journal.get(action.journalKey);
@@ -248,6 +279,8 @@ async function commandStatus(args: Args, context: Context): Promise<void> {
         `  action ${action.side} L${action.levelIndex}#${action.actionSeq}`
         + ` ${action.state} journal=${entry?.state ?? "-"}`
         + ` amountIn=${action.amountInWei} minOut=${action.minOutWei}`
+        + ` gas_price_wei=${action.gasPriceWei ?? "-"} fee_est_wei=${action.feeEstWei ?? "-"}`
+        + ` fee_delta_wei=${action.feeDeltaWei ?? "-"} (unverified wallet-native delta via nativeBalanceAtHash @ receipt block)`
         + ` tx=${action.txHash ?? "-"} code=${action.failureCode ?? "-"}`,
       );
     }
@@ -296,11 +329,10 @@ async function commandPauseResume(args: Args, context: Context, paused: boolean)
   const jobId = requireFlag(args, "job");
   const job = await context.store.getJob(jobId);
   if (job === null) throw new Error("no such job.");
-  await context.store.setJobStatus({
-    quantJobId: jobId,
-    status: paused ? "paused" : (job.admittedAtMs === null ? "discovered" : "armed"),
-    nowMs: Date.now(),
-  });
+  const changed = paused
+    ? await context.store.pauseJob({ quantJobId: jobId, nowMs: Date.now() })
+    : await context.store.resumeJob({ quantJobId: jobId, nowMs: Date.now() });
+  if (!changed) throw new Error("the job status changed; reread it before trying again.");
   // The HONEST sentence: this is a server-side refusal. It stops INTENTS.
   // Reconciliation and the balance checks continue, and `resume` re-arms
   // nothing — levels keep their state (R2.5).
@@ -372,13 +404,12 @@ async function commandRetireLevel(args: Args, context: Context): Promise<void> {
   const publicClient = createPublicClient({
     chain: bsc, transport: fallback(context.config.rpcUrls.map((url) => http(url))),
   });
-  const { publicKeyToAddress } = await import("viem/accounts");
-  const { accountKeyHashForAddress } = await import("../src/wallet/altana.js");
   if (job.sessionPublicKey === null) throw new Error("the job has no admitted session key.");
-  const keyHash = accountKeyHashForAddress(publicKeyToAddress(job.sessionPublicKey));
+  const keyHash = keccak256(job.sessionPublicKey);
   const keyIsValid = await publicClient.readContract({
     address: getAddress(BNB.keyStore), abi: KEYSTORE_ABI, functionName: "isValidKey",
     args: [getAddress(job.tradingWallet), keyHash],
+    blockNumber: finalized.number,
   });
   const allowed = await retirementAllowed({
     action: blocking,
@@ -401,9 +432,15 @@ async function commandRetireLevel(args: Args, context: Context): Promise<void> {
   }
   const wallet = getAddress(job.tradingWallet);
   const [u, wbnb, native] = await Promise.all([
-    context.reader.tokenBalanceAt(context.config.u, wallet, finalized.number),
-    context.reader.tokenBalanceAt(context.config.wbnb, wallet, finalized.number),
-    context.reader.nativeBalanceAt(wallet, finalized.number),
+    context.reader.tokenBalanceAtHash === undefined
+      ? context.reader.tokenBalanceAt(context.config.u, wallet, finalized.number)
+      : context.reader.tokenBalanceAtHash(context.config.u, wallet, finalized.hash),
+    context.reader.tokenBalanceAtHash === undefined
+      ? context.reader.tokenBalanceAt(context.config.wbnb, wallet, finalized.number)
+      : context.reader.tokenBalanceAtHash(context.config.wbnb, wallet, finalized.hash),
+    context.reader.nativeBalanceAtHash === undefined
+      ? context.reader.nativeBalanceAt(wallet, finalized.number)
+      : context.reader.nativeBalanceAtHash(wallet, finalized.hash),
   ]);
   const level = (await context.store.listLevels(jobId))
     .find((row) => row.levelIndex === levelIndex);
@@ -428,6 +465,11 @@ async function commandRetireLevel(args: Args, context: Context): Promise<void> {
       baselineNativeWei: native,
       note: `retire-level:${levelIndex}`,
     },
+    journalKey: blocking.journalKey,
+    ...(level === undefined ? {} : {
+      expectedLevelRowVersion: level.rowVersion,
+      expectedState: level.state,
+    }),
     nowMs: Date.now(),
   });
   console.log(
@@ -449,16 +491,22 @@ async function commandAcknowledgeExternal(args: Args, context: Context): Promise
   if (job === null) throw new Error("no such job.");
   if (mode === "retire") {
     if (!yesLive(args)) { console.log("Rehearsal only. Pass --yes-live to stop the job."); return; }
-    await context.store.setJobStatus({ quantJobId: jobId, status: "paused", nowMs: Date.now() });
+    await context.store.pauseJob({ quantJobId: jobId, nowMs: Date.now() });
     console.log("job stopped: no new intents. Inventory stays in the client's wallet.");
     return;
   }
   const finalized = await context.reader.finalizedBlock();
   const wallet = getAddress(job.tradingWallet);
   const [u, wbnb, native] = await Promise.all([
-    context.reader.tokenBalanceAt(context.config.u, wallet, finalized.number),
-    context.reader.tokenBalanceAt(context.config.wbnb, wallet, finalized.number),
-    context.reader.nativeBalanceAt(wallet, finalized.number),
+    context.reader.tokenBalanceAtHash === undefined
+      ? context.reader.tokenBalanceAt(context.config.u, wallet, finalized.number)
+      : context.reader.tokenBalanceAtHash(context.config.u, wallet, finalized.hash),
+    context.reader.tokenBalanceAtHash === undefined
+      ? context.reader.tokenBalanceAt(context.config.wbnb, wallet, finalized.number)
+      : context.reader.tokenBalanceAtHash(context.config.wbnb, wallet, finalized.hash),
+    context.reader.nativeBalanceAtHash === undefined
+      ? context.reader.nativeBalanceAt(wallet, finalized.number)
+      : context.reader.nativeBalanceAtHash(wallet, finalized.hash),
   ]);
   console.log(
     `rebase at finalized block ${finalized.number}: U=${u} WBNB=${wbnb} native=${native}\n`
@@ -466,20 +514,16 @@ async function commandAcknowledgeExternal(args: Args, context: Context): Promise
     + "(R3.10); only the baseline the expected-balance check measures against moves.",
   );
   if (!yesLive(args)) { console.log("Rehearsal only. Pass --yes-live to open the epoch."); return; }
-  const epoch = await context.store.openEpoch({
+  const epoch = await context.store.acknowledgeExternal({
     quantJobId: jobId,
     startedBlock: finalized.number,
     startedBlockHash: finalized.hash,
     baselineUWei: u,
     baselineWbnbWei: wbnb,
     baselineNativeWei: native,
-    note: "acknowledge-external:rebase",
     nowMs: Date.now(),
   });
-  await context.store.setJobStatus({
-    quantJobId: jobId, status: "armed", holdCode: null, nowMs: Date.now(),
-  });
-  console.log(`epoch ${epoch.epoch} opened.`);
+  console.log(epoch.kind === "ok" ? `epoch ${epoch.record.epoch} opened; accounting restriction cleared.` : "refused: the accounting snapshot changed or the epoch is stale.");
 }
 
 async function commandReport(args: Args, context: Context): Promise<void> {
@@ -547,9 +591,9 @@ async function commandSelfTest(args: Args, context: Context): Promise<void> {
   if (allocationUWei < config.params.minClipUWei) {
     throw new Error("--allocation-u is below the minimum clip.");
   }
-  const termDays = Number(flagString(args, "term-days") ?? "2");
-  if (!Number.isInteger(termDays) || termDays < 1 || termDays > 7) {
-    throw new Error("--term-days must be an integer 1..7.");
+  const termDays = Number(flagString(args, "term-days") ?? "7");
+  if (termDays !== 7 && termDays !== 30) {
+    throw new Error("--term-days must be 7 or 30; self-test grants are capped at 30 days.");
   }
   if (existsSync(config.selfTestFile)) {
     throw new Error("The self-test file already exists; refusing to overwrite a job that may be live.");
@@ -565,28 +609,105 @@ async function commandSelfTest(args: Args, context: Context): Promise<void> {
 
   const nowSeconds = Math.floor(Date.now() / 1_000);
   const expiresAt = nowSeconds + termDays * 86_400;
-  const fee = config.params.relayFeePerSubmitWei;
   // Caps in the wizard's shape. U: the allocation (at most one day of buys).
   // WBNB: four times the worst-case base at the deepest level, so R5.4's
-  // chunk inequality is comfortably met. Native: twelve padded relay fees.
+  // chunk inequality is comfortably met. Native: twelve live fee estimates.
+  const finalized = await context.reader.finalizedBlock();
   const latest = await context.reader.latestBlockNumber();
-  const reserves = await context.reader.reservesAt(config.pair, latest);
+  const reserves = context.reader.reservesAtHash === undefined
+    ? await context.reader.reservesAt(config.pair, finalized.number)
+    : await context.reader.reservesAtHash(config.pair, finalized.hash);
+  if (reserves.blockHash !== undefined && reserves.blockHash.toLowerCase() !== finalized.hash.toLowerCase()) {
+    throw new Error("The finalized reserve read was not hash-consistent.");
+  }
   const wbnbIsToken0 = getAddress(reserves.token0) === getAddress(config.wbnb);
   const mid = midFromReserves(
     wbnbIsToken0 ? reserves.reserve1 : reserves.reserve0,
     wbnbIsToken0 ? reserves.reserve0 : reserves.reserve1,
   );
+  const reserveUWei = wbnbIsToken0 ? reserves.reserve1 : reserves.reserve0;
+  const paramsResult = admittedQuantParams(config.params, allocationUWei);
+  if (!("bandBps" in paramsResult)) {
+    throw new Error("Refusing rehearsal: allocation is below the first configured tier.");
+  }
+  const params = paramsResult;
+  let gasPriceWei: bigint;
+  try {
+    gasPriceWei = await context.reader.gasPriceWei();
+  } catch {
+    throw new Error("Refusing rehearsal: gas price is unavailable.");
+  }
+  if (gasPriceWei <= 0n) throw new Error("Refusing rehearsal: gas price is unavailable.");
+  if (gasPriceWei > 1_000n * 10n ** 9n) {
+    throw new Error("Refusing rehearsal: gas price is implausible.");
+  }
+  const fee = feeEstWei(params, gasPriceWei);
   // The REAL ladder (compounded, actual level count), not a linear guess.
-  const ladderResult = buildLadder({ allocationUWei, p0E18: mid, params: config.params });
+  const ladderResult = buildLadder({ allocationUWei, p0E18: mid, params });
   if (!ladderResult.ok) throw new Error(`The ladder cannot be built: ${ladderResult.code}.`);
   const ladder = ladderResult.ladder;
-  const deepest = ladder.buyPrice[ladder.levels] ?? 0n;
+  const deepest = ladder.minBuyPriceE18;
   if (deepest <= 0n) throw new Error("The ladder would reach a zero price; lower maxLevels or the band.");
   const worstBase = (ladder.clipUWei * 10n ** 18n) / deepest;
   const wbnbDayCapWei = worstBase * 4n;
-  const nativeDayCapWei = fee * 3n * 12n;
-  // The arm floor at impact 0 (the worker measures impact itself at arm).
-  const floor = armFloor({ clipUWei: ladder.clipUWei, midE18: mid, impactBps: 0n, params: config.params });
+  const nativeDayCapWei = fee * 12n;
+  const nativeBalance = context.reader.nativeBalanceAtHash === undefined
+    ? await context.reader.nativeBalanceAt(wallet.address, finalized.number)
+    : await context.reader.nativeBalanceAtHash(wallet.address, finalized.hash);
+  const quoteAtFinalized = async (amountInWei: bigint): Promise<bigint> =>
+    context.reader.quoteV2AtHash === undefined
+      ? context.reader.quoteV2At(config.router, [config.u, config.wbnb], amountInWei, finalized.number)
+      : context.reader.quoteV2AtHash(config.router, [config.u, config.wbnb], amountInWei, finalized.hash);
+  const probe = ladder.clipUWei / 100n;
+  const fullQuote = await quoteAtFinalized(ladder.clipUWei);
+  const probeQuote = probe <= 0n ? 0n : await quoteAtFinalized(probe);
+  const impactBps = probe <= 0n ? 0n : quantPriceImpactBps(fullQuote, probeQuote);
+  const floor = armFloor({
+    clipUWei: ladder.clipUWei, midE18: mid, impactBps, params,
+    gasPriceWei,
+  });
+  let seedQuoteOutWei: bigint | null = null;
+  let seedMinOutWei: bigint | null = null;
+  if (params.seedMode === "symmetric") {
+    seedMinOutWei = buyMinOut({
+      clipUWei: ladder.clipUWei, buyPriceE18: mid,
+      levelIndex: ladder.levels, actionSeq: 1, params,
+    });
+    seedQuoteOutWei = fullQuote;
+  }
+  const seedRequiredNativeWei = params.seedMode === "symmetric" && seedQuoteOutWei !== null
+    ? requiredNativeWei({
+      side: "buy", ownBaseWei: seedQuoteOutWei, otherLevels: [],
+      minCapLimitWei: wbnbDayCapWei, params, gasPriceWei,
+    })
+    : fee;
+  let maxExecutableClipWei = 0n;
+  if (params.seedMode === "symmetric") {
+    const clears = async (clipWei: bigint): Promise<boolean> => {
+      if (clipWei <= 0n) return false;
+      try {
+        const quote = await quoteAtFinalized(clipWei);
+        const minimum = buyMinOut({
+          clipUWei: clipWei, buyPriceE18: mid, levelIndex: ladder.levels,
+          actionSeq: 1, params,
+        });
+        return quote >= minimum;
+      } catch {
+        return false;
+      }
+    };
+    let low = 0n;
+    let high = reserveUWei;
+    if (await clears(params.minClipUWei)) {
+      low = params.minClipUWei;
+      while (low < high) {
+        const middle = (low + high + 1n) / 2n;
+        if (await clears(middle)) low = middle;
+        else high = middle - 1n;
+      }
+      maxExecutableClipWei = low;
+    }
+  }
   const spec = quantSelfTestSessionSpec({
     router: config.router, u: config.u, wbnb: config.wbnb,
     uDayCapWei: allocationUWei, wbnbDayCapWei, nativeDayCapWei,
@@ -617,7 +738,8 @@ async function commandSelfTest(args: Args, context: Context): Promise<void> {
   const admission = assertQuantSessionAdmissible({
     session: rehearsal.session, spec: projection.spec,
     job: { tradingWalletAddress: wallet.address, sessionExpiresAtMs: expiresAt * 1_000 },
-    router: config.router, u: config.u, wbnb: config.wbnb, params: config.params,
+    router: config.router, u: config.u, wbnb: config.wbnb, params,
+    gasPriceWei,
     ladder: { ...ladder, midE18: mid }, nowSeconds,
   });
   console.log(
@@ -625,15 +747,38 @@ async function commandSelfTest(args: Args, context: Context): Promise<void> {
     + `  wallet:      ${wallet.address}\n`
     + `  allocation:  ${allocationU} U · daily cap ${allocationU} U · term ${termDays} d\n`
     + `  mid:         ${mid.toString(10)} (U wei per WBNB)\n`
+    + `  blocks:      finalized ${finalized.number} latest ${latest} lag ${latest - finalized.number}\n`
     + `  caps/day:    U ${allocationUWei.toString(10)} · WBNB ${wbnbDayCapWei.toString(10)} · native ${nativeDayCapWei.toString(10)} wei\n`
     + `  ladder:      ${ladder.levels} level(s), clip ${ladder.clipUWei.toString(10)} U wei, buy[1] ${(ladder.buyPrice[1] ?? 0n).toString(10)}, sell[1] ${(ladder.sellPrice[1] ?? 0n).toString(10)}\n`
-    + `  arm floor:   required ${floor.requiredBps} bps (gas ${floor.gasBps}) vs band ${config.params.bandBps} → ${floor.economic ? "economic" : "NOT economic"}\n`
+    + `  native gate: balance ${nativeBalance.toString(10)} vs seed required ${seedRequiredNativeWei.toString(10)} wei\n`
+    + (seedQuoteOutWei === null ? "" : `  seed quote:   ${seedQuoteOutWei} vs tagged minOut ${seedMinOutWei}\n`)
+    + `  tier:        ${params.bandBps} bps (bandTiers=${params.bandTiers})\n`
+    + `  gas price:   ${gasPriceWei} wei (${formatGwei(gasPriceWei)} gwei)\n`
+    + `  feeEst:      ${fee} wei\n`
+    + `  max clip:    ${maxExecutableClipWei} U wei (quote-based tagged boundary)\n`
+    + `  params:      seed=${params.seedMode} recenter=${params.recenterMode} digest=${config.paramsDigest}\n`
+    + `  cells:       ${ladder.levels} (lower ${ladder.lowerLevels}, upper ${ladder.upperLevels})\n`
+    + `  recenter:    budget ${Math.ceil(termDays / params.recenterBudgetDays)} / cooldown ${params.recenterCooldownSec}s\n`
+    + "  gate-1:      ARMED -> seed pending -> SEED SETTLED; FAILED<=3; PENDING<=30; UNKNOWN/converted/term-end=STOP\n"
+    + `  impact:      ${impactBps} bps\n`
+    + `  arm floor:   required ${floor.requiredBps} bps (gas ${floor.gasBps}) vs band ${params.bandBps} → ${floor.economic ? "economic" : "NOT economic"}\n`
+    + `  seed reserve: ${seedRequiredNativeWei} wei; native balance ${nativeBalance}; shortfall ${nativeBalance >= seedRequiredNativeWei ? 0n : seedRequiredNativeWei - nativeBalance}\n`
     + `  admission:   ${admission.ok ? "ADMISSIBLE" : `REFUSED ${admission.code}`}\n`
     + `  file:        ${config.selfTestFile}\n`
     + `  job id:      ${jobId}`,
   );
   if (!floor.economic) throw new Error("Refusing to grant: the arm floor is not economic at this mid.");
   if (!admission.ok) throw new Error(`Refusing to grant: the session would not be admitted (${admission.code}).`);
+  if (latest < finalized.number
+    || latest - finalized.number > BigInt(Math.floor(config.params.maxQuoteLagBlocks / 2))) {
+    throw new Error("Refusing gate 1: latest-finalized lag exceeds half the configured quote lag.");
+  }
+  if (nativeBalance < seedRequiredNativeWei) {
+    throw new Error("Refusing gate 1: task wallet native balance is below the first-seed reservation.");
+  }
+  if (seedQuoteOutWei !== null && seedMinOutWei !== null && seedQuoteOutWei < seedMinOutWei) {
+    throw new Error("Refusing gate 1: the seed quote does not clear its P0-anchored tagged minimum.");
+  }
   if (!yesLive(args)) { console.log("Rehearsal only. Pass --yes-live to grant."); return; }
 
   // R4: claim the file EXCLUSIVELY before any gas is spent.
@@ -711,7 +856,7 @@ function commandHelp(): void {
     + "  acknowledge-external --job <id> --mode rebase|retire [--yes-live]\n"
     + "  report --job <id> [--yes-live]\n"
     + "  seal --recipient <b64> --in <f> --out <f>\n"
-    + "  self-test --allocation-u <U> [--term-days 2] [--yes-live]  gate 1: grant + seal into QUANT_SELF_TEST_FILE\n",
+    + "  self-test --allocation-u <U> [--term-days 7] [--yes-live]  gate 1: grant + seal into QUANT_SELF_TEST_FILE\n",
   );
 }
 

@@ -34,27 +34,39 @@
  * journal row stays UNKNOWN with `quant_actions.resolution_json` as the record,
  * and `status` shows both.
  */
-import { getAddress, type Address, type Hex } from "viem";
+import { getAddress, keccak256, stringToHex, type Address, type Hex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import { accountKeyHashForAddress } from "../wallet/altana.js";
 import type { ExecutionJournal, JournalEntry } from "../store/journal.js";
 import type {
   QuantActionRow,
+  QuantEpochRow,
   QuantJobRow,
   QuantJobStore,
 } from "../store/quantJobs.js";
 import type { WalletProvider, WalletCall } from "../core/types.js";
 import type { QuantChainReader } from "./readers.js";
 import { verifyQuantFill, type VerifiedFill } from "./receipt.js";
-import { ceilDiv, DUST_WEI, feeEstInU, partitionExit } from "./grid.js";
-import type { QuantStrategyParams } from "./config.js";
+import {
+  exitShares, historicalFeeEstInU, partitionExit,
+} from "./grid.js";
+import {
+  bandBpsForAllocation,
+  b2ScalarParamsDigest,
+  canonicalQuantBandTiers,
+  parseQuantBandTiers,
+  quantParamsDigest,
+  type QuantAdmittedParams,
+  type QuantHistoricalParams,
+  type QuantStrategyParams,
+} from "./config.js";
 
 export type QuantReconcileDeps = {
   readonly store: QuantJobStore;
   readonly journal: ExecutionJournal;
   readonly provider: WalletProvider;
   readonly reader: QuantChainReader;
-  readonly params: QuantStrategyParams;
+  readonly params: QuantStrategyParams | QuantHistoricalParams;
   readonly venue: {
     readonly router: Address;
     readonly u: Address;
@@ -71,6 +83,193 @@ export type QuantReconcileOutcome = {
   readonly settled: boolean;
   readonly released: boolean;
 };
+
+export type QuantAccountingClassification = "non-entry" | "covered" | "unresolved" | "out-of-scope";
+
+export type QuantExecutionInterval = {
+  readonly kind: "covered" | "unresolved" | "out-of-scope" | "structure";
+  readonly lower: bigint | null;
+  readonly upper: bigint | null;
+  /** Equality at the epoch timestamp stays unresolved but has no applied hypothesis. */
+  readonly emptyUnresolved?: boolean;
+};
+
+/** R13.1's half-open/closed interval normalization, before subset enumeration. */
+export function normalizeExecutionInterval(input: {
+  readonly action: QuantActionRow;
+  readonly epochBlock: bigint;
+  readonly epochTimestampSec?: bigint;
+  readonly observationBlock: bigint;
+  readonly deadlineBlock?: bigint;
+  readonly ancestorCanonical?: boolean;
+}): QuantExecutionInterval {
+  if (input.action.state === "intended") return { kind: "covered", lower: null, upper: null };
+  if (input.action.submitFinalizedNumber === null || input.action.submitFinalizedHash === null) {
+    return { kind: "structure", lower: null, upper: null };
+  }
+  if (input.ancestorCanonical === false) return { kind: "structure", lower: null, upper: null };
+  if (input.action.submitFinalizedNumber >= input.observationBlock) {
+    return { kind: "out-of-scope", lower: null, upper: null };
+  }
+  const lower = input.action.submitFinalizedNumber > input.epochBlock
+    ? input.action.submitFinalizedNumber : input.epochBlock;
+  const deadline = input.deadlineBlock ?? input.observationBlock;
+  const upper = deadline < input.observationBlock ? deadline : input.observationBlock;
+  if (lower >= upper) {
+    // R13.1 keeps deadline equality conservative. The interval is empty for
+    // enumeration, but the action is not reclassified as proven covered
+    // merely because the two timestamps happen to compare equal.
+    if (input.epochTimestampSec !== undefined
+      && BigInt(input.action.deadlineSec) === input.epochTimestampSec
+      && input.action.submitFinalizedNumber < input.observationBlock) {
+      return { kind: "unresolved", lower, upper, emptyUnresolved: true };
+    }
+    return { kind: "out-of-scope", lower, upper };
+  }
+  return { kind: "unresolved", lower, upper };
+}
+
+export type QuantAccountingVerdict = {
+  readonly admissible: boolean;
+  readonly expectedUWei: bigint;
+  readonly expectedWbnbWei: bigint;
+  readonly pending: readonly string[];
+  readonly classification: ReadonlyMap<string, QuantAccountingClassification>;
+  readonly reason?: "reconcile-structure" | "reconcile-stale";
+};
+
+/**
+ * R12/R13's unresolved-action accounting, kept pure so the memory and PG
+ * workers consume the same subset enumeration. Inputs are already canonical
+ * reads; this function never guesses from a quote or from a journal timeout.
+ */
+export function reconcileAccounting(input: {
+  readonly epoch: QuantEpochRow;
+  readonly epochTimestampSec: bigint;
+  readonly observationBlock: bigint;
+  readonly observationAtSec: bigint;
+  readonly actualUWei: bigint;
+  readonly actualWbnbWei: bigint;
+  readonly actions: readonly QuantActionRow[];
+  readonly maxPending?: number;
+  readonly deadlineBlocks?: ReadonlyMap<string, bigint>;
+  readonly canonicalAncestors?: ReadonlyMap<string, boolean>;
+  readonly dustWei?: bigint;
+}): QuantAccountingVerdict {
+  const dust = input.dustWei ?? 1_000_000_000_000n;
+  const classification = new Map<string, QuantAccountingClassification>();
+  const pending: QuantActionRow[] = [];
+  let expectedUWei = input.epoch.baselineUWei;
+  let expectedWbnbWei = input.epoch.baselineWbnbWei;
+  for (const action of input.actions) {
+    if (action.state === "settled" && (action.fillInWei === null || action.fillOutWei === null
+      || action.executedBlock === null || action.executedAtSec === null)) {
+      return {
+        admissible: false, expectedUWei, expectedWbnbWei,
+        pending: pending.map((row) => row.journalKey), classification,
+        reason: "reconcile-structure",
+      };
+    }
+    if (action.state === "settled" && action.executedBlock !== null
+      && action.executedBlock > input.epoch.startedBlock
+      && action.executedBlock <= input.observationBlock
+      && action.fillInWei !== null && action.fillOutWei !== null) {
+      if (action.side === "buy") {
+        expectedUWei -= action.fillInWei;
+        expectedWbnbWei += action.fillOutWei;
+      } else {
+        expectedUWei += action.fillOutWei;
+        expectedWbnbWei -= action.fillInWei;
+      }
+      continue;
+    }
+    if (action.state === "intended") {
+      classification.set(action.journalKey, "non-entry");
+      continue;
+    }
+    if (action.state === "settled" || action.state === "failed" || action.state === "aborted") continue;
+    if (action.submitFinalizedNumber === null || action.submitFinalizedHash === null) {
+      classification.set(action.journalKey, "unresolved");
+      return {
+        admissible: false, expectedUWei, expectedWbnbWei,
+        pending: pending.map((row) => row.journalKey), classification,
+        reason: "reconcile-structure",
+      };
+    }
+    const interval = normalizeExecutionInterval({
+      action, epochBlock: input.epoch.startedBlock,
+      epochTimestampSec: input.epochTimestampSec,
+      observationBlock: input.observationBlock,
+      ...(input.deadlineBlocks?.get(action.journalKey) === undefined ? {} : {
+        deadlineBlock: input.deadlineBlocks.get(action.journalKey)!,
+      }),
+      ...(input.canonicalAncestors?.get(action.journalKey) === undefined ? {} : {
+        ancestorCanonical: input.canonicalAncestors.get(action.journalKey)!,
+      }),
+    });
+    if (interval.kind === "structure") {
+      return {
+        admissible: false, expectedUWei, expectedWbnbWei,
+        pending: pending.map((row) => row.journalKey), classification,
+        reason: "reconcile-structure",
+      };
+    }
+    if (interval.kind === "out-of-scope") {
+      classification.set(action.journalKey,
+        action.submitFinalizedNumber >= input.observationBlock
+          ? "out-of-scope"
+          : BigInt(action.deadlineSec) < input.epochTimestampSec ? "covered" : "out-of-scope");
+      continue;
+    }
+    const deadlineAtEpoch = BigInt(action.deadlineSec) < input.epochTimestampSec;
+    if (deadlineAtEpoch) {
+      classification.set(action.journalKey, "covered");
+      continue;
+    }
+    classification.set(action.journalKey, "unresolved");
+    pending.push(action);
+  }
+  const maxPending = input.maxPending ?? 3;
+  const nonTerminal = input.actions.filter((action) =>
+    action.state !== "settled" && action.state !== "failed" && action.state !== "aborted");
+  if (nonTerminal.length > maxPending || pending.length > maxPending) {
+    return { admissible: false, expectedUWei, expectedWbnbWei, pending: pending.map((a) => a.journalKey), classification, reason: "reconcile-structure" };
+  }
+  const subsetCount = 1 << pending.length;
+  for (let mask = 0; mask < subsetCount; mask += 1) {
+    let uLow = expectedUWei;
+    let wLow = expectedWbnbWei;
+    let uExact = true;
+    let wExact = true;
+    for (let index = 0; index < pending.length; index += 1) {
+      if ((mask & (1 << index)) === 0) continue;
+      const action = pending[index]!;
+      if (action.side === "buy") {
+        uLow -= action.amountInWei;
+        wLow += action.minOutWei;
+        wExact = false;
+      } else {
+        uLow += action.minOutWei;
+        wLow -= action.amountInWei;
+        uExact = false;
+      }
+    }
+    const uOk = uExact ? abs(input.actualUWei - uLow) <= dust : input.actualUWei >= uLow - dust;
+    const wOk = wExact ? abs(input.actualWbnbWei - wLow) <= dust : input.actualWbnbWei >= wLow - dust;
+    if (uOk && wOk) return {
+      admissible: true, expectedUWei, expectedWbnbWei,
+      pending: pending.map((a) => a.journalKey), classification,
+    };
+  }
+  return {
+    admissible: false, expectedUWei, expectedWbnbWei,
+    pending: pending.map((a) => a.journalKey), classification,
+  };
+}
+
+function abs(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
 
 /** Two full submit windows plus margin, the journal's own guard, restated. */
 const SUBMIT_TIMEOUT_MS = 45_000;
@@ -118,6 +317,27 @@ export async function verifyAndSettle(
     && receipt.blockNumber < action.submitFinalizedNumber) {
     return { ok: false, code: "receipt-before-anchor" };
   }
+  if (action.submitFinalizedNumber === null || action.submitFinalizedHash === null) {
+    return { ok: false, code: "ancestor-missing" };
+  }
+  let receiptBlock: { readonly number: bigint; readonly hash: Hex; readonly timestampSec: bigint } | undefined;
+  if (deps.reader.reservesAtHash !== undefined
+    && typeof deps.reader.finalizedBlock === "function" && typeof deps.reader.blockAt === "function") {
+    const finalized = await deps.reader.finalizedBlock();
+    if (receipt.blockNumber > finalized.number) return { ok: false, code: "receipt-unfinalized" };
+    const ancestorBlock = await deps.reader.blockAt(action.submitFinalizedNumber);
+    receiptBlock = await deps.reader.blockAt(receipt.blockNumber);
+    if (receiptBlock.hash.toLowerCase() !== receipt.blockHash.toLowerCase()
+      || receiptBlock.hash.toLowerCase() !== transaction.blockHash.toLowerCase()) {
+      return { ok: false, code: "receipt-noncanonical" };
+    }
+    if (ancestorBlock.hash.toLowerCase() !== action.submitFinalizedHash.toLowerCase()) {
+      return { ok: false, code: "ancestor-noncanonical" };
+    }
+    if (receiptBlock.timestampSec > BigInt(action.deadlineSec)) {
+      return { ok: false, code: "receipt-after-deadline" };
+    }
+  }
   let calls: readonly WalletCall[];
   try {
     calls = parseCalls(action.callsJson);
@@ -138,8 +358,246 @@ export async function verifyAndSettle(
     minOutWei: action.minOutWei,
   });
   if (!verdict.ok) return { ok: false, code: verdict.code };
-  const settled = await settleVerified(deps, job, action, verdict.fill);
+  const params = admittedParams(job, deps.params);
+  if (params === null) return { ok: false, code: "params-unreadable" };
+  if (isR14Params(params)
+    && (action.feeEstWei === null || action.gasPriceWei === null
+      || action.feeEstWei <= 0n || action.gasPriceWei <= 0n)) {
+    return { ok: false, code: "params-unreadable" };
+  }
+  const feeDeltaWei = await settlementFeeDelta(deps, job, action, receiptBlock);
+  const settled = await settleVerified(
+    deps, job, action, verdict.fill, params, receiptBlock, feeDeltaWei,
+  );
   return settled ? { ok: true, fill: verdict.fill } : { ok: false, code: "settle-conflict" };
+}
+
+const LEGACY_REQUIRED_KEYS = [
+  "strategyVersion", "bandBps", "maxLevels", "minClipUWei", "minNetEdgeBps",
+  "entryTolBps", "exitTolBps", "maxImpactBps", "cooldownSec",
+  "maxQuoteLagBlocks", "relayFeePerSubmitWei",
+] as const;
+
+const B2_REQUIRED_KEYS = [
+  "strategyVersion", "seedMode", "seedWindowCycles", "bandBps", "maxLevels",
+  "minClipUWei", "minNetEdgeBps", "entryTolBps", "exitTolBps", "maxImpactBps",
+  "cooldownSec", "maxQuoteLagBlocks", "relayFeePerSubmitWei", "recenterMode",
+  "recenterCooldownSec", "recenterBudgetDays", "minTermDays",
+] as const;
+
+const R14_REQUIRED_KEYS = [
+  "paramsSchema", "strategyVersion", "seedMode", "seedWindowCycles", "bandTiers",
+  "bandBps", "maxLevels", "minClipUWei", "minNetEdgeBps", "entryTolBps",
+  "exitTolBps", "maxImpactBps", "cooldownSec", "maxQuoteLagBlocks",
+  "relayFeePerSubmitWei", "relayGasUnits", "relayFeePadBps", "recenterMode",
+  "recenterCooldownSec", "recenterBudgetDays", "minTermDays",
+] as const;
+
+const R14_ONLY_KEYS = ["paramsSchema", "bandTiers", "relayGasUnits", "relayFeePadBps"] as const;
+const B2_ONLY_KEYS = [
+  "seedMode", "seedWindowCycles", "recenterMode", "recenterCooldownSec",
+  "recenterBudgetDays", "minTermDays",
+] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasAny(raw: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.some((key) => key in raw);
+}
+
+function historicalNumber(raw: Record<string, unknown>, key: string): number | null {
+  const value = raw[key];
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+}
+
+function historicalBigint(raw: Record<string, unknown>, key: string): bigint | null {
+  const value = raw[key];
+  if (typeof value === "string" && /^[0-9]+$/u.test(value)) return BigInt(value);
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  return null;
+}
+
+function allKeysPresent(raw: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.every((key) => key in raw);
+}
+
+function parseHistoricalParams(raw: Record<string, unknown>): QuantHistoricalParams | null {
+  if (!allKeysPresent(raw, LEGACY_REQUIRED_KEYS)) return null;
+  const strategyVersion = raw["strategyVersion"];
+  const bandBps = historicalNumber(raw, "bandBps");
+  const maxLevels = historicalNumber(raw, "maxLevels");
+  const minClipUWei = historicalBigint(raw, "minClipUWei");
+  const minNetEdgeBps = historicalNumber(raw, "minNetEdgeBps");
+  const entryTolBps = historicalNumber(raw, "entryTolBps");
+  const exitTolBps = historicalNumber(raw, "exitTolBps");
+  const maxImpactBps = historicalNumber(raw, "maxImpactBps");
+  const cooldownSec = historicalNumber(raw, "cooldownSec");
+  const maxQuoteLagBlocks = historicalNumber(raw, "maxQuoteLagBlocks");
+  const relayFeePerSubmitWei = historicalBigint(raw, "relayFeePerSubmitWei");
+  if (typeof strategyVersion !== "string" || bandBps === null || maxLevels === null
+    || minClipUWei === null || minNetEdgeBps === null || entryTolBps === null
+    || exitTolBps === null || maxImpactBps === null || cooldownSec === null
+    || maxQuoteLagBlocks === null || relayFeePerSubmitWei === null) return null;
+  return {
+    strategyVersion: strategyVersion as QuantHistoricalParams["strategyVersion"],
+    seedMode: "none", seedWindowCycles: 9, bandBps, maxLevels, minClipUWei,
+    minNetEdgeBps, entryTolBps, exitTolBps, maxImpactBps, cooldownSec,
+    maxQuoteLagBlocks, relayFeePerSubmitWei, recenterMode: "none",
+    recenterCooldownSec: 86_400, recenterBudgetDays: 1, minTermDays: 7,
+  };
+}
+
+function parseB2Params(raw: Record<string, unknown>): QuantHistoricalParams | null {
+  if (!allKeysPresent(raw, B2_REQUIRED_KEYS)) return null;
+  const parsed = parseHistoricalParams(raw);
+  if (parsed === null) return null;
+  const seedMode = raw["seedMode"];
+  const seedWindowCycles = historicalNumber(raw, "seedWindowCycles");
+  const recenterMode = raw["recenterMode"];
+  const recenterCooldownSec = historicalNumber(raw, "recenterCooldownSec");
+  const recenterBudgetDays = historicalNumber(raw, "recenterBudgetDays");
+  const minTermDays = historicalNumber(raw, "minTermDays");
+  if ((seedMode !== "none" && seedMode !== "symmetric")
+    || seedWindowCycles === null || recenterMode !== "none" && recenterMode !== "both"
+    || recenterCooldownSec === null || recenterBudgetDays === null || minTermDays === null) {
+    return null;
+  }
+  return {
+    ...parsed, seedMode, seedWindowCycles, recenterMode,
+    recenterCooldownSec, recenterBudgetDays, minTermDays,
+  };
+}
+
+function parseR14Params(
+  raw: Record<string, unknown>, job: QuantJobRow,
+): QuantAdmittedParams | null {
+  if (raw["paramsSchema"] !== "r14" || !allKeysPresent(raw, R14_REQUIRED_KEYS)) return null;
+  const seedMode = raw["seedMode"];
+  const recenterMode = raw["recenterMode"];
+  const bandTiers = raw["bandTiers"];
+  const bandBps = historicalNumber(raw, "bandBps");
+  const seedWindowCycles = historicalNumber(raw, "seedWindowCycles");
+  const maxLevels = historicalNumber(raw, "maxLevels");
+  const minClipUWei = historicalBigint(raw, "minClipUWei");
+  const minNetEdgeBps = historicalNumber(raw, "minNetEdgeBps");
+  const entryTolBps = historicalNumber(raw, "entryTolBps");
+  const exitTolBps = historicalNumber(raw, "exitTolBps");
+  const maxImpactBps = historicalNumber(raw, "maxImpactBps");
+  const cooldownSec = historicalNumber(raw, "cooldownSec");
+  const maxQuoteLagBlocks = historicalNumber(raw, "maxQuoteLagBlocks");
+  const relayFeePerSubmitWei = historicalBigint(raw, "relayFeePerSubmitWei");
+  const relayGasUnits = historicalBigint(raw, "relayGasUnits");
+  const relayFeePadBps = historicalBigint(raw, "relayFeePadBps");
+  const recenterCooldownSec = historicalNumber(raw, "recenterCooldownSec");
+  const recenterBudgetDays = historicalNumber(raw, "recenterBudgetDays");
+  const minTermDays = historicalNumber(raw, "minTermDays");
+  if ((seedMode !== "none" && seedMode !== "symmetric")
+    || (recenterMode !== "none" && recenterMode !== "both")
+    || typeof bandTiers !== "string" || bandBps === null || seedWindowCycles === null
+    || maxLevels === null || minClipUWei === null || minNetEdgeBps === null
+    || entryTolBps === null || exitTolBps === null || maxImpactBps === null
+    || cooldownSec === null || maxQuoteLagBlocks === null || relayFeePerSubmitWei === null
+    || relayGasUnits === null || relayFeePadBps === null || recenterCooldownSec === null
+    || recenterBudgetDays === null || minTermDays === null) return null;
+  let canonicalTiers: string;
+  try {
+    canonicalTiers = canonicalQuantBandTiers(parseQuantBandTiers(bandTiers));
+  } catch {
+    return null;
+  }
+  if (canonicalTiers !== bandTiers) return null;
+  if (raw["strategyVersion"] !== "grid-v2-quant:1"
+    || seedWindowCycles < 3 || seedWindowCycles > 30
+    || maxLevels < (seedMode === "symmetric" ? 2 : 1)
+    || maxLevels > (seedMode === "symmetric" ? 3 : 5)
+    || minClipUWei < 5n * 10n ** 18n
+    || minNetEdgeBps < 25 || minNetEdgeBps > 500
+    || entryTolBps < 10 || entryTolBps > 300
+    || exitTolBps < 10 || exitTolBps > 300
+    || maxImpactBps < 5 || maxImpactBps > 300
+    || cooldownSec < 60 || cooldownSec > 86_400
+    || maxQuoteLagBlocks < 1 || maxQuoteLagBlocks > 200
+    || relayFeePerSubmitWei < 10_000_000_000_000n
+    || relayFeePerSubmitWei > 10_000_000_000_000_000n
+    || relayGasUnits < 200_000n || relayGasUnits > 1_000_000n
+    || relayFeePadBps < 10_000n || relayFeePadBps > 30_000n
+    || recenterCooldownSec < 86_400 || recenterCooldownSec > 604_800
+    || recenterBudgetDays < 1 || recenterBudgetDays > 90
+    || minTermDays < 7 || minTermDays > 90
+    || recenterMode === "both" && seedMode !== "symmetric") return null;
+  const fixedFloor = 50 + entryTolBps + exitTolBps + minNetEdgeBps;
+  const parsedTiers = parseQuantBandTiers(bandTiers);
+  if (parsedTiers.some((tier) => tier.bandBps <= fixedFloor)
+    || parsedTiers[0]!.minAllocationUWei < (seedMode === "symmetric"
+      ? 2n * minClipUWei : minClipUWei)) return null;
+  const params: QuantAdmittedParams = {
+    paramsSchema: "r14", strategyVersion: raw["strategyVersion"] as QuantAdmittedParams["strategyVersion"],
+    seedMode, seedWindowCycles, bandTiers, bandBps, maxLevels, minClipUWei,
+    minNetEdgeBps, entryTolBps, exitTolBps, maxImpactBps, cooldownSec,
+    maxQuoteLagBlocks, relayFeePerSubmitWei, relayGasUnits, relayFeePadBps,
+    recenterMode, recenterCooldownSec, recenterBudgetDays, minTermDays,
+  };
+  if (typeof raw["strategyVersion"] !== "string"
+    || quantParamsDigest(params).toLowerCase() !== job.paramsDigest?.toLowerCase()) return null;
+  const selected = bandBpsForAllocation(params, job.allocationUWei);
+  if (!selected.ok || selected.bandBps !== bandBps) return null;
+  return params;
+}
+
+export function admittedParams(
+  job: QuantJobRow, _fallback: QuantStrategyParams | QuantHistoricalParams,
+): QuantAdmittedParams | QuantHistoricalParams | null {
+  if (job.paramsJson === null || job.paramsDigest === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(job.paramsJson);
+    if (!isRecord(parsed)) return null;
+    const raw = parsed;
+    if (hasAny(raw, R14_ONLY_KEYS)) return parseR14Params(raw, job);
+    if (hasAny(raw, B2_ONLY_KEYS)) {
+      const params = parseB2Params(raw);
+      return params !== null && b2ScalarParamsDigest(params).toLowerCase() === job.paramsDigest.toLowerCase()
+        ? params : null;
+    }
+    const params = parseHistoricalParams(raw);
+    return params !== null && legacyParamsDigest(raw).toLowerCase() === job.paramsDigest.toLowerCase()
+      ? params : null;
+  } catch {
+    return null;
+  }
+}
+
+function isR14Params(params: QuantAdmittedParams | QuantHistoricalParams): params is QuantAdmittedParams {
+  return "bandTiers" in params;
+}
+
+async function settlementFeeDelta(
+  deps: QuantReconcileDeps,
+  job: QuantJobRow,
+  action: QuantActionRow,
+  receiptBlock: { readonly number: bigint; readonly hash: Hex; readonly timestampSec: bigint } | undefined,
+): Promise<bigint | null> {
+  if (action.preNativeWei <= 0n || receiptBlock === undefined
+    || deps.reader.nativeBalanceAtHash === undefined) return null;
+  try {
+    const after = await deps.reader.nativeBalanceAtHash(job.tradingWallet, receiptBlock.hash);
+    return action.preNativeWei - after;
+  } catch {
+    return null;
+  }
+}
+
+function legacyParamsDigest(raw: Record<string, unknown>): Hex {
+  return keccak256(stringToHex(JSON.stringify({
+    strategyVersion: String(raw["strategyVersion"]),
+    bandBps: Number(raw["bandBps"]), maxLevels: Number(raw["maxLevels"]),
+    minClipUWei: String(raw["minClipUWei"]), minNetEdgeBps: Number(raw["minNetEdgeBps"]),
+    entryTolBps: Number(raw["entryTolBps"]), exitTolBps: Number(raw["exitTolBps"]),
+    maxImpactBps: Number(raw["maxImpactBps"]), cooldownSec: Number(raw["cooldownSec"]),
+    maxQuoteLagBlocks: Number(raw["maxQuoteLagBlocks"]),
+    relayFeePerSubmitWei: String(raw["relayFeePerSubmitWei"]),
+  })));
 }
 
 /** The account key hash for the job's ADMITTED public key. No key is opened. */
@@ -157,6 +615,9 @@ async function settleVerified(
   job: QuantJobRow,
   action: QuantActionRow,
   fill: VerifiedFill,
+  params: QuantAdmittedParams | QuantHistoricalParams,
+  finalized?: { readonly number: bigint; readonly hash: Hex; readonly timestampSec: bigint },
+  feeDeltaWei: bigint | null = null,
 ): Promise<boolean> {
   const levels = await deps.store.listLevels(job.quantJobId);
   const level = levels.find((row) => row.levelIndex === action.levelIndex);
@@ -169,7 +630,9 @@ async function settleVerified(
     const midE18 = fill.fillOutWei === 0n
       ? 0n
       : (fill.fillInWei * 10n ** 18n) / fill.fillOutWei;
-    const entryCostUWei = feeEstInU(deps.params, midE18);
+    const entryCostUWei = isR14Params(params)
+      ? (action.feeEstWei! * midE18) / 10n ** 18n
+      : historicalFeeEstInU(params, midE18);
     const plan = job.wbnbCapMinLimitWei > 0n
       ? partitionExit(fill.fillOutWei, job.wbnbCapMinLimitWei)
       : [fill.fillOutWei];
@@ -181,7 +644,7 @@ async function settleVerified(
       swapLogIndex: fill.swapLogIndex,
       fillInWei: fill.fillInWei,
       fillOutWei: fill.fillOutWei,
-      feeDeltaWei: null,
+      feeDeltaWei,
       entryCostUWei,
       nextLevelState: "holding-base",
       nextBaseWei: fill.fillOutWei,
@@ -190,6 +653,8 @@ async function settleVerified(
       cyclesClosedDelta: 0,
       realizedDeltaUWei: 0n,
       residualDeltaWei: 0n,
+      executedBlock: finalized?.number ?? fill.blockNumber,
+      executedAtSec: finalized?.timestampSec ?? null,
       // BC29: the plan is a SNAPSHOT of the partition, not of the floors. Every
       // chunk's floor is recomputed with the CURRENT fee valuation before every
       // intent, so a stale valuation can never admit a sell that no longer
@@ -205,13 +670,23 @@ async function settleVerified(
   const remaining = level.baseWei > action.amountInWei
     ? level.baseWei - action.amountInWei
     : 0n;
-  const closes = remaining < DUST_WEI;
+  let shares: ReturnType<typeof exitShares>;
+  try {
+    shares = exitShares({
+      amountWei: action.amountInWei,
+      baseWei: level.baseWei,
+      baseAtCycleStartWei: level.baseAtCycleStartWei || level.baseWei,
+      basisUWei: level.basisUWei,
+      entryCostUWei: level.entryCostUWei,
+    });
+  } catch {
+    return false;
+  }
+  const closes = shares.closes;
   // The realized delta is the cycle's PROCEEDS minus the share of basis this
   // chunk carried. The final chunk carries the rounding residual, so the sum of
   // the shares equals the basis exactly (R4.4).
-  const basisShare = closes
-    ? level.basisUWei
-    : ceilDiv(level.basisUWei * action.amountInWei, level.baseAtCycleStartWei || 1n);
+  const basisShare = shares.basisShareUWei;
   const result = await deps.store.settleAction({
     journalKey: action.journalKey,
     quantJobId: job.quantJobId,
@@ -220,7 +695,7 @@ async function settleVerified(
     swapLogIndex: fill.swapLogIndex,
     fillInWei: fill.fillInWei,
     fillOutWei: fill.fillOutWei,
-    feeDeltaWei: null,
+    feeDeltaWei,
     entryCostUWei: closes ? 0n : level.entryCostUWei,
     nextLevelState: closes ? "armed-quote" : "holding-base",
     nextBaseWei: closes ? 0n : remaining,
@@ -231,6 +706,8 @@ async function settleVerified(
     // A cycle that closes with an unsold remainder records it as RESIDUAL, and
     // the level keeps it as unattributed inventory (R7.2). Nothing is dropped.
     residualDeltaWei: closes ? remaining : 0n,
+    executedBlock: finalized?.number ?? fill.blockNumber,
+    executedAtSec: finalized?.timestampSec ?? null,
     exitPlanJson: closes ? null : level.exitPlanJson,
     nowMs,
   });

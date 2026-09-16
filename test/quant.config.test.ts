@@ -11,6 +11,8 @@ import { describe, it } from "node:test";
 
 import {
   feeEstWei,
+  admittedQuantParams,
+  parseQuantBandTiers,
   quantEgressOrigins,
   quantParamsDigest,
   QUANT_API_ORIGINS_ALLOWED,
@@ -21,7 +23,6 @@ import {
   resolveQuantStrategyParams,
   type QuantEnv,
 } from "../src/quant/config.js";
-import { RELAY_FEE_PER_EXIT_WEI } from "../src/ops/relayFee.js";
 
 const RELAY = "https://relay.altana.network";
 
@@ -60,49 +61,106 @@ describe("QUANT_ENABLED — the tri-state", () => {
 });
 
 describe("strategy parameters", () => {
-  it("ships the cleared defaults — band 700, not the body's 300", () => {
+  it("ships the R14 process defaults without a process-level band", () => {
     const params = resolveQuantStrategyParams({});
     assert.deepEqual(params, QUANT_STRATEGY_DEFAULTS);
-    assert.equal(params.bandBps, 700);
-    assert.equal(params.minClipUWei, 10n * 10n ** 18n);
+    assert.equal(params.bandTiers, "10:700");
+    assert.equal(params.minClipUWei, 5n * 10n ** 18n);
     assert.equal(params.maxImpactBps, 50);
-    assert.equal(params.entryTolBps, 50);
-    assert.equal(params.exitTolBps, 50);
+    assert.equal(params.entryTolBps, 40);
+    assert.equal(params.exitTolBps, 10);
+    assert.equal(params.minNetEdgeBps, 25);
     assert.equal(params.strategyVersion, QUANT_STRATEGY_VERSION);
-    assert.equal(params.relayFeePerSubmitWei, RELAY_FEE_PER_EXIT_WEI);
+    assert.equal(params.relayFeePerSubmitWei, 30_000_000_000_000n);
+    assert.equal(params.relayGasUnits, 300_000n);
+    assert.equal(params.relayFeePadBps, 15_000n);
   });
 
-  it("FEE_EST is 3x the relay constant, and there is no other fee number", () => {
-    assert.equal(feeEstWei(QUANT_STRATEGY_DEFAULTS), 3n * RELAY_FEE_PER_EXIT_WEI);
+  it("uses the live estimator and its floor at 0.05 gwei", () => {
+    assert.equal(feeEstWei(QUANT_STRATEGY_DEFAULTS, 50_000_000n), 30_000_000_000_000n);
+    assert.equal(feeEstWei(QUANT_STRATEGY_DEFAULTS, 100_000_000n), 45_000_000_000_000n);
   });
 
   it("bounds every override and refuses out-of-range values", () => {
-    assert.throws(() => resolveQuantStrategyParams({ QUANT_BAND_BPS: "100" }));
-    assert.throws(() => resolveQuantStrategyParams({ QUANT_BAND_BPS: "2001" }));
+    assert.throws(() => resolveQuantStrategyParams({ QUANT_BAND_TIERS_BPS: "10:149" }));
+    assert.throws(() => resolveQuantStrategyParams({ QUANT_BAND_TIERS_BPS: "10:2001" }));
     assert.throws(() => resolveQuantStrategyParams({ QUANT_MAX_LEVELS: "6" }));
     assert.throws(() => resolveQuantStrategyParams({ QUANT_MIN_CLIP_U_WEI: "1" }));
     assert.throws(() => resolveQuantStrategyParams({ QUANT_COOLDOWN_SEC: "59" }));
     assert.throws(() => resolveQuantStrategyParams({ QUANT_MAX_IMPACT_BPS: "301" }));
-    assert.throws(() => resolveQuantStrategyParams({ QUANT_BAND_BPS: "seven hundred" }));
+    assert.throws(() => resolveQuantStrategyParams({ QUANT_BAND_TIERS_BPS: "ten:700" }));
+    assert.throws(() => resolveQuantStrategyParams({ QUANT_RELAY_FEE_PER_SUBMIT_WEI: "9999999999999" }));
+    assert.throws(() => resolveQuantStrategyParams({ QUANT_RELAY_FEE_PER_SUBMIT_WEI: "10000000000000001" }));
+    assert.throws(() => resolveQuantStrategyParams({ QUANT_RELAY_GAS_UNITS: "199999" }));
+    assert.throws(() => resolveQuantStrategyParams({ QUANT_RELAY_FEE_PAD_BPS: "30001" }));
   });
 
   it("refuses a band that cannot cover its own fixed costs", () => {
-    // 2 legs (50) + entry (50) + exit (50) + edge (50) = 200 bps of floor.
+    // 2 legs (50) + entry (70) + exit (10) + edge (25) = 155 bps.
     assert.throws(
-      () => resolveQuantStrategyParams({ QUANT_BAND_BPS: "200" }),
+      () => resolveQuantStrategyParams({
+        QUANT_ENTRY_TOL_BPS: "70", QUANT_BAND_TIERS_BPS: "10:155",
+      }),
       /fixed cost floor/u,
     );
-    assert.doesNotThrow(() => resolveQuantStrategyParams({ QUANT_BAND_BPS: "201" }));
+    assert.doesNotThrow(() => resolveQuantStrategyParams({
+      QUANT_ENTRY_TOL_BPS: "70", QUANT_BAND_TIERS_BPS: "10:156",
+    }));
   });
 
   it("digests every economic parameter — a change moves the hash", () => {
     const base = quantParamsDigest(resolveQuantStrategyParams({}));
-    assert.notEqual(base, quantParamsDigest(resolveQuantStrategyParams({ QUANT_BAND_BPS: "800" })));
+    assert.notEqual(base, quantParamsDigest(resolveQuantStrategyParams({ QUANT_BAND_TIERS_BPS: "10:800" })));
     assert.notEqual(base, quantParamsDigest(resolveQuantStrategyParams({ QUANT_MAX_LEVELS: "4" })));
     assert.notEqual(
       base, quantParamsDigest(resolveQuantStrategyParams({ QUANT_MIN_NET_EDGE_BPS: "60" })),
     );
     assert.equal(base, quantParamsDigest(resolveQuantStrategyParams({})));
+  });
+
+  it("refuses reordered or duplicate tiers and canonicalizes accepted spelling", () => {
+    assert.throws(
+      () => resolveQuantStrategyParams({ QUANT_BAND_TIERS_BPS: "30:200,10:250" }),
+      /strictly ascending/u,
+    );
+    assert.throws(() => parseQuantBandTiers("10:250,10:200"), /strictly ascending/u);
+    const params = resolveQuantStrategyParams({
+      QUANT_BAND_TIERS_BPS: " 010 : 0700 ",
+    });
+    assert.equal(params.bandTiers, "10:700");
+    assert.deepEqual(
+      parseQuantBandTiers("999999:250,1000000:200"),
+      [
+        { minAllocationUWei: 999999n * 10n ** 18n, bandBps: 250 },
+        { minAllocationUWei: 1000000n * 10n ** 18n, bandBps: 200 },
+      ],
+    );
+  });
+
+  it("selects allocation tiers and refuses below the first threshold", () => {
+    const params = resolveQuantStrategyParams({
+      QUANT_BAND_TIERS_BPS: "10:250,30:200",
+      QUANT_SEED_MODE: "symmetric",
+    });
+    assert.deepEqual(admittedQuantParams(params, 9n * 10n ** 18n), {
+      ok: false, code: "below-minimum",
+    });
+    const at29 = admittedQuantParams(params, 29n * 10n ** 18n);
+    const at30 = admittedQuantParams(params, 30n * 10n ** 18n);
+    assert.ok("bandBps" in at29 && "bandBps" in at30);
+    if (!("bandBps" in at29) || !("bandBps" in at30)) return;
+    assert.equal(at29.bandBps, 250);
+    assert.equal(at30.bandBps, 200);
+    assert.deepEqual(admittedQuantParams(params, 2n * 5n * 10n ** 18n - 1n), {
+      ok: false, code: "below-minimum",
+    });
+    assert.notEqual(
+      quantParamsDigest(resolveQuantStrategyParams({
+        QUANT_BAND_TIERS_BPS: "10:250,40:200", QUANT_SEED_MODE: "symmetric",
+      })),
+      quantParamsDigest(params),
+      "the full tier table is digest-bound even when allocation selects the same band",
+    );
   });
 });
 
@@ -157,9 +215,9 @@ describe("resolveQuantRuntimeConfig", () => {
     );
   });
 
-  it("REFUSES a band change that keeps the old digest", () => {
+  it("REFUSES a tier-table change that keeps the old digest", () => {
     assert.throws(
-      () => resolveQuantRuntimeConfig(baseEnv({ QUANT_BAND_BPS: "800" }), {
+      () => resolveQuantRuntimeConfig(baseEnv({ QUANT_BAND_TIERS_BPS: "10:800" }), {
         publicRpcUrl: "https://rpc.example",
       }),
       /params-digest-mismatch/u,

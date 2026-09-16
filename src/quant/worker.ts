@@ -30,11 +30,13 @@ import type {
   QuantJobRow,
   QuantJobStore,
   QuantLevelRow,
+  QuantObservationAcceptance,
 } from "../store/quantJobs.js";
 import type { WalletProvider } from "../core/types.js";
 import { buildPancakeTokenSwap, directPath } from "../ops/pancakeTokens.js";
 import {
   assertQuantSessionAdmissible,
+  checkLadderAdmissible,
   openSession,
   permissionsDigest,
   projectGrantedPermissions,
@@ -45,30 +47,43 @@ import {
 import {
   feeEstInU,
   actionDeadlineSec,
-  advanceTrigger,
   armFloor,
   buildLadder,
   buyMinOut,
   ceilDiv,
-  levelTriggerSide,
   midFromReserves,
   partitionExit,
   quantPriceImpactBps,
   quoteAcceptable,
   requiredNativeWei,
+  rebuildLines,
   sellFloor,
   triggerArmed,
   type LevelObligation,
 } from "./grid.js";
-import { quantJournalKey, submitQuantAction, type QuantExecuteDeps } from "./execute.js";
-import { recoverUnsettledActions, type QuantReconcileDeps } from "./reconcile.js";
+import { checkQuantMeters, quantJournalKey, submitQuantAction, type QuantExecuteDeps } from "./execute.js";
+import { reconcileAccounting, recoverUnsettledActions, type QuantReconcileDeps } from "./reconcile.js";
 import { orderedReserves, type QuantChainReader } from "./readers.js";
 import type { QuantTransport } from "./termix.js";
 import type { QuantKeypair } from "./envelope.js";
-import type { QuantStrategyParams } from "./config.js";
+import { admittedQuantParams, feeEstWei, type QuantAdmittedParams, type QuantStrategyParams } from "./config.js";
+import { admittedParams } from "./reconcile.js";
 import type { QuantHoldCode, QuantObservation } from "./types.js";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const GAS_MAX_AGE_MS = 30_000;
+const MAX_GAS_PRICE_WEI = 1_000n * 10n ** 9n;
+
+type QuantAdmittedWorkerDeps = Omit<QuantWorkerDeps, "params"> & {
+  readonly params: QuantAdmittedParams;
+};
+
+type GasEvidence = {
+  readonly ok: true;
+  readonly gasPriceWei: bigint;
+  readonly feeEstWei: bigint;
+  readonly gasReadAtMs: number;
+};
 
 export type QuantWorkerDeps = {
   readonly store: QuantJobStore;
@@ -108,6 +123,56 @@ export type QuantCycleOptions = {
   /** Injected for the offline scenario suite; production reads the chain. */
   readonly observationSource?: (job: QuantJobRow) => Promise<QuantObservation>;
 };
+
+export type QuantRecenterPreview =
+  | { readonly kind: "none"; readonly side: null }
+  | { readonly kind: "hold"; readonly side: "up" | "down"; readonly code: QuantHoldCode }
+  | {
+    readonly kind: "recenter";
+    readonly side: "up" | "down";
+    readonly buyPrice: readonly bigint[];
+    readonly sellPrice: readonly bigint[];
+    readonly reseed: boolean;
+    readonly cause: string;
+  };
+
+/** Pure B2 decision preview. It reads no store and performs no chain calls. */
+export function previewRecenter(
+  job: QuantJobRow,
+  levels: readonly QuantLevelRow[],
+  observation: QuantObservation,
+  params: QuantAdmittedParams,
+): QuantRecenterPreview {
+  if (params.recenterMode !== "both" || params.seedMode !== "symmetric") {
+    return { kind: "none", side: null };
+  }
+  const upper = levels.find((row) => row.levelIndex === job.levels);
+  const lower = levels.find((row) => row.levelIndex === Math.max(1, job.levels - 1));
+  if (upper === undefined || lower === undefined) return { kind: "none", side: null };
+  const side: "up" | "down" | null = observation.midE18 > upper.sellPriceE18
+    ? "up" : observation.midE18 < lower.buyPriceE18 ? "down" : null;
+  if (side === null) return { kind: "none", side: null };
+  if (job.recenterConsecutive < 2 || job.recenterSide !== side) {
+    return { kind: "none", side: null };
+  }
+  if (job.recenters >= job.recenterBudget) return { kind: "hold", side, code: "recenter-budget-exhausted" };
+  const cooldownFrom = job.lastRecenterAtMs ?? job.admittedAtMs ?? 0;
+  if (observation.observedAtMs - cooldownFrom < params.recenterCooldownSec * 1_000) {
+    return { kind: "hold", side, code: "recenter-cooldown" };
+  }
+  if (levels.some((row) => row.state === "blocked" || row.state === "retired" || row.seedPending)) {
+    return { kind: "hold", side, code: levels.some((row) => row.state === "retired") ? "recenter-retired" : "recenter-busy" };
+  }
+  const lines = rebuildLines({
+    anchorE18: observation.midE18, levels: job.levels,
+    lower: Math.max(1, job.levels - 1), params,
+  });
+  const reseed = side === "up" && upper.state === "armed-quote";
+  return {
+    kind: "recenter", side, buyPrice: lines.buyPrice, sellPrice: lines.sellPrice,
+    reseed, cause: `${side}:mid${side === "up" ? ">top" : "<bottom"}`,
+  };
+}
 
 /* -------------------------------------------------------------------------- */
 /* Cycle                                                                      */
@@ -208,36 +273,38 @@ async function runOneJob(
 
   /* Wire refresh. A job that fails PARSING is held with the field named. */
   const wire = await deps.transport.job(jobRow.quantJobId);
+  let job: QuantJobRow = jobRow;
+  let wireChanged = false;
+  let wireIssue: QuantHoldCode | null = null;
   if (!wire.ok) {
-    await deps.store.setJobStatus({
+    wireIssue = wire.code === "wire-invalid" ? "wire-invalid" : "inbox-unavailable";
+  } else {
+    const record = wire.data;
+    const updatedWire = await deps.store.updateJobWire({
       quantJobId: jobRow.quantJobId,
-      status: jobRow.status === "discovered" ? "discovered" : jobRow.status,
-      holdCode: wire.code === "wire-invalid" ? "wire-invalid" : "inbox-unavailable",
+      strategyId: record.strategyId,
+      tradingWallet: record.tradingWalletAddress,
+      allocationUWei: record.allocationUWei,
+      dailyCapUWei: record.dailyCapUWei,
+      termDays: record.termDays,
+      startedAtMs: record.startedAtMs,
+      endsAtMs: record.endsAtMs,
+      sessionExpiresAtMs: record.sessionExpiresAtMs,
+      revokedAtMs: record.revokedAtMs,
       nowMs,
     });
-    return { actions: 0, holds: 1, notes: [`${jobRow.quantJobId}:${wire.code}`] };
-  }
-  const record = wire.data;
-  const job = (await deps.store.updateJobWire({
-    quantJobId: jobRow.quantJobId,
-    strategyId: record.strategyId,
-    tradingWallet: record.tradingWalletAddress,
-    allocationUWei: record.allocationUWei,
-    dailyCapUWei: record.dailyCapUWei,
-    termDays: record.termDays,
-    startedAtMs: record.startedAtMs,
-    endsAtMs: record.endsAtMs,
-    sessionExpiresAtMs: record.sessionExpiresAtMs,
-    revokedAtMs: record.revokedAtMs,
-    nowMs,
-  }));
-  if (job === null) {
-    // QUANT-SELFTEST R7: the wire now names a different strategy than the one
-    // this row belongs to. Nothing of it is applied and no intent is planned.
-    await deps.store.setJobStatus({
-      quantJobId: jobRow.quantJobId, status: jobRow.status, holdCode: "foreign-strategy", nowMs,
-    });
-    return { actions: 0, holds: 1, notes: [`${jobRow.quantJobId}:foreign-strategy:wire-changed`] };
+    if (updatedWire === null) {
+      // Foreign wire data is retained as a telemetry hold, but it must not
+      // prevent recovery of an already-admitted action.
+      wireIssue = "foreign-strategy";
+    } else {
+      job = updatedWire;
+      wireChanged = updatedWire.wireDiffers || updatedWire.wireState === "changed";
+      if (!wireChanged && updatedWire.holdCode === "wire-changed") {
+        await deps.store.holdJob({ quantJobId: jobRow.quantJobId, holdCode: null, nowMs });
+        job = await deps.store.getJob(jobRow.quantJobId) ?? updatedWire;
+      }
+    }
   }
 
   /* Phase 0 — recovery, ALWAYS, dry-run included: it writes only truth. */
@@ -251,6 +318,77 @@ async function runOneJob(
   /* Term end: no new intents, then the report once everything is terminal. */
   if (job.endsAtMs !== null && nowMs >= job.endsAtMs) {
     return finishTerm(deps, job, notes, dryRun);
+  }
+
+  if (job.status === "paused") {
+    if (!(await verifyBaseline(deps, job))) {
+      await hold(deps, job.quantJobId, "baseline-unverified");
+      notes.push(`${job.quantJobId}:baseline-unverified`, `${job.quantJobId}:paused`);
+      return { actions: 0, holds: 1, notes };
+    }
+    const truthObservation = options.observationSource === undefined
+      ? await readObservation(deps, job) : await options.observationSource(job);
+    const pausedAccounting = await checkAccounting(deps, job, truthObservation);
+    if (pausedAccounting !== null && !pausedAccounting.admissible) {
+      const published = await deps.store.publishTruthVerdict({
+        quantJobId: job.quantJobId, expectedAccountingRev: pausedAccounting.accountingRev,
+        expectedEpoch: pausedAccounting.epoch, expectedEpochHash: pausedAccounting.epochHash,
+        observationBlock: truthObservation.blockNumber, observationHash: truthObservation.blockHash,
+        admissible: pausedAccounting.admissible,
+        evidenceJson: JSON.stringify({
+          block: truthObservation.blockNumber.toString(10), hash: truthObservation.blockHash,
+          expected: { u: pausedAccounting.expectedUWei.toString(10), wbnb: pausedAccounting.expectedWbnbWei.toString(10) },
+          actual: pausedAccounting.actual, pending: pausedAccounting.pending,
+        }),
+        nowMs,
+      });
+      if (!published.ok) notes.push(`${job.quantJobId}:reconcile-stale`);
+      await hold(deps, job.quantJobId, published.ok ? "external-activity" : "reconcile-stale");
+    }
+    notes.push(`${job.quantJobId}:paused`);
+    return { actions: 0, holds: 0, notes };
+  }
+
+  if (wireIssue !== null) {
+    try {
+      const truthObservation = await readObservation(deps, job);
+      if (!(await verifyBaseline(deps, job))) {
+        await hold(deps, job.quantJobId, "baseline-unverified");
+      } else {
+        const truth = await checkAccounting(deps, job, truthObservation);
+        if (truth !== null && !truth.admissible) {
+          const published = await deps.store.publishTruthVerdict({
+            quantJobId: job.quantJobId, expectedAccountingRev: truth.accountingRev,
+            expectedEpoch: truth.epoch, expectedEpochHash: truth.epochHash,
+            observationBlock: truthObservation.blockNumber, observationHash: truthObservation.blockHash,
+            admissible: truth.admissible,
+            evidenceJson: JSON.stringify({
+              block: truthObservation.blockNumber.toString(10), hash: truthObservation.blockHash,
+              expected: { u: truth.expectedUWei.toString(10), wbnb: truth.expectedWbnbWei.toString(10) },
+              actual: truth.actual, pending: truth.pending,
+            }),
+            nowMs,
+          });
+          if (!published.ok) notes.push(`${job.quantJobId}:reconcile-stale`);
+        }
+      }
+    } catch {
+      notes.push(`${job.quantJobId}:truth-snapshot-unavailable`);
+    }
+    await hold(deps, job.quantJobId, wireIssue);
+    notes.push(`${job.quantJobId}:${wireIssue}`);
+    return { actions: 0, holds: 1, notes };
+  }
+
+  if (wireChanged) {
+    await hold(deps, job.quantJobId, "wire-changed");
+    notes.push(`${job.quantJobId}:wire-changed`);
+    return { actions: 0, holds: 1, notes };
+  }
+  if (job.paramsDigest !== null && job.paramsDigest.toLowerCase() !== deps.paramsDigest.toLowerCase()) {
+    await hold(deps, job.quantJobId, "params-changed");
+    notes.push(`${job.quantJobId}:params-changed`);
+    return { actions: 0, holds: 1, notes };
   }
 
   /* Liveness (spec §2.5), adopted from the skill as-is. */
@@ -272,59 +410,152 @@ async function runOneJob(
     return { actions: 0, holds: admitted.ok ? 0 : 1, notes };
   }
 
-  const levels = await deps.store.listLevels(job.quantJobId);
+  let levels = await deps.store.listLevels(job.quantJobId);
   if (levels.length === 0) return { actions: 0, holds: 0, notes };
+  const parsedParams = admittedParams(job, deps.params);
+  if (parsedParams === null || !("bandTiers" in parsedParams)) {
+    await hold(deps, job.quantJobId, "params-unreadable");
+    notes.push(`${job.quantJobId}:params-unreadable`);
+    return { actions: 0, holds: 1, notes };
+  }
+  const admittedDeps: QuantAdmittedWorkerDeps = { ...deps, params: parsedParams };
 
   /* Observation. */
-  const observation = options.observationSource === undefined
-    ? await readObservation(deps, job)
-    : await options.observationSource(job);
-  const fresh = job.lastObservedBlock === null
-    || observation.blockNumber > job.lastObservedBlock;
-  await deps.store.withQuantFence(job.quantJobId, async (fence) => {
-    if (!fresh) {
-      // R3.9: identity IS the finalized block number. A repeated `--once`
-      // against one lagging node cannot manufacture the second reading, and a
-      // height regression across RPCs is harmless rather than a counter reset.
-      await fence.markStaleObservation(job.quantJobId, job.staleObservations + 1);
-      if (job.staleObservations + 1 >= 2) {
-        // Two stale readings in a row is an OUTAGE, and BC13 resets the latches.
-        for (const level of levels) {
-          await fence.setLevelTrigger({
-            quantJobId: job.quantJobId, levelIndex: level.levelIndex,
-            consecutive: 0, side: null,
-          });
-        }
-      }
-      return;
-    }
-    await fence.recordObservation({ quantJobId: job.quantJobId, observation });
-  });
-  if (!fresh) {
-    notes.push(`${job.quantJobId}:stale-observation`);
+  let observation: QuantObservation;
+  try {
+    observation = options.observationSource === undefined
+      ? await readObservation(deps, job)
+      : await options.observationSource(job);
+  } catch {
+    await hold(deps, job.quantJobId, "observation-unverified");
+    notes.push(`${job.quantJobId}:observation-unverified`);
+    return { actions: 0, holds: 1, notes };
+  }
+  if (dryRun) {
+    // Dry-run may recover truth but cannot publish a market observation or any
+    // decision evidence. It is a pure preview of the persisted snapshot.
+    const preview = previewRecenter(job, levels, observation, admittedDeps.params);
+    notes.push(`${job.quantJobId}:dry-run`, `${job.quantJobId}:dry-run:recenter-${preview.kind}`);
     return { actions: 0, holds: 1, notes };
   }
 
-  if (dryRun) {
-    // Dry-run reaches exactly this far: everything through "decide", then
-    // `hold: dry-run`, no claim, no submit, and no state write but the run row.
-    notes.push(`${job.quantJobId}:dry-run`);
+  const gas = await readGasEvidence(admittedDeps, admittedDeps.params);
+  if (!gas.ok) {
+    await hold(admittedDeps, job.quantJobId, gas.code);
+    notes.push(`${job.quantJobId}:${gas.code}`);
     return { actions: 0, holds: 1, notes };
+  }
+  if (job.holdCode === "gas-price-unavailable" || job.holdCode === "gas-price-implausible") {
+    await admittedDeps.store.holdJob({ quantJobId: job.quantJobId, holdCode: null, nowMs });
+  }
+
+  let accepted = await deps.store.acceptObservation({
+    quantJobId: job.quantJobId, observation, intervalMs: deps.intervalMs,
+    processDigest: deps.paramsDigest,
+  });
+  if (!accepted.accepted) {
+    notes.push(`${job.quantJobId}:${accepted.reason ?? "observation-not-accepted"}`);
+    return { actions: 0, holds: 1, notes };
+  }
+  job = accepted.job;
+  levels = [...accepted.levels];
+
+  if (!(await verifyBaseline(deps, job))) {
+    await hold(deps, job.quantJobId, "baseline-unverified");
+    notes.push(`${job.quantJobId}:baseline-unverified`);
+    return { actions: 0, holds: 1, notes };
+  }
+  job = await deps.store.getJob(job.quantJobId) ?? job;
+  levels = [...await deps.store.listLevels(job.quantJobId)];
+  accepted = { ...accepted, job, levels };
+
+  let accounting: Awaited<ReturnType<typeof checkAccounting>>;
+  try {
+    accounting = await checkAccounting(deps, job, accepted.observation);
+  } catch {
+    await hold(deps, job.quantJobId, "snapshot-unverified");
+    notes.push(`${job.quantJobId}:snapshot-unverified`);
+    return { actions: 0, holds: 1, notes };
+  }
+  if (accounting !== null) {
+    if (accounting.reason === "reconcile-structure") {
+      await hold(deps, job.quantJobId, "reconcile-structure");
+      notes.push(`${job.quantJobId}:reconcile-structure`);
+      return { actions: 0, holds: 1, notes };
+    }
+    const published = await deps.store.publishAccountingVerdict({
+      quantJobId: job.quantJobId, expectedAccountingRev: accounting.accountingRev,
+      expectedEpoch: accounting.epoch, expectedEpochHash: accounting.epochHash,
+      observationBlock: accepted.observation.blockNumber, observationHash: accepted.observation.blockHash,
+      admissible: accounting.admissible,
+      evidenceJson: JSON.stringify({
+        block: accepted.observation.blockNumber.toString(10), hash: accepted.observation.blockHash,
+        expected: { u: accounting.expectedUWei.toString(10), wbnb: accounting.expectedWbnbWei.toString(10) },
+        actual: accounting.actual, pending: accounting.pending,
+      }), nowMs: deps.nowMs(),
+    });
+    if (!published.ok) {
+      await hold(deps, job.quantJobId, "reconcile-stale");
+      notes.push(`${job.quantJobId}:reconcile-stale`);
+      return { actions: 0, holds: 1, notes };
+    }
+    if (!accounting.admissible) {
+      notes.push(`${job.quantJobId}:external-activity`);
+      return { actions: 0, holds: 1, notes };
+    }
+    if (job.accountingState !== "ok") {
+      notes.push(`${job.quantJobId}:external-activity`);
+      return { actions: 0, holds: 1, notes };
+    }
+    job = await deps.store.getJob(job.quantJobId) ?? job;
+    levels = [...await deps.store.listLevels(job.quantJobId)];
+    accepted = { ...accepted, job, levels };
   }
 
   /* Decide, claim, release, submit — ONE submission per job per cycle. */
-  const planned = await planOneAction(deps, job, levels, observation);
+  const planned = await planOneAction(admittedDeps, accepted, gas);
   if (planned.kind === "hold") {
+    if (planned.code === "gas-price-unavailable" || planned.code === "gas-price-implausible"
+      || planned.code === "gas-price-moved") {
+      await hold(admittedDeps, job.quantJobId, planned.code);
+      notes.push(`${job.quantJobId}:${planned.code}`);
+      return { actions: 0, holds: 1, notes };
+    }
+    const recenterJob = await deps.store.getJob(job.quantJobId) ?? job;
+    const recenterLevels = await deps.store.listLevels(job.quantJobId);
+    const recentered = await maybeRecenter(admittedDeps, recenterJob, recenterLevels, accepted.observation, gas);
+    if (recentered.kind === "recentered") {
+      notes.push(`${job.quantJobId}:recentered:${recentered.side}`);
+      return { actions: 0, holds: 0, notes };
+    }
+    if (recentered.kind === "hold") {
+      notes.push(`${job.quantJobId}:${recentered.code}`);
+      return { actions: 0, holds: 1, notes };
+    }
     notes.push(`${job.quantJobId}:${planned.code}`);
+    if (planned.detail !== undefined) notes.push(`${job.quantJobId}:${planned.code}:${planned.detail}`);
     return { actions: 0, holds: 1, notes };
   }
-  if (planned.kind === "idle") return { actions: 0, holds: 0, notes };
+  if (planned.kind === "idle") {
+    const recenterJob = await deps.store.getJob(job.quantJobId) ?? job;
+    const recenterLevels = await deps.store.listLevels(job.quantJobId);
+    const recentered = await maybeRecenter(admittedDeps, recenterJob, recenterLevels, accepted.observation, gas);
+    if (recentered.kind === "recentered") {
+      notes.push(`${job.quantJobId}:recentered:${recentered.side}`);
+      return { actions: 0, holds: 0, notes };
+    }
+    if (recentered.kind === "hold") {
+      notes.push(`${job.quantJobId}:${recentered.code}`);
+      return { actions: 0, holds: 1, notes };
+    }
+    return { actions: 0, holds: 0, notes };
+  }
 
   const executeDeps: QuantExecuteDeps = {
-    store: deps.store, journal: deps.journal, provider: deps.provider,
-    reader: deps.reader, keypair: deps.keypair, params: deps.params,
-    venue: deps.venue, nowMs: deps.nowMs,
-    ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+    store: admittedDeps.store, journal: admittedDeps.journal, provider: admittedDeps.provider,
+    reader: admittedDeps.reader, keypair: admittedDeps.keypair, params: admittedDeps.params,
+    venue: admittedDeps.venue, nowMs: admittedDeps.nowMs,
+    ...(admittedDeps.signal === undefined ? {} : { signal: admittedDeps.signal }),
   };
   const outcome = await submitQuantAction(executeDeps, {
     job,
@@ -335,6 +566,124 @@ async function runOneJob(
   });
   notes.push(`${job.quantJobId}:${outcome.kind}`);
   return { actions: 1, holds: 0, notes };
+}
+
+async function checkAccounting(
+  deps: QuantWorkerDeps,
+  job: QuantJobRow,
+  observation: QuantObservation,
+): Promise<(ReturnType<typeof reconcileAccounting> & { readonly actual: { readonly u: string; readonly wbnb: string }; readonly accountingRev: bigint; readonly epoch: number; readonly epochHash: Hex | null }) | null> {
+  // Legacy offline harnesses predate the hash-bound balance seam. Production
+  // readers and the B2 tests expose it; without it this helper cannot claim a
+  // canonical accounting verdict.
+  if (deps.reader.tokenBalanceAtHash === undefined) return null;
+  const epoch = await deps.store.currentEpoch(job.quantJobId);
+  if (epoch === null) return null;
+  if (epoch.startedBlockHash === null) throw new Error("snapshot-unverified");
+  const [actualU, actualWbnb] = await Promise.all([
+    deps.reader.tokenBalanceAtHash === undefined
+      ? deps.reader.tokenBalanceAt(deps.venue.u, job.tradingWallet, observation.blockNumber)
+      : deps.reader.tokenBalanceAtHash(deps.venue.u, job.tradingWallet, observation.blockHash),
+    deps.reader.tokenBalanceAtHash === undefined
+      ? deps.reader.tokenBalanceAt(deps.venue.wbnb, job.tradingWallet, observation.blockNumber)
+      : deps.reader.tokenBalanceAtHash(deps.venue.wbnb, job.tradingWallet, observation.blockHash),
+  ]);
+  const [epochBlock, observationBlock] = await Promise.all([
+    deps.reader.blockAt(epoch.startedBlock),
+    deps.reader.blockAt(observation.blockNumber),
+  ]);
+  if (epochBlock.hash.toLowerCase() !== epoch.startedBlockHash.toLowerCase()
+    || observationBlock.hash.toLowerCase() !== observation.blockHash.toLowerCase()
+    || observation.blockNumber < epoch.startedBlock) {
+    throw new Error("snapshot-unverified");
+  }
+  const actions = await deps.store.listAccountingActions(job.quantJobId);
+  const deadlineBlocks = new Map<string, bigint>();
+  const canonicalAncestors = new Map<string, boolean>();
+  for (const action of actions) {
+    if (action.state === "intended" || action.state === "settled"
+      || action.state === "failed" || action.state === "aborted") continue;
+    if (action.submitFinalizedNumber === null || action.submitFinalizedHash === null) continue;
+    if (action.submitFinalizedNumber < observation.blockNumber) {
+      try {
+        const ancestor = await deps.reader.blockAt(action.submitFinalizedNumber);
+        canonicalAncestors.set(action.journalKey,
+          ancestor.hash.toLowerCase() === action.submitFinalizedHash.toLowerCase());
+      } catch {
+        canonicalAncestors.set(action.journalKey, false);
+      }
+    }
+    if (BigInt(action.deadlineSec) >= epochBlock.timestampSec) {
+      deadlineBlocks.set(action.journalKey, await lastBlockAtOrBefore(
+        deps.reader, epoch.startedBlock, observation.blockNumber,
+        BigInt(action.deadlineSec), observationBlock.timestampSec,
+      ));
+    }
+  }
+  const verdict = reconcileAccounting({
+    epoch, epochTimestampSec: epochBlock.timestampSec,
+    observationBlock: observation.blockNumber,
+    observationAtSec: BigInt(Math.floor(observation.observedAtMs / 1_000)),
+    actualUWei: actualU, actualWbnbWei: actualWbnb,
+    actions, maxPending: job.levels, deadlineBlocks, canonicalAncestors,
+  });
+  return {
+    ...verdict,
+    accountingRev: job.accountingRev,
+    epoch: epoch.epoch,
+    epochHash: epoch.startedBlockHash,
+    actual: { u: actualU.toString(10), wbnb: actualWbnb.toString(10) },
+  };
+}
+
+/** Last block in [start, end] whose timestamp is no later than the deadline. */
+async function lastBlockAtOrBefore(
+  reader: QuantChainReader,
+  start: bigint,
+  end: bigint,
+  deadlineSec: bigint,
+  endTimestampSec: bigint,
+): Promise<bigint> {
+  if (end <= start || endTimestampSec <= deadlineSec) return end;
+  let low = start;
+  let high = end;
+  while (low < high) {
+    const middle = (low + high + 1n) / 2n;
+    const block = await reader.blockAt(middle);
+    if (block.timestampSec <= deadlineSec) low = middle;
+    else high = middle - 1n;
+  }
+  return low;
+}
+
+async function verifyBaseline(deps: QuantWorkerDeps, job: QuantJobRow): Promise<boolean> {
+  const epoch = await deps.store.currentEpoch(job.quantJobId);
+  if (epoch === null) return false;
+  if (epoch.verified && epoch.startedBlockHash !== null) return true;
+  if (deps.reader.tokenBalanceAtHash === undefined || deps.reader.nativeBalanceAtHash === undefined
+    || typeof deps.reader.blockAt !== "function") return false;
+  try {
+    let blockHash = epoch.startedBlockHash;
+    if (blockHash === null) {
+      const block = await deps.reader.blockAt(epoch.startedBlock);
+      blockHash = block.hash;
+      await deps.store.setEpochHash({
+        quantJobId: job.quantJobId, epoch: epoch.epoch, blockHash, nowMs: deps.nowMs(),
+      });
+    }
+    const [u, wbnb, native] = await Promise.all([
+      deps.reader.tokenBalanceAtHash(deps.venue.u, job.tradingWallet, blockHash),
+      deps.reader.tokenBalanceAtHash(deps.venue.wbnb, job.tradingWallet, blockHash),
+      deps.reader.nativeBalanceAtHash(job.tradingWallet, blockHash),
+    ]);
+    return deps.store.verifyEpochBaseline({
+      quantJobId: job.quantJobId, epoch: epoch.epoch,
+      baselineUWei: u, baselineWbnbWei: wbnb, baselineNativeWei: native,
+      nowMs: deps.nowMs(),
+    });
+  } catch {
+    return false;
+  }
 }
 
 async function hold(
@@ -349,7 +698,12 @@ async function readObservation(
   deps: QuantWorkerDeps, job: QuantJobRow,
 ): Promise<QuantObservation> {
   const finalized = await deps.reader.finalizedBlock();
-  const reserves = await deps.reader.reservesAt(deps.venue.pair, finalized.number);
+  const reserves = deps.reader.reservesAtHash === undefined
+    ? await deps.reader.reservesAt(deps.venue.pair, finalized.number)
+    : await deps.reader.reservesAtHash(deps.venue.pair, finalized.hash);
+  if (reserves.blockHash !== undefined && reserves.blockHash.toLowerCase() !== finalized.hash.toLowerCase()) {
+    throw new Error("observation-unverified");
+  }
   const ordered = orderedReserves(reserves, deps.venue.u);
   void job;
   return {
@@ -357,6 +711,26 @@ async function readObservation(
     blockHash: finalized.hash,
     observedAtMs: deps.nowMs(),
     midE18: midFromReserves(ordered.reserveUWei, ordered.reserveWbnbWei),
+  };
+}
+
+async function readGasEvidence(
+  deps: QuantWorkerDeps,
+  params: QuantStrategyParams,
+): Promise<GasEvidence | { readonly ok: false; readonly code: "gas-price-unavailable" | "gas-price-implausible" }> {
+  let gasPriceWei: bigint;
+  try {
+    gasPriceWei = await deps.reader.gasPriceWei();
+  } catch {
+    return { ok: false, code: "gas-price-unavailable" };
+  }
+  if (gasPriceWei <= 0n) return { ok: false, code: "gas-price-unavailable" };
+  if (gasPriceWei > MAX_GAS_PRICE_WEI) return { ok: false, code: "gas-price-implausible" };
+  return {
+    ok: true,
+    gasPriceWei,
+    feeEstWei: feeEstWei(params, gasPriceWei),
+    gasReadAtMs: deps.nowMs(),
   };
 }
 
@@ -390,11 +764,28 @@ async function admitJob(
   const nowMs = deps.nowMs();
   const nowSeconds = Math.floor(nowMs / 1_000);
 
-  const observation = await readObservation(deps, job);
+  let observation: QuantObservation;
+  try {
+    observation = await readObservation(deps, job);
+  } catch {
+    await hold(deps, job.quantJobId, "observation-unverified");
+    return { ok: false, note: "observation-unverified" };
+  }
+  const paramsResult = admittedQuantParams(deps.params, job.allocationUWei);
+  if (!("bandBps" in paramsResult)) {
+    await hold(deps, job.quantJobId, "below-minimum");
+    return { ok: false, note: "below-minimum" };
+  }
+  const params = paramsResult;
+  const gas = await readGasEvidence(deps, params);
+  if (!gas.ok) {
+    await hold(deps, job.quantJobId, gas.code);
+    return { ok: false, note: gas.code };
+  }
   const ladderResult = buildLadder({
     allocationUWei: job.allocationUWei,
     p0E18: observation.midE18,
-    params: deps.params,
+    params,
   });
   if (!ladderResult.ok) {
     await hold(
@@ -405,19 +796,68 @@ async function admitJob(
   }
   const ladder = ladderResult.ladder;
 
+  if (params.seedMode === "symmetric" && job.termDays < params.minTermDays) {
+    await hold(deps, job.quantJobId, "term-too-short");
+    return { ok: false, note: "term-too-short" };
+  }
+  if (params.seedMode === "symmetric"
+    && job.dailyCapUWei < ladder.clipUWei * BigInt(ladder.levels)) {
+    await hold(deps, job.quantJobId, "day-cap-too-small");
+    return { ok: false, note: "day-cap-too-small" };
+  }
+
   /* The arm floor, on THIS pool, with a measured impact. */
-  const impactBps = await measureImpactBps(deps, ladder.clipUWei, observation.blockNumber);
+  const impactBps = await measureImpactBps(deps, ladder.clipUWei, observation.blockNumber, observation.blockHash);
   const floor = armFloor({
     clipUWei: ladder.clipUWei,
     midE18: observation.midE18,
     impactBps,
-    params: deps.params,
+    params, gasPriceWei: gas.gasPriceWei,
   });
+  const ladderGate = checkLadderAdmissible({
+    ladder: { levels: ladder.levels, clipUWei: ladder.clipUWei, buyPrice: ladder.buyPrice,
+      sellPrice: ladder.sellPrice, midE18: observation.midE18,
+      minSellPriceE18: ladder.minSellPriceE18 },
+    allocationUWei: job.allocationUWei, dailyCapUWei: job.dailyCapUWei,
+    capRows: plaintext.permissions.spend.map((row) => ({ token: row.token ?? null, limit: row.limit })),
+    u: deps.venue.u, wbnb: deps.venue.wbnb, impactBps, params, gasPriceWei: gas.gasPriceWei,
+  });
+  if (!ladderGate.ok) {
+    const code = ladderGate.code === "day-cap-too-small" ? "day-cap-too-small"
+      : ladderGate.code === "arm-uneconomic" ? "arm-uneconomic" : "session-not-admissible";
+    await hold(deps, job.quantJobId, code);
+    return { ok: false, note: ladderGate.code };
+  }
   if (!floor.economic) {
     // Re-evaluated EVERY cycle until `endsAt` — pool depth moves, so this hold
     // is not permanent and does not close the job.
     await hold(deps, job.quantJobId, "arm-uneconomic");
     return { ok: false, note: `arm-uneconomic:${floor.requiredBps}` };
+  }
+
+  if (params.seedMode === "symmetric") {
+    const seedFloor = buyMinOut({
+      clipUWei: ladder.clipUWei, buyPriceE18: observation.midE18,
+      levelIndex: ladder.levels, actionSeq: 1, params,
+    });
+    try {
+      const seedQuote = deps.reader.quoteV2AtHash === undefined
+        ? await deps.reader.quoteV2At(
+          deps.venue.router, directPath(deps.venue.u, deps.venue.wbnb),
+          ladder.clipUWei, observation.blockNumber,
+        )
+        : await deps.reader.quoteV2AtHash(
+          deps.venue.router, directPath(deps.venue.u, deps.venue.wbnb),
+          ladder.clipUWei, observation.blockHash,
+        );
+      if (seedQuote < seedFloor) {
+        await hold(deps, job.quantJobId, "seed-unexecutable");
+        return { ok: false, note: "seed-unexecutable" };
+      }
+    } catch {
+      await hold(deps, job.quantJobId, "seed-unexecutable");
+      return { ok: false, note: "seed-unexecutable" };
+    }
   }
 
   const projection = projectGrantedPermissions(plaintext.permissions, {
@@ -439,6 +879,7 @@ async function admitJob(
     job: {
       tradingWalletAddress: getAddress(job.tradingWallet),
       sessionExpiresAtMs: job.sessionExpiresAtMs,
+      allocationUWei: job.allocationUWei,
     },
     ladder: {
       levels: ladder.levels,
@@ -446,8 +887,11 @@ async function admitJob(
       buyPrice: ladder.buyPrice,
       sellPrice: ladder.sellPrice,
       midE18: observation.midE18,
+      minBuyPriceE18: ladder.minBuyPriceE18,
+      minSellPriceE18: ladder.minSellPriceE18,
     },
-    params: deps.params,
+    params,
+    gasPriceWei: gas.gasPriceWei,
     nowSeconds,
   });
   if (!admissible.ok) {
@@ -474,9 +918,15 @@ async function admitJob(
   }
 
   const [baselineU, baselineWbnb, baselineNative] = await Promise.all([
-    deps.reader.tokenBalanceAt(deps.venue.u, getAddress(job.tradingWallet), observation.blockNumber),
-    deps.reader.tokenBalanceAt(deps.venue.wbnb, getAddress(job.tradingWallet), observation.blockNumber),
-    deps.reader.nativeBalanceAt(getAddress(job.tradingWallet), observation.blockNumber),
+    deps.reader.tokenBalanceAtHash === undefined
+      ? deps.reader.tokenBalanceAt(deps.venue.u, getAddress(job.tradingWallet), observation.blockNumber)
+      : deps.reader.tokenBalanceAtHash(deps.venue.u, getAddress(job.tradingWallet), observation.blockHash),
+    deps.reader.tokenBalanceAtHash === undefined
+      ? deps.reader.tokenBalanceAt(deps.venue.wbnb, getAddress(job.tradingWallet), observation.blockNumber)
+      : deps.reader.tokenBalanceAtHash(deps.venue.wbnb, getAddress(job.tradingWallet), observation.blockHash),
+    deps.reader.nativeBalanceAtHash === undefined
+      ? deps.reader.nativeBalanceAt(getAddress(job.tradingWallet), observation.blockNumber)
+      : deps.reader.nativeBalanceAtHash(getAddress(job.tradingWallet), observation.blockHash),
   ]);
 
   const result = await deps.store.admitJob({
@@ -489,23 +939,32 @@ async function admitJob(
     wbnbCapMinLimitWei: admissible.wbnbCapMinLimitWei,
     residualThresholdWei: admissible.residualThresholdWei,
     paramsJson: JSON.stringify({
-      ...deps.params,
-      minClipUWei: deps.params.minClipUWei.toString(10),
-      relayFeePerSubmitWei: deps.params.relayFeePerSubmitWei.toString(10),
+      ...params,
+      paramsSchema: "r14",
+      minClipUWei: params.minClipUWei.toString(10),
+      relayFeePerSubmitWei: params.relayFeePerSubmitWei.toString(10),
+      relayGasUnits: params.relayGasUnits.toString(10),
+      relayFeePadBps: params.relayFeePadBps.toString(10),
     }),
     paramsDigest: deps.paramsDigest,
     p0E18: ladder.p0E18,
     armBlock: observation.blockNumber,
+    armBlockHash: observation.blockHash,
     levels: Array.from({ length: ladder.levels }, (_unused, index) => ({
       levelIndex: index + 1,
       buyPriceE18: ladder.buyPrice[index + 1] ?? 0n,
       sellPriceE18: ladder.sellPrice[index + 1] ?? 0n,
+      seedPending: params.seedMode === "symmetric" && index + 1 > ladder.lowerLevels,
     })),
     clipUWei: ladder.clipUWei,
     idleUWei: ladder.idleUWei,
     baselineUWei: baselineU,
     baselineWbnbWei: baselineWbnb,
     baselineNativeWei: baselineNative,
+    capRowsJson: JSON.stringify(plaintext.permissions.spend.map((row) => ({
+      token: row.token ?? null, limit: row.limit.toString(10), period: row.period,
+    }))),
+    recenterBudget: Math.ceil(job.termDays / params.recenterBudgetDays),
     nowMs,
   });
   return result.kind === "ok"
@@ -549,13 +1008,18 @@ async function measureImpactBps(
   deps: QuantWorkerDeps,
   clipUWei: bigint,
   blockNumber: bigint,
+  blockHash?: Hex,
 ): Promise<bigint> {
   const path = directPath(deps.venue.u, deps.venue.wbnb);
   const probe = clipUWei / 100n;
   if (probe <= 0n) return 0n;
   const [full, small] = await Promise.all([
-    deps.reader.quoteV2At(deps.venue.router, path, clipUWei, blockNumber),
-    deps.reader.quoteV2At(deps.venue.router, path, probe, blockNumber),
+    blockHash !== undefined && deps.reader.quoteV2AtHash !== undefined
+      ? deps.reader.quoteV2AtHash(deps.venue.router, path, clipUWei, blockHash)
+      : deps.reader.quoteV2At(deps.venue.router, path, clipUWei, blockNumber),
+    blockHash !== undefined && deps.reader.quoteV2AtHash !== undefined
+      ? deps.reader.quoteV2AtHash(deps.venue.router, path, probe, blockHash)
+      : deps.reader.quoteV2At(deps.venue.router, path, probe, blockNumber),
   ]);
   return quantPriceImpactBps(full, small);
 }
@@ -566,7 +1030,7 @@ async function measureImpactBps(
 
 type PlanResult =
   | { readonly kind: "idle" }
-  | { readonly kind: "hold"; readonly code: string }
+  | { readonly kind: "hold"; readonly code: QuantHoldCode; readonly detail?: string }
   | {
       readonly kind: "act";
       readonly action: QuantActionRow;
@@ -576,65 +1040,106 @@ type PlanResult =
     };
 
 async function planOneAction(
-  deps: QuantWorkerDeps,
-  job: QuantJobRow,
-  levels: readonly QuantLevelRow[],
-  observation: QuantObservation,
+  deps: QuantAdmittedWorkerDeps,
+  snapshot: QuantObservationAcceptance,
+  gas: GasEvidence,
 ): Promise<PlanResult> {
+  const job = snapshot.job;
+  const levels = snapshot.levels;
+  const observation = snapshot.observation;
   // SELLS BEFORE BUYS — the PHASE3.15 semantic kept verbatim. Exits reduce
   // exposure, so they never wait behind an entry.
   const ordered = [...levels].sort((a, b) => {
     const sellFirst = (level: QuantLevelRow): number =>
       level.state === "holding-base" ? 0 : 1;
-    return sellFirst(a) - sellFirst(b) || a.levelIndex - b.levelIndex;
+    const seedFirst = (level: QuantLevelRow): number => level.seedPending ? 0 : 1;
+    return sellFirst(a) - sellFirst(b)
+      || seedFirst(a) - seedFirst(b)
+      || a.levelIndex - b.levelIndex;
   });
   // R5.5 / audit A1: the native reservation charges every OTHER level for what
   // its own non-terminal ACTION owes, so the open actions are read ONCE here,
   // after phase 0 has already driven every one of them to the truth.
   const pending = await deps.store.listNonTerminalActions(job.quantJobId);
-  let lastHold: string | null = null;
+  let lastHold: Extract<PlanResult, { readonly kind: "hold" }> | null = null;
   for (const level of ordered) {
-    const outcome = await planLevel(deps, job, levels, pending, level, observation);
+    const outcome = await planLevel(deps, job, levels, pending, level, observation, gas);
     if (outcome.kind === "act") return outcome;
-    if (outcome.kind === "hold") lastHold = outcome.code;
+    if (outcome.kind === "hold") lastHold = outcome;
   }
-  return lastHold === null ? { kind: "idle" } : { kind: "hold", code: lastHold };
+  return lastHold === null ? { kind: "idle" } : lastHold;
 }
 
 async function planLevel(
-  deps: QuantWorkerDeps,
+  deps: QuantAdmittedWorkerDeps,
   job: QuantJobRow,
   levels: readonly QuantLevelRow[],
   pending: readonly QuantActionRow[],
   level: QuantLevelRow,
   observation: QuantObservation,
+  gas: GasEvidence,
 ): Promise<PlanResult> {
   if (level.state === "retired" || level.state === "blocked") return { kind: "idle" };
   const nowMs = deps.nowMs();
-  const side = levelTriggerSide({
-    midE18: observation.midE18,
-    buyPriceE18: level.buyPriceE18,
-    sellPriceE18: level.sellPriceE18,
-    holdingBase: level.state === "holding-base",
-  });
-  const evidence = advanceTrigger(
-    { consecutive: level.triggerConsecutive, side: level.triggerSide },
-    side,
-  );
-  await deps.store.withQuantFence(job.quantJobId, async (fence) => {
-    await fence.setLevelTrigger({
-      quantJobId: job.quantJobId,
-      levelIndex: level.levelIndex,
-      consecutive: evidence.consecutive,
-      side: evidence.side,
+  if (level.seedPending && level.state === "armed-quote") {
+    if (level.seedRefusals + level.seedSubmissions >= deps.params.seedWindowCycles) {
+      await deps.store.withQuantFence(job.quantJobId, async (fence) => {
+        await fence.convertSeed({
+          quantJobId: job.quantJobId, levelIndex: level.levelIndex,
+          seedWindowCycles: deps.params.seedWindowCycles, ladderGen: level.ladderGen,
+          expectedProcessDigest: deps.paramsDigest, nowMs,
+        });
+        await fence.recordLevelOutcome({
+          quantJobId: job.quantJobId, levelIndex: level.levelIndex,
+          holdCode: "seed-window-expired", seedCounted: false,
+          acceptedBlock: observation.blockNumber, ladderGen: level.ladderGen,
+          nowMs,
+        });
+      });
+      return { kind: "idle" };
+    }
+    if (level.lastActionAtMs !== null
+      && nowMs - level.lastActionAtMs < deps.params.cooldownSec * 1_000) {
+      await recordLevelOutcome(deps, job, level, "cooldown", false, observation, nowMs);
+      return { kind: "hold", code: "cooldown" };
+    }
+    const anchor = job.anchorE18 > 0n ? job.anchorE18 : job.p0E18;
+    const withinBand = observation.midE18 * 10_000n >= anchor * (10_000n - BigInt(deps.params.entryTolBps))
+      && observation.midE18 * 10_000n <= anchor * (10_000n + BigInt(deps.params.entryTolBps));
+    if (!withinBand) {
+      await recordLevelOutcome(deps, job, level, "seed-price-drift", true, observation, nowMs);
+      return { kind: "hold", code: "seed-price-drift" };
+    }
+    const actionSeq = level.actionSeq + 1;
+    const latest = await deps.reader.latestBlockNumber();
+    const outcome = await planBuy(deps, job, levels, pending, level, observation, {
+      actionSeq, deadlineSec: actionDeadlineSec(Math.floor(nowMs / 1_000), level.levelIndex),
+      latest, wallet: getAddress(job.tradingWallet), nowMs, seed: true,
+      gas,
     });
-  });
-  if (!triggerArmed(evidence)) return { kind: "idle" };
+    if (outcome.kind === "hold") {
+      const counting = outcome.code === "price-moved"
+        || outcome.code === "impact-too-high" || outcome.code === "seed-price-drift";
+      await recordLevelOutcome(deps, job, level, outcome.code as QuantHoldCode, counting, observation, nowMs);
+    }
+    return outcome;
+  }
+  // Accepted observations own the latch write. Planning consumes the returned
+  // post-fence snapshot and never advances evidence a second time.
+  const evidence = {
+    consecutive: level.triggerConsecutive,
+    side: level.triggerSide,
+  };
+  if (!triggerArmed(evidence)) {
+    await recordLevelOutcome(deps, job, level, null, false, observation, nowMs);
+    return { kind: "idle" };
+  }
 
   // Cooldown is measured from the action's `created_at`, per level, and is a
   // HOLD: it never advances state.
   if (level.lastActionAtMs !== null
     && nowMs - level.lastActionAtMs < deps.params.cooldownSec * 1_000) {
+    await recordLevelOutcome(deps, job, level, "cooldown", false, observation, nowMs);
     return { kind: "hold", code: "cooldown" };
   }
 
@@ -644,13 +1149,21 @@ async function planLevel(
   const deadlineSec = actionDeadlineSec(Math.floor(nowMs / 1_000), level.levelIndex);
 
   if (evidence.side === "buy") {
-    return planBuy(deps, job, levels, pending, level, observation, {
-      actionSeq, deadlineSec, latest, wallet, nowMs,
+    const outcome = await planBuy(deps, job, levels, pending, level, observation, {
+      actionSeq, deadlineSec, latest, wallet, nowMs, gas,
     });
+    if (outcome.kind === "hold") {
+      await recordLevelOutcome(deps, job, level, outcome.code as QuantHoldCode, false, observation, nowMs);
+    }
+    return outcome;
   }
-  return planSell(deps, job, level, observation, {
-    actionSeq, deadlineSec, latest, wallet, nowMs,
+  const outcome = await planSell(deps, job, level, observation, {
+    actionSeq, deadlineSec, latest, wallet, nowMs, gas,
   });
+  if (outcome.kind === "hold") {
+    await recordLevelOutcome(deps, job, level, outcome.code as QuantHoldCode, false, observation, nowMs);
+  }
+  return outcome;
 }
 
 type PlanContext = {
@@ -659,7 +1172,14 @@ type PlanContext = {
   readonly latest: bigint;
   readonly wallet: Address;
   readonly nowMs: number;
+  readonly seed?: boolean;
+  readonly gas: GasEvidence;
 };
+
+type InsertIntentResult = QuantActionRow | {
+  readonly kind: "hold";
+  readonly code: "gas-price-unavailable" | "gas-price-implausible" | "gas-price-moved";
+} | null;
 
 /**
  * What ONE other level still owes in submissions, as the inventory
@@ -703,7 +1223,7 @@ function levelObligation(
 }
 
 async function planBuy(
-  deps: QuantWorkerDeps,
+  deps: QuantAdmittedWorkerDeps,
   job: QuantJobRow,
   levels: readonly QuantLevelRow[],
   pending: readonly QuantActionRow[],
@@ -711,9 +1231,12 @@ async function planBuy(
   observation: QuantObservation,
   ctx: PlanContext,
 ): Promise<PlanResult> {
+  if (ctx.nowMs - ctx.gas.gasReadAtMs > GAS_MAX_AGE_MS) {
+    return { kind: "hold", code: "gas-price-unavailable" };
+  }
   const minOutWei = buyMinOut({
     clipUWei: job.clipUWei,
-    buyPriceE18: level.buyPriceE18,
+    buyPriceE18: ctx.seed ? (job.anchorE18 > 0n ? job.anchorE18 : job.p0E18) : level.buyPriceE18,
     levelIndex: level.levelIndex,
     actionSeq: ctx.actionSeq,
     params: deps.params,
@@ -752,7 +1275,7 @@ async function planBuy(
     ownBaseWei: quoteOutWei,
     otherLevels: others,
     minCapLimitWei: job.wbnbCapMinLimitWei,
-    params: deps.params,
+    params: deps.params, gasPriceWei: ctx.gas.gasPriceWei,
   });
   let nativeBalance: bigint;
   try {
@@ -760,7 +1283,12 @@ async function planBuy(
   } catch {
     return { kind: "hold", code: "meter-unreadable" };
   }
-  if (nativeBalance < required) return { kind: "hold", code: "no-gas" };
+  if (nativeBalance < required) {
+    return {
+      kind: "hold", code: "no-gas",
+      detail: `balance=${nativeBalance} required=${required} shortfall=${required - nativeBalance}`,
+    };
+  }
 
   /* The U budget, enforced by US, independently of session authority (R4.5). */
   const budget = await checkUBudget(deps, job, job.clipUWei, ctx.nowMs);
@@ -790,9 +1318,18 @@ async function planBuy(
     baseAtCycleStartWei: 0n,
     wallet: ctx.wallet,
     observation,
+    seed: ctx.seed === true,
+    requiredNativeWei: required,
+    preNativeBlock: ctx.latest,
+    plannedAccountingRev: job.accountingRev,
+    plannedAccountingEpoch: job.accountingEpoch,
+    gasPriceWei: ctx.gas.gasPriceWei,
+    feeEstWei: ctx.gas.feeEstWei,
+    gasReadAtMs: ctx.gas.gasReadAtMs,
     nowMs: ctx.nowMs,
   });
   if (inserted === null) return { kind: "hold", code: "store-conflict" };
+  if ("kind" in inserted) return { kind: "hold", code: inserted.code };
   return {
     kind: "act", action: inserted, calls,
     requiredNativeWei: required, tokenIn: deps.venue.u,
@@ -800,12 +1337,15 @@ async function planBuy(
 }
 
 async function planSell(
-  deps: QuantWorkerDeps,
+  deps: QuantAdmittedWorkerDeps,
   job: QuantJobRow,
   level: QuantLevelRow,
   observation: QuantObservation,
   ctx: PlanContext,
 ): Promise<PlanResult> {
+  if (ctx.nowMs - ctx.gas.gasReadAtMs > GAS_MAX_AGE_MS) {
+    return { kind: "hold", code: "gas-price-unavailable" };
+  }
   // R7.2: the chunk comes from the PARTITION of the ACTUAL inventory, and each
   // chunk waits for capacity for the WHOLE chunk on every cap row.
   const chunks = job.wbnbCapMinLimitWei > 0n
@@ -816,6 +1356,7 @@ async function planSell(
 
   const floor = sellFloor({
     amountWei,
+    baseWei: level.baseWei,
     baseAtCycleStartWei: level.baseAtCycleStartWei > 0n
       ? level.baseAtCycleStartWei : level.baseWei,
     basisUWei: level.basisUWei,
@@ -826,7 +1367,7 @@ async function planSell(
     midE18: observation.midE18,
     levelIndex: level.levelIndex,
     actionSeq: ctx.actionSeq,
-    params: deps.params,
+    params: deps.params, gasPriceWei: ctx.gas.gasPriceWei,
   });
   const path = directPath(deps.venue.wbnb, deps.venue.u);
   let quoteOutWei: bigint;
@@ -871,7 +1412,7 @@ async function planSell(
     ownBaseWei: 0n,
     otherLevels: [],
     minCapLimitWei: job.wbnbCapMinLimitWei,
-    params: deps.params,
+    params: deps.params, gasPriceWei: ctx.gas.gasPriceWei,
   });
   let nativeBalance: bigint;
   try {
@@ -879,7 +1420,12 @@ async function planSell(
   } catch {
     return { kind: "hold", code: "meter-unreadable" };
   }
-  if (nativeBalance < required) return { kind: "hold", code: "no-gas" };
+  if (nativeBalance < required) {
+    return {
+      kind: "hold", code: "no-gas",
+      detail: `balance=${nativeBalance} required=${required} shortfall=${required - nativeBalance}`,
+    };
+  }
 
   const calls = buildPancakeTokenSwap({
     router: deps.venue.router,
@@ -906,9 +1452,17 @@ async function planSell(
       ? level.baseAtCycleStartWei : level.baseWei,
     wallet: ctx.wallet,
     observation,
+    requiredNativeWei: required,
+    preNativeBlock: ctx.latest,
+    plannedAccountingRev: job.accountingRev,
+    plannedAccountingEpoch: job.accountingEpoch,
+    gasPriceWei: ctx.gas.gasPriceWei,
+    feeEstWei: ctx.gas.feeEstWei,
+    gasReadAtMs: ctx.gas.gasReadAtMs,
     nowMs: ctx.nowMs,
   });
   if (inserted === null) return { kind: "hold", code: "store-conflict" };
+  if ("kind" in inserted) return { kind: "hold", code: inserted.code };
   return {
     kind: "act", action: inserted, calls,
     requiredNativeWei: required, tokenIn: deps.venue.wbnb,
@@ -930,6 +1484,17 @@ async function checkUBudget(
   nowMs: number,
 ): Promise<{ readonly ok: true } | { readonly ok: false; readonly code: QuantHoldCode }> {
   const actions = await deps.store.listActions(job.quantJobId);
+  const levels = await deps.store.listLevels(job.quantJobId);
+  return checkUBudgetSnapshot(job, actions, levels, clipUWei, nowMs);
+}
+
+function checkUBudgetSnapshot(
+  job: QuantJobRow,
+  actions: readonly QuantActionRow[],
+  levels: readonly QuantLevelRow[],
+  clipUWei: bigint,
+  nowMs: number,
+): { readonly ok: true } | { readonly ok: false; readonly code: QuantHoldCode } {
   let reserved = 0n;
   let openBasis = 0n;
   for (const action of actions) {
@@ -942,9 +1507,9 @@ async function checkUBudget(
       continue;
     }
     if (action.state !== "settled" || action.fillInWei === null) continue;
-    if (nowMs - action.updatedAtMs < DAY_MS) reserved += action.fillInWei;
+    const executedAtMs = action.executedAtSec === null ? action.updatedAtMs : Number(action.executedAtSec) * 1_000;
+    if (nowMs - executedAtMs < DAY_MS) reserved += action.fillInWei;
   }
-  const levels = await deps.store.listLevels(job.quantJobId);
   for (const level of levels) {
     if (level.state === "holding-base") openBasis += level.basisUWei;
   }
@@ -958,7 +1523,7 @@ async function checkUBudget(
 }
 
 async function insertIntent(
-  deps: QuantWorkerDeps,
+  deps: QuantAdmittedWorkerDeps,
   job: QuantJobRow,
   level: QuantLevelRow,
   input: {
@@ -976,14 +1541,23 @@ async function insertIntent(
     readonly baseAtCycleStartWei: bigint;
     readonly wallet: Address;
     readonly observation: QuantObservation;
+    readonly seed?: boolean;
+    readonly requiredNativeWei: bigint;
+    readonly preNativeBlock?: bigint;
+    readonly plannedAccountingRev?: bigint;
+    readonly plannedAccountingEpoch?: number | null;
+    readonly gasPriceWei: bigint;
+    readonly feeEstWei: bigint;
+    readonly gasReadAtMs: number;
     readonly nowMs: number;
   },
-): Promise<QuantActionRow | null> {
+): Promise<InsertIntentResult> {
   const [preU, preWbnb, preNative] = await Promise.all([
     deps.reader.tokenBalanceAt(deps.venue.u, input.wallet).catch(() => 0n),
     deps.reader.tokenBalanceAt(deps.venue.wbnb, input.wallet).catch(() => 0n),
-    deps.reader.nativeBalanceAt(input.wallet).catch(() => 0n),
+    deps.reader.nativeBalanceAt(input.wallet).catch(() => null),
   ]);
+  if (preNative === null) return null;
   // The DECISION NOTE is written BEFORE the submit, and it is what the term-end
   // report replays (their skill's rule: a note invented at term end is a
   // rationalisation). It is bounded at 2000 chars and NEVER passes through
@@ -1000,18 +1574,72 @@ async function insertIntent(
     quoteOutWei: input.quoteOutWei.toString(10),
     minOutWei: input.minOutWei.toString(10),
     impactBps: input.impactBps,
-    feeEstUWei: feeEstInU(deps.params, input.observation.midE18).toString(10),
+    gasPriceWei: input.gasPriceWei.toString(10),
+    feeEstWei: input.feeEstWei.toString(10),
+    feeEstUWei: feeEstInU(deps.params, input.observation.midE18, input.gasPriceWei).toString(10),
     bandBps: deps.params.bandBps,
+    evidenceKind: input.seed === true ? "seed" : "crossing",
   }).slice(0, 2_000);
+  let preClaimCode: "gas-price-unavailable" | "gas-price-implausible" | "gas-price-moved" | null = null;
   const result = await deps.store.withQuantFence(job.quantJobId, async (fence: QuantFence) => {
     // RE-READ inside the fence. The trigger latch was written earlier in this
     // cycle, which bumped the level's `row_version`, so the row this decision
     // started from is already stale — and an intent CAS'd against a stale
     // version would silently never insert. The fence is what makes the re-read
     // and the insert one transaction.
-    const current = (await fence.listLevels(job.quantJobId))
+    const [fencedJob, fencedLevels, fencedPending, recentBuys] = await Promise.all([
+      fence.getJob(job.quantJobId),
+      fence.listLevels(job.quantJobId),
+      fence.listNonTerminalActions(job.quantJobId),
+      fence.listRecentBuys(job.quantJobId, input.nowMs - DAY_MS),
+    ]);
+    const current = fencedLevels
       .find((row) => row.levelIndex === level.levelIndex);
-    if (current === undefined) return { kind: "conflict" as const, record: null };
+    if (fencedJob === null || current === undefined) {
+      return { kind: "conflict" as const, record: null };
+    }
+    let refreshedGas: bigint;
+    try {
+      refreshedGas = await deps.reader.gasPriceWei();
+    } catch {
+      preClaimCode = "gas-price-unavailable";
+      return null;
+    }
+    if (refreshedGas <= 0n) {
+      preClaimCode = "gas-price-unavailable";
+      return null;
+    }
+    if (refreshedGas > MAX_GAS_PRICE_WEI) {
+      preClaimCode = "gas-price-implausible";
+      return null;
+    }
+    if (input.nowMs - input.gasReadAtMs > GAS_MAX_AGE_MS
+      || feeEstWei(deps.params, input.gasPriceWei) !== input.feeEstWei) {
+      preClaimCode = "gas-price-moved";
+      return null;
+    }
+    if (feeEstWei(deps.params, refreshedGas) > input.feeEstWei) {
+      preClaimCode = "gas-price-moved";
+      return null;
+    }
+    if (input.side === "buy") {
+      const actionByKey = new Map<string, QuantActionRow>();
+      for (const row of recentBuys) actionByKey.set(row.journalKey, row);
+      for (const row of fencedPending) actionByKey.set(row.journalKey, row);
+      const budget = checkUBudgetSnapshot(
+        fencedJob, [...actionByKey.values()], fencedLevels, input.amountInWei, input.nowMs,
+      );
+      if (!budget.ok) return { kind: "conflict" as const, record: null };
+    }
+    const fencedRequiredNativeWei = requiredNativeWei({
+      side: input.side,
+      ownBaseWei: input.side === "buy" ? input.quoteOutWei : 0n,
+      otherLevels: fencedLevels
+        .filter((row) => row.levelIndex !== current.levelIndex)
+        .map((row) => levelObligation(row, fencedPending)),
+      minCapLimitWei: fencedJob.wbnbCapMinLimitWei,
+      params: deps.params, gasPriceWei: input.gasPriceWei,
+    });
     return fence.insertIntent({
       journalKey: quantJournalKey(job.quantJobId, current.levelIndex, input.actionSeq),
       quantJobId: job.quantJobId,
@@ -1037,12 +1665,290 @@ async function insertIntent(
       preUWei: preU,
       preWbnbWei: preWbnb,
       preNativeWei: preNative,
+      preNativeBlock: input.preNativeBlock ?? null,
       basisUWei: input.basisUWei,
       baseAtCycleStartWei: input.baseAtCycleStartWei,
+      ladderGen: current.ladderGen,
+      evidence: input.seed === true
+        ? { kind: "seed", accepted: input.observation.blockNumber }
+        : {
+          kind: "crossing",
+          first: current.triggerBlockFirst ?? input.observation.blockNumber,
+          second: input.observation.blockNumber,
+        },
+      // Recomputed from the rows read on this fence. The planner's earlier
+      // estimate is advisory; the persisted claim carries this value.
+      requiredNativeWei: fencedRequiredNativeWei,
+      gasPriceWei: input.gasPriceWei,
+      feeEstWei: input.feeEstWei,
+      plannedWallet: input.wallet,
+      plannedProcessDigest: deps.paramsDigest,
+      planObservationBlock: input.observation.blockNumber,
+      planObservationHash: input.observation.blockHash,
+      planObservationAtMs: input.observation.observedAtMs,
+      ...(input.plannedAccountingRev === undefined ? {} : {
+        plannedAccountingRev: input.plannedAccountingRev,
+      }),
+      ...(input.plannedAccountingEpoch === undefined ? {} : {
+        plannedAccountingEpoch: input.plannedAccountingEpoch,
+      }),
+      planTriggerFirst: current.triggerBlockFirst,
+      plannedBuyPriceE18: current.buyPriceE18,
+      plannedSellPriceE18: current.sellPriceE18,
+      seedWindowCycles: deps.params.seedWindowCycles,
+      maxQuoteLagBlocks: deps.params.maxQuoteLagBlocks,
       nowMs: input.nowMs,
     });
   });
+  if (preClaimCode !== null) return { kind: "hold", code: preClaimCode };
+  if (result === null) return null;
   return result.kind === "ok" ? result.record : null;
+}
+
+async function recordLevelOutcome(
+  deps: QuantWorkerDeps,
+  job: QuantJobRow,
+  level: QuantLevelRow,
+  holdCode: QuantHoldCode | null,
+  seedCounted: boolean,
+  observation: QuantObservation,
+  nowMs: number,
+): Promise<void> {
+  await deps.store.withQuantFence(job.quantJobId, async (fence) => {
+    await fence.recordLevelOutcome({
+      quantJobId: job.quantJobId, levelIndex: level.levelIndex, holdCode,
+      seedCounted, acceptedBlock: observation.blockNumber, acceptedHash: observation.blockHash,
+      acceptedAtMs: observation.observedAtMs, ladderGen: level.ladderGen,
+      expectedProcessDigest: deps.paramsDigest,
+      ...(holdCode === null ? {} : { cause: holdCode }), nowMs,
+    });
+  });
+}
+
+async function maybeRecenter(
+  deps: QuantAdmittedWorkerDeps,
+  job: QuantJobRow,
+  levels: readonly QuantLevelRow[],
+  observation: QuantObservation,
+  gas: GasEvidence,
+): Promise<
+  | { readonly kind: "none" }
+  | { readonly kind: "hold"; readonly code: QuantHoldCode }
+  | { readonly kind: "recentered"; readonly side: "up" | "down" }
+> {
+  const preview = previewRecenter(job, levels, observation, deps.params);
+  if (preview.kind === "none") return { kind: "none" };
+  if (preview.kind === "hold") {
+    if (preview.code === "recenter-budget-exhausted" || preview.code === "recenter-cooldown"
+      || preview.code === "recenter-busy" || preview.code === "recenter-retired") {
+      await hold(deps, job.quantJobId, preview.code);
+    }
+    return { kind: "hold", code: preview.code };
+  }
+  if (preview.side === "down" && isTaggedDownNoop(job, levels, observation, preview, deps.params, gas)) {
+    await deps.store.resetLatches(job.quantJobId, false);
+    await hold(deps, job.quantJobId, "recenter-noop");
+    return { kind: "hold", code: "recenter-noop" };
+  }
+  let seedQuoteOutWei: bigint | undefined;
+  if (preview.reseed) {
+    try {
+      const path = directPath(deps.venue.u, deps.venue.wbnb);
+      seedQuoteOutWei = deps.reader.quoteV2AtHash === undefined
+        ? await deps.reader.quoteV2At(deps.venue.router, path, job.clipUWei, observation.blockNumber)
+        : await deps.reader.quoteV2AtHash(deps.venue.router, path, job.clipUWei, observation.blockHash);
+    } catch {
+      await hold(deps, job.quantJobId, "recenter-deferred");
+      return { kind: "hold", code: "recenter-deferred" };
+    }
+  }
+  let reseedNativeBalance: bigint | null = null;
+  if (preview.reseed) {
+    const upper = levels.find((row) => row.levelIndex === job.levels);
+    if (upper === undefined) return { kind: "hold", code: "recenter-deferred" };
+    const [uBalance, nativeBalance] = await Promise.all([
+      deps.reader.tokenBalanceAt(deps.venue.u, job.tradingWallet).catch(() => 0n),
+      deps.reader.nativeBalanceAt(job.tradingWallet).catch(() => 0n),
+    ]);
+    reseedNativeBalance = nativeBalance;
+    if (uBalance < job.clipUWei || nativeBalance <= 0n) {
+      await hold(deps, job.quantJobId, "recenter-deferred");
+      return { kind: "hold", code: "recenter-deferred" };
+    }
+    if (job.sessionPublicKey === null) {
+      await hold(deps, job.quantJobId, "recenter-deferred");
+      return { kind: "hold", code: "recenter-deferred" };
+    }
+    const otherLevels = levels.filter((row) => row.levelIndex !== upper.levelIndex)
+      .map((row) => levelObligation(row, []));
+    const required = requiredNativeWei({
+      side: "buy", ownBaseWei: seedQuoteOutWei ?? 0n, otherLevels,
+      minCapLimitWei: job.wbnbCapMinLimitWei, params: deps.params,
+      gasPriceWei: gas.gasPriceWei,
+    });
+    const meters = await checkQuantMeters({
+      provider: deps.provider, walletAddress: job.tradingWallet,
+      publicKey: job.sessionPublicKey, tokenIn: deps.venue.u,
+      amountInWei: job.clipUWei, requiredNativeWei: required,
+    });
+    if (!meters.ok) {
+      await hold(deps, job.quantJobId, "recenter-deferred");
+      return { kind: "hold", code: "recenter-deferred" };
+    }
+    const chain = await runChainAdmissionChecks({
+      reads: deps.chainAdmission, wallet: job.tradingWallet,
+      keyHash: accountKeyHashForAddress(publicKeyToAddress(job.sessionPublicKey)),
+      publicKey: job.sessionPublicKey,
+      probes: buildAdmissionProbes(deps, job.clipUWei, job.tradingWallet),
+    });
+    if (!chain.ok) {
+      await hold(deps, job.quantJobId, "recenter-deferred");
+      return { kind: "hold", code: "recenter-deferred" };
+    }
+  }
+  let impact: bigint;
+  try {
+    impact = await measureImpactBps(deps, job.clipUWei, observation.blockNumber, observation.blockHash);
+  } catch {
+    await hold(deps, job.quantJobId, "recenter-deferred");
+    return { kind: "hold", code: "recenter-deferred" };
+  }
+  const economics = armFloor({
+    clipUWei: job.clipUWei, midE18: observation.midE18, impactBps: impact,
+    params: deps.params, gasPriceWei: gas.gasPriceWei,
+  });
+  if (!economics.economic) {
+    await hold(deps, job.quantJobId, "recenter-uneconomic");
+    return { kind: "hold", code: "recenter-uneconomic" };
+  }
+  let capRows: readonly { readonly token: Address | null; readonly limit: bigint }[] = [];
+  try {
+    const parsed: unknown = job.capRowsJson === null ? [] : JSON.parse(job.capRowsJson);
+    if (Array.isArray(parsed)) {
+      capRows = parsed.map((row) => {
+        if (typeof row !== "object" || row === null) throw new Error("cap");
+        const item = row as Record<string, unknown>;
+        return {
+          token: item["token"] === null ? null : getAddress(String(item["token"])),
+          limit: BigInt(String(item["limit"])),
+        };
+      });
+    }
+  } catch {
+    await hold(deps, job.quantJobId, "recenter-cap-too-small");
+    return { kind: "hold", code: "recenter-cap-too-small" };
+  }
+  const ladderGate = checkLadderAdmissible({
+    ladder: { levels: job.levels, clipUWei: job.clipUWei, buyPrice: preview.buyPrice,
+      sellPrice: preview.sellPrice, midE18: observation.midE18,
+      ...(preview.sellPrice[Math.max(1, job.levels - 1)] === undefined ? {} : {
+        minSellPriceE18: preview.sellPrice[Math.max(1, job.levels - 1)]!,
+      }) },
+    allocationUWei: job.allocationUWei, dailyCapUWei: job.dailyCapUWei, capRows,
+    u: deps.venue.u, wbnb: deps.venue.wbnb, impactBps: impact, params: deps.params,
+    gasPriceWei: gas.gasPriceWei,
+    ...(seedQuoteOutWei === undefined ? {} : { seedQuoteOutWei }),
+    ...(preview.reseed ? {
+      seedActionSeq: (levels.find((row) => row.levelIndex === job.levels)?.actionSeq ?? 0) + 1,
+    } : {}),
+  });
+  if (!ladderGate.ok) {
+    const code = ladderGate.code === "arm-uneconomic" ? "recenter-uneconomic"
+      : ladderGate.code === "seed-unexecutable" ? "seed-unexecutable" : "recenter-cap-too-small";
+    await hold(deps, job.quantJobId, code);
+    return { kind: "hold", code };
+  }
+  if (preview.reseed) {
+    try {
+      const [freshU, freshNative] = await Promise.all([
+        deps.reader.tokenBalanceAt(deps.venue.u, job.tradingWallet),
+        deps.reader.nativeBalanceAt(job.tradingWallet),
+      ]);
+      if (freshU < job.clipUWei) {
+        await hold(deps, job.quantJobId, "recenter-deferred");
+        return { kind: "hold", code: "recenter-deferred" };
+      }
+      reseedNativeBalance = freshNative;
+    } catch {
+      await hold(deps, job.quantJobId, "recenter-deferred");
+      return { kind: "hold", code: "recenter-deferred" };
+    }
+  }
+  const result = await deps.store.withQuantFence(job.quantJobId, async (fence) => {
+    const [fencedJob, fencedLevels, fencedPending, recentBuys] = await Promise.all([
+      fence.getJob(job.quantJobId),
+      fence.listLevels(job.quantJobId),
+      fence.listNonTerminalActions(job.quantJobId),
+      fence.listRecentBuys(job.quantJobId, deps.nowMs() - DAY_MS),
+    ]);
+    if (fencedJob === null) return { kind: "conflict" as const, record: null };
+    if (preview.reseed) {
+      const actionByKey = new Map<string, QuantActionRow>();
+      for (const row of recentBuys) actionByKey.set(row.journalKey, row);
+      for (const row of fencedPending) actionByKey.set(row.journalKey, row);
+      const budget = checkUBudgetSnapshot(
+        fencedJob, [...actionByKey.values()], fencedLevels, fencedJob.clipUWei, deps.nowMs(),
+      );
+      if (!budget.ok) return { kind: "deferred" as const };
+      const upper = fencedLevels.find((row) => row.levelIndex === fencedJob.levels);
+      const required = requiredNativeWei({
+        side: "buy", ownBaseWei: seedQuoteOutWei ?? 0n,
+        otherLevels: fencedLevels
+          .filter((row) => row.levelIndex !== upper?.levelIndex)
+          .map((row) => levelObligation(row, fencedPending)),
+        minCapLimitWei: fencedJob.wbnbCapMinLimitWei, params: deps.params,
+        gasPriceWei: gas.gasPriceWei,
+      });
+      if (reseedNativeBalance === null || required > reseedNativeBalance) {
+        return { kind: "deferred" as const };
+      }
+    }
+    return fence.recenterLadder({
+      quantJobId: job.quantJobId, expectedGeneration: job.ladderGen,
+      observationBlock: observation.blockNumber, observationHash: observation.blockHash,
+      observationAtMs: observation.observedAtMs, side: preview.side,
+      newAnchorE18: observation.midE18, newBuyPrice: preview.buyPrice,
+      newSellPrice: preview.sellPrice, cause: preview.cause, nowMs: deps.nowMs(),
+      reseed: preview.reseed, cooldownSec: deps.params.recenterCooldownSec,
+      expectedWallet: job.tradingWallet, expectedProcessDigest: deps.paramsDigest,
+    });
+  });
+  if (result.kind === "deferred") {
+    await hold(deps, job.quantJobId, "recenter-deferred");
+    return { kind: "hold", code: "recenter-deferred" };
+  }
+  if (result.kind !== "ok") {
+    await hold(deps, job.quantJobId, "recenter-conflict");
+    return { kind: "hold", code: "recenter-conflict" };
+  }
+  return { kind: "recentered", side: preview.side };
+}
+
+function isTaggedDownNoop(
+  job: QuantJobRow,
+  levels: readonly QuantLevelRow[],
+  observation: QuantObservation,
+  preview: Extract<QuantRecenterPreview, { readonly kind: "recenter" }>,
+  params: QuantAdmittedParams,
+  gas: GasEvidence,
+): boolean {
+  if (levels.some((level) => level.state !== "holding-base")) return false;
+  return levels.every((level) => {
+    const amount = partitionExit(level.baseWei, job.wbnbCapMinLimitWei)[0] ?? 0n;
+    if (amount <= 0n) return true;
+    const common = {
+      amountWei: amount, baseWei: level.baseWei,
+      baseAtCycleStartWei: level.baseAtCycleStartWei || level.baseWei,
+      basisUWei: level.basisUWei, entryCostUWei: level.entryCostUWei,
+      midE18: observation.midE18, levelIndex: level.levelIndex,
+      actionSeq: level.actionSeq + 1, params, gasPriceWei: gas.gasPriceWei,
+    };
+    const oldFloor = sellFloor({ ...common, sellPriceE18: level.sellPriceE18 });
+    const newFloor = sellFloor({
+      ...common, sellPriceE18: preview.sellPrice[level.levelIndex] ?? level.sellPriceE18,
+    });
+    return oldFloor.minOutWei === newFloor.minOutWei;
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1058,13 +1964,13 @@ async function finishTerm(
   const nowMs = deps.nowMs();
   const pending = await deps.store.listNonTerminalActions(job.quantJobId);
   if (pending.length > 0) {
-    await deps.store.setJobStatus({
-      quantJobId: job.quantJobId, status: "ended-unresolved", nowMs,
-    });
-    notes.push(`${job.quantJobId}:ended-unresolved`);
+    if (job.status !== "reported") {
+      await deps.store.markEnded({ quantJobId: job.quantJobId, unresolved: true, nowMs });
+      notes.push(`${job.quantJobId}:ended-unresolved`);
+    }
     return { actions: 0, holds: 0, notes };
   }
-  if (job.status === "reported" || dryRun) {
+  if (dryRun) {
     return { actions: 0, holds: 0, notes };
   }
   // Max 24 attempts with the store's own attempt counter as the backoff.
@@ -1073,6 +1979,13 @@ async function finishTerm(
     return { actions: 0, holds: 0, notes };
   }
   const actions = await deps.store.listActions(job.quantJobId);
+  if (job.status === "reported" && job.reportedAtMs !== null
+    && !actions.some((action) => action.state === "settled" && action.updatedAtMs > job.reportedAtMs!)) {
+    return { actions: 0, holds: 0, notes };
+  }
+  if (job.status !== "ended" && job.status !== "ended-unresolved" && job.status !== "reported") {
+    await deps.store.markEnded({ quantJobId: job.quantJobId, unresolved: false, nowMs });
+  }
   const trades = actions
     .filter((action) => action.state === "settled" && action.txHash !== null)
     .map((action) => ({ txHash: action.txHash as Hex, note: action.note.slice(0, 2_000) }));
@@ -1086,11 +1999,11 @@ async function finishTerm(
     notesApplied: response.ok ? response.data.notesApplied : null,
     nowMs,
   });
-  await deps.store.setJobStatus({
-    quantJobId: job.quantJobId,
-    status: response.ok ? "reported" : "ended",
-    nowMs,
-  });
+  if (response.ok) {
+    await deps.store.markReported({ quantJobId: job.quantJobId, nowMs });
+  } else {
+    await deps.store.markEnded({ quantJobId: job.quantJobId, unresolved: false, nowMs });
+  }
   notes.push(`${job.quantJobId}:${response.ok ? "reported" : "report-retry"}`);
   return { actions: 0, holds: 0, notes };
 }
