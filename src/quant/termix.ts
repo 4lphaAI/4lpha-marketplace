@@ -193,7 +193,14 @@ export function parseQuantJob(
 
 export function parseInboxItem(value: unknown): QuantTransportResult<QuantInboxItem> {
   if (!isRecord(value)) return invalid("inboxItem");
-  const fields = ["envelopeId", "quantJobId", "ephemeralPublicKey", "nonce", "ciphertext", "algorithm"] as const;
+  // The live inbox (2026-09-16, FINDINGS bn-8) names the envelope `id`; the
+  // skill docs the fixtures were built from said `envelopeId`. Either is the
+  // envelope's identity; nothing downstream keys on the spelling.
+  const envelopeId = typeof value["envelopeId"] === "string" && value["envelopeId"] !== ""
+    ? value["envelopeId"]
+    : value["id"];
+  if (typeof envelopeId !== "string" || envelopeId === "") return invalid("envelopeId");
+  const fields = ["quantJobId", "ephemeralPublicKey", "nonce", "ciphertext", "algorithm"] as const;
   for (const field of fields) {
     const raw = value[field];
     if (typeof raw !== "string" || raw === "") return invalid(field);
@@ -201,7 +208,7 @@ export function parseInboxItem(value: unknown): QuantTransportResult<QuantInboxI
   return {
     ok: true,
     data: {
-      envelopeId: String(value["envelopeId"]),
+      envelopeId,
       quantJobId: String(value["quantJobId"]),
       ephemeralPublicKey: String(value["ephemeralPublicKey"]),
       nonce: String(value["nonce"]),

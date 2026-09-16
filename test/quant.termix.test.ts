@@ -109,6 +109,23 @@ describe("inbox and trade parsing", () => {
     }
   });
 
+  it("accepts the live inbox shape, which names the envelope `id` (bn-8)", () => {
+    const live = {
+      id: "cmu4d87l40pkkv001rf2z0grl", quantJobId: "cmu4d7rma0pk3v0010ufg6dlq",
+      ciphertext: "c", ephemeralPublicKey: "p", nonce: "n",
+      algorithm: "x25519-hkdf-chacha20poly1305", createdAt: "2026-09-16T17:19:22.984Z",
+    };
+    const parsed = parseInboxItem(live);
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) assert.equal(parsed.data.envelopeId, "cmu4d87l40pkkv001rf2z0grl");
+    // `envelopeId` still wins when both are present; neither ⇒ refused.
+    const both = parseInboxItem({ ...live, envelopeId: "e-explicit" });
+    if (both.ok) assert.equal(both.data.envelopeId, "e-explicit");
+    const neither = parseInboxItem({ ...live, id: "" });
+    assert.equal(neither.ok, false);
+    if (!neither.ok) assert.equal(neither.detail, "envelopeId");
+  });
+
   it("requires a 32-byte txHash on an indexer trade", () => {
     assert.equal(parseIndexerTrade({ txHash: "0x1234", direction: "buy" }).ok, false);
     const parsed = parseIndexerTrade({
