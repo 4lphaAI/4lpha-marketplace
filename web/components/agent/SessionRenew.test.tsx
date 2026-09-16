@@ -113,6 +113,14 @@ describe("SessionRenew", () => {
     }
   });
 
+  it("names the reserved key's expiry on the retry line from a wire descriptor (expiresAt, not expiry)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json({ data: { pendingRenewal: pending("granting") } })));
+    await mount();
+    expect(host.textContent).toContain("Retry grant");
+    expect(host.textContent).not.toContain("unavailable date");
+    expect(host.textContent).toContain(new Date((NOW + 7_200) * 1_000).toISOString());
+  });
+
   it("[F12] keeps the cancel response when the wire uses expiresAt", async () => {
     let reads = 0;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {

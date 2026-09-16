@@ -175,9 +175,11 @@ export function useSessionRenew(props: SessionRenewProps): SessionRenewSlots {
       setPending(null);
       return;
     }
+    // The wire descriptor carries `expiresAt`; the wizard reads `expiry` (the S1 shape), so normalise here as responseData() does.
+    const normalised = { ...value, expiry: typeof value.expiry === "number" ? value.expiry : value.expiresAt ?? value.expiry };
     const renewal = data?.onChainRevoke === undefined
-      ? value
-      : { ...value, onChainRevoke: data.onChainRevoke };
+      ? normalised
+      : { ...normalised, onChainRevoke: data.onChainRevoke };
     setPending(renewal);
     const phase = data?.renewalPhase ?? renewal.phase;
     const hasRevoke = renewal.onChainRevoke !== undefined
