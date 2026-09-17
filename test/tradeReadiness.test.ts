@@ -17,16 +17,16 @@ function envelope(lane: "bstocks" | "allowlist", count: number, staleness: numbe
   };
 }
 
-function plane(allowlist: TradeReadinessProbeResult): TradeReadinessDataPlane {
+function plane(allowlist: TradeReadinessProbeResult, bstocks = 25): TradeReadinessDataPlane {
   return {
     async probeUniverse(lane) {
-      return lane === "bstocks" ? { status: 200, envelope: envelope("bstocks", 25) } : allowlist;
+      return lane === "bstocks" ? { status: 200, envelope: envelope("bstocks", bstocks) } : allowlist;
     },
   };
 }
 
 describe("trade readiness", () => {
-  it("requires exactly 25 bStocks and a non-empty, non-null-staleness allowlist", async () => {
+  it("requires at least 25 bStocks and a non-empty, non-null-staleness allowlist", async () => {
     const readiness = await createTradeReadiness({
       dataPlane: plane({ status: 200, envelope: envelope("allowlist", 1) }), intervalMs: 60_000,
     });
@@ -34,6 +34,21 @@ describe("trade readiness", () => {
     assert.equal(readiness.allowlistAvailable, true);
     assert.equal(readiness.bstocksAddresses.size, 25);
     readiness.stop();
+  });
+
+  it("stays ready when the bStocks lane grows past the static 25 and stands down below it", async () => {
+    const grown = await createTradeReadiness({
+      dataPlane: plane({ status: 200, envelope: envelope("allowlist", 1) }, 46), intervalMs: 60_000,
+    });
+    assert.equal(grown.ready, true);
+    assert.equal(grown.bstocksAddresses.size, 46);
+    grown.stop();
+    const short = await createTradeReadiness({
+      dataPlane: plane({ status: 200, envelope: envelope("allowlist", 1) }, 24), intervalMs: 60_000,
+    });
+    assert.equal(short.ready, false);
+    assert.equal(short.bstocksAddresses.size, 0);
+    short.stop();
   });
 
   it("remembers legacy invalid_lane and null staleness as unavailable", async () => {

@@ -70,7 +70,10 @@ export async function createTradeReadiness(input: CreateTradeReadinessInput): Pr
         input.dataPlane.probeUniverse("allowlist"),
       ]);
       const bstockRows = bstocks.status === 200 ? rows(bstocks.envelope, "bstocks") : null;
-      ready = bstockRows?.length === 25;
+      // The static floor is 25 (REVIEW2 R9). The lane grew past it on
+      // 2026-09-17 when the data plane unioned the Binance RWA list onto the
+      // static rows (46 that day) and `=== 25` stood every worker down.
+      ready = bstockRows !== null && bstockRows.length >= 25;
       bstocksAddresses = ready ? new Set(bstockRows) : new Set<string>();
       const allowlistRows = allowlist.status === 200 ? rows(allowlist.envelope, "allowlist") : null;
       const legacyUnavailable = allowlist.status === 400
