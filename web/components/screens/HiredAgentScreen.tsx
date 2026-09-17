@@ -1408,16 +1408,33 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       await mutate("revoke", "/revoke", {});
       currentView = await detail.refresh() ?? view;
     }
+    // An EXPIRED session is already invalid in the KeyStore (2026-09-17,
+    // trading-agent-01-new): the SDK's revoke then submits only the account-level
+    // revoke, which reverts KeyDoesNotExist on Altana, and the page looped on
+    // that error for ever. The plane's finalized-revocation read is the
+    // authority: a fresh `invalid`/`missing` verdict IS removal, so it is
+    // checked before the passkey prompt and again after a FAILED relay result.
+    {
+      const evidence = await readRegistration();
+      currentView = await detail.refresh() ?? currentView;
+      if (hasFreshRevocationProof(removeSnapshotOf(currentView, registration, evidence), Date.now())) {
+        setMessage("Agent removed. The recorded session is no longer valid on chain (expired or revoked); no revocation was needed.");
+        return;
+      }
+    }
     setMessage("Removing: approve the on-chain session-key revocation with your passkey…");
     const result = await (await import("@/lib/altana/client")).revokeAgentSession({
       record: owner.passkey,
       ownerViewWalletAddress: view.walletAddress as `0x${string}`,
       sessionPublicKey: view.sessionPublicKey as `0x${string}`,
     });
-    if (result.status === "FAILED") throw new Error("The on-chain session-key revocation failed. The execution plane is already revoked; press Finish removal to retry the chain step.");
     const evidence = await readRegistration();
     currentView = await detail.refresh() ?? currentView;
-    if (hasFreshRevocationProof(removeSnapshotOf(currentView, registration, evidence), Date.now())) {
+    const proven = hasFreshRevocationProof(removeSnapshotOf(currentView, registration, evidence), Date.now());
+    if (result.status === "FAILED" && !proven) {
+      throw new Error("The on-chain session-key revocation failed. The execution plane is already revoked; press Finish removal to retry the chain step.");
+    }
+    if (proven) {
       setMessage("Agent removed. Every verified position was exited to BNB before revocation.");
     } else {
       setMessage("The revocation was submitted. Press Finish removal after the chain confirms it.");
