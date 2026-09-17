@@ -1454,28 +1454,56 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     if (view === null || owner.passkey === null || view.sessionPublicKey === null) {
       throw new Error("Hard revoke needs the passkey that owns this wallet.");
     }
-    const current = await detail.refresh() ?? view;
+    let current = await detail.refresh() ?? view;
     if (current.renewalPending === true) {
       throw new Error("A renewal is pending; finish or cancel it before revoking the session.");
     }
-    if (current.status === "armed") {
-      setMessage("Hard revoke: pausing the worker before revoking session authority…");
-      await mutate("pause", "/pause", {});
+    // 2026-09-17 (trading-agent-01-new): this path used to go straight to the
+    // SDK. On an EXPIRED session the SDK's account-level revoke reverts
+    // KeyDoesNotExist (authority lives in the KeyStore, where the key is
+    // already invalid), the error was never caught, and the plane never
+    // recorded the local revoke — so it never read the KeyStore evidence that
+    // already proves removal. Order now: plane revoke first, then evidence,
+    // and the passkey ceremony only when the evidence is not there yet.
+    if (current.status !== "revoked") {
+      if (trading && (await detail.refreshTrade())?.lifecycle.draining !== true) {
+        setMessage("Removing: closing the entry gate on the execution plane…");
+        await mutate("tradeDrain", "/trade/drain", {});
+      }
+      setMessage("Removing: recording the revoke on the execution plane…");
+      await mutate("revoke", "/revoke", {});
+      current = await detail.refresh() ?? current;
+    }
+    {
+      const evidence = await readRegistration();
+      current = await detail.refresh() ?? current;
+      if (hasFreshRevocationProof(removeSnapshotOf(current, registration, evidence), Date.now())) {
+        setMessage("Agent removed. The session key is no longer valid on chain (expired); tokens left in the wallet can be withdrawn from Account.");
+        return;
+      }
     }
     setMessage("Hard revoke: approve the on-chain session-key revocation. This does not guarantee conversion of remaining tokens to BNB.");
-    const result = await (await import("@/lib/altana/client")).revokeAgentSession({
-      record: owner.passkey,
-      ownerViewWalletAddress: current.walletAddress as `0x${string}`,
-      sessionPublicKey: current.sessionPublicKey as `0x${string}`,
-    });
-    if (result.status === "FAILED") throw new Error("Hard revoke failed on-chain; no successful removal is being reported.");
+    let failure: string | null = null;
+    try {
+      const result = await (await import("@/lib/altana/client")).revokeAgentSession({
+        record: owner.passkey,
+        ownerViewWalletAddress: current.walletAddress as `0x${string}`,
+        sessionPublicKey: current.sessionPublicKey as `0x${string}`,
+      });
+      if (result.status === "FAILED") failure = "the relay reported FAILED";
+    } catch (error) {
+      failure = error instanceof Error ? error.message.slice(0, 160) : "the relay refused the bundle";
+    }
     const evidence = await readRegistration();
-    const latest = await detail.refresh() ?? view;
-    if (!hasFreshRevocationProof(removeSnapshotOf(latest, registration, evidence), Date.now())) {
-      setMessage("Hard revoke was submitted but is not yet confirmed. Retry after confirmation; conversion to BNB remains incomplete.");
+    const latest = await detail.refresh() ?? current;
+    if (hasFreshRevocationProof(removeSnapshotOf(latest, registration, evidence), Date.now())) {
+      setMessage("Session authority is hard-revoked. Conversion to BNB is incomplete; open Account recovery for any remaining tokens.");
       return;
     }
-    setMessage("Session authority is hard-revoked. Conversion to BNB is incomplete; open Account recovery for any remaining tokens.");
+    if (failure !== null) {
+      throw new Error(`The on-chain revocation did not happen (${failure}). Plane status: ${latest.status}; KeyStore evidence: ${evidence?.kind ?? "none"}. Press Remove again in a few seconds.`);
+    }
+    setMessage("Hard revoke was submitted but is not yet confirmed. Retry after confirmation; conversion to BNB remains incomplete.");
   });
 
   const cat = Category("grid");
