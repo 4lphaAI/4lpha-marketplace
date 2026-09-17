@@ -198,7 +198,7 @@ export async function runQuantWorkerOnce(
     }
   }
 
-  const jobs = await deps.store.listWorkableJobs(deps.strategyId);
+  const jobs = orderWorkableJobs(await deps.store.listWorkableJobs(deps.strategyId));
   for (const job of jobs) {
     try {
       const outcome = await runOneJob(deps, job, options);
@@ -738,13 +738,51 @@ async function readGasEvidence(
 /* Admission                                                                  */
 /* -------------------------------------------------------------------------- */
 
+function compareJobOrder(left: QuantJobRow, right: QuantJobRow): number {
+  if (left.createdAtMs < right.createdAtMs) return -1;
+  if (left.createdAtMs > right.createdAtMs) return 1;
+  if (left.quantJobId < right.quantJobId) return -1;
+  if (left.quantJobId > right.quantJobId) return 1;
+  return 0;
+}
+
+function orderWorkableJobs(jobs: readonly QuantJobRow[]): readonly QuantJobRow[] {
+  const discovered = jobs.filter((row) => row.status === "discovered").sort(compareJobOrder);
+  let discoveredIndex = 0;
+  return jobs.map((row) => row.status === "discovered"
+    ? discovered[discoveredIndex++]!
+    : row);
+}
+
+function walletSharedHolder(
+  job: QuantJobRow,
+  rows: readonly QuantJobRow[],
+): QuantJobRow | null {
+  const wallet = job.tradingWallet.toLowerCase();
+  const matching = rows.filter((row) => row.quantJobId !== job.quantJobId
+    && row.strategyId === job.strategyId
+    && row.tradingWallet.toLowerCase() === wallet
+    // C156: only safe terminal rows release the wallet; unresolved does not.
+    && row.status !== "ended"
+    && row.status !== "reported");
+  const admitted = matching.filter((row) => row.status !== "discovered").sort(compareJobOrder)[0];
+  if (admitted !== undefined) return admitted;
+  const discovered = matching.filter((row) => row.status === "discovered").sort(compareJobOrder)[0];
+  return discovered !== undefined && compareJobOrder(discovered, job) < 0 ? discovered : null;
+}
+
 async function admitJob(
   deps: QuantWorkerDeps,
   job: QuantJobRow,
   dryRun: boolean,
 ): Promise<{ readonly ok: boolean; readonly note: string }> {
-  if (job.envelopeJson === null) return { ok: false, note: "envelope-missing" };
   if (dryRun) return { ok: false, note: "dry-run" };
+  const holder = walletSharedHolder(job, await deps.store.listJobs());
+  if (holder !== null) {
+    await hold(deps, job.quantJobId, "wallet-shared");
+    return { ok: false, note: `wallet-shared:${holder.quantJobId}` };
+  }
+  if (job.envelopeJson === null) return { ok: false, note: "envelope-missing" };
   let envelope: unknown;
   try {
     envelope = JSON.parse(job.envelopeJson);

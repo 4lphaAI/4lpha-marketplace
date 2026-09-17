@@ -80,6 +80,7 @@ export type QuantHoldCode =
   | "impact-too-high"
   | "inbox-unavailable"
   | "job-not-tradable"
+  | "wallet-shared"
   | "meter-exhausted"
   | "meter-unreadable"
   | "needs-operator"

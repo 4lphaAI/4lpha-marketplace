@@ -29,7 +29,8 @@ import { MemoryQuantTransport } from "../src/quant/termix.js";
 import type { QuantChainReader } from "../src/quant/readers.js";
 import type { QuantStrategyParams } from "../src/quant/config.js";
 import type { ExecutionReceipt, SessionRef, SpendInfoReading, WalletProvider } from "../src/core/types.js";
-import type { QuantJobRecord } from "../src/quant/types.js";
+import type { QuantHoldCode, QuantInboxItem, QuantJobRecord } from "../src/quant/types.js";
+import type { QuantJobRow } from "../src/store/quantJobs.js";
 import { accountKeyHashForAddress } from "../src/wallet/altana.js";
 import { publicKeyToAddress } from "viem/accounts";
 import {
@@ -50,6 +51,10 @@ const JOB = "quant-job-scenario";
 const SEED = `0x${"88".repeat(32)}`;
 const KEYPAIR = deriveKeypair(SEED);
 const NOW_SEC = 1_800_000_000 - 5 * 86_400;
+const NOW_MS = NOW_SEC * 1_000;
+const DAY_MS = 86_400_000;
+const ZERO_WALLET = getAddress("0x0000000000000000000000000000000000000000");
+const WALLET_SHARED_HOLD: Extract<QuantHoldCode, "wallet-shared"> = "wallet-shared";
 
 const fixture = JSON.parse(
   readFileSync(new URL("./fixtures/quant/admissible-session.json", import.meta.url), "utf8"),
@@ -110,6 +115,80 @@ class RebaseBeforeTruthStore extends MemoryQuantJobStore {
   }
 }
 
+class TimedDiscoveryStore extends MemoryQuantJobStore {
+  readonly #createdAtMs: ReadonlyMap<string, number>;
+
+  constructor(createdAtMs: ReadonlyMap<string, number>) {
+    super();
+    this.#createdAtMs = createdAtMs;
+  }
+
+  override async discoverJob(
+    input: Parameters<QuantJobStore["discoverJob"]>[0],
+  ): Promise<QuantJobRow> {
+    const createdAtMs = this.#createdAtMs.get(input.quantJobId);
+    return super.discoverJob(createdAtMs === undefined ? input : { ...input, nowMs: createdAtMs });
+  }
+}
+
+class ReversedWorkableStore extends TimedDiscoveryStore {
+  override async listWorkableJobs(strategyId: string): Promise<readonly QuantJobRow[]> {
+    return [...await super.listWorkableJobs(strategyId)].reverse();
+  }
+}
+
+class BrokenEnvelopeStore extends TimedDiscoveryStore {
+  readonly #brokenJobId: string;
+
+  constructor(createdAtMs: ReadonlyMap<string, number>, brokenJobId: string) {
+    super(createdAtMs);
+    this.#brokenJobId = brokenJobId;
+  }
+
+  override async discoverJob(
+    input: Parameters<QuantJobStore["discoverJob"]>[0],
+  ): Promise<QuantJobRow> {
+    const envelopeJson = input.quantJobId === this.#brokenJobId
+      ? JSON.stringify({ algorithm: "would-fail-if-opened" })
+      : input.envelopeJson;
+    return super.discoverJob({ ...input, envelopeJson });
+  }
+}
+
+class HeldStatusStore extends MemoryQuantJobStore {
+  readonly #holderId: string;
+  showHeld = false;
+
+  constructor(holderId: string) {
+    super();
+    this.#holderId = holderId;
+  }
+
+  override async listJobs(): Promise<readonly QuantJobRow[]> {
+    const rows = await super.listJobs();
+    return rows.map((row) => row.quantJobId === this.#holderId && this.showHeld
+      ? { ...row, status: "held" as const }
+      : row);
+  }
+}
+
+class UppercaseWalletStore extends MemoryQuantJobStore {
+  readonly #holderId: string;
+  uppercaseHolder = false;
+
+  constructor(holderId: string) {
+    super();
+    this.#holderId = holderId;
+  }
+
+  override async listJobs(): Promise<readonly QuantJobRow[]> {
+    const rows = await super.listJobs();
+    return rows.map((row) => row.quantJobId === this.#holderId && this.uppercaseHolder
+      ? { ...row, tradingWallet: row.tradingWallet.toUpperCase() as Address }
+      : row);
+  }
+}
+
 function jobRecord(overrides: Partial<QuantJobRecord> = {}): QuantJobRecord {
   return {
     id: JOB,
@@ -125,6 +204,48 @@ function jobRecord(overrides: Partial<QuantJobRecord> = {}): QuantJobRecord {
     revokedAtMs: null,
     ...overrides,
   };
+}
+
+function inboxItem(quantJobId: string): QuantInboxItem {
+  return {
+    envelopeId: `env-${quantJobId}`,
+    quantJobId,
+    ...seal(JSON.stringify(fixture.session), KEYPAIR.publicKey),
+  };
+}
+
+function setInboxJobs(harness: Harness, records: readonly QuantJobRecord[]): void {
+  const state = (harness.deps.transport as MemoryQuantTransport).state;
+  state.inbox = records.map((record) => inboxItem(record.id));
+  state.jobs = new Map(records.map((record) => [record.id, record] as const));
+}
+
+function addInboxJobs(harness: Harness, records: readonly QuantJobRecord[]): void {
+  const state = (harness.deps.transport as MemoryQuantTransport).state;
+  state.inbox = records.map((record) => inboxItem(record.id));
+  for (const record of records) state.jobs.set(record.id, record);
+}
+
+async function hydrateStoreJob(harness: Harness, record: QuantJobRecord): Promise<void> {
+  await harness.store.discoverJob({
+    quantJobId: record.id, envelopeId: `env-${record.id}`, envelopeJson: "{}",
+    strategyId: record.strategyId, nowMs: harness.clock.nowMs,
+  });
+  await harness.store.updateJobWire({
+    quantJobId: record.id, strategyId: record.strategyId,
+    tradingWallet: record.tradingWalletAddress, allocationUWei: record.allocationUWei,
+    dailyCapUWei: record.dailyCapUWei, termDays: record.termDays,
+    startedAtMs: record.startedAtMs, endsAtMs: record.endsAtMs,
+    sessionExpiresAtMs: record.sessionExpiresAtMs, revokedAtMs: record.revokedAtMs,
+    nowMs: harness.clock.nowMs,
+  });
+}
+
+async function admittedHolder(store: MemoryQuantJobStore = new MemoryQuantJobStore()): Promise<Harness> {
+  const harness = makeHarness({ store });
+  await cycle(harness);
+  assert.equal((await harness.store.getJob(JOB))?.status, "armed");
+  return harness;
 }
 
 function makeHarness(options: {
@@ -360,6 +481,212 @@ async function cycle(harness: Harness, options: { readonly dryRun?: boolean } = 
   harness.clock.nowMs += 60_000;
   return runQuantWorkerOnce(harness.deps, options);
 }
+
+describe("quant worker — one live job per trading wallet (R14.4)", () => {
+  it("BC-S203/S211: admits the earlier discovered job and holds the later one before opening its envelope", async () => {
+    const holderId = "z-wallet-old";
+    const duplicateId = "a-wallet-new";
+    const store = new BrokenEnvelopeStore(
+      new Map([[holderId, NOW_MS], [duplicateId, NOW_MS + 1]]),
+      duplicateId,
+    );
+    const harness = makeHarness({ store });
+    setInboxJobs(harness, [jobRecord({ id: holderId }), jobRecord({ id: duplicateId })]);
+
+    const report = await cycle(harness);
+    const holder = await harness.store.getJob(holderId);
+    const duplicate = await harness.store.getJob(duplicateId);
+    assert.equal(report.errors, 0);
+    assert.equal(holder?.status, "armed");
+    assert.equal(duplicate?.status, "discovered");
+    assert.equal(duplicate?.holdCode, WALLET_SHARED_HOLD);
+    assert.equal(duplicate?.admittedAtMs, null);
+    assert.equal(duplicate?.accountingEpoch, null);
+    assert.equal((await harness.store.listLevels(duplicateId)).length, 0);
+    assert.ok(report.notes.includes(`${duplicateId}:${WALLET_SHARED_HOLD}:${holderId}`), report.notes.join(","));
+  });
+
+  it("BC-S210: a known-wallet broken holder still reserves the wallet", async () => {
+    const holderId = "a-broken-holder";
+    const candidateId = "z-after-broken-holder";
+    const store = new BrokenEnvelopeStore(
+      new Map([[holderId, NOW_MS], [candidateId, NOW_MS + 1]]),
+      holderId,
+    );
+    const harness = makeHarness({ store });
+    setInboxJobs(harness, [jobRecord({ id: holderId }), jobRecord({ id: candidateId })]);
+
+    const report = await cycle(harness);
+    assert.equal((await harness.store.getJob(holderId))?.status, "discovered");
+    assert.equal((await harness.store.getJob(holderId))?.holdCode, "session-not-admissible");
+    assert.equal((await harness.store.getJob(candidateId))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(report.notes.includes(`${candidateId}:${WALLET_SHARED_HOLD}:${holderId}`), report.notes.join(","));
+  });
+
+  it("BC-S207: the earliest createdAtMs wins when inbox/workable iteration is reversed", async () => {
+    const holderId = "a-created-old";
+    const duplicateId = "z-created-new";
+    const store = new ReversedWorkableStore(
+      new Map([[holderId, NOW_MS], [duplicateId, NOW_MS + 1_000]]),
+    );
+    const harness = makeHarness({ store });
+    setInboxJobs(harness, [jobRecord({ id: duplicateId }), jobRecord({ id: holderId })]);
+
+    const report = await cycle(harness);
+    assert.equal(report.errors, 0);
+    assert.equal((await harness.store.getJob(holderId))?.status, "armed");
+    assert.equal((await harness.store.getJob(duplicateId))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(report.notes.includes(`${duplicateId}:${WALLET_SHARED_HOLD}:${holderId}`), report.notes.join(","));
+  });
+
+  it("BC-S207: equal createdAtMs uses the smaller quantJobId", async () => {
+    const winnerId = "a-equal-time";
+    const duplicateId = "z-equal-time";
+    const store = new ReversedWorkableStore(
+      new Map([[winnerId, NOW_MS], [duplicateId, NOW_MS]]),
+    );
+    const harness = makeHarness({ store });
+    setInboxJobs(harness, [jobRecord({ id: duplicateId }), jobRecord({ id: winnerId })]);
+
+    const report = await cycle(harness);
+    assert.equal(report.errors, 0);
+    assert.equal((await harness.store.getJob(winnerId))?.status, "armed");
+    assert.equal((await harness.store.getJob(duplicateId))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(report.notes.includes(`${duplicateId}:${WALLET_SHARED_HOLD}:${winnerId}`), report.notes.join(","));
+  });
+
+  it("BC-S207: an admitted holder outranks an older discovered candidate", async () => {
+    const candidateId = "a-older-discovered";
+    const store = new TimedDiscoveryStore(
+      new Map([[JOB, NOW_MS + 1_000], [candidateId, NOW_MS]]),
+    );
+    const harness = await admittedHolder(store);
+    addInboxJobs(harness, [jobRecord({
+      id: candidateId,
+      endsAtMs: harness.clock.nowMs + 4 * DAY_MS,
+    })]);
+
+    const report = await cycle(harness);
+    assert.equal(report.errors, 0);
+    assert.equal((await harness.store.getJob(JOB))?.status, "armed");
+    assert.equal((await harness.store.getJob(candidateId))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(report.notes.includes(`${candidateId}:${WALLET_SHARED_HOLD}:${JOB}`), report.notes.join(","));
+  });
+
+  it("BC-S204/S208: ended and reported release the wallet, but ended-unresolved does not", async () => {
+    for (const terminalStatus of ["ended", "reported"] as const) {
+      const candidateId = `wallet-${terminalStatus}`;
+      const harness = await admittedHolder();
+      await harness.store.markEnded({ quantJobId: JOB, unresolved: false, nowMs: harness.clock.nowMs });
+      if (terminalStatus === "reported") {
+        await harness.store.markReported({ quantJobId: JOB, nowMs: harness.clock.nowMs });
+      }
+      addInboxJobs(harness, [jobRecord({ id: candidateId, endsAtMs: harness.clock.nowMs + 4 * DAY_MS })]);
+
+      await cycle(harness);
+      assert.equal((await harness.store.getJob(candidateId))?.status, "armed", terminalStatus);
+    }
+
+    const unresolved = await admittedHolder();
+    await unresolved.store.markEnded({ quantJobId: JOB, unresolved: true, nowMs: unresolved.clock.nowMs });
+    const candidateId = "wallet-unresolved";
+    addInboxJobs(unresolved, [jobRecord({ id: candidateId, endsAtMs: unresolved.clock.nowMs + 4 * DAY_MS })]);
+
+    const report = await cycle(unresolved);
+    assert.equal((await unresolved.store.getJob(JOB))?.status, "ended-unresolved");
+    assert.equal((await unresolved.store.getJob(candidateId))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(report.notes.includes(`${candidateId}:${WALLET_SHARED_HOLD}:${JOB}`), report.notes.join(","));
+  });
+
+  it("BC-S204: paused and held holders block a discovered successor", async () => {
+    const paused = await admittedHolder();
+    assert.equal(await paused.store.pauseJob({ quantJobId: JOB, nowMs: paused.clock.nowMs }), true);
+    const pausedCandidate = "wallet-paused";
+    addInboxJobs(paused, [jobRecord({ id: pausedCandidate, endsAtMs: paused.clock.nowMs + 4 * DAY_MS })]);
+    await cycle(paused);
+    assert.equal((await paused.store.getJob(pausedCandidate))?.holdCode, WALLET_SHARED_HOLD);
+
+    const heldStore = new HeldStatusStore(JOB);
+    const held = await admittedHolder(heldStore);
+    heldStore.showHeld = true;
+    const heldCandidate = "wallet-held";
+    addInboxJobs(held, [jobRecord({ id: heldCandidate, endsAtMs: held.clock.nowMs + 4 * DAY_MS })]);
+    const report = await cycle(held);
+    assert.equal((await heldStore.listJobs()).find((row) => row.quantJobId === JOB)?.status, "held");
+    assert.equal((await held.store.getJob(heldCandidate))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(report.notes.includes(`${heldCandidate}:${WALLET_SHARED_HOLD}:${JOB}`), report.notes.join(","));
+  });
+
+  it("BC-S205: strategy scope ignores a same-wallet row belonging to another strategy", async () => {
+    const harness = makeHarness();
+    const foreign = jobRecord({ id: "foreign-wallet-holder", strategyId: "other-strategy" });
+    await hydrateStoreJob(harness, foreign);
+    const candidateId = "wallet-local-strategy";
+    setInboxJobs(harness, [jobRecord({ id: candidateId })]);
+
+    const report = await cycle(harness);
+    assert.equal(report.errors, 0);
+    assert.equal((await harness.store.getJob(candidateId))?.status, "armed");
+  });
+
+  it("BC-S205: wallet comparison is case-insensitive", async () => {
+    const store = new UppercaseWalletStore(JOB);
+    const harness = await admittedHolder(store);
+    store.uppercaseHolder = true;
+    const candidateId = "wallet-case-variant";
+    addInboxJobs(harness, [jobRecord({ id: candidateId })]);
+
+    const report = await cycle(harness);
+    assert.equal(report.errors, 0);
+    assert.equal((await harness.store.getJob(candidateId))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(report.notes.includes(`${candidateId}:${WALLET_SHARED_HOLD}:${JOB}`), report.notes.join(","));
+  });
+
+  it("BC-S210: an unhydrated zero-wallet row does not reserve a real wallet", async () => {
+    const harness = makeHarness();
+    const placeholderId = "a-unhydrated-placeholder";
+    const candidateId = "z-real-wallet";
+    setInboxJobs(harness, [jobRecord({ id: placeholderId }), jobRecord({ id: candidateId })]);
+    (harness.deps.transport as MemoryQuantTransport).state.jobs.delete(placeholderId);
+
+    const report = await cycle(harness);
+    assert.equal(report.errors, 0);
+    assert.equal((await harness.store.getJob(placeholderId))?.tradingWallet, ZERO_WALLET);
+    assert.equal((await harness.store.getJob(candidateId))?.status, "armed");
+    assert.notEqual((await harness.store.getJob(candidateId))?.holdCode, WALLET_SHARED_HOLD);
+  });
+
+  it("BC-S208/S211: an unresolved action keeps the wallet reserved until safe terminalization", async () => {
+    const harness = makeHarness();
+    await cycle(harness);
+    harness.chain.mid = BUY_1 - E18;
+    await cycle(harness);
+    harness.chain.failNextSubmit = "throw";
+    await cycle(harness);
+    harness.clock.nowMs = (NOW_SEC + 4 * 86_400 + 60) * 1_000;
+    await cycle(harness);
+    assert.equal((await harness.store.getJob(JOB))?.status, "ended-unresolved");
+
+    const candidateId = "wallet-after-unresolved";
+    addInboxJobs(harness, [jobRecord({
+      id: candidateId,
+      endsAtMs: harness.clock.nowMs + 4 * DAY_MS,
+      sessionExpiresAtMs: harness.clock.nowMs + 4 * DAY_MS,
+    })]);
+    const held = await cycle(harness);
+    assert.equal((await harness.store.getJob(candidateId))?.holdCode, WALLET_SHARED_HOLD);
+    assert.ok(held.notes.includes(`${candidateId}:${WALLET_SHARED_HOLD}:${JOB}`), held.notes.join(","));
+
+    const action = (await harness.store.listActions(JOB))[0];
+    assert.ok(action !== undefined);
+    await harness.store.setActionState({
+      journalKey: action.journalKey, state: "failed", failureCode: "test-terminal", nowMs: harness.clock.nowMs,
+    });
+    await harness.store.markEnded({ quantJobId: JOB, unresolved: false, nowMs: harness.clock.nowMs });
+    await cycle(harness);
+    assert.equal((await harness.store.getJob(candidateId))?.status, "armed");
+  });
+});
 
 describe("quant worker — arm", () => {
   it("discovers, admits and arms a job in one cycle", async () => {
