@@ -1423,16 +1423,25 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       }
     }
     setMessage("Removing: approve the on-chain session-key revocation with your passkey…");
-    const result = await (await import("@/lib/altana/client")).revokeAgentSession({
-      record: owner.passkey,
-      ownerViewWalletAddress: view.walletAddress as `0x${string}`,
-      sessionPublicKey: view.sessionPublicKey as `0x${string}`,
-    });
+    // The SDK THROWS when the relay refuses the bundle at simulation (the
+    // KeyDoesNotExist case) and returns `status: "FAILED"` when it lands and
+    // reverts; both are "no revocation happened" and both defer to the proof.
+    let failure: string | null = null;
+    try {
+      const result = await (await import("@/lib/altana/client")).revokeAgentSession({
+        record: owner.passkey,
+        ownerViewWalletAddress: view.walletAddress as `0x${string}`,
+        sessionPublicKey: view.sessionPublicKey as `0x${string}`,
+      });
+      if (result.status === "FAILED") failure = "the relay reported FAILED";
+    } catch (error) {
+      failure = error instanceof Error ? error.message.slice(0, 160) : "the relay refused the bundle";
+    }
     const evidence = await readRegistration();
     currentView = await detail.refresh() ?? currentView;
     const proven = hasFreshRevocationProof(removeSnapshotOf(currentView, registration, evidence), Date.now());
-    if (result.status === "FAILED" && !proven) {
-      throw new Error("The on-chain session-key revocation failed. The execution plane is already revoked; press Finish removal to retry the chain step.");
+    if (failure !== null && !proven) {
+      throw new Error(`The on-chain session-key revocation did not happen (${failure}). Plane status: ${currentView.status}; KeyStore evidence: ${evidence?.kind ?? "none"}. Press Remove again after the plane records the revoke, or use Finish removal.`);
     }
     if (proven) {
       setMessage("Agent removed. Every verified position was exited to BNB before revocation.");
