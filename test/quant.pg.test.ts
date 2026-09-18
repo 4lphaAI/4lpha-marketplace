@@ -241,6 +241,7 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
       ],
       clipUWei: 10n * U, idleUWei: 0n,
       baselineUWei: 30n * U, baselineWbnbWei: 0n, baselineNativeWei: 10n ** 16n,
+      capRowsJson: '[{"token":null,"limit":"50000000000000000","period":"day"}]',
       nowMs: clock,
     });
     assert.equal(admitted.kind, "ok");
@@ -250,6 +251,10 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
     assert.equal(levels[0]?.buyPriceE18, 688n * U);
     assert.equal((await store.getJob(JOB))?.anchorE18, 740n * U);
     assert.equal((await store.getJob(JOB))?.ladderGen, 0);
+    // bn-11: PostgreSQL admission persists the cap rows (memory/PG parity), and
+    // the backfill refuses a row that already has them.
+    assert.equal((await store.getJob(JOB))?.capRowsJson, '[{"token":null,"limit":"50000000000000000","period":"day"}]');
+    assert.equal(await store.backfillCapRows({ quantJobId: JOB, capRowsJson: "[]", nowMs: clock }), false);
     assert.equal((await store.listRecenters(JOB)).length, 0);
     assert.equal((await store.listSeedEvents(JOB)).length, 0);
 

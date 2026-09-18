@@ -562,6 +562,13 @@ export interface QuantJobStore {
    */
   listWorkableJobs(strategyId: string): Promise<readonly QuantJobRow[]>;
   holdJob(input: { readonly quantJobId: string; readonly holdCode: QuantHoldCode | null; readonly nowMs: number }): Promise<void>;
+  /**
+   * FINDINGS bn-11 repair: backfill the cap rows admission persisted only on
+   * the memory twin. Writes ONLY when the row is armed and `cap_rows_json` is
+   * still null (so it can never overwrite what admission recorded); returns
+   * whether it wrote.
+   */
+  backfillCapRows(input: { readonly quantJobId: string; readonly capRowsJson: string; readonly nowMs: number }): Promise<boolean>;
   pauseJob(input: { readonly quantJobId: string; readonly nowMs: number }): Promise<boolean>;
   resumeJob(input: { readonly quantJobId: string; readonly nowMs: number }): Promise<boolean>;
   markEnded(input: { readonly quantJobId: string; readonly unresolved: boolean; readonly nowMs: number }): Promise<void>;
@@ -1037,6 +1044,15 @@ export class MemoryQuantJobStore implements QuantJobStore {
     await this.withQuantFence(input.quantJobId, async (fence) => {
       await fence.setJobHold({ quantJobId: input.quantJobId, holdCode: input.holdCode });
     });
+  }
+
+  async backfillCapRows(input: { readonly quantJobId: string; readonly capRowsJson: string; readonly nowMs: number }): Promise<boolean> {
+    const row = this.#jobs.get(input.quantJobId);
+    if (row === undefined || row.status !== "armed" || row.capRowsJson !== null) return false;
+    this.#jobs.set(input.quantJobId, {
+      ...row, capRowsJson: input.capRowsJson, rowVersion: row.rowVersion + 1, updatedAtMs: input.nowMs,
+    });
+    return true;
   }
 
   async pauseJob(input: { readonly quantJobId: string; readonly nowMs: number }): Promise<boolean> {
@@ -3261,6 +3277,7 @@ export class PostgresQuantJobStore implements QuantJobStore {
              idle_u_wei = $16::numeric, hold_code = null,
              anchor_e18 = $12::numeric, ladder_gen = 0, recenters = 0,
              recenter_budget = $17::int,
+             cap_rows_json = $18,
              wire_state = 'compatible', accounting_state = 'ok', accounting_epoch = 1,
              accounting_evidence_json = null, accounting_rev = 0,
              row_version = row_version + 1, updated_at_ms = $7::bigint
@@ -3273,6 +3290,10 @@ export class PostgresQuantJobStore implements QuantJobStore {
           input.residualThresholdWei.toString(10), input.paramsJson, input.paramsDigest,
           input.p0E18.toString(10), input.armBlock.toString(10), input.levels.length,
           input.clipUWei.toString(10), input.idleUWei.toString(10), input.recenterBudget ?? 0,
+          // FINDINGS bn-11: the memory twin persisted the cap rows at admission
+          // (line ~933) and PostgreSQL did not, so the first live re-centre read
+          // an empty cap set and refused `recenter-cap-too-small`.
+          input.capRowsJson ?? null,
         ],
       );
       const row = result.rows[0];
@@ -3405,6 +3426,20 @@ export class PostgresQuantJobStore implements QuantJobStore {
           row_version = row_version + 1, updated_at_ms = $3::bigint where quant_job_id = $1`,
         [input.quantJobId, input.holdCode, input.nowMs],
       );
+    });
+  }
+
+  async backfillCapRows(input: { readonly quantJobId: string; readonly capRowsJson: string; readonly nowMs: number }): Promise<boolean> {
+    return this.#sql.transaction(async (tx) => {
+      await tx.query(`/* quantJobs.fence */ select pg_advisory_xact_lock($1::integer, hashtext($2))`, [QUANT_LOCK_CLASSID, input.quantJobId]);
+      const result = await tx.query<{ readonly quant_job_id: string }>(
+        `/* quantJobs.backfillCapRows */ update quant_jobs set cap_rows_json = $2,
+          row_version = row_version + 1, updated_at_ms = $3::bigint
+          where quant_job_id = $1 and status = 'armed' and cap_rows_json is null
+          returning quant_job_id`,
+        [input.quantJobId, input.capRowsJson, input.nowMs],
+      );
+      return result.rows.length === 1;
     });
   }
 

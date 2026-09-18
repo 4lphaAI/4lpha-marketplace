@@ -57,7 +57,7 @@ import {
   armFloor, buildLadder, buyMinOut, midFromReserves, quantPriceImpactBps,
   requiredNativeWei,
 } from "../src/quant/grid.js";
-import { assertQuantSessionAdmissible, parseSessionPlaintext, projectGrantedPermissions } from "../src/quant/admission.js";
+import { assertQuantSessionAdmissible, openSession, parseSessionPlaintext, projectGrantedPermissions } from "../src/quant/admission.js";
 import { agentAuthorityFromPrivateKey, ownerAuthorityFromPrivateKey } from "../src/wallet/altana.js";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { existsSync } from "node:fs";
@@ -350,6 +350,33 @@ async function commandWorker(args: Args, context: Context): Promise<void> {
   } finally {
     try { await lease.closeGracefully(); } catch { /* the lock dies with us */ }
   }
+}
+
+/**
+ * FINDINGS bn-11 repair: jobs admitted before the PostgreSQL `admitJob` wrote
+ * `cap_rows_json` cannot pass the re-centre ladder gate (it reads an empty cap
+ * set and holds `recenter-cap-too-small`). Opens the envelope ONCE, exactly as
+ * admission did, and writes the same rows; refuses to touch a row that already
+ * has them. The plaintext never leaves this function; nothing is printed but
+ * the row count.
+ */
+async function commandRepairCapRows(args: Args, context: Context): Promise<void> {
+  const jobId = requireFlag(args, "job");
+  const job = await context.store.getJob(jobId);
+  if (job === null) throw new Error("no such job.");
+  if (job.status !== "armed") throw new Error(`job is ${job.status}; only an armed job is repaired.`);
+  if (job.capRowsJson !== null) { console.log("cap rows already present; nothing to do."); return; }
+  if (job.envelopeJson === null) throw new Error("the job has no envelope.");
+  const keypair = quantKeypairFromSeed(context.config.envelopeKey);
+  const opened = openSession(JSON.parse(job.envelopeJson) as Parameters<typeof openSession>[0], keypair);
+  if (!opened.ok) throw new Error(`envelope refused: ${opened.code}`);
+  const rows = opened.session.permissions.spend.map((row) => ({
+    token: row.token ?? null, limit: row.limit.toString(10), period: row.period,
+  }));
+  console.log(`About to backfill ${rows.length} cap row(s) for ${jobId} (tokens: ${rows.map((row) => row.token ?? "native").join(", ")}).`);
+  if (!yesLive(args)) { console.log("Rehearsal only. Pass --yes-live to write."); return; }
+  const wrote = await context.store.backfillCapRows({ quantJobId: jobId, capRowsJson: JSON.stringify(rows), nowMs: Date.now() });
+  console.log(wrote ? "backfilled." : "not written: the row changed or already had cap rows.");
 }
 
 async function commandPauseResume(args: Args, context: Context, paused: boolean): Promise<void> {
@@ -901,6 +928,7 @@ async function main(): Promise<void> {
       case "status": await commandStatus(args, context); break;
       case "worker": await commandWorker(args, context); break;
       case "pause": await commandPauseResume(args, context, true); break;
+      case "repair-cap-rows": await commandRepairCapRows(args, context); break;
       case "resume": await commandPauseResume(args, context, false); break;
       case "resolve": await commandResolve(args, context); break;
       case "retire-level": await commandRetireLevel(args, context); break;

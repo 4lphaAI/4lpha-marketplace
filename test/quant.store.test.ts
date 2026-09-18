@@ -150,6 +150,23 @@ describe("quant store — admission", () => {
     });
     assert.deepEqual(await store.listLevels(JOB), before);
   });
+
+  it("bn-11: backfills cap rows ONLY on an armed row that has none, and never overwrites", async () => {
+    const store = await armedStore();
+    const armed = await store.getJob(JOB);
+    // The shared fixture admits without cap rows, which is exactly the shape
+    // the pre-fix PostgreSQL admission left behind on production.
+    if (armed?.capRowsJson !== null) {
+      assert.equal(await store.backfillCapRows({ quantJobId: JOB, capRowsJson: "[]", nowMs: 4_000 }), false);
+      return;
+    }
+    const rows = JSON.stringify([{ token: null, limit: "1", period: "day" }]);
+    assert.equal(await store.backfillCapRows({ quantJobId: JOB, capRowsJson: rows, nowMs: 4_000 }), true);
+    assert.equal((await store.getJob(JOB))?.capRowsJson, rows);
+    assert.equal(await store.backfillCapRows({ quantJobId: JOB, capRowsJson: "[]", nowMs: 5_000 }), false);
+    assert.equal((await store.getJob(JOB))?.capRowsJson, rows);
+    assert.equal(await store.backfillCapRows({ quantJobId: "no-such-job", capRowsJson: rows, nowMs: 5_000 }), false);
+  });
 });
 
 describe("quant store — intents and the blocking CAS", () => {
