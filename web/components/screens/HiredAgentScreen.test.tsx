@@ -414,7 +414,10 @@ describe("Hired agent detail provenance", () => {
   // click signed the plane's exit, the relay refused the dead key, the row
   // stayed open. The passkey close now runs first; the plane's exit then
   // skips the empty NFT and closes the row. A LIVE session is untouched.
-  for (const mode of ["expired", "live"] as const) it(`open row ? ${mode} session: ${mode === "expired" ? "passkey close, then plane exit" : "plane exit only"}`, async () => {
+  // A plane that answers 200 for a REFUSED exit, or one whose row never closes,
+  // used to be re-signed on every step: the reason is now shown and the loop
+  // stops after ONE signed exit per position.
+  for (const mode of ["expired", "live", "refused", "stuck-row"] as const) it(`open row ? ${mode}: ${mode === "expired" ? "passkey close, then plane exit" : mode === "live" ? "plane exit only" : "one signed exit, then the reason"}`, async () => {
     let chainLiquidity = 500n;
     let rowClosed = false;
     let locallyRevoked = false;
@@ -423,7 +426,7 @@ describe("Hired agent detail provenance", () => {
     const openRowView: AgentDetailView = {
       ...view,
       status: "paused",
-      sessionExpiresAt: mode === "expired" ? nowSec - 60 : nowSec + 5 * 86_400,
+      sessionExpiresAt: mode === "live" ? nowSec + 5 * 86_400 : nowSec - 60,
     };
     const refresh = vi.fn(async () => ({
       ...openRowView,
@@ -484,9 +487,11 @@ describe("Hired agent detail provenance", () => {
         // The plane's exit: with liquidity still in the NFT the dead session
         // key is refused by the relay; with none it skips and closes the row.
         effects.push("plane-exit");
-        if (chainLiquidity > 0n && mode === "expired") return new Response(JSON.stringify({ error: { message: "Execution reported FAILED (SESSION_EXPIRED)." } }), { status: 502, headers: { "content-type": "application/json" } });
-        chainLiquidity = 0n; rowClosed = true;
-        return json({});
+        if (chainLiquidity > 0n && mode !== "live") return new Response(JSON.stringify({ error: { message: "Execution reported FAILED (SESSION_EXPIRED)." } }), { status: 502, headers: { "content-type": "application/json" } });
+        if (mode === "refused") return json({ exit: { sequenceId: "seq-1", status: "rolled-back", code: "RESERVE_UNAVAILABLE", reason: "The wallet cannot cover one exit's relay fee.", confirmedSteps: 0 } });
+        chainLiquidity = 0n;
+        if (mode !== "stuck-row") rowClosed = true;
+        return json({ exit: { sequenceId: "seq-1", status: "completed", code: "OK", reason: "", confirmedSteps: 1 } });
       }
       if (url.endsWith("/revoke")) {
         effects.push("local-revoke");
@@ -510,6 +515,14 @@ describe("Hired agent detail provenance", () => {
         remove?.click();
         for (let i = 0; i < 12; i += 1) await Promise.resolve();
       });
+      if (mode === "refused" || mode === "stuck-row") {
+        expect(effects).toEqual(["close-nft", "plane-exit"]);
+        expect(hook.owner.signEnvelope).toHaveBeenCalledTimes(1);
+        expect(host.textContent).toContain(mode === "refused"
+          ? "The plane did not close real-position-7 (rolled-back, RESERVE_UNAVAILABLE): The wallet cannot cover one exit's relay fee."
+          : "The plane reported the exit of real-position-7 but its row is still open.");
+        return;
+      }
       if (mode === "expired") {
         expect(String(confirm.mock.calls[0]?.[0])).toContain("The session has expired, so the agent cannot close its positions.");
         expect(effects).toEqual(["close-nft", "plane-exit", "local-revoke", "broadcast-revoke"]);

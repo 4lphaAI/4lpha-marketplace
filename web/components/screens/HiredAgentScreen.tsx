@@ -333,6 +333,22 @@ function responseWarning(payload: unknown): string | undefined {
   return typeof note === "string" && note.length > 0 ? note : undefined;
 }
 
+/**
+ * The exit route answers 200 for a saga that was HELD or ROLLED BACK as well
+ * as one that completed; `code` and `reason` say why. Read, never trusted
+ * beyond stopping the loop.
+ */
+function lpExitOutcome(payload: unknown): { readonly status: string; readonly code: string; readonly reason: string } | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const data = (payload as { readonly data?: unknown }).data;
+  if (typeof data !== "object" || data === null) return null;
+  const exit = (data as { readonly exit?: unknown }).exit;
+  if (typeof exit !== "object" || exit === null) return null;
+  const { status, code, reason } = exit as { readonly status?: unknown; readonly code?: unknown; readonly reason?: unknown };
+  if (typeof status !== "string") return null;
+  return { status, code: typeof code === "string" ? code : "UNKNOWN", reason: typeof reason === "string" ? reason : "" };
+}
+
 function loadLegacyProgress(key: string): RemoveProgress {
   try {
     const raw = window.localStorage.getItem(key);
@@ -1153,6 +1169,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     let current = refreshed ?? view;
     let localProgress = progress;
     let localFinalizedRevocation = finalizedRevocation;
+    const exitedPositionIds = new Set<string>();
     for (let step = 0; step < MAX_REMOVE_STEPS && current !== null; step += 1) {
       const decision = nextRemoveStep(
         removeSnapshotOf(current, registration, localFinalizedRevocation), localProgress, Date.now(),
@@ -1207,11 +1224,23 @@ export function HiredAgentScreen({ agentId, go }: Props) {
         await mutate("pause", "/pause", {});
         current = await detail.refresh();
       } else if (decision.kind === "exit" && decision.positionId !== undefined) {
+        // One signed exit per position per click. The route answers 200 for a
+        // refused saga too, and a row the plane will not close came back as
+        // `exit` again on every step — ten passkey prompts for nothing
+        // (2026-09-21). The reason now stops the loop and is shown.
+        if (exitedPositionIds.has(decision.positionId)) {
+          throw new Error(`The plane reported the exit of ${decision.positionId} but its row is still open. Refresh and try again; nothing was signed twice.`);
+        }
+        exitedPositionIds.add(decision.positionId);
         try {
           // PHASE3.24 Part B: ask for the inline conversion so the withdraw and
           // the swap ride ONE submission when the deployment allows the token;
           // the plane falls back to the two-submission exit when it does not.
-          await mutate("lpExit", `/lp/${encodeURIComponent(decision.positionId)}/exit`, { positionId: decision.positionId, inlineConvert: true });
+          const payload = await mutate("lpExit", `/lp/${encodeURIComponent(decision.positionId)}/exit`, { positionId: decision.positionId, inlineConvert: true });
+          const outcome = lpExitOutcome(payload);
+          if (outcome !== null && outcome.status !== "completed") {
+            throw new Error(`The plane did not close ${decision.positionId} (${outcome.status}, ${outcome.code}): ${outcome.reason}`);
+          }
           const { failedPositionId: _failed, ...rest } = localProgress;
           localProgress = rest;
           saveSupportProgress(rest);
