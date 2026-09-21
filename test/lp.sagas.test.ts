@@ -1968,6 +1968,60 @@ describe("lp exit: the optional step's behaviour table (Rev2 item 12)", () => {
     assert.match(sequences[0]?.note ?? "", /SESSION_EXPIRED/);
   });
 
+  // 2026-09-21: the owner emptied the NFT with the passkey after the session
+  // expired, then Remove's exit was refused here before the builder could say
+  // "nothing to withdraw" — the row never closed, the revoke was unreachable.
+  it("an EXPIRED session still closes the row of an EMPTY NFT on the owner's exit — and nothing else", async () => {
+    const h = await createLpHarness();
+    const facts = h.deps.agent.sessionFacts;
+    assert.ok(facts !== null);
+    const expired: LpSagaDeps = {
+      ...h.deps,
+      agent: {
+        ...h.deps.agent,
+        sessionFacts: {
+          ...facts,
+          spec: { ...facts.spec, expiresAt: NOW_SEC - 1 },
+          expiry: NOW_SEC - 1,
+        },
+      },
+    };
+    // Liquidity still in the NFT: refused exactly as before, nothing submitted.
+    const refused = await runLpManualExit(expired, POSITION_ID);
+    assert.equal(refused.status, "rolled-back");
+    assert.equal(refused.code, "SESSION_EXPIRED");
+    assert.equal(h.provider.submitted.length, 0);
+    assert.equal((await h.store.getPosition(OWNER, AGENT_ID, POSITION_ID))?.state, "open");
+
+    // The NFT is empty on chain: the builder's skip closes the row, no session needed.
+    h.positions.set("42", { liquidity: 0n, tickLower: -1_000, tickUpper: 1_000 });
+    const closed = await runLpManualExit(expired, POSITION_ID);
+    assert.equal(closed.status, "completed");
+    assert.equal(h.provider.submitted.length, 0, "nothing is ever submitted without a session");
+    assert.equal((await h.store.getPosition(OWNER, AGENT_ID, POSITION_ID))?.state, "closed");
+    const sequences = await h.store.listSequences(OWNER, AGENT_ID);
+    const last = sequences.find((sequence) => sequence.state === "completed");
+    assert.ok(last !== undefined);
+    // The note carries the LAST skip (the optional sweep); both steps are recorded, none submitted.
+    assert.match(last.note ?? "", /SESSION_EXPIRED/);
+    assert.deepEqual(last.steps.map((step) => step.kind), ["zap-out", "sweep-token"]);
+    // The kind gate: the worker's protect on the same expired session and an
+    // equally empty NFT is refused exactly as before — the door is the owner's.
+    await h.store.createPosition({ positionId: "position-43", agentId: AGENT_ID, ownerAddress: OWNER, token0: TOKEN, token1: WBNB, fee: 10_000, tokenId: "43", basisWei: 10n ** 18n });
+    h.positions.set("43", { liquidity: 0n, tickLower: -1_000, tickUpper: 1_000 });
+    const protectRefused = await runLpProtect(expired, "position-43");
+    assert.equal(protectRefused.status, "rolled-back");
+    assert.equal(protectRefused.code, "SESSION_EXPIRED");
+    assert.equal((await h.store.getPosition(OWNER, AGENT_ID, "position-43"))?.state, "open");
+    // A BURNED NFT takes the same skip on the owner's exit.
+    h.positions.set("43", "burned");
+    const burned = await runLpManualExit(expired, "position-43");
+    assert.equal(burned.status, "completed");
+    assert.equal(h.provider.submitted.length, 0);
+    assert.equal((await h.store.getPosition(OWNER, AGENT_ID, "position-43"))?.state, "closed");
+    assert.deepEqual(await workerQueue(h), { sequences: 0, positions: 0 });
+  });
+
   it("a between-step RAILS failure is a recorded skip on the optional step", async () => {
     const h = await createLpHarness();
     scriptExitToQuote(h);

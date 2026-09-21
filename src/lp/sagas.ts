@@ -2026,6 +2026,34 @@ async function driveSequence(input: DriveInput): Promise<LpSagaRunResult> {
         if (held !== null) return held;
         continue;
       }
+      // A manual-exit step that would SUBMIT NOTHING needs no session
+      // (2026-09-21). With the session expired, the owner emptied the NFT
+      // with the passkey, then the plane refused the exit here — before the
+      // builder could answer "no liquidity; nothing to withdraw" — so the row
+      // could never close and Remove could never reach the revoke. Only the
+      // builder's own SKIP passes, on the owner's door only; a submit, a
+      // throw or a rails failure is refused exactly as before. Nothing is
+      // signed or sent on this path: the build reads the chain and decides.
+      if (
+        kind === "manual-exit" &&
+        (decision.code === "NO_SESSION" || decision.code === "SESSION_EXPIRED")
+      ) {
+        let skipReason: string | null = null;
+        try {
+          const built = await step.build({
+            market: await deps.market(),
+            deadline: BigInt(nowSec() + deadlineSec),
+          });
+          if (built.action === "skip") skipReason = built.reason;
+        } catch {
+          skipReason = null;
+        }
+        if (skipReason !== null) {
+          const held = await recordSkip(step, `${decision.code}: ${skipReason}`);
+          if (held !== null) return held;
+          continue;
+        }
+      }
       return refuseCleanly(decision.code, decision.reason);
     }
     const facts = deps.agent.sessionFacts;
