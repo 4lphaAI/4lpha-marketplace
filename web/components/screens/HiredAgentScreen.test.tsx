@@ -410,6 +410,124 @@ describe("Hired agent detail provenance", () => {
     }
   });
 
+  // 2026-09-21: an expired session made Remove loop on the exit step — each
+  // click signed the plane's exit, the relay refused the dead key, the row
+  // stayed open. The passkey close now runs first; the plane's exit then
+  // skips the empty NFT and closes the row. A LIVE session is untouched.
+  for (const mode of ["expired", "live"] as const) it(`open row ? ${mode} session: ${mode === "expired" ? "passkey close, then plane exit" : "plane exit only"}`, async () => {
+    let chainLiquidity = 500n;
+    let rowClosed = false;
+    let locallyRevoked = false;
+    const effects: string[] = [];
+    const nowSec = Math.floor(Date.now() / 1_000);
+    const openRowView: AgentDetailView = {
+      ...view,
+      status: "paused",
+      sessionExpiresAt: mode === "expired" ? nowSec - 60 : nowSec + 5 * 86_400,
+    };
+    const refresh = vi.fn(async () => ({
+      ...openRowView,
+      status: locallyRevoked ? "revoked" : "paused",
+      positions: [{ ...view.positions[0]!, state: rowClosed ? "closed" : "open" }],
+    }));
+    hook.detail = {
+      state: "ready", view: openRowView, market: null, trade: null, asOfMs: 2_000,
+      message: "", readHeaders: {}, signIn: vi.fn(), refresh,
+    };
+    hook.owner.passkey = { walletAddress: view.walletAddress };
+    hook.owner.signEnvelope.mockReset();
+    hook.owner.signEnvelope.mockResolvedValue({ signed: true });
+    hook.publicClient = {};
+    hook.readOnChainPosition.mockReset();
+    hook.readOnChainPosition.mockImplementation(async () => ({
+      kind: "position", blockNumber: 100n, readAtMs: Date.now(), amountsAvailable: true, sqrtPriceX96: 1n << 96n,
+      tokenId: 9_007_199_254_740_993n,
+      liquidity: chainLiquidity,
+      token0: view.grid.token0,
+      token1: view.grid.token1,
+      fee: view.grid.fee,
+      tickLower: -9,
+      tickUpper: 1,
+      amounts: { amount0: 1_000n, amount1: 2_000n },
+      minimums: { amount0: 990n, amount1: 1_980n },
+    }));
+    hook.listWalletPositionIds.mockReset();
+    hook.listWalletPositionIds.mockResolvedValue([]);
+    hook.closeLpPositionWithPasskey.mockReset();
+    hook.closeLpPositionWithPasskey.mockImplementation(async () => {
+      effects.push("close-nft");
+      chainLiquidity = 0n;
+      return { status: "CONFIRMED", callsId: "0x1234" };
+    });
+    hook.revokeAgentSession.mockReset();
+    hook.revokeAgentSession.mockImplementation(async () => {
+      effects.push("broadcast-revoke");
+      return { status: "PENDING", callsId: "0xrevoke" };
+    });
+    window.localStorage.clear();
+    const confirm = vi.fn((_message?: string) => true);
+    Object.defineProperty(window, "confirm", { configurable: true, value: confirm });
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request: (_name: string, _options: unknown, callback: () => Promise<unknown>) => callback() },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (request: RequestInfo | URL) => {
+      const url = String(request);
+      const json = (data: unknown) => new Response(JSON.stringify({ data }), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/session")) {
+        return json({
+          sessionRegistration: { kind: "registered", checkedAtMs: Date.now() },
+          finalizedSessionRevocation: { kind: "registered", checkedAtMs: Date.now(), finalizedBlockNumber: "100", finalizedBlockHash: `0x${"55".repeat(32)}` },
+        });
+      }
+      if (url.endsWith("/lp/real-position-7/exit")) {
+        // The plane's exit: with liquidity still in the NFT the dead session
+        // key is refused by the relay; with none it skips and closes the row.
+        effects.push("plane-exit");
+        if (chainLiquidity > 0n && mode === "expired") return new Response(JSON.stringify({ error: { message: "Execution reported FAILED (SESSION_EXPIRED)." } }), { status: 502, headers: { "content-type": "application/json" } });
+        chainLiquidity = 0n; rowClosed = true;
+        return json({});
+      }
+      if (url.endsWith("/revoke")) {
+        effects.push("local-revoke");
+        locallyRevoked = true;
+        return json({});
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }));
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    try {
+      await act(async () => {
+        root.render(<HiredAgentScreen agentId="owner-exact-agent-92" go={() => undefined} />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const remove = [...host.querySelectorAll("button")].find((button) => button.textContent === "Remove");
+      expect(remove?.disabled).toBe(false);
+      await act(async () => {
+        remove?.click();
+        for (let i = 0; i < 12; i += 1) await Promise.resolve();
+      });
+      if (mode === "expired") {
+        expect(String(confirm.mock.calls[0]?.[0])).toContain("The session has expired, so the agent cannot close its positions.");
+        expect(effects).toEqual(["close-nft", "plane-exit", "local-revoke", "broadcast-revoke"]);
+        expect(hook.closeLpPositionWithPasskey).toHaveBeenCalledTimes(1);
+        return;
+      }
+      expect(String(confirm.mock.calls[0]?.[0])).toContain("1 open position will be closed");
+      expect(effects).toEqual(["plane-exit", "local-revoke", "broadcast-revoke"]);
+      expect(hook.closeLpPositionWithPasskey).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => { root.unmount(); });
+      host.remove();
+      hook.publicClient = undefined;
+      hook.owner.passkey = null;
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("shows the trade detail controls and keeps Remove available while a position is open", () => {
     hook.detail = {
       state: "ready",

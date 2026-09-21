@@ -434,6 +434,9 @@ function removeConfirmText(decision: ReturnType<typeof nextRemoveStep>): string 
     : `Remove this agent? ${open} open position${open === 1 ? "" : "s"} will be closed one after another, then the session key revoked on the plane and on chain. Proceeds come back as BNB plus the pool's quote asset.`;
 }
 
+/** The exit confirm once the session is dead: the passkey closes, nothing is converted. */
+const EXPIRED_REMOVE_CONFIRM = "The session has expired, so the agent cannot close its positions. Remove will close each open position with your passkey (both legs return to the wallet, nothing is converted), then revoke the session key on the plane and on chain.";
+
 function removeActionLabel(decision: ReturnType<typeof nextRemoveStep>, removed: boolean): string {
   if (removed) return "Removed";
   if (decision.kind === "check-revoke") return "Check removal";
@@ -1161,7 +1164,16 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       // chain is asked, and the passkey empties whatever is still there. This
       // also covers the sequence the plane cannot settle: the NFT comes out
       // whether or not its bookkeeping ever agrees.
-      if (["local-revoke", "broadcast-revoke", "check-revoke", "retry-revoke"].includes(decision.kind)) {
+      //
+      // An EXPIRED session takes the same door for the exit step (2026-09-21):
+      // the plane's exit submits through the dead session key, the relay
+      // refuses it, the sequence rolls back and the row stays open — so every
+      // click cost one passkey prompt and moved nothing. The passkey empties
+      // the NFT first; the plane's exit then finds no liquidity, skips the
+      // submission and closes the row without touching the session.
+      const sessionExpired = sessionExpiry(current.sessionExpiresAt, Date.now()).state === "expired";
+      if (["local-revoke", "broadcast-revoke", "check-revoke", "retry-revoke"].includes(decision.kind)
+        || (decision.kind === "exit" && sessionExpired)) {
         if (pendingClose.current?.identity === chainIdentity) {
           const status = await (await import("@/lib/altana/client")).readRevokeCallsStatus(pendingClose.current.callsId);
           if (chainIdentityRef.current !== chainIdentity) throw new Error("NFT request identity changed");
@@ -1620,7 +1632,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       discovered={chainReadIdentity === chainIdentity ? discovered : []}
       onTogglePause={() => void togglePause()}
       onRemove={() => {
-        if (remove.kind === "check-revoke" || window.confirm(removeConfirmText(remove))) void runRemove();
+        if (remove.kind === "check-revoke" || window.confirm(sessionDead && remove.kind === "exit" ? EXPIRED_REMOVE_CONFIRM : removeConfirmText(remove))) void runRemove();
       }}
       onResolve={() => {
         if (window.confirm("Resolve the stuck step from chain evidence? Nothing is retried and no money moves.")) void resolveBlocker();
@@ -1683,7 +1695,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
                   : view?.hireSizingName === "lending-v1" ? "/deploy/lending" : "/deploy/grid"}
               />
             : <Button variant="danger" icon={<Icon name="revoke" size={15} />} disabled={actionsDisabled || remove.kind === "blocked" || !removeProgressHydrated} title={remove.kind === "blocked" ? remove.message : undefined} onClick={() => {
-                if (remove.kind === "check-revoke" || window.confirm(removeConfirmText(remove))) void runRemove();
+                if (remove.kind === "check-revoke" || window.confirm(sessionDead && remove.kind === "exit" ? EXPIRED_REMOVE_CONFIRM : removeConfirmText(remove))) void runRemove();
               }}>{removeActionLabel(remove, removed)}</Button>}
           {remove.kind === "blocked" && remove.blocker !== undefined && remove.blocker.resolvableDecisionId !== null
             ? <Button variant="secondary" disabled={busy} title={remove.message} onClick={() => { if (window.confirm("Resolve the stuck step from chain evidence? Nothing is retried and no money moves.")) void resolveBlocker(); }}>Resolve</Button>
