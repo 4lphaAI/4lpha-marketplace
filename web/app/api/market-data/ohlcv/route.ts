@@ -12,6 +12,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const interval = request.nextUrl.searchParams.get("interval") ?? "1m";
   const rawLimit = request.nextUrl.searchParams.get("limit") ?? "300";
   const limit = Number(rawLimit);
+  const token = request.nextUrl.searchParams.get("token")?.toLowerCase() ?? null;
 
   if (!KINDS.has(kind as MarketResourceKind)) {
     return NextResponse.json({ error: { code: "invalid_kind" } }, { status: 400 });
@@ -25,12 +26,16 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
     return NextResponse.json({ error: { code: "invalid_limit" } }, { status: 400 });
   }
+  if (token !== null && !ADDRESS_PATTERN.test(token)) {
+    return NextResponse.json({ error: { code: "invalid_token" } }, { status: 400 });
+  }
 
   const baseUrl = (process.env["DATA_PLANE_URL"] ?? DEFAULT_DATA_PLANE_URL).replace(/\/$/u, "");
   const path = kind === "pool" ? `/pools/${address}/ohlcv` : `/klines/${address}`;
   const upstreamUrl = new URL(`${baseUrl}${path}`);
   upstreamUrl.searchParams.set("interval", interval);
   upstreamUrl.searchParams.set("limit", String(limit));
+  if (token !== null) upstreamUrl.searchParams.set("token", token);
 
   const headers: Record<string, string> = { accept: "application/json" };
   const dataPlaneToken = process.env["DATA_PLANE_TOKEN"]?.trim();

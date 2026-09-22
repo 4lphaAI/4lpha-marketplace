@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { USDT_56, WBNB_56 } from "./pairs";
-import { displaySide, emptyRungPairs, gridSideInverted, gridSideLabel, liveRungSides, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, reduceTokenKlines, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, stickyArmBenchmark, tokenKlinesPath, type DetailPosition } from "./agent-detail";
+import { displaySide, emptyRungPairs, gridSideInverted, gridSideLabel, liveRungSides, liveRungValueWei, mapAgentDetail, ohlcvLimit, ohlcvRequestPath, reduceOhlcv, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, stickyArmBenchmark, tokenKlinesPath, type DetailPosition } from "./agent-detail";
 import type { OnChainPosition, OnChainPositionRead } from "@/lib/altana/position-reader";
 import { priceAtTick as priceAtTickRef } from "./pairs";
 
@@ -345,6 +345,16 @@ describe("OHLCV request and HODL reducer", () => {
     );
   });
 
+  it("appends the display base as a token param so the pool feed prices our side", () => {
+    expect(ohlcvRequestPath(POOL, NOW - 120_001, NOW, "1m", WBNB_56)).toBe(
+      `/api/market-data/ohlcv?kind=pool&address=${POOL}&interval=1m&limit=8&token=${WBNB_56}`,
+    );
+    expect(ohlcvRequestPath(POOL, NOW - 120_001, NOW, "1m", null)).toBe(
+      `/api/market-data/ohlcv?kind=pool&address=${POOL}&interval=1m&limit=8`,
+    );
+    expect(() => ohlcvRequestPath(POOL, NOW - 120_001, NOW, "1m", "nope")).toThrow("Token address is invalid.");
+  });
+
   it("computes WBNB spot return from the same fresh series", () => {
     const result = reduceOhlcv(response(), NOW - 60_000, NOW);
     expect(result.priceNow).toBe(720);
@@ -374,30 +384,8 @@ describe("OHLCV request and HODL reducer", () => {
     expect(otherLeg.banner).toBe("chart prices the other leg, not WBNB");
   });
 
-  it("reads WBNB's own token klines as the chart of a WBNB-base grid, same shape and HODL as the pool feed", () => {
-    // Measured 2026-09-11: the pool feed for USDT/WBNB prices USDT (≈ 0.999);
-    // `kind=token` for WBNB is the USDT-per-WBNB series the page wants.
+  it("builds the token klines path used to price the quote asset", () => {
     expect(tokenKlinesPath(WBNB_56, 8, "1m")).toBe(`/api/market-data/ohlcv?kind=token&address=${WBNB_56}&interval=1m&limit=8`);
-    const klines = {
-      data: [
-        { timestamp: NOW, open: 705, high: 721, low: 704, close: 720, volume: 2 },
-        { timestamp: NOW - 60_000, open: 700, high: 711, low: 699, close: 705, volume: 1 },
-      ],
-      meta: { address: WBNB_56, interval: "1m", limit: 2, source: "onchainos", asOf: NOW, staleness: "fresh", count: 2 },
-    };
-    const result = reduceTokenKlines(klines, NOW - 60_000, NOW, { baseSymbol: "WBNB", interval: "1m" });
-    expect(result.candles.map((candle) => candle.timestamp)).toEqual([NOW - 60_000, NOW]);
-    expect(result.candles[1]?.volume).toBe(2);
-    expect(result.stale).toBe(false);
-    expect(result.banner).toBeNull();
-    expect(result.priceNow).toBe(720);
-    expect(result.hodl.value).toBe("2.13%");
-    expect(result.hodl.note).toContain("WBNB spot return since arm");
-    const stale = reduceTokenKlines({ ...klines, meta: { ...klines.meta, staleness: "stale" } }, NOW - 60_000, NOW, { baseSymbol: "WBNB" });
-    expect(stale.stale).toBe(true);
-    expect(stale.priceNow).toBeNull();
-    expect(stale.hodl.reason).toBe("— chart data is stale");
-    expect(() => reduceTokenKlines({ data: [], meta: { source: "x", asOf: NOW } }, NOW, NOW, { baseSymbol: null })).toThrow("Klines staleness is missing.");
   });
 
   it("accepts any reviewed pool the agent actually trades", () => {

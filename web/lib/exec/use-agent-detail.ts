@@ -14,7 +14,6 @@ import {
   ohlcvRequestPath,
   priceInQuote,
   tokenKlinesPath,
-  reduceTokenKlines,
   reduceOhlcv,
   reduceQuoteKlines,
   stickyArmBenchmark,
@@ -149,12 +148,11 @@ function detailQuoteSymbol(view: AgentDetailView | null): string | null {
 }
 
 /**
- * GRID-DETAIL-ORIENTATION-HOTFIX — the USD series of this agent's DISPLAY
- * base. The pool feed prices the pool's own base, which for the USDT/WBNB
- * pools is USDT (measured 2026-09-11: closes ≈ 0.999) — a flat line that is
- * not this agent's price. When the display base is WBNB the page reads WBNB's
- * own token klines instead; every other pair keeps the pool feed and its
- * pair-identity checks exactly as before.
+ * GRID-DETAIL-ORIENTATION-HOTFIX, resolved 2026-09-22: the data plane's pool
+ * OHLCV feed now takes `token=<address>` to price the side the caller wants,
+ * so the page asks for its own display base directly instead of falling back
+ * to GeckoTerminal's default (`base`, which for the USDT/WBNB pools was USDT
+ * — measured 2026-09-11: closes ≈ 0.999, not this agent's price).
  */
 async function fetchBaseSeries(
   view: AgentDetailView,
@@ -166,12 +164,7 @@ async function fetchBaseSeries(
 ): Promise<{ readonly ok: true; readonly result: OhlcvResult } | { readonly ok: false; readonly status: number }> {
   const base = detailBaseAddress(view);
   const baseSymbol = detailBaseSymbol(view);
-  if (base !== null && base.toLowerCase() === WBNB_56) {
-    const response = await fetch(tokenKlinesPath(base, ohlcvLimit(armMs, nowMs, interval), interval), { cache: "no-store", signal });
-    if (!response.ok) return { ok: false, status: response.status };
-    return { ok: true, result: reduceTokenKlines(await response.json() as unknown, armMs, nowMs, { baseSymbol, interval }) };
-  }
-  const response = await fetch(ohlcvRequestPath(pool, armMs, nowMs, interval), { cache: "no-store", signal });
+  const response = await fetch(ohlcvRequestPath(pool, armMs, nowMs, interval, base), { cache: "no-store", signal });
   if (!response.ok) return { ok: false, status: response.status };
   return {
     ok: true,

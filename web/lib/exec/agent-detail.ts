@@ -1733,16 +1733,20 @@ export function ohlcvLimit(armMs: number, nowMs: number, interval: ChartInterval
   return Math.min(500, Math.ceil(Math.max(0, nowMs - armMs) / INTERVAL_MS[interval]) + 5);
 }
 
-export function ohlcvRequestPath(pool: string, armMs: number, nowMs: number, interval: ChartInterval = "1m"): string {
+// `token` names which side of the pool the caller wants priced — the data
+// plane otherwise answers with GeckoTerminal's own `base` (whichever side
+// it picked, not necessarily this grid's display base). Passed through
+// verbatim by the BFF (`invalid_token` on a malformed address).
+export function ohlcvRequestPath(pool: string, armMs: number, nowMs: number, interval: ChartInterval = "1m", token?: string | null): string {
   if (!ADDRESS.test(pool)) throw new Error("Pool address is invalid.");
-  return `/api/market-data/ohlcv?kind=pool&address=${pool.toLowerCase()}&interval=${interval}&limit=${ohlcvLimit(armMs, nowMs, interval)}`;
+  if (token != null && !ADDRESS.test(token)) throw new Error("Token address is invalid.");
+  const tokenParam = token == null ? "" : `&token=${token.toLowerCase()}`;
+  return `/api/market-data/ohlcv?kind=pool&address=${pool.toLowerCase()}&interval=${interval}&limit=${ohlcvLimit(armMs, nowMs, interval)}${tokenParam}`;
 }
 
-// A single token's own USD klines. The pool feed prices only ITS base in USD,
-// and the data plane has no `token=base|quote` parameter, so pricing a grid in
-// its quote asset is a ratio of two USD series rather than a feed we can ask
-// for — and a grid whose display base is WBNB (USDT/WBNB) reads WBNB's own
-// series, because the pool feed prices USDT there ({@link reduceTokenKlines}).
+// A single token's own USD klines. Pricing a grid in its quote asset is a
+// ratio of two USD series (this one for the quote, the pool feed for the
+// base) rather than a feed either endpoint answers directly.
 export function tokenKlinesPath(token: string, limit: number, interval: ChartInterval): string {
   if (!ADDRESS.test(token)) throw new Error("Token address is invalid.");
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error("Kline limit is invalid.");
@@ -1775,54 +1779,6 @@ export function stickyArmBenchmark(
     payload: { ...body, data: { ...data, grid: { ...grid, benchmark: remembered } } },
     remembered,
     pending: false,
-  };
-}
-
-/**
- * GRID-DETAIL-ORIENTATION-HOTFIX — the token klines feed as the SAME
- * `OhlcvResult` the pool feed produces, for a grid whose display base is
- * WBNB. Measured 2026-09-11: the pool feed for the USDT/WBNB pools prices
- * USDT (closes ≈ 0.999), so `reduceOhlcv` rightly refuses it; WBNB's own USD
- * series (`kind=token`) IS the USDT-per-WBNB price the page wants. The
- * feed carries no `base`/`quote` identity, so the caller vouches for the
- * address it asked for; freshness and the HODL return follow `reduceOhlcv`.
- */
-export function reduceTokenKlines(
-  payload: unknown,
-  armMs: number,
-  nowMs: number,
-  expected: { readonly baseSymbol: string | null; readonly interval?: ChartInterval },
-): OhlcvResult {
-  const bar = INTERVAL_MS[expected.interval ?? "1m"];
-  if (!safeInteger(armMs) || !safeInteger(nowMs)) throw new Error("OHLCV time is invalid.");
-  const body = row(payload);
-  const meta = row(body?.["meta"]);
-  if (body === null || meta === null || !Array.isArray(body["data"])) throw new Error("Klines returned an unexpected response.");
-  if (typeof meta["source"] !== "string" || meta["source"].length === 0 || !safeInteger(meta["asOf"])) throw new Error("Klines metadata is invalid.");
-  if (meta["staleness"] !== "fresh" && meta["staleness"] !== "stale" && meta["staleness"] !== "dead") throw new Error("Klines staleness is missing.");
-  const candles: ChartCandle[] = body["data"].map((value) => {
-    const candle = row(value);
-    if (candle === null || !safeInteger(candle["timestamp"]) || !finitePositive(candle["open"])
-      || !finitePositive(candle["high"]) || !finitePositive(candle["low"])
-      || !finitePositive(candle["close"])) throw new Error("Kline candle is invalid.");
-    const volume = typeof candle["volume"] === "number" && Number.isFinite(candle["volume"]) && candle["volume"] >= 0 ? candle["volume"] : 0;
-    return { timestamp: candle["timestamp"], open: candle["open"], high: candle["high"], low: candle["low"], close: candle["close"], volume };
-  }).sort((a, b) => a.timestamp - b.timestamp);
-  const latest = candles[candles.length - 1];
-  const latestAge = latest === undefined ? null : nowMs - latest.timestamp;
-  const fresh = meta["staleness"] === "fresh" && latestAge !== null && latestAge >= 0 && latestAge <= bar * 2;
-  const start = candles.find((candle) => candle.timestamp >= armMs);
-  const startValid = start !== undefined && start.timestamp - armMs >= 0 && start.timestamp - armMs < bar;
-  const symbol = expected.baseSymbol ?? "WBNB";
-  const hodl = !startValid ? { value: null, reason: "— no candle at arm time" }
-    : !fresh || latest === undefined ? { value: null, reason: "— chart data is stale" }
-      : { value: `${(((latest.close - start.close) / start.close) * 100).toFixed(2)}%`, reason: null, note: `${symbol} spot return since arm · if you had held ${symbol} instead` };
-  return {
-    candles,
-    stale: !fresh,
-    banner: fresh ? null : `chart data is stale (as of ${new Date(meta["asOf"]).toISOString()})`,
-    priceNow: fresh && latest !== undefined ? latest.close : null,
-    hodl,
   };
 }
 
