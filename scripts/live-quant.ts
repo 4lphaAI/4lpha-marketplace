@@ -19,7 +19,7 @@
  *   seal                 our seal, the test-only twin of theirs
  *   worker               one cycle (rehearses unless --yes-live)
  *   pause / resume       store status only — the honest half
- *   resolve              --calls-id-read | --tx <hash>           evidence only
+ *   resolve              --calls-id-read | --tx <hash> | --not-executed   evidence only
  *   retire-level         the ONLY release for an unresolvable action
  *   acknowledge-external rebase | retire, after `external-activity`
  *   report               send the term-end notes now
@@ -62,9 +62,9 @@ import { agentAuthorityFromPrivateKey, ownerAuthorityFromPrivateKey } from "../s
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { existsSync } from "node:fs";
 import {
-  admittedParams, retirementAllowed, verifyAndSettle, type QuantReconcileDeps,
+  admittedParams, notExecutedProof, retirementAllowed, verifyAndSettle, type QuantReconcileDeps,
 } from "../src/quant/reconcile.js";
-import { createQuantJobStore, type QuantJobStore } from "../src/store/quantJobs.js";
+import { createQuantJobStore, type QuantJobStore, type QuantLevelRow } from "../src/store/quantJobs.js";
 import { createJournal, type ExecutionJournal } from "../src/store/journal.js";
 import { AltanaProvider } from "../src/wallet/altana.js";
 import { KEYSTORE_ABI } from "../src/wallet/abis.js";
@@ -130,6 +130,17 @@ function admissionEvidenceFromParamsJson(paramsJson: string | null): AdmissionEv
     return { grantShape, platformTargets };
   } catch {
     return null;
+  }
+}
+
+function resolutionKind(resolutionJson: string): string {
+  try {
+    const parsed: unknown = JSON.parse(resolutionJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "-";
+    const kind = (parsed as Record<string, unknown>)["kind"];
+    return typeof kind === "string" ? kind : "-";
+  } catch {
+    return "-";
   }
 }
 
@@ -308,7 +319,10 @@ async function commandStatus(args: Args, context: Context): Promise<void> {
         + ` amountIn=${action.amountInWei} minOut=${action.minOutWei}`
         + ` gas_price_wei=${action.gasPriceWei ?? "-"} fee_est_wei=${action.feeEstWei ?? "-"}`
         + ` fee_delta_wei=${action.feeDeltaWei ?? "-"} (unverified wallet-native delta via nativeBalanceAtHash @ receipt block)`
-        + ` tx=${action.txHash ?? "-"} code=${action.failureCode ?? "-"}`,
+        + ` tx=${action.txHash ?? "-"} code=${action.failureCode ?? "-"}`
+        + (entry?.state === "UNKNOWN" ? ` journal_error=${entry.lastError ?? "-"}` : "")
+        + (action.state === "failed" && action.resolutionJson !== null
+          ? ` resolution=${resolutionKind(action.resolutionJson)}` : ""),
       );
     }
     // Three SEPARATE numbers, never merged (R2.4): ours, theirs, and gas.
@@ -407,6 +421,75 @@ async function commandResolve(args: Args, context: Context): Promise<void> {
   if (job === null) throw new Error("no such job.");
   const deps = reconcileDeps(context);
 
+  if (args.flags.get("not-executed") === true) {
+    // R14.5. Operator-run only; the daemon never runs this door. Unlike
+    // `retire-level`, EVERY read happens BEFORE the `--yes-live` gate so the
+    // rehearsal prints the evidence (a deliberate divergence).
+    let proof: ReturnType<typeof notExecutedProof>;
+    let level: QuantLevelRow | undefined;
+    try {
+      level = (await context.store.listLevels(job.quantJobId))
+        .find((row) => row.levelIndex === action.levelIndex);
+      const entry = await context.journal.get(journalKey);
+      const others = (await context.store.listAccountingActions(job.quantJobId))
+        .filter((row) => row.journalKey !== journalKey);
+      // `listJobs`, NOT `listWorkableJobs`: the historical / other-strategy job
+      // sharing this wallet is exactly the one P2 must see.
+      const sharedWalletJobs = (await context.store.listJobs()).filter((row) =>
+        row.quantJobId !== job.quantJobId
+        && row.tradingWallet.toLowerCase() === job.tradingWallet.toLowerCase()).length;
+      const epoch = await context.store.currentEpoch(job.quantJobId);
+      const finalized = await context.reader.finalizedBlock();
+      const epochBlock = epoch === null ? null : await context.reader.blockAt(epoch.startedBlock);
+      const submitAncestor = action.submitFinalizedNumber === null
+        ? null : await context.reader.blockAt(action.submitFinalizedNumber);
+      if (context.reader.tokenBalanceAtHash === undefined) {
+        console.log("refused: no-hash-reader");
+        return;
+      }
+      const wallet = getAddress(job.tradingWallet);
+      const actualUWei = await context.reader.tokenBalanceAtHash(context.config.u, wallet, finalized.hash);
+      const actualWbnbWei = await context.reader.tokenBalanceAtHash(context.config.wbnb, wallet, finalized.hash);
+      proof = notExecutedProof({
+        action,
+        journalState: entry?.state ?? null,
+        journalHasCallsId: entry?.externalRef.callsId !== undefined,
+        others,
+        sharedWalletJobs,
+        level: level ?? null,
+        epoch,
+        epochBlockHash: epochBlock?.hash ?? null,
+        submitAncestorHash: submitAncestor?.hash ?? null,
+        finalized,
+        actualUWei,
+        actualWbnbWei,
+      });
+    } catch {
+      // Unavailability is not evidence.
+      console.log("refused: read-failed");
+      return;
+    }
+    if (proof.evidence !== undefined) console.log(`evidence: ${JSON.stringify(proof.evidence)}`);
+    if (!proof.ok) { console.log(`refused: ${proof.code}`); return; }
+    console.log("verdict: not executed (deadline passed at a finalized block; balances match the verified baseline).");
+    if (!yesLive(args)) {
+      console.log("Rehearsal only. The door is IRREVERSIBLE. Pass --yes-live to write.");
+      return;
+    }
+    const result = await context.store.resolveNotExecuted({
+      journalKey,
+      expectedActionRowVersion: action.rowVersion,
+      expectedLevelRowVersion: level!.rowVersion,
+      expectedLadderGen: level!.ladderGen,
+      resolutionJson: JSON.stringify(proof.evidence),
+      nowMs: Date.now(),
+    });
+    console.log(result.kind === "ok"
+      ? `resolved: not executed; level ${action.levelIndex} restored to ${action.priorLevelState}`
+      : "refused: action-moved");
+    return;
+  }
+
   if (args.flags.get("calls-id-read") === true) {
     const entry = await context.journal.get(journalKey);
     const callsId = entry?.externalRef.callsId;
@@ -440,7 +523,7 @@ async function commandResolve(args: Args, context: Context): Promise<void> {
     console.log(verdict.ok ? `settled ${txFlag}` : `refused: ${verdict.code}`);
     return;
   }
-  throw new Error("resolve requires --calls-id-read or --tx <hash>.");
+  throw new Error("resolve requires --calls-id-read, --tx <hash> or --not-executed.");
 }
 
 async function commandRetireLevel(args: Args, context: Context): Promise<void> {
@@ -906,6 +989,7 @@ function commandHelp(): void {
     + "  pause --job <id> / resume --job <id>     server-side refusal only\n"
     + "  resolve --action <key> --calls-id-read\n"
     + "  resolve --action <key> --tx <hash>       positive evidence only\n"
+    + "  resolve --action <key> --not-executed [--yes-live]  deadline passed + balances = verified baseline; irreversible\n"
     + "  retire-level --job <id> --level <n> [--yes-live]\n"
     + "  acknowledge-external --job <id> --mode rebase|retire [--yes-live]\n"
     + "  report --job <id> [--yes-live]\n"

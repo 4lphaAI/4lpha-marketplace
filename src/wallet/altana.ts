@@ -159,6 +159,9 @@ const DEFAULT_AWAIT_POLL_MS = 2_000;
  */
 export const DEFAULT_SUBMIT_TIMEOUT_MS = 45_000;
 
+/** The fixed head of the submit-timeout message; quant classifies on it (R14.5). */
+export const RELAY_SUBMIT_TIMEOUT_PREFIX = "The relay did not answer within ";
+
 /**
  * The account's `period` enum value for DAY.
  *
@@ -1189,7 +1192,7 @@ export class AltanaProvider implements WalletProvider {
           })),
         }),
         this.#submitTimeoutMs,
-        `The relay did not answer within ${this.#submitTimeoutMs}ms. Whether it accepted the submission is UNKNOWN.`,
+        `${RELAY_SUBMIT_TIMEOUT_PREFIX}${this.#submitTimeoutMs}ms. Whether it accepted the submission is UNKNOWN.`,
       );
       throwIfAborted(params.signal);
       const receipt = toReceipt(result);

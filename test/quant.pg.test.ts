@@ -22,7 +22,8 @@
  * `replaceEnvelope`, `admitJob` (win AND conflict), `getJob`, `listJobs`,
  * `listWorkableJobs`, transition methods, `listLevels`, `insertIntent` (win AND
  * the blocked/stale conflicts), `markActionSubmitted`, `abortIntent`,
- * `setActionState`, `settleAction` (settle, idempotent no-op, and the
+ * `setActionState`, `resolveNotExecuted` (R14.5: conflicts and the door),
+ * `settleAction` (settle, idempotent no-op, and the
  * OWNERSHIP conflict), `retireLevel`, `openEpoch`, `currentEpoch`,
  * `recordObservation` + its trim, `markStaleObservation`, `listRecentBuys`,
  * `listNonTerminalActions`, `recordIndexerTrades`, `listIndexerTrades`,
@@ -777,6 +778,56 @@ test("BC31 — every quant statement executes on a REAL PostgreSQL", {
       assert.equal((await journal.get(raceKey))?.state, "PENDING", "the journal is untouched");
       assert.equal((await store.getAction(raceKey))?.state, "submitted");
       assert.equal((await store.listLevels(JOB))[1]?.state, "blocked");
+
+      /* ---- R14.5 BC-S218/S219 (PG half): resolveNotExecuted --------------- */
+      const notUnknown = await store.resolveNotExecuted({
+        journalKey: raceKey, expectedActionRowVersion: claimedBySender.kind === "ok" ? claimedBySender.record.rowVersion : 0,
+        expectedLevelRowVersion: (await store.listLevels(JOB))[1]!.rowVersion,
+        expectedLadderGen: (await store.listLevels(JOB))[1]!.ladderGen,
+        resolutionJson: '{"v":1,"kind":"not-executed"}', nowMs: clock,
+      });
+      assert.equal(notUnknown.kind, "conflict", "a `submitted` action is not the door's");
+      assert.equal(notUnknown.record?.state, "submitted");
+      await journal.markUnknown(raceKey, "Quant submission outcome is unknown; held for reconciliation. cause=relay-timeout waited_ms=45000");
+      const unknownRow = await store.setActionState({
+        journalKey: raceKey, state: "unknown", failureCode: "submit-ambiguous", nowMs: clock,
+      });
+      assert.equal(unknownRow?.state, "unknown");
+      const doorLevel = (await store.listLevels(JOB))[1]!;
+      const jobBeforeDoor = (await store.getJob(JOB))!;
+      const doorInput = {
+        journalKey: raceKey, expectedActionRowVersion: unknownRow!.rowVersion,
+        expectedLevelRowVersion: doorLevel.rowVersion, expectedLadderGen: doorLevel.ladderGen,
+        resolutionJson: '{"v":1,"kind":"not-executed"}', nowMs: clock,
+      };
+      for (const stale of [
+        { expectedActionRowVersion: unknownRow!.rowVersion - 1 },
+        { expectedLevelRowVersion: doorLevel.rowVersion + 1 },
+        { expectedLadderGen: doorLevel.ladderGen + 1 },
+      ]) {
+        const refused = await store.resolveNotExecuted({ ...doorInput, ...stale });
+        assert.equal(refused.kind, "conflict");
+        assert.equal(refused.record?.state, "unknown");
+        assert.equal((await store.getAction(raceKey))?.rowVersion, unknownRow!.rowVersion, "nothing written");
+        assert.equal((await store.listLevels(JOB))[1]?.rowVersion, doorLevel.rowVersion, "nothing written");
+        assert.equal((await store.getJob(JOB))?.accountingRev, jobBeforeDoor.accountingRev, "nothing written");
+      }
+      const door = await store.resolveNotExecuted(doorInput);
+      assert.equal(door.kind, "ok");
+      const resolved = await store.getAction(raceKey);
+      assert.equal(resolved?.state, "failed");
+      assert.equal(resolved?.failureCode, "not-executed-proven");
+      assert.equal(resolved?.resolutionJson, '{"v":1,"kind":"not-executed"}');
+      const reopened = (await store.listLevels(JOB))[1]!;
+      assert.equal(reopened.state, "armed-quote");
+      assert.equal(reopened.rowVersion, doorLevel.rowVersion + 1);
+      assert.equal(reopened.baseWei, doorLevel.baseWei);
+      assert.equal(reopened.basisUWei, doorLevel.basisUWei);
+      assert.equal(reopened.realizedUWei, doorLevel.realizedUWei);
+      assert.equal((await store.getJob(JOB))?.accountingRev, jobBeforeDoor.accountingRev + 1n);
+      assert.equal((await journal.get(raceKey))?.state, "UNKNOWN", "the journal row stays UNKNOWN");
+      assert.equal((await store.listNonTerminalActions(JOB)).some((row) => row.journalKey === raceKey), false);
+      assert.equal((await store.resolveNotExecuted(doorInput)).kind, "conflict", "the door is one-shot");
     } finally {
       await senderSql.close();
     }

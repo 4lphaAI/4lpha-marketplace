@@ -38,7 +38,10 @@
  */
 import { getAddress, keccak256, stringToHex, type Address, type Hex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
-import { accountKeyHashForAddress, agentAuthorityFromPrivateKey } from "../wallet/altana.js";
+import {
+  accountKeyHashForAddress, agentAuthorityFromPrivateKey, RELAY_SUBMIT_TIMEOUT_PREFIX,
+} from "../wallet/altana.js";
+import { ExecutionPlaneError, ProviderError } from "../core/types.js";
 import type {
   ExecutionReceipt,
   SessionRef,
@@ -118,6 +121,20 @@ const QUANT_EXECUTE_MESSAGES: Readonly<Record<QuantExecuteCode, string>> = Objec
   "submit-ambiguous": "The relay's answer is unknown; the action is held.",
   "submit-failed": "The relay reported the submission failed.",
 });
+
+/**
+ * R14.5: classify an ambiguous submit into a FIXED token. Only the token is
+ * ever emitted — never the error's message, which an SDK may have written.
+ */
+export function ambiguousCause(error: unknown): string {
+  if (error instanceof QuantExecuteError) return `quant-${error.code}`;
+  if (error instanceof ProviderError && error.message.startsWith(RELAY_SUBMIT_TIMEOUT_PREFIX)) {
+    return "relay-timeout";
+  }
+  if (error instanceof ExecutionPlaneError) return `plane-${error.code.toLowerCase()}`;
+  if (error instanceof Error && error.name === "AbortError") return "aborted";
+  return "other";
+}
 
 /* -------------------------------------------------------------------------- */
 /* Deps                                                                       */
@@ -386,6 +403,7 @@ export async function submitQuantAction(
 
   /* Phase 3 — open, check, CAS, submit. */
   let receipt: ExecutionReceipt;
+  let submitEnteredAtMs: number | null = null;
   try {
     receipt = await withJobSession(deps, job, async (opened) => {
       const rebuiltCalls = buildPancakeTokenSwap({
@@ -434,6 +452,7 @@ export async function submitQuantAction(
       // has been sent, so the honest outcome is a rollback, not a hold.
       if (claimed.kind !== "ok") throw new QuantExecuteError("store-conflict");
       // ─── FROM HERE EVERY THROW IS AMBIGUOUS ───────────────────────────────
+      submitEnteredAtMs = deps.nowMs();
       return deps.provider.executeViaSession({
         session: opened.session,
         calls: rebuiltCalls,
@@ -458,8 +477,13 @@ export async function submitQuantAction(
       });
       return { kind: "rolled-back", code: code as QuantExecuteCode };
     }
+    // R14.5: a token from a FIXED vocabulary plus our own clock — never the
+    // SDK/relay message text.
+    const waitedMs = submitEnteredAtMs === null ? null : deps.nowMs() - submitEnteredAtMs;
     await deps.journal.markUnknown(
-      action.journalKey, "Quant submission outcome is unknown; held for reconciliation.",
+      action.journalKey,
+      `Quant submission outcome is unknown; held for reconciliation. cause=${ambiguousCause(error)}`
+        + (waitedMs === null ? "" : ` waited_ms=${waitedMs}`),
     );
     await deps.store.setActionState({
       journalKey: action.journalKey,

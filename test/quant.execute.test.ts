@@ -23,6 +23,7 @@ import { QUANT_STRATEGY_DEFAULTS, QUANT_ROUTER_56, QUANT_U_56, QUANT_WBNB_56 } f
 import { deriveKeypair, seal } from "../src/quant/envelope.js";
 import { permissionsDigest, parseSessionPlaintext, projectGrantedPermissions, specDigest } from "../src/quant/admission.js";
 import {
+  ambiguousCause,
   checkQuantMeters,
   quantJournalKey,
   submitQuantAction,
@@ -30,7 +31,14 @@ import {
   type QuantExecuteDeps,
 } from "../src/quant/execute.js";
 import { buildPancakeTokenSwap } from "../src/ops/pancakeTokens.js";
-import type { ExecutionReceipt, SessionRef, SpendInfoReading, WalletProvider } from "../src/core/types.js";
+import { BNB, type Client as AltanaClient } from "@altananetwork/sdk";
+import {
+  AltanaProvider, RELAY_SUBMIT_TIMEOUT_PREFIX, agentAuthorityFromPrivateKey,
+} from "../src/wallet/altana.js";
+import {
+  ExecutionPlaneError, ProviderError, SessionExpiredError,
+  type ExecutionReceipt, type SessionRef, type SpendInfoReading, type WalletProvider,
+} from "../src/core/types.js";
 import type { QuantChainReader } from "../src/quant/readers.js";
 
 const U = 10n ** 18n;
@@ -476,5 +484,78 @@ describe("quant journal keys", () => {
     assert.notEqual(a, quantJournalKey(JOB, 1, 2));
     assert.notEqual(a, quantJournalKey(JOB, 2, 1));
     assert.notEqual(a, quantJournalKey("other", 1, 1));
+  });
+});
+
+describe("R14.5 Part B — the ambiguous-submit cause, without SDK text", () => {
+  const TIMEOUT_MESSAGE = `${RELAY_SUBMIT_TIMEOUT_PREFIX}45000ms. Whether it accepted the submission is UNKNOWN.`;
+
+  it("BC-S221: ambiguousCause maps every table row to a fixed token", () => {
+    assert.equal(ambiguousCause(new QuantExecuteError("store-conflict")), "quant-store-conflict");
+    assert.equal(ambiguousCause(new QuantExecuteError("calls-mismatch")), "quant-calls-mismatch");
+    assert.equal(ambiguousCause(new ProviderError(TIMEOUT_MESSAGE)), "relay-timeout");
+    assert.equal(ambiguousCause(new ProviderError("Wallet provider request failed.")), "plane-provider_error");
+    assert.equal(ambiguousCause(new SessionExpiredError()), "plane-session_expired");
+    assert.equal(ambiguousCause(new ExecutionPlaneError("NOT_ALLOWED", "x")), "plane-not_allowed");
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    assert.equal(ambiguousCause(abort), "aborted");
+    assert.equal(ambiguousCause(new Error(TIMEOUT_MESSAGE)), "other", "only a ProviderError is the relay timeout");
+    assert.equal(ambiguousCause("a thrown string"), "other");
+    assert.equal(ambiguousCause(undefined), "other");
+  });
+
+  it("BC-S222: a relay timeout journals cause=relay-timeout waited_ms=, and never the SDK text or a key", async () => {
+    const stubMessage = `${TIMEOUT_MESSAGE} ${PRIVATE_KEY} ${"ab".repeat(24)}`;
+    const context = await probe({
+      onExecute: async () => { throw new ProviderError(stubMessage); },
+    });
+    const action = await intent(context.store);
+    const job = await context.store.getJob(JOB);
+    const outcome = await submitQuantAction(context.deps, {
+      job: job!, action: action!, calls: CALLS,
+      requiredNativeWei: 3n * 10n ** 14n, tokenIn: QUANT_U_56,
+    });
+    assert.equal(outcome.kind, "unknown");
+    const entry = await context.journal.get(action!.journalKey);
+    assert.equal(entry?.state, "UNKNOWN");
+    const lastError = entry?.lastError ?? "";
+    assert.ok(lastError.includes("cause=relay-timeout waited_ms="), lastError);
+    assert.equal(lastError.toLowerCase().includes(PRIVATE_KEY.slice(2).toLowerCase()), false);
+    assert.doesNotMatch(lastError, /[0-9a-f]{40,}/iu, "no hex of 40+ characters");
+    assert.equal(lastError.includes(stubMessage), false);
+    assert.equal(lastError.includes(RELAY_SUBMIT_TIMEOUT_PREFIX), false, "only the token, never the message");
+    assert.equal((await context.store.getAction(action!.journalKey))?.failureCode, "submit-ambiguous");
+  });
+
+  it("BC-S223: the real withTimeout path raises a ProviderError that starts with the exported prefix", async () => {
+    // Audit L3: the bytes are today's, so every other kind's UNKNOWN text is unchanged.
+    assert.equal(RELAY_SUBMIT_TIMEOUT_PREFIX, "The relay did not answer within ");
+    const provider = new AltanaProvider({
+      network: BNB,
+      client: { execute: () => new Promise(() => { /* never settles */ }) } as unknown as AltanaClient,
+      submitTimeoutMs: 5,
+    });
+    const session = provider.restoreSession({
+      spec: {
+        allowedCalls: [{ to: QUANT_ROUTER_56 }],
+        spendCaps: [{ limit: 10n ** 17n, period: "day" }],
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      },
+      agent: agentAuthorityFromPrivateKey(`0x${"22".repeat(32)}` as Hex),
+      walletAddress: WALLET,
+      publicKey: `0x${"ab".repeat(64)}` as Hex,
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    });
+    await assert.rejects(
+      provider.executeViaSession({ session, calls: [{ to: QUANT_ROUTER_56, value: 1n }], bypassLocalPolicyCheck: true }),
+      (error: unknown) => {
+        assert.ok(error instanceof ProviderError);
+        assert.ok(error.message.startsWith(RELAY_SUBMIT_TIMEOUT_PREFIX), error.message);
+        assert.equal(error.message, `${RELAY_SUBMIT_TIMEOUT_PREFIX}5ms. Whether it accepted the submission is UNKNOWN.`);
+        assert.equal(ambiguousCause(error), "relay-timeout");
+        return true;
+      },
+    );
   });
 });

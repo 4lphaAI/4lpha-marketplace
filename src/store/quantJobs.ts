@@ -636,6 +636,20 @@ export interface QuantJobStore {
     readonly restoreLevel?: boolean;
     readonly nowMs: number;
   }): Promise<QuantActionRow | null>;
+  /**
+   * R14.5 operator door: `unknown → failed:not-executed-proven` + level restore
+   * + accounting, in ONE fenced transaction, CAS'd on the action row version,
+   * the level row version and the ladder generation. The journal row stays
+   * UNKNOWN; `resolutionJson` is the record.
+   */
+  resolveNotExecuted(input: {
+    readonly journalKey: string;
+    readonly expectedActionRowVersion: number;
+    readonly expectedLevelRowVersion: number;
+    readonly expectedLadderGen: number;
+    readonly resolutionJson: string;
+    readonly nowMs: number;
+  }): Promise<QuantCasResult<QuantActionRow>>;
   /** Action + level + receipt ownership + accounting, in ONE transaction. */
   settleAction(input: SettleQuantActionInput): Promise<QuantCasResult<QuantActionRow>>;
   retireLevel(input: {
@@ -1263,6 +1277,56 @@ export class MemoryQuantJobStore implements QuantJobStore {
       rowVersion: job.rowVersion + 1, updatedAtMs: input.nowMs,
     });
     return structuredClone(next);
+  }
+
+  async resolveNotExecuted(input: {
+    readonly journalKey: string;
+    readonly expectedActionRowVersion: number;
+    readonly expectedLevelRowVersion: number;
+    readonly expectedLadderGen: number;
+    readonly resolutionJson: string;
+    readonly nowMs: number;
+  }): Promise<QuantCasResult<QuantActionRow>> {
+    const quantJobId = this.#actions.get(input.journalKey)?.quantJobId ?? "";
+    return this.withQuantFence(quantJobId, async () => {
+      const existing = this.#actions.get(input.journalKey);
+      if (existing === undefined) return { kind: "conflict", record: null };
+      if (existing.state !== "unknown" || existing.rowVersion !== input.expectedActionRowVersion
+        || existing.txHash !== null) {
+        return { kind: "conflict", record: structuredClone(existing) };
+      }
+      const levelKey = this.#levelKey(existing.quantJobId, existing.levelIndex);
+      const level = this.#levels.get(levelKey);
+      if (level === undefined || level.state !== "blocked"
+        || level.rowVersion !== input.expectedLevelRowVersion
+        || level.ladderGen !== input.expectedLadderGen) {
+        return { kind: "conflict", record: structuredClone(existing) };
+      }
+      const next: QuantActionRow = {
+        ...existing,
+        state: "failed",
+        failureCode: "not-executed-proven",
+        resolutionJson: input.resolutionJson,
+        rowVersion: existing.rowVersion + 1,
+        updatedAtMs: input.nowMs,
+      };
+      this.#actions.set(next.journalKey, next);
+      this.#levels.set(levelKey, {
+        ...level,
+        state: existing.priorLevelState,
+        triggerConsecutive: 0,
+        triggerSide: null,
+        ...(existing.evidenceKind === "seed"
+          ? { seedLastCause: `failed:${existing.journalKey}:not-executed-proven` } : {}),
+        rowVersion: level.rowVersion + 1,
+      });
+      const job = this.#jobs.get(existing.quantJobId);
+      if (job !== undefined) this.#jobs.set(existing.quantJobId, {
+        ...job, accountingRev: job.accountingRev + 1n,
+        rowVersion: job.rowVersion + 1, updatedAtMs: input.nowMs,
+      });
+      return { kind: "ok", record: structuredClone(next) };
+    });
   }
 
   async settleAction(input: SettleQuantActionInput): Promise<QuantCasResult<QuantActionRow>> {
@@ -3696,6 +3760,74 @@ export class PostgresQuantJobStore implements QuantJobStore {
         [action.quantJobId, input.nowMs],
       );
       return action;
+    });
+  }
+
+  async resolveNotExecuted(input: {
+    readonly journalKey: string;
+    readonly expectedActionRowVersion: number;
+    readonly expectedLevelRowVersion: number;
+    readonly expectedLadderGen: number;
+    readonly resolutionJson: string;
+    readonly nowMs: number;
+  }): Promise<QuantCasResult<QuantActionRow>> {
+    return this.#sql.transaction(async (tx) => {
+      const actionLookup = await tx.query<JobRowShape>(`/* quantActions.get */ select ${ACTION_COLUMNS} from quant_actions where journal_key = $1`, [input.journalKey]);
+      const beforeRow = actionLookup.rows[0];
+      if (beforeRow === undefined) return { kind: "conflict" as const, record: null };
+      const before = rowToAction(beforeRow);
+      await tx.query(`/* quantJobs.fence */ select pg_advisory_xact_lock($1::integer, hashtext($2))`, [QUANT_LOCK_CLASSID, before.quantJobId]);
+      // Both CAS predicates are checked under the fence BEFORE any write, so a
+      // mismatch on either row returns a conflict with nothing written.
+      const current = await tx.query<JobRowShape>(`/* quantActions.get */ select ${ACTION_COLUMNS} from quant_actions where journal_key = $1`, [input.journalKey]);
+      const action = current.rows[0] === undefined ? null : rowToAction(current.rows[0]);
+      if (action === null || action.state !== "unknown"
+        || action.rowVersion !== input.expectedActionRowVersion || action.txHash !== null) {
+        return { kind: "conflict" as const, record: action };
+      }
+      const levelRead = await tx.query<JobRowShape>(
+        `/* quantLevels.getOne */ select ${LEVEL_COLUMNS} from quant_levels where quant_job_id = $1 and level_index = $2::int`,
+        [action.quantJobId, action.levelIndex],
+      );
+      const level = levelRead.rows[0] === undefined ? null : rowToLevel(levelRead.rows[0]);
+      if (level === null || level.state !== "blocked"
+        || level.rowVersion !== input.expectedLevelRowVersion
+        || level.ladderGen !== input.expectedLadderGen) {
+        return { kind: "conflict" as const, record: action };
+      }
+      const updated = await tx.query<JobRowShape>(
+        `/* quantActions.resolveNotExecuted */
+         update quant_actions
+         set state = 'failed', failure_code = 'not-executed-proven', resolution_json = $3,
+             row_version = row_version + 1, updated_at_ms = $4::bigint
+         where journal_key = $1 and row_version = $2::int and state = 'unknown' and tx_hash is null
+         returning ${ACTION_COLUMNS}`,
+        [input.journalKey, input.expectedActionRowVersion, input.resolutionJson, input.nowMs],
+      );
+      const row = updated.rows[0];
+      if (row === undefined) return { kind: "conflict" as const, record: action };
+      const restored = await tx.query<{ level_index: number }>(
+        `/* quantLevels.resolveNotExecuted */
+         update quant_levels
+         set state = $3, trigger_consecutive = 0, trigger_side = null,
+             seed_last_cause = case when $6::boolean then $7::text else seed_last_cause end,
+             row_version = row_version + 1
+         where quant_job_id = $1 and level_index = $2::int and state = 'blocked'
+           and row_version = $4::int and ladder_gen = $5::int
+         returning level_index`,
+        [action.quantJobId, action.levelIndex, action.priorLevelState,
+          input.expectedLevelRowVersion, input.expectedLadderGen,
+          action.evidenceKind === "seed", `failed:${action.journalKey}:not-executed-proven`],
+      );
+      // Unreachable under the fence (the level was read above); a throw rolls
+      // the action write back rather than leaving it half-applied.
+      if (restored.rows.length !== 1) throw new Error("quant level moved under the fence.");
+      await tx.query(
+        `/* quantJobs.accountingRev */ update quant_jobs set accounting_rev = accounting_rev + 1,
+          row_version = row_version + 1, updated_at_ms = $2::bigint where quant_job_id = $1`,
+        [action.quantJobId, input.nowMs],
+      );
+      return { kind: "ok" as const, record: rowToAction(row) };
     });
   }
 

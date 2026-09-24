@@ -1152,6 +1152,53 @@ describe("quant worker — budgets and term end", () => {
     );
   });
 
+  it("BC-S220: after the not-executed door, settleAction conflicts and the resolved BUY no longer reserves the day cap", async () => {
+    const harness = makeHarness();
+    const state = (harness.deps.transport as MemoryQuantTransport).state;
+    // One 10 U clip fits a 15 U day cap; two do not. While the ambiguous buy is
+    // non-terminal it reserves its full amount (R7.3), so a re-buy would hold.
+    state.jobs.set(JOB, jobRecord({ dailyCapUWei: 15n * U }));
+    await cycle(harness);
+    harness.chain.mid = BUY_1 - E18;
+    await cycle(harness);
+    harness.chain.failNextSubmit = "throw";
+    await cycle(harness);
+    const unknown = (await harness.store.listActions(JOB)).find((row) => row.state === "unknown");
+    assert.ok(unknown !== undefined, "the thrown submit leaves an unknown buy");
+    assert.equal(unknown.side, "buy");
+    const blocked = (await harness.store.listLevels(JOB)).find((row) => row.levelIndex === unknown.levelIndex)!;
+    assert.equal(blocked.state, "blocked");
+
+    const door = await harness.store.resolveNotExecuted({
+      journalKey: unknown.journalKey,
+      expectedActionRowVersion: unknown.rowVersion,
+      expectedLevelRowVersion: blocked.rowVersion,
+      expectedLadderGen: blocked.ladderGen,
+      resolutionJson: '{"v":1,"kind":"not-executed"}',
+      nowMs: harness.clock.nowMs,
+    });
+    assert.equal(door.kind, "ok");
+    // Irreversible: a fill discovered afterwards can never be settled on this row.
+    const late = await harness.store.settleAction({
+      journalKey: unknown.journalKey, quantJobId: JOB, levelIndex: unknown.levelIndex,
+      txHash: `0x${"9f".repeat(32)}` as Hex, swapLogIndex: 2n,
+      fillInWei: unknown.amountInWei, fillOutWei: unknown.minOutWei, feeDeltaWei: null,
+      entryCostUWei: 0n, nextLevelState: "holding-base", nextBaseWei: unknown.minOutWei,
+      nextBaseAtCycleStartWei: unknown.minOutWei, nextBasisUWei: unknown.amountInWei,
+      cyclesClosedDelta: 0, realizedDeltaUWei: 0n, residualDeltaWei: 0n,
+      exitPlanJson: null, nowMs: harness.clock.nowMs,
+    });
+    assert.equal(late.kind, "conflict");
+
+    const before = harness.chain.submissions;
+    const notes: string[] = [];
+    for (let index = 0; index < 3 && harness.chain.submissions === before; index += 1) {
+      notes.push(...(await cycle(harness)).notes);
+    }
+    assert.equal(harness.chain.submissions, before + 1, notes.join(","));
+    assert.equal(notes.some((note) => note.endsWith(":day-cap-exhausted")), false, notes.join(","));
+  });
+
   it("REPORTS once past endsAt, and does not report twice", async () => {
     const harness = makeHarness();
     await cycle(harness);

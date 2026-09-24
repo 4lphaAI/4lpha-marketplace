@@ -22,6 +22,10 @@
  *     passed at a finalized block, `live-quant retire-level`, which is
  *     PERMANENT.
  *
+ * R14.5 adds ONE operator-run exit for an `unknown` action with no callsId:
+ * `resolve --not-executed`, on two positive finalized facts (deadline passed,
+ * balances equal the verified baseline), never on silence — `notExecutedProof`.
+ *
  * Disclosed consequence: a lost relay response can idle one level until the
  * session expires. That is the fail-closed price of not double-buying. Funds
  * never leave the client's wallet either way.
@@ -43,6 +47,7 @@ import type {
   QuantEpochRow,
   QuantJobRow,
   QuantJobStore,
+  QuantLevelRow,
 } from "../store/quantJobs.js";
 import type { WalletProvider, WalletCall } from "../core/types.js";
 import type { QuantChainReader } from "./readers.js";
@@ -1035,4 +1040,155 @@ export async function retirementAllowed(input: {
   if (!keyDead) return { allowed: false, reason: "session-still-valid" };
   if (!deadlinePassed) return { allowed: false, reason: "deadline-not-passed" };
   return { allowed: true, reason: "key-dead-and-deadline-passed" };
+}
+
+export type NotExecutedRefusal =
+  | "not-ambiguous"
+  | "has-callsid"
+  | "wallet-shared"
+  | "level-moved"
+  | "other-action-pending"
+  | "other-action-unverified"
+  | "epoch-unverified"
+  | "window-before-epoch"
+  | "deadline-not-passed"
+  | "amount-below-dust"
+  | "balance-mismatch"
+  | "balance-ambiguous";
+
+/** The record `resolve --not-executed` persists. Bigints are decimal strings. */
+export type NotExecutedEvidence = {
+  readonly v: 1;
+  readonly kind: "not-executed";
+  readonly finalizedBlock: string;
+  readonly finalizedHash: Hex;
+  readonly finalizedTimestampSec: string;
+  readonly deadlineSec: number;
+  readonly epoch: number;
+  readonly epochStartedBlock: string;
+  readonly epochStartedBlockHash: Hex;
+  readonly expectedUWei: string;
+  readonly expectedWbnbWei: string;
+  readonly actualUWei: string;
+  readonly actualWbnbWei: string;
+  readonly dustWei: string;
+  /** Journal keys of the settled fills applied to the baseline. */
+  readonly appliedSettled: readonly string[];
+};
+
+/**
+ * R14.5: the deadline-passed "not executed" proof for ONE ambiguous action.
+ * Pure, no I/O; the operator CLI does the reads. Two positive, finalized,
+ * hash-bound facts: the router deadline has passed at `F` (the batch can
+ * never execute from now on), and the balances at `F` match the verified
+ * epoch baseline plus every settled fill — the empty-subset case of
+ * `reconcileAccounting`, at the same dust — and NOT the executed hypothesis.
+ *
+ * `executedBlock` is the finalized head at settlement (≥ the true receipt
+ * block), inherited from `reconcileAccounting` unchanged. Both mis-placements
+ * it can cause refuse (`balance-mismatch`); neither opens.
+ */
+export function notExecutedProof(input: {
+  readonly action: QuantActionRow;
+  readonly journalState: string | null;
+  readonly journalHasCallsId: boolean;
+  readonly others: readonly QuantActionRow[];
+  readonly sharedWalletJobs: number;
+  readonly level: QuantLevelRow | null;
+  readonly epoch: QuantEpochRow | null;
+  readonly epochBlockHash: Hex | null;
+  readonly submitAncestorHash: Hex | null;
+  readonly finalized: { readonly number: bigint; readonly hash: Hex; readonly timestampSec: bigint };
+  readonly actualUWei: bigint;
+  readonly actualWbnbWei: bigint;
+  readonly dustWei?: bigint;
+}): { readonly ok: true; readonly evidence: NotExecutedEvidence }
+  | { readonly ok: false; readonly code: NotExecutedRefusal; readonly evidence?: NotExecutedEvidence } {
+  const { action, epoch, finalized } = input;
+  const dust = input.dustWei ?? 1_000_000_000_000n;
+  // P1
+  if (action.state !== "unknown" || action.txHash !== null || input.journalState !== "UNKNOWN") {
+    return { ok: false, code: "not-ambiguous" };
+  }
+  if (input.journalHasCallsId) return { ok: false, code: "has-callsid" };
+  // P2
+  if (input.sharedWalletJobs !== 0) return { ok: false, code: "wallet-shared" };
+  // P3
+  if (input.level === null || input.level.state !== "blocked"
+    || input.level.ladderGen !== action.ladderGen) {
+    return { ok: false, code: "level-moved" };
+  }
+  // P4
+  if (input.others.some((other) =>
+    other.state !== "settled" && other.state !== "failed" && other.state !== "aborted")) {
+    return { ok: false, code: "other-action-pending" };
+  }
+  // P5
+  if (input.others.some((other) => other.state === "settled" && (other.fillInWei === null
+    || other.fillOutWei === null || other.executedBlock === null || other.executedAtSec === null))) {
+    return { ok: false, code: "other-action-unverified" };
+  }
+  // P6
+  if (epoch === null || epoch.verified !== true || epoch.startedBlockHash === null
+    || input.epochBlockHash === null
+    || input.epochBlockHash.toLowerCase() !== epoch.startedBlockHash.toLowerCase()) {
+    return { ok: false, code: "epoch-unverified" };
+  }
+  // P7
+  if (action.submitFinalizedNumber === null || action.submitFinalizedHash === null
+    || input.submitAncestorHash === null
+    || input.submitAncestorHash.toLowerCase() !== action.submitFinalizedHash.toLowerCase()
+    || action.submitFinalizedNumber < epoch.startedBlock) {
+    return { ok: false, code: "window-before-epoch" };
+  }
+  // P8
+  if (finalized.number < epoch.startedBlock || finalized.timestampSec <= BigInt(action.deadlineSec)) {
+    return { ok: false, code: "deadline-not-passed" };
+  }
+  // P9
+  if (action.amountInWei <= 2n * dust) return { ok: false, code: "amount-below-dust" };
+  // P10 — `reconcileAccounting`'s settled-fill rule, verbatim.
+  let expectedUWei = epoch.baselineUWei;
+  let expectedWbnbWei = epoch.baselineWbnbWei;
+  const appliedSettled: string[] = [];
+  for (const other of input.others) {
+    if (other.state !== "settled" || other.executedBlock === null
+      || other.fillInWei === null || other.fillOutWei === null) continue;
+    if (other.executedBlock <= epoch.startedBlock || other.executedBlock > finalized.number) continue;
+    if (other.side === "buy") {
+      expectedUWei -= other.fillInWei;
+      expectedWbnbWei += other.fillOutWei;
+    } else {
+      expectedUWei += other.fillOutWei;
+      expectedWbnbWei -= other.fillInWei;
+    }
+    appliedSettled.push(other.journalKey);
+  }
+  const evidence: NotExecutedEvidence = {
+    v: 1,
+    kind: "not-executed",
+    finalizedBlock: finalized.number.toString(10),
+    finalizedHash: finalized.hash,
+    finalizedTimestampSec: finalized.timestampSec.toString(10),
+    deadlineSec: action.deadlineSec,
+    epoch: epoch.epoch,
+    epochStartedBlock: epoch.startedBlock.toString(10),
+    epochStartedBlockHash: epoch.startedBlockHash,
+    expectedUWei: expectedUWei.toString(10),
+    expectedWbnbWei: expectedWbnbWei.toString(10),
+    actualUWei: input.actualUWei.toString(10),
+    actualWbnbWei: input.actualWbnbWei.toString(10),
+    dustWei: dust.toString(10),
+    appliedSettled,
+  };
+  const notExecuted = abs(input.actualUWei - expectedUWei) <= dust
+    && abs(input.actualWbnbWei - expectedWbnbWei) <= dust;
+  const executed = action.side === "sell"
+    ? abs(input.actualWbnbWei - (expectedWbnbWei - action.amountInWei)) <= dust
+      && input.actualUWei >= expectedUWei + action.minOutWei - dust
+    : abs(input.actualUWei - (expectedUWei - action.amountInWei)) <= dust
+      && input.actualWbnbWei >= expectedWbnbWei + action.minOutWei - dust;
+  if (!notExecuted) return { ok: false, code: "balance-mismatch", evidence };
+  if (executed) return { ok: false, code: "balance-ambiguous", evidence };
+  return { ok: true, evidence };
 }
