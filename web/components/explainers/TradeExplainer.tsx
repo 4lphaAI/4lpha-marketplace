@@ -432,7 +432,7 @@ function TradeExplainer({
       font: "var(--type-mono-xs)",
       color: "var(--text-subtle)"
     }
-  }, /*#__PURE__*/React.createElement("span", null, "MODELS MID-CAP / DEGEN / SIGMA"), /*#__PURE__*/React.createElement("span", null, "MAX 3 OPEN POSITIONS"), /*#__PURE__*/React.createElement("span", null, "NO RE-ENTRY"), /*#__PURE__*/React.createElement("span", null, "MAX HOLD 480 MIN")));
+  }, /*#__PURE__*/React.createElement("span", null, "MODELS DEGEN / SIGMA"), /*#__PURE__*/React.createElement("span", null, "MAX 3 OPEN POSITIONS"), /*#__PURE__*/React.createElement("span", null, "NO RE-ENTRY"), /*#__PURE__*/React.createElement("span", null, "MAX HOLD 480 MIN")));
 }
 
 export { TradeExplainer };

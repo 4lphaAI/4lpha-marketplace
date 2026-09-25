@@ -9,8 +9,8 @@ const tradingConfigStart = deploySource.indexOf("  trading: [", configStart);
 const tradingConfig = deploySource.slice(tradingConfigStart, deploySource.indexOf("  lp: [", tradingConfigStart));
 
 describe("Trading control presentation", () => {
-  it("keeps all four trading models and wire break-even disabled", () => {
-    expect(tradingPresets).toContain('label: "Mid-Cap"');
+  it("keeps the three trading models and wire break-even disabled", () => {
+    expect(tradingPresets).not.toContain('executionModel: "mid-cap"');
     expect(tradingPresets).toContain('label: "Degen"');
     expect(tradingPresets).toContain('label: "Sigma"');
     expect(tradingPresets).toContain('label: "Blue Chip", executionModel: "blue-chip"');
@@ -26,7 +26,7 @@ describe("Trading control presentation", () => {
   });
 
   it("renders the mockup's positive stop-loss values while retaining positive canonical BPS", () => {
-    for (const value of ['stopLoss: "25"', 'stopLoss: "35"', 'stopLoss: "50"']) {
+    for (const value of ['stopLoss: "35"', 'stopLoss: "50"']) {
       expect(tradingPresets).toContain(value);
     }
     expect(tradingConfig).toContain("min: 0, max: 100");

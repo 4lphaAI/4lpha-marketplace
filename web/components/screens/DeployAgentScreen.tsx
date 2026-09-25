@@ -100,8 +100,6 @@ const PRESETS = {
   trading: [
     { id: "bluechip", label: "Blue Chip", executionModel: "blue-chip", note: "> $1B and bStocks. Established on-chain equities.",
       set: { confidence: "80", minMcap: "1,000,000,000", maxMcap: "", perTrade: "0.002", capital: "0.01", tp1: "40", stopLoss: "25", holdTime: "1,440", maxPositions: "3" } },
-    { id: "midcap", label: "Mid-Cap", executionModel: "mid-cap", note: "$10M – $1B. Balanced entry gate and sizing",
-      set: { confidence: "80", minMcap: "10,000,000", maxMcap: "1,000,000,000", perTrade: "0.02", capital: "0.02", tp1: "40", stopLoss: "25", holdTime: "1,440", maxPositions: "3" } },
     { id: "degen", label: "Degen", executionModel: "degen", note: "Runners under $1M selected from Four.meme and Flap.sh",
       set: { confidence: "75", minMcap: "", maxMcap: "1,000,000", perTrade: "0.01", capital: "0.02", tp1: "60", stopLoss: "35", holdTime: "480", maxPositions: "4" } },
     { id: "sigma", label: "Sigma", executionModel: "sigma", note: "Machine learning to spot daily runners by 4lpha",
@@ -1203,7 +1201,8 @@ function DeployAgentScreen({ kind, go }) {
     try {
       const saved = JSON.parse(raw);
       const settings = saved.settings ?? saved;
-      const presetId = settings.executionModel === "blue-chip" ? "bluechip" : settings.executionModel === "mid-cap" ? "midcap" : settings.executionModel;
+      // A saved `mid-cap` redeploy has no panel any more; it falls through the `some` check below and is ignored.
+      const presetId = settings.executionModel === "blue-chip" ? "bluechip" : settings.executionModel;
       if (!PRESETS.trading.some((entry) => entry.id === presetId)) return;
       setPreset(presetId);
       setValues((current) => ({ ...current,
