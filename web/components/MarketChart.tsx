@@ -144,6 +144,8 @@ export function MarketChart({ kind, address, title, candles: suppliedCandles, ma
     const volumeSeries = chart.addSeries(HistogramSeries, {
       priceFormat: { type: "volume" },
       priceScaleId: "volume",
+      lastValueVisible: false,
+      priceLineVisible: false,
     });
     chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
 
@@ -253,7 +255,7 @@ export function MarketChart({ kind, address, title, candles: suppliedCandles, ma
       position: marker.side === "buy" ? "belowBar" : "aboveBar",
       shape: marker.side === "buy" ? "arrowUp" : "arrowDown",
       color: marker.side === "buy" ? "oklch(0.72 0.09 205)" : "#f0913a",
-      text: marker.side === "buy" ? "BUY FILL" : "SELL FILL",
+      text: marker.side === "buy" ? "B" : "S",
     })));
   }, [markers]);
 

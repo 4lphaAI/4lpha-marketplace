@@ -54,19 +54,20 @@ type Tab = "Overview" | "Run log";
 type Fill = { readonly motion: DetailMotion; readonly side: "buy" | "sell" };
 
 const TICK_ASK = "var(--warn)", TICK_BID = "var(--cat-grid)";
+const RUNG_LINE = "#2cd391";
 const LP_HIRE_STORAGE_KEY = "4lpha:lp-hire:v1";
 const LENDING_HIRE_STORAGE_KEY = "4lpha:lending-hire:v1";
 
-function Panel({ title, right, children, pad = 0, className = "" }: { readonly title?: React.ReactNode; readonly right?: React.ReactNode; readonly children: React.ReactNode; readonly pad?: number; readonly className?: string }) {
+function Panel({ title, right, children, pad = 0, className = "", fill = false }: { readonly title?: React.ReactNode; readonly right?: React.ReactNode; readonly children: React.ReactNode; readonly pad?: number; readonly className?: string; readonly fill?: boolean }) {
   return (
-    <section className={className} style={{ border: "1px solid var(--border-card)", borderRadius: "var(--radius-md)", background: "var(--surface-card)", overflow: "hidden" }}>
+    <section className={className} style={{ border: "1px solid var(--border-card)", borderRadius: "var(--radius-md)", background: "var(--surface-card)", overflow: "hidden", ...(fill ? { display: "flex", flexDirection: "column" } : {}) }}>
       {title ? (
         <header style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", borderBottom: "1px solid var(--line-1)" }}>
           <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>{title}</span>
           <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 14 }}>{right}</span>
         </header>
       ) : null}
-      <div style={{ padding: pad }}>{children}</div>
+      <div style={{ padding: pad, ...(fill ? { flex: 1, minHeight: 0, position: "relative" } : {}) }}>{children}</div>
     </section>
   );
 }
@@ -318,8 +319,15 @@ function chartMarkers(rows: OhlcvResult["candles"], rowsWithFills: readonly Fill
   return rowsWithFills.flatMap((fill) => {
     const completedAt = Date.parse(fill.motion.timeTitle);
     if (!Number.isSafeInteger(completedAt)) return [];
-    const nearest = rows.reduce((best, row) => Math.abs(row.timestamp - completedAt) < Math.abs(best.timestamp - completedAt) ? row : best, rows[0]!);
-    return [{ timestamp: nearest.timestamp, side: fill.side }];
+    // A fill outside the loaded window has no candle to sit on; snapping it to the
+    // nearest edge candle would draw it at the wrong time.
+    const first = rows[0]!.timestamp;
+    const last = rows[rows.length - 1]!.timestamp;
+    const step = rows.length > 1 ? (last - first) / (rows.length - 1) : 1;
+    if (completedAt < first || completedAt >= last + step) return [];
+    let bucket = rows[0]!;
+    for (const row of rows) { if (row.timestamp <= completedAt) bucket = row; else break; }
+    return [{ timestamp: bucket.timestamp, side: fill.side }];
   }).sort((a, b) => a.timestamp - b.timestamp);
 }
 
@@ -597,10 +605,10 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
         <Button variant={showCharts ? "secondary" : "ghost"} size="sm" onClick={() => setShowCharts(!showCharts)} icon={<Icon name="grid-trading" size={14} />}>{showCharts ? "Hide charts" : "Show charts"}</Button>
       </div>
       {showCharts ? (<>
-      <div className="fl-grid-detail-charts" style={{ display: "grid", gridTemplateColumns: "minmax(0,2fr) minmax(280px,1fr)", gap: 16, alignItems: "start" }}>
+      <div className="fl-grid-detail-charts" style={{ display: "grid", gridTemplateColumns: "minmax(0,2fr) minmax(280px,1fr)", gap: 16, alignItems: "stretch" }}>
         <Panel title={`${view?.grid.pair ?? "—"} pool price`} right={<>
-          <span style={{ display: "flex", alignItems: "center", gap: 6, font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" }}><i style={{ width: 8, height: 8, borderRadius: 999, background: TICK_BID }} />BUY FILL</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 6, font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" }}><i style={{ width: 8, height: 8, borderRadius: 999, background: TICK_ASK }} />SELL FILL</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" }}><i style={{ width: 8, height: 8, borderRadius: 999, background: TICK_BID }} />B</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" }}><i style={{ width: 8, height: 8, borderRadius: 999, background: TICK_ASK }} />S</span>
           <SegmentedToggle options={CHART_INTERVALS.map((value) => ({ value, label: value }))} value={detail.chartInterval} onChange={(next: string) => detail.setChartInterval(next as ChartInterval)} />
           <SegmentedToggle options={[{ value: "usd", label: "USD" }, { value: "quote", label: view?.grid.quote ?? "QUOTE" }]} value={detail.chartUnit} onChange={(next: string) => detail.setChartUnit(next === "quote" ? "quote" : "usd")} />
         </>}>
@@ -610,17 +618,17 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
                 {detail.marketReason ?? "—"}
               </div>
             ) : (
-            <MarketChart kind="pool" address={view.grid.pool} title={view.grid.pair} candles={detail.market === null && detail.chartCandles === null ? undefined : chartSeries} markers={markers} priceLines={[{ price: rungOnChart(view, "bid", detail.chartUnit), color: TICK_BID, title: displayRungSource(view, "bid") === "signed" ? "BID · SIGNED" : "BID" }, { price: rungOnChart(view, "ask", detail.chartUnit), color: TICK_ASK, title: displayRungSource(view, "ask") === "signed" ? "ASK · SIGNED" : "ASK" }].flatMap((line) => line.price === null ? [] : [{ price: line.price, color: line.color, title: line.title }])} embedded height={200} />
+            <MarketChart kind="pool" address={view.grid.pool} title={view.grid.pair} candles={detail.market === null && detail.chartCandles === null ? undefined : chartSeries} markers={markers} priceLines={[{ price: rungOnChart(view, "bid", detail.chartUnit), color: TICK_BID, title: displayRungSource(view, "bid") === "signed" ? "BID · SIGNED" : "BID" }, { price: rungOnChart(view, "ask", detail.chartUnit), color: TICK_ASK, title: displayRungSource(view, "ask") === "signed" ? "ASK · SIGNED" : "ASK" }].flatMap((line) => line.price === null ? [] : [{ price: line.price, color: RUNG_LINE, title: line.title }])} embedded height={200} />
             )}
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>
               {chartAxis(chartSeries).map((time, index) => <span key={index}>{time}</span>)}
             </div>
           </div>
         </Panel>
-        <Panel title="Fill feed" right={<span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>{view === null ? "—" : feed.length} FILLS</span>}>
+        <Panel fill title="Fill feed" right={<span style={{ font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>{view === null ? "—" : feed.length} FILLS</span>}>
           {/* Same height as the chart body beside it (14 + 200 + 8 + axis + 10); a
               longer feed scrolls inside rather than growing the row. */}
-          <div style={{ display: "grid", alignContent: "start", maxHeight: 246, overflowY: "auto" }}>
+          <div style={{ display: "grid", alignContent: "start", position: "absolute", inset: 0, overflowY: "auto" }}>
             {feed.length === 0 ? (
               <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 4, padding: "11px 16px" }}>—</div>
             ) : feed.map((fill, i) => (
