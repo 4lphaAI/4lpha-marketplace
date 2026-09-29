@@ -598,7 +598,7 @@ function GridDetail({ detail, view, onChain, discovered, emptyRungs, busy, close
     return [...crosses, ...fills(view).filter((fill) => !known.has(fill.motion.sequenceId))]
       .sort((a, b) => b.motion.timeTitle.localeCompare(a.motion.timeTitle));
   }, [emptyRungs, view]);
-  const markers = useMemo(() => chartMarkers(candles, feed), [candles, feed]);
+  const markers = useMemo(() => chartMarkers(chartSeries, feed), [chartSeries, feed]);
   return (
     <div style={{ display: "grid", gap: 16 }}>
       <div style={{ display: "flex" }}>
