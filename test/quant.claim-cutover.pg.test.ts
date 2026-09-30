@@ -63,6 +63,26 @@ async function recovered(sql: SqlClient, jobId: string, key: string, wallet: str
   await owner(sql, hashOf(key), wallet, key);
 }
 
+/** The evidence the R14.5 door persists; the cutover reads only `v`, `kind` and `finalizedTimestampSec` (past `action()`'s deadline of 1). */
+const doorEvidence = (over: Record<string, unknown> = {}) =>
+  JSON.stringify({ v: 1, kind: "not-executed", finalizedBlock: "100", finalizedTimestampSec: "1790218500", deadlineSec: 1, ...over });
+/**
+ * The pair `live-quant resolve --not-executed` leaves, written by the real store method: the action fails as
+ * `not-executed-proven` with the evidence, its level is restored, and the journal row stays UNKNOWN without a hash.
+ */
+async function notExecuted(sql: SqlClient, jobId: string, key: string, resolutionJson = doorEvidence()): Promise<void> {
+  await action(sql, jobId, key, "unknown");
+  await journal(sql, key, jobId, "UNKNOWN", null);
+  await sql.query(`update quant_levels set state = 'blocked' where quant_job_id = $1 and level_index = 0`, [jobId]);
+  const store = await PostgresQuantJobStore.create(sql);
+  const level = (await store.listLevels(jobId))[0]!;
+  const row = (await store.getAction(key))!;
+  const door = await store.resolveNotExecuted({ journalKey: key, expectedActionRowVersion: row.rowVersion,
+    expectedLevelRowVersion: level.rowVersion, expectedLadderGen: level.ladderGen, resolutionJson, nowMs: 5 });
+  assert.equal(door.kind, "ok");
+  await sql.query("alter table quant_jobs drop column claim_generation"); // a legacy database has none; create() re-adds it
+}
+
 /** Current schema of the Grid store and the journal, minus the claim column, as a legacy production database has it. */
 async function seedLegacySchema(sql: SqlClient): Promise<void> {
   await PostgresQuantJobStore.create(sql);
@@ -144,7 +164,7 @@ test("claim cutover: census, plan-check and apply on isolated databases", { time
       if (seed !== undefined) await seed(sql);
       return { url: urlOf(name), sql };
     };
-    const report = async (sql: SqlClient) => await runCensus(sql) as unknown as { digest: Hex; draftPlan: CutoverPlan;
+    const report = async (sql: SqlClient) => await runCensus(sql) as unknown as { digest: Hex; draftPlan: CutoverPlan; unresolved: string[];
       wallets: { wallet: string; jobs: { jobId: string; persistedClaimGeneration: string | null }[] }[]; schema: { supported: boolean; reasons: string[] } };
     const snapshot = (sql: SqlClient) => withQuantRebalanceCensusSnapshot(sql, async (tx) => {
       const inventory = await readInventory(tx);
@@ -323,6 +343,30 @@ test("claim cutover: census, plan-check and apply on isolated databases", { time
       await untouched(sql, before);
     });
 
+    await t.test("the pair the R14.5 not-executed door leaves is accepted, and its job applies as the holder", async () => {
+      const { url, sql } = await populated();
+      await notExecuted(sql, "j1", "n0");
+      const rows = () => sql.query(`select to_jsonb(a) as row, (select to_jsonb(j) from execution_journal j where j.idempotency_key = 'n0') as journal
+        from quant_actions a where journal_key = 'n0'`);
+      const door = (await rows()).rows[0] as { row: Record<string, unknown>; journal: Record<string, unknown> };
+      assert.equal(door.row["state"], "failed"); assert.equal(door.row["failure_code"], "not-executed-proven");
+      assert.equal(door.journal["state"], "UNKNOWN");
+      const before = await report(sql);
+      assert.deepEqual(before.unresolved, []);
+      assert.deepEqual(before.draftPlan.groups.find((group) => group.wallet === W1), { wallet: W1, holderJobId: "j1", excludedJobIds: [] });
+      const plan = chosen(before.draftPlan, W2, "j2b");
+      assert.equal((await runPlanCheck(sql, plan))["ok"], true);
+      const outcome = await applyCutover({ databaseUrl: url, plan });
+      assert.equal(outcome.kind, "applied", JSON.stringify(outcome));
+      assert.deepEqual((await new PostgresQuantWalletClaimStore(sql).list()).map((row) => [row.wallet.toLowerCase(), row.jobId, row.mode]).sort(),
+        [[W1, "j1", "active"], [W2, "j2b", "active"]]);
+      assert.deepEqual((await rows()).rows[0], door, "the action and its UNKNOWN journal are not touched");
+      // The numeric form of the finalized time is read the same way.
+      const numeric = await populated();
+      await notExecuted(numeric.sql, "j1", "n0", doorEvidence({ finalizedTimestampSec: 1790218500 }));
+      assert.deepEqual((await report(numeric.sql)).unresolved, []);
+    });
+
     await t.test("unresolved Grid work refuses independently of job status, join, or how it is linked", async () => {
       const scenarios: readonly (readonly [string, (sql: SqlClient) => Promise<void>, RegExp])[] = [
         ...["intended", "submitted", "committed-unverified", "unknown", "needs-operator"].map((state) => [`${state} action`,
@@ -389,6 +433,48 @@ test("claim cutover: census, plan-check and apply on isolated databases", { time
         ["a hashless COMMITTED journal of another job", async (sql) => {
           await action(sql, "j1", "o28", "settled", hashOf("o28")); await journal(sql, "o28", "j2a", "COMMITTED", null); await owner(sql, hashOf("o28"), W1, "o28"); },
         /journal-attribution-mismatch:j1:o28/u],
+        // R14.5 `resolve --not-executed` leaves an UNKNOWN journal on a failed / not-executed-proven action; anything short of that stays refused.
+        ["a not-executed-proven action with another failure code", async (sql) => {
+          await notExecuted(sql, "j1", "n1"); await sql.query(`update quant_actions set failure_code = 'submit-ambiguous' where journal_key = 'n1'`); },
+        /journal-unresolved:j1:n1:UNKNOWN/u],
+        ["a not-executed-proven action that is aborted, not failed", async (sql) => {
+          await notExecuted(sql, "j1", "n2"); await sql.query(`update quant_actions set state = 'aborted' where journal_key = 'n2'`); },
+        /journal-unresolved:j1:n2:UNKNOWN/u],
+        ["a not-executed-proven action without a resolution", async (sql) => {
+          await notExecuted(sql, "j1", "n3"); await sql.query(`update quant_actions set resolution_json = null where journal_key = 'n3'`); },
+        /journal-unresolved:j1:n3:UNKNOWN/u],
+        ["a not-executed-proven action with an unreadable resolution", async (sql) => { await notExecuted(sql, "j1", "n4", "not json"); },
+          /journal-unresolved:j1:n4:UNKNOWN/u],
+        ["a resolution of another version", async (sql) => { await notExecuted(sql, "j1", "n5", doorEvidence({ v: 2 })); }, /journal-unresolved:j1:n5:UNKNOWN/u],
+        ["a resolution of another kind", async (sql) => { await notExecuted(sql, "j1", "n6", doorEvidence({ kind: "settled" })); }, /journal-unresolved:j1:n6:UNKNOWN/u],
+        ["a resolution finalized exactly at the deadline", async (sql) => { await notExecuted(sql, "j1", "n7", doorEvidence({ finalizedTimestampSec: "1" })); },
+          /journal-unresolved:j1:n7:UNKNOWN/u],
+        // R4-1: the action's own deadline column decides, not the evidence's copy of it (100 vs 1, finalized at 50).
+        ["a resolution past its own recorded deadline but not the action's", async (sql) => {
+          await notExecuted(sql, "j1", "n15", doorEvidence({ deadlineSec: 1, finalizedTimestampSec: "50" }));
+          await sql.query(`update quant_actions set deadline_sec = 100 where journal_key = 'n15'`); },
+        /journal-unresolved:j1:n15:UNKNOWN/u],
+        ["a resolution whose finalized time is not a decimal", async (sql) => { await notExecuted(sql, "j1", "n8", doorEvidence({ finalizedTimestampSec: "0x7fffffff" })); },
+          /journal-unresolved:j1:n8:UNKNOWN/u],
+        ["a not-executed-proven pair whose journal has a call id", async (sql) => {
+          await notExecuted(sql, "j1", "n9");
+          await sql.query(`update execution_journal set external_ref = jsonb_set(external_ref, '{callsId}', '"${hashOf("n9-calls")}"') where idempotency_key = 'n9'`); },
+        /journal-unresolved:j1:n9:UNKNOWN/u],
+        ["a not-executed-proven action that carries a transaction hash", async (sql) => {
+          await notExecuted(sql, "j1", "n10"); await sql.query(`update quant_actions set tx_hash = '${hashOf("n10")}' where journal_key = 'n10'`); },
+        /terminal-action-with-committed-evidence:j1:n10:failed/u],
+        ["a not-executed-proven pair whose journal names a transaction", async (sql) => {
+          await notExecuted(sql, "j1", "n11");
+          await sql.query(`update execution_journal set external_ref = jsonb_set(external_ref, '{txHash}', '"${hashOf("n11")}"') where idempotency_key = 'n11'`); },
+        /terminal-action-with-committed-evidence:j1:n11:failed/u],
+        ["a not-executed-proven action with a receipt owner", async (sql) => { await notExecuted(sql, "j1", "n12"); await owner(sql, hashOf("n12"), W1, "n12"); },
+          /terminal-action-with-committed-evidence:j1:n12:failed/u],
+        ["a not-executed-proven action whose journal is not UNKNOWN", async (sql) => {
+          await notExecuted(sql, "j1", "n13"); await sql.query(`update execution_journal set state = 'PENDING' where idempotency_key = 'n13'`); },
+        /journal-unresolved:j1:n13:PENDING/u],
+        ["a not-executed-proven action whose UNKNOWN journal belongs to another job", async (sql) => {
+          await notExecuted(sql, "j1", "n14"); await sql.query(`update execution_journal set agent_id = 'j2a' where idempotency_key = 'n14'`); },
+        /journal-attribution-mismatch:j1:n14/u],
       ];
       for (const [label, mutate, expected] of scenarios) {
         const { url, sql } = await populated(); await mutate(sql);

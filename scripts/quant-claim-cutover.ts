@@ -113,8 +113,11 @@ type GridJob = Readonly<{
   jobId: string; strategyId: string; wallet: string; status: string; admittedAtMs: number | null;
   rowVersion: number; claimGeneration: string | null;
 }>;
-type JournalFact = Readonly<{ key: string; agentId: string; state: string; txHash: string | null }>;
-type ActionFact = Readonly<{ key: string; jobId: string; state: string; txHash: string | null }>;
+type JournalFact = Readonly<{ key: string; agentId: string; state: string; txHash: string | null; hasCallsId: boolean }>;
+type ActionFact = Readonly<{
+  key: string; jobId: string; state: string; txHash: string | null;
+  failureCode: string | null; resolutionJson: string | null; deadlineSec: string;
+}>;
 type OwnershipFact = Readonly<{ txHash: string; wallet: string; journalKey: string }>;
 export type CutoverPlan = Readonly<{
   version: 1; censusDigest: Hex;
@@ -229,6 +232,20 @@ function legacySchemaReasons(inventory: Inventory): string[] {
 const TX_HASH = /^0x[0-9a-fA-F]{64}$/u;
 const sameHash = (a: string | null, b: string | null): boolean => a !== null && b !== null && a.toLowerCase() === b.toLowerCase();
 
+/** The persisted shape of the R14.5 door (`NotExecutedEvidence`): the finalized block is strictly past the action's router deadline. */
+function notExecutedProven(action: ActionFact): boolean {
+  if (action.state !== "failed" || action.failureCode !== "not-executed-proven" || action.resolutionJson === null) return false;
+  try {
+    const parsed: unknown = JSON.parse(action.resolutionJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+    const evidence = parsed as Record<string, unknown>;
+    const stamp = evidence["finalizedTimestampSec"];
+    return evidence["v"] === 1 && evidence["kind"] === "not-executed"
+      && (typeof stamp === "number" || typeof stamp === "string" && /^[0-9]+$/u.test(stamp))
+      && BigInt(stamp) > BigInt(action.deadlineSec);
+  } catch { return false; }
+}
+
 /**
  * Potentially submitted, non-definitive or contradictory Grid work, judged independently of job status and of
  * any join. The permitted terminal pairs are the ones the existing Grid code produces: `settleAction` writes a
@@ -237,7 +254,11 @@ const sameHash = (a: string | null, b: string | null): boolean => a !== null && 
  * `src/quant/reconcile.ts` `COMMITTED-hash/found` settles from the relay's hash and leaves the journal's null).
  * Every failed or aborted action is paired with no journal row (a pre-begin refusal) or a ROLLED_BACK one that
  * never carries a hash (a reported relay failure may keep its `callsId`), and never has an owner. UNKNOWN is never
- * definitive. A combination those paths cannot produce is refused, not repaired: this adds no recovery semantics.
+ * definitive, except the one state the audited R14.5 operator door `live-quant resolve --not-executed` leaves for good
+ * (`src/store/quantJobs.ts` `resolveNotExecuted`): the action is `failed` / `not-executed-proven` with its
+ * `NotExecutedEvidence` and the journal row stays UNKNOWN with no `callsId` (`notExecutedProven`). The rule above
+ * already refuses every terminal action that has a hash, an owner or a hash-bearing journal, so those are not repeated.
+ * A combination those paths cannot produce is refused, not repaired: this adds no recovery semantics.
  */
 function unresolvedFindings(
   actions: readonly ActionFact[], journals: readonly JournalFact[], ownership: readonly OwnershipFact[], jobs: readonly GridJob[],
@@ -266,7 +287,8 @@ function unresolvedFindings(
   for (const journal of journals) {
     const paired = actionByKey.get(journal.key);
     const definitive = journal.state === "ROLLED_BACK"
-      || journal.state === "COMMITTED" && (journal.txHash === null ? paired?.state === "settled" : TX_HASH.test(journal.txHash));
+      || journal.state === "COMMITTED" && (journal.txHash === null ? paired?.state === "settled" : TX_HASH.test(journal.txHash))
+      || journal.state === "UNKNOWN" && !journal.hasCallsId && paired !== undefined && notExecutedProven(paired);
     if (!definitive) findings.push(`journal-unresolved:${journal.agentId}:${journal.key}:${journal.state}`);
     if (paired === undefined) findings.push(`journal-orphan:${journal.agentId}:${journal.key}:${journal.state}`);
   }
@@ -295,18 +317,23 @@ export async function takeCensus(tx: SqlClient, frozen?: Inventory): Promise<Cen
     status: String(row["status"]), admittedAtMs: row["admitted_at_ms"] === null ? null : Number(row["admitted_at_ms"]),
     rowVersion: Number(row["row_version"]), claimGeneration: row["claim_generation"] === null ? null : String(row["claim_generation"]),
   }));
-  const actions: ActionFact[] = has("quant_actions", ["journal_key", "quant_job_id", "state", "tx_hash"]) ? (await tx.query<Record<string, unknown>>(
-    `/* quantClaimCutover.actions */ select journal_key, quant_job_id, state, tx_hash from quant_actions order by journal_key`)).rows
+  const actions: ActionFact[] = has("quant_actions", ["journal_key", "quant_job_id", "state", "tx_hash", "failure_code", "resolution_json", "deadline_sec"]) ? (await tx.query<Record<string, unknown>>(
+    `/* quantClaimCutover.actions */ select journal_key, quant_job_id, state, tx_hash, failure_code, resolution_json,
+       deadline_sec::text as deadline_sec from quant_actions order by journal_key`)).rows
     .map((row) => ({ key: String(row["journal_key"]), jobId: String(row["quant_job_id"]), state: String(row["state"]),
-      txHash: row["tx_hash"] === null ? null : String(row["tx_hash"]) })) : [];
+      txHash: row["tx_hash"] === null ? null : String(row["tx_hash"]),
+      failureCode: row["failure_code"] === null ? null : String(row["failure_code"]),
+      resolutionJson: row["resolution_json"] === null ? null : String(row["resolution_json"]),
+      deadlineSec: String(row["deadline_sec"]) })) : [];
   const ownership: OwnershipFact[] = has("quant_receipt_ownership", ["tx_hash", "trading_wallet", "journal_key"]) ? (await tx.query<Record<string, unknown>>(
     `/* quantClaimCutover.ownership */ select tx_hash, lower(trading_wallet) as wallet, journal_key from quant_receipt_ownership order by tx_hash, trading_wallet, swap_log_index`)).rows
     .map((row) => ({ txHash: String(row["tx_hash"]), wallet: String(row["wallet"]), journalKey: String(row["journal_key"]) })) : [];
   const journals: JournalFact[] = ["idempotency_key", "agent_id", "state", "kind", "external_ref"].every((column) => inventory.get("execution_journal")?.includes(column) === true) ? (await tx.query<Record<string, unknown>>(
-    `/* quantClaimCutover.journals */ select idempotency_key, agent_id, state, nullif(external_ref->>'txHash', '') as tx_hash
+    `/* quantClaimCutover.journals */ select idempotency_key, agent_id, state, nullif(external_ref->>'txHash', '') as tx_hash,
+       coalesce(external_ref ? 'callsId', false) as has_calls_id
      from execution_journal where kind = 'quantTrade' order by idempotency_key`)).rows
     .map((row) => ({ key: String(row["idempotency_key"]), agentId: String(row["agent_id"]), state: String(row["state"]),
-      txHash: row["tx_hash"] === null ? null : String(row["tx_hash"]) })) : [];
+      txHash: row["tx_hash"] === null ? null : String(row["tx_hash"]), hasCallsId: row["has_calls_id"] === true })) : [];
 
   // Display projection: the shared census over the same rows, plus persisted generations and claims.
   const claimsStore = new PostgresQuantWalletClaimStore(tx);
