@@ -35,6 +35,7 @@ import { FileQuantTransport } from "../src/quant/selftest.js";
 import { runQuantWorkerOnce } from "../src/quant/worker.js";
 import { assertQuantBoot, buildWorkerDeps } from "./quantWorkerDeps.js";
 import { createQuantJobStore } from "../src/store/quantJobs.js";
+import { createQuantWalletClaimStore } from "../src/store/quantWalletClaims.js";
 import {
   createJournal,
   reconcile,
@@ -92,6 +93,11 @@ async function main(): Promise<void> {
 
   const store = await createQuantJobStore();
   const journal = await createJournal();
+  const claims = await createQuantWalletClaimStore({ databaseUrl: config.databaseUrl });
+  if (!(await claims.schemaInstalled()) || !(await claims.migrationInstalled())) {
+    await Promise.all([store.close(), journal.close(), claims.close()].map((promise) => promise.catch(() => undefined)));
+    throw new Error("Boot refused: wallet-claim-migration-not-installed.");
+  }
 
   const relayUrl = BNB.relayUrl ?? "";
   if (relayUrl === "") throw new Error("Boot refused: no Altana relay serves chain 56.");
@@ -108,7 +114,7 @@ async function main(): Promise<void> {
   }
 
   const deps = await buildWorkerDeps(
-    { config, store, journal, transport, reader, provider },
+    { config, store, claims, journal, transport, reader, provider },
     lease.fence.signal,
   );
 
@@ -170,7 +176,7 @@ async function main(): Promise<void> {
 
   drain.complete();
   try { await lease.closeGracefully(); } catch { /* the lock dies with us */ }
-  for (const closable of [store, journal]) {
+  for (const closable of [store, journal, claims]) {
     try { await closable.close(); } catch { /* independent close */ }
   }
 }

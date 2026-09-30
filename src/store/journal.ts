@@ -667,6 +667,7 @@ export interface ExecutionJournal {
   beginWithSpend(
     input: JournalBeginInput,
     sinceMs: number,
+    tx?: SqlClient,
   ): Promise<JournalBeginWithSpendResult>;
   /** Atomic first-wins C1 bind. Different bytes can never replace a binding. */
   bindPreparedIntent(
@@ -720,6 +721,7 @@ export interface ExecutionJournal {
   resolveUnknown(
     idempotencyKey: string,
     evidence: JournalResolutionEvidence,
+    externalRef?: Pick<JournalExternalRef, "txHash">,
   ): Promise<JournalEntry>;
   /**
    * Record an UNKNOWN step as COMMITTED on positive on-chain proof that it
@@ -1245,6 +1247,7 @@ export class MemoryExecutionJournal implements ExecutionJournal {
   async beginWithSpend(
     input: JournalBeginInput,
     sinceMs: number,
+    _tx?: SqlClient,
   ): Promise<JournalBeginWithSpendResult> {
     return this.#withLock(input.idempotencyKey, async () => {
       // No await between the insert and the sum, so no other turn of the event
@@ -1379,13 +1382,14 @@ export class MemoryExecutionJournal implements ExecutionJournal {
   resolveUnknown(
     idempotencyKey: string,
     evidence: JournalResolutionEvidence,
+    externalRef?: Pick<JournalExternalRef, "txHash">,
   ): Promise<JournalEntry> {
     // `lastError` is deliberately NOT passed: the merge already honours
     // `undefined` as "leave it alone", which is Rev2 item 17's promise.
     return this.#transition(
       idempotencyKey,
       "ROLLED_BACK",
-      { externalRef: { resolution: boundResolutionEvidence(evidence) } },
+      { externalRef: { ...(externalRef ?? {}), resolution: boundResolutionEvidence(evidence) } },
       "resolve-unknown",
     );
   }
@@ -1887,6 +1891,23 @@ export class PostgresExecutionJournal implements ExecutionJournal {
     return new PostgresExecutionJournal(sql, now);
   }
 
+  /** Attach only after an offline schema gate; unlike create(), this is read-only. */
+  static async attachExisting(
+    sql: SqlClient,
+    now: Clock = Date.now,
+  ): Promise<PostgresExecutionJournal> {
+    const result = await sql.query<{ readonly column_name: string }>(
+      `/* journal.attachExisting */ select column_name from information_schema.columns
+       where table_schema='public' and table_name='execution_journal'`,
+    );
+    const present = new Set(result.rows.map((row) => row.column_name));
+    const required = JOURNAL_COLUMNS.split(",").map((column) => column.trim());
+    if (required.some((column) => !present.has(column))) {
+      throw new Error("execution-journal-schema-not-installed");
+    }
+    return new PostgresExecutionJournal(sql, now);
+  }
+
   async begin(input: JournalBeginInput): Promise<JournalEntry> {
     return this.#sql.transaction(async (tx) => this.#insert(tx, input));
   }
@@ -1894,20 +1915,22 @@ export class PostgresExecutionJournal implements ExecutionJournal {
   async beginWithSpend(
     input: JournalBeginInput,
     sinceMs: number,
+    tx?: SqlClient,
   ): Promise<JournalBeginWithSpendResult> {
-    return this.#sql.transaction(async (tx) => {
+    const work = async (client: SqlClient): Promise<JournalBeginWithSpendResult> => {
       // ONE transaction: the row is inserted and the competing spend is summed
       // under the same snapshot, so a concurrent trade either sees this row or
       // is seen by it — never neither.
-      const { entry, created } = await this.#insertDetecting(tx, input);
+      const { entry, created } = await this.#insertDetecting(client, input);
       const otherSpendWei = await this.#sum(
-        tx,
+        client,
         input.agentId,
         sinceMs,
         input.idempotencyKey,
       );
       return { entry, otherSpendWei, created };
-    });
+    };
+    return tx === undefined ? this.#sql.transaction(work) : work(tx);
   }
 
   async #insert(tx: SqlClient, input: JournalBeginInput): Promise<JournalEntry> {
@@ -2077,12 +2100,13 @@ export class PostgresExecutionJournal implements ExecutionJournal {
   resolveUnknown(
     idempotencyKey: string,
     evidence: JournalResolutionEvidence,
+    externalRef?: Pick<JournalExternalRef, "txHash">,
   ): Promise<JournalEntry> {
     // `lastError` omitted on purpose — the transition below preserves it.
     return this.#transition(
       idempotencyKey,
       "ROLLED_BACK",
-      { externalRef: { resolution: boundResolutionEvidence(evidence) } },
+      { externalRef: { ...(externalRef ?? {}), resolution: boundResolutionEvidence(evidence) } },
       "resolve-unknown",
     );
   }

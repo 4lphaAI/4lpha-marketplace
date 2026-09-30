@@ -14,6 +14,7 @@ import { getAddress, type Address, type Hex } from "viem";
 
 import { MemoryExecutionJournal } from "../src/store/journal.js";
 import { MemoryQuantJobStore, type QuantJobStore } from "../src/store/quantJobs.js";
+import { MemoryQuantWalletClaimStore } from "../src/store/quantWalletClaims.js";
 import {
   QUANT_STRATEGY_DEFAULTS,
   QUANT_ROUTER_56,
@@ -483,6 +484,88 @@ async function cycle(harness: Harness, options: { readonly dryRun?: boolean } = 
 }
 
 describe("quant worker — one live job per trading wallet (R14.4)", () => {
+  it("promotes a provisional shared wallet claim with Grid admission and persists its generation", async () => {
+    const harness = makeHarness();
+    setInboxJobs(harness, [jobRecord({ id: JOB })]);
+    const claims = new MemoryQuantWalletClaimStore({
+      async noAction() { return true; },
+      async terminalAndNoUnresolved() { return false; },
+    }, true);
+    const report = await runQuantWorkerOnce({ ...harness.deps, claims });
+    const admitted = await harness.store.getJob(JOB);
+    assert.equal(report.errors, 0);
+    assert.equal(admitted?.status, "armed");
+    assert.ok((admitted?.claimGeneration ?? null) !== null);
+    assert.equal(await claims.isActive({ wallet: WALLET, strategyKind: "grid", strategyId: "strategy-1",
+      jobId: JOB, generation: admitted!.claimGeneration! }), true);
+  });
+
+  it("keeps the wallet fence through intent insertion and the submit claim", async () => {
+    const harness = makeHarness();
+    setInboxJobs(harness, [jobRecord({ id: JOB })]);
+    const claims = new MemoryQuantWalletClaimStore({
+      async noAction() { return true; },
+      async terminalAndNoUnresolved() { return false; },
+    }, true);
+    const deps = { ...harness.deps, claims };
+    await runQuantWorkerOnce(deps);
+    harness.chain.mid = BUY_1 - E18;
+    for (let index = 0; index < 4; index += 1) {
+      harness.chain.block += 10n;
+      harness.clock.nowMs += 60_000;
+      await runQuantWorkerOnce(deps);
+    }
+    const admitted = await harness.store.getJob(JOB);
+    assert.ok(admitted?.claimGeneration !== null && admitted?.claimGeneration !== undefined);
+    assert.ok(harness.chain.submissions > 0);
+    assert.equal(await claims.isActive({ wallet: WALLET, strategyKind: "grid", strategyId: "strategy-1",
+      jobId: JOB, generation: admitted!.claimGeneration! }), true);
+  });
+
+  it("refuses a valid stored generation when the active shared wallet claim is absent", async () => {
+    const harness = makeHarness();
+    setInboxJobs(harness, [jobRecord({ id: JOB })]);
+    await runQuantWorkerOnce(harness.deps);
+    const admitted = await harness.store.getJob(JOB);
+    assert.equal(admitted?.status, "armed");
+    const absentClaims = new MemoryQuantWalletClaimStore({
+      async noAction() { return true; },
+      async terminalAndNoUnresolved() { return false; },
+    }, true);
+    await runQuantWorkerOnce({ ...harness.deps, claims: absentClaims });
+    assert.equal((await harness.store.getJob(JOB))?.holdCode, "claim-inconsistent");
+    assert.equal(harness.chain.submissions, 0);
+  });
+
+  it("fails closed before inbox discovery when the cutover migration is absent", async () => {
+    const harness = makeHarness();
+    setInboxJobs(harness, [jobRecord({ id: JOB })]);
+    const claims = new MemoryQuantWalletClaimStore({
+      async noAction() { return true; },
+      async terminalAndNoUnresolved() { return false; },
+    }, false);
+    await assert.rejects(() => runQuantWorkerOnce({ ...harness.deps, claims }), /wallet-claim-migration-not-installed/u);
+    assert.equal((await harness.store.listJobs()).length, 0);
+    assert.equal(harness.chain.submissions, 0);
+  });
+
+  it("refuses legacy null claim generations after migration enforcement while preserving legacy fixtures", async () => {
+    const legacy = makeHarness();
+    setInboxJobs(legacy, [jobRecord({ id: JOB })]);
+    await runQuantWorkerOnce(legacy.deps);
+    const row = await legacy.store.getJob(JOB);
+    assert.equal(row?.status, "armed");
+    assert.equal(row?.claimGeneration ?? null, null);
+    const claims = new MemoryQuantWalletClaimStore({
+      async noAction() { return true; },
+      async terminalAndNoUnresolved() { return false; },
+    }, true);
+    await runQuantWorkerOnce({ ...legacy.deps, claims });
+    const held = await legacy.store.getJob(JOB);
+    assert.equal(held?.holdCode, "claim-inconsistent");
+    assert.equal(legacy.chain.submissions, 0);
+  });
+
   it("BC-S203/S211: admits the earlier discovered job and holds the later one before opening its envelope", async () => {
     const holderId = "z-wallet-old";
     const duplicateId = "a-wallet-new";

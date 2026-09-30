@@ -9,6 +9,7 @@ import { createPublicClient, fallback, getAddress, http, type Address } from "vi
 import { bsc } from "viem/chains";
 import type { ExecutionJournal } from "../src/store/journal.js";
 import type { QuantJobStore } from "../src/store/quantJobs.js";
+import type { QuantWalletClaimStore } from "../src/store/quantWalletClaims.js";
 import type { QuantRuntimeConfig } from "../src/quant/config.js";
 import { quantKeypairFromSeed } from "../src/quant/execute.js";
 import type { QuantChainReader } from "../src/quant/readers.js";
@@ -19,10 +20,15 @@ import { QUANT_ENVELOPE_ALGORITHM, publicKeyEquals, type QuantKeypair } from "..
 import { assertReconcileGuardCoversSubmitWindow } from "../src/store/journal.js";
 import type { WalletProvider } from "../src/core/types.js";
 import { ACCOUNT_ABI, KEYSTORE_ABI } from "../src/wallet/abis.js";
+import {
+  expandedConfigVenueTargets, findExpandedConfigProfile, normalizeExpandedQuantConfig,
+  QUANT_EXPANDED_CONFIG_PROFILES, type QuantExpandedConfigProfile,
+} from "../src/quant/rebalanceConfig.js";
 
 export type QuantWorkerComposition = {
   readonly config: QuantRuntimeConfig;
   readonly store: QuantJobStore;
+  readonly claims: QuantWalletClaimStore;
   readonly journal: ExecutionJournal;
   readonly transport: QuantTransport;
   readonly reader: QuantChainReader;
@@ -40,6 +46,7 @@ export async function buildWorkerDeps(
   });
   return {
     store: input.store,
+    claims: input.claims,
     journal: input.journal,
     provider: input.provider,
     reader: input.reader,
@@ -119,6 +126,8 @@ export async function assertQuantBoot(input: {
   readonly config: QuantRuntimeConfig;
   readonly keypair: QuantKeypair;
   readonly provider: WalletProvider;
+  /** Reviewed expanded-config profiles; defaults to the registry (test seam, like `findExpandedConfigProfile`). */
+  readonly profiles?: readonly QuantExpandedConfigProfile[];
 }): Promise<void> {
   const { transport, reader, config, keypair, provider } = input;
   const chainId = await reader.chainId();
@@ -142,6 +151,7 @@ export async function assertQuantBoot(input: {
   if (block.data.uDecimals !== 18) {
     throw new Error("Boot refused: the settlement token does not have 18 decimals.");
   }
+  let venueTargets = block.data.venueAllowlist;
   if (block.data.tradableTokens.length === 1) {
     // Keep the verified legacy one-token predicate intact.
     const token = block.data.tradableTokens[0];
@@ -154,12 +164,30 @@ export async function assertQuantBoot(input: {
       throw new Error("Boot refused: the tradable token does not have 18 decimals.");
     }
   } else if (block.data.tradableTokens.length > 1) {
-    const refusal = gridTradableSetRefusal(block.data.tradableTokens, config.wbnb);
-    if (refusal !== null) throw new Error(refusal);
+    const normalized = normalizeExpandedQuantConfig(block.data);
+    if (!normalized.ok) throw new Error("Boot refused: platform-config-invalid.");
+    const profile = findExpandedConfigProfile(normalized.projection, input.profiles ?? QUANT_EXPANDED_CONFIG_PROFILES);
+    if (profile === null) {
+      // R14.6: no reviewed profile matches, but Grid only needs its own pair.
+      const refusal = gridTradableSetRefusal(normalized.projection.tradableTokens, config.wbnb);
+      if (refusal !== null) throw new Error(refusal);
+      // Normalization already lower-cased the row addresses.
+      venueTargets = [...new Set(normalized.projection.venueRows.map((row) => row.address))];
+    } else {
+      const matchedTargets = expandedConfigVenueTargets(normalized.projection, profile);
+      if (matchedTargets === null) throw new Error("Boot refused: platform-config-invalid.");
+      venueTargets = matchedTargets;
+      const gridToken = normalized.projection.tradableTokens.find(
+        (entry) => entry.address === getAddress(config.wbnb).toLowerCase(),
+      );
+      if (gridToken === undefined || gridToken.decimals !== 18 || gridToken.priceRoute !== "direct") {
+        throw new Error("Boot refused: expanded profile does not preserve Grid's WBNB direct facts.");
+      }
+    }
   } else {
-    throw new Error("Boot refused: the tradable set is not exactly one token.");
+    throw new Error("Boot refused: platform-config-invalid.");
   }
-  const venues = block.data.venueAllowlist.map((address) => getAddress(address).toLowerCase());
+  const venues = venueTargets.map((address) => getAddress(address).toLowerCase());
   if (!venues.includes(getAddress(config.router).toLowerCase())) {
     throw new Error("Boot refused: the pinned Pancake V2 router is not in the venue allowlist.");
   }

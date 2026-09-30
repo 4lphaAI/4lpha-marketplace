@@ -54,8 +54,20 @@ export type QuantConfigBlock = {
     readonly decimals: number;
     readonly priceRoute: string;
   }[];
+  /** Raw seven-field venue rows exist only for expanded configs; Grid's legacy projection stays address-only. */
+  readonly venueRows?: readonly QuantVenueAllowlistRow[];
   readonly venueAllowlist: readonly Address[];
 };
+
+export type QuantVenueAllowlistRow = Readonly<{
+  label: string;
+  kind: string;
+  address: Address;
+  protocol: string | null;
+  verified: boolean;
+  auditUrl: string | null;
+  officialUrl: string | null;
+}>;
 
 export type QuantAgentKeyBlock = {
   readonly encryptionPublicKey: string | null;
@@ -273,6 +285,25 @@ export function parseConfigBlock(value: unknown): QuantTransportResult<QuantConf
   }
   const rawVenues = quant["venueAllowlist"];
   if (!Array.isArray(rawVenues)) return invalid("venueAllowlist");
+  if (tradableTokens.length > 1) {
+    const venueRows: QuantVenueAllowlistRow[] = [];
+    const expectedKeys = ["address", "auditUrl", "kind", "label", "officialUrl", "protocol", "verified"];
+    for (const entry of rawVenues) {
+      if (!isRecord(entry) || Object.keys(entry).sort().join("|") !== expectedKeys.join("|")) return invalid("venueAllowlist[].shape");
+      const label = entry["label"]; const kind = entry["kind"]; const address = parseAddress(entry["address"]);
+      const protocol = entry["protocol"]; const verified = entry["verified"];
+      const auditUrl = entry["auditUrl"]; const officialUrl = entry["officialUrl"];
+      if (typeof label !== "string" || label.trim() === "" || typeof kind !== "string" || kind.trim() === ""
+        || address === null || !(protocol === null || typeof protocol === "string") || typeof verified !== "boolean"
+        || !(auditUrl === null || typeof auditUrl === "string") || !(officialUrl === null || typeof officialUrl === "string")) {
+        return invalid("venueAllowlist[].field");
+      }
+      venueRows.push({ label, kind, address, protocol, verified, auditUrl, officialUrl });
+    }
+    // Preserve raw row multiplicity for exact expanded-profile matching. Do not
+    // create an address target set before the profile comparison succeeds.
+    return { ok: true, data: { chainId, u, uDecimals, tradableTokens, venueAllowlist: [], venueRows } };
+  }
   const venueAllowlist: Address[] = [];
   for (const entry of rawVenues) {
     const direct = parseAddress(entry);

@@ -83,6 +83,8 @@ export type QuantJobRow = {
   readonly permissionsDigest: Hex | null;
   readonly projectionDigest: Hex | null;
   readonly admittedAtMs: number | null;
+  /** Shared cross-strategy claim generation; null until an explicit cutover/admission. */
+  readonly claimGeneration?: bigint | null;
   readonly chainCheckedAtMs: number | null;
   readonly wbnbCapMinLimitWei: bigint;
   readonly residualThresholdWei: bigint;
@@ -313,6 +315,7 @@ export type UpdateQuantJobWireInput = {
 export type AdmitQuantJobInput = {
   readonly quantJobId: string;
   readonly expectedRowVersion: number;
+  readonly claimGeneration?: bigint | null;
   readonly sessionPublicKey: Hex;
   readonly sessionExpiry: number;
   readonly permissionsDigest: Hex;
@@ -551,7 +554,7 @@ export interface QuantJobStore {
   discoverJob(input: DiscoverQuantJobInput): Promise<QuantJobRow>;
   updateJobWire(input: UpdateQuantJobWireInput): Promise<UpdateQuantJobWireResult | null>;
   replaceEnvelope(quantJobId: string, envelopeJson: string, nowMs: number): Promise<void>;
-  admitJob(input: AdmitQuantJobInput): Promise<QuantCasResult<QuantJobRow>>;
+  admitJob(input: AdmitQuantJobInput, tx?: SqlClient): Promise<QuantCasResult<QuantJobRow>>;
   getJob(quantJobId: string): Promise<QuantJobRow | null>;
   listJobs(): Promise<readonly QuantJobRow[]>;
   /**
@@ -617,10 +620,11 @@ export interface QuantJobStore {
   markActionSubmitted(input: {
     readonly journalKey: string;
     readonly expectedRowVersion: number;
+    readonly claimGeneration?: bigint | null;
     readonly submitFinalizedNumber: bigint;
     readonly submitFinalizedHash: Hex;
     readonly nowMs: number;
-  }): Promise<QuantCasResult<QuantActionRow>>;
+  }, tx?: SqlClient): Promise<QuantCasResult<QuantActionRow>>;
   /** `intended → aborted` + level restore, in ONE transaction (R5.2). */
   abortIntent(input: {
     readonly journalKey: string;
@@ -740,7 +744,7 @@ export interface QuantJobStore {
   }): Promise<QuantReportRow>;
   listReports(quantJobId: string): Promise<readonly QuantReportRow[]>;
   recordRun(row: QuantRunRow): Promise<void>;
-  withQuantFence<T>(quantJobId: string, work: (fence: QuantFence) => Promise<T>): Promise<T>;
+  withQuantFence<T>(quantJobId: string, work: (fence: QuantFence) => Promise<T>, tx?: SqlClient): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -828,7 +832,7 @@ export class MemoryQuantJobStore implements QuantJobStore {
       envelopeJson: input.envelopeJson, envelopeId: input.envelopeId,
       sessionPublicKey: null, sessionExpiry: null,
       permissionsDigest: null, projectionDigest: null,
-      admittedAtMs: null, chainCheckedAtMs: null,
+      admittedAtMs: null, claimGeneration: null, chainCheckedAtMs: null,
       wbnbCapMinLimitWei: 0n, residualThresholdWei: 0n,
       paramsJson: null, paramsDigest: null,
       p0E18: 0n, armBlock: null, levels: 0, clipUWei: 0n, idleUWei: 0n,
@@ -909,7 +913,7 @@ export class MemoryQuantJobStore implements QuantJobStore {
     });
   }
 
-  async admitJob(input: AdmitQuantJobInput): Promise<QuantCasResult<QuantJobRow>> {
+  async admitJob(input: AdmitQuantJobInput, _tx?: SqlClient): Promise<QuantCasResult<QuantJobRow>> {
     return this.withQuantFence(input.quantJobId, async () => this.#admitJobUnsafe(input));
   }
 
@@ -927,6 +931,7 @@ export class MemoryQuantJobStore implements QuantJobStore {
       permissionsDigest: input.permissionsDigest,
       projectionDigest: input.projectionDigest,
       admittedAtMs: input.nowMs,
+      claimGeneration: input.claimGeneration ?? null,
       chainCheckedAtMs: input.nowMs,
       wbnbCapMinLimitWei: input.wbnbCapMinLimitWei,
       residualThresholdWei: input.residualThresholdWei,
@@ -1127,12 +1132,18 @@ export class MemoryQuantJobStore implements QuantJobStore {
   async markActionSubmitted(input: {
     readonly journalKey: string;
     readonly expectedRowVersion: number;
+    readonly claimGeneration?: bigint | null;
     readonly submitFinalizedNumber: bigint;
     readonly submitFinalizedHash: Hex;
     readonly nowMs: number;
-  }): Promise<QuantCasResult<QuantActionRow>> {
+  }, _tx?: SqlClient): Promise<QuantCasResult<QuantActionRow>> {
+    const prior = this.#actions.get(input.journalKey);
+    const job = prior === undefined ? undefined : this.#jobs.get(prior.quantJobId);
+    if (input.claimGeneration !== undefined && input.claimGeneration !== (job?.claimGeneration ?? null)) {
+      return { kind: "conflict", record: prior === undefined ? null : structuredClone(prior) };
+    }
     return this.withQuantFence(
-      this.#actions.get(input.journalKey)?.quantJobId ?? "",
+      prior?.quantJobId ?? "",
       async () => this.#markActionSubmittedUnsafe(input),
     );
   }
@@ -1614,6 +1625,7 @@ export class MemoryQuantJobStore implements QuantJobStore {
   async withQuantFence<T>(
     quantJobId: string,
     work: (fence: QuantFence) => Promise<T>,
+    _tx?: SqlClient,
   ): Promise<T> {
     // A per-job mutex — the memory twin of `pg_advisory_xact_lock`. There is no
     // transaction to abort here, which is exactly why the PostgreSQL suite is
@@ -2422,6 +2434,7 @@ const QUANT_JOBS_DDL = `
     permissions_digest text null,
     projection_digest text null,
     admitted_at_ms bigint null,
+    claim_generation numeric null,
     chain_checked_at_ms bigint null,
     wbnb_cap_min_limit_wei numeric not null default 0,
     residual_threshold_wei numeric not null default 0,
@@ -2692,6 +2705,9 @@ const QUANT_SCHEMA_MIGRATIONS_DDL = `
   )
 `;
 
+/** The one column statement the production claim cutover applies; `QUANT_MIGRATIONS` uses the same text. */
+export const QUANT_CLAIM_GENERATION_COLUMN_DDL = `alter table quant_jobs add column if not exists claim_generation numeric`;
+
 /**
  * Additive migrations for a table that already exists.
  *
@@ -2701,6 +2717,7 @@ const QUANT_SCHEMA_MIGRATIONS_DDL = `
  * so an existing row is valid the moment it lands.
  */
 const QUANT_MIGRATIONS: readonly string[] = [
+  QUANT_CLAIM_GENERATION_COLUMN_DDL,
   `alter table quant_jobs add column if not exists stale_observations int not null default 0`,
   `alter table quant_jobs add column if not exists residual_threshold_wei numeric not null default 0`,
   `alter table quant_levels add column if not exists exit_plan_json text`,
@@ -2771,7 +2788,7 @@ const JOB_COLUMNS =
   "quant_job_id, strategy_id, trading_wallet, allocation_u_wei, daily_cap_u_wei, term_days, "
   + "started_at_ms, ends_at_ms, session_expires_at_ms, revoked_at_ms, status, envelope_json, "
   + "envelope_id, session_public_key, session_expiry, permissions_digest, projection_digest, "
-  + "admitted_at_ms, chain_checked_at_ms, wbnb_cap_min_limit_wei, residual_threshold_wei, "
+  + "admitted_at_ms, claim_generation, chain_checked_at_ms, wbnb_cap_min_limit_wei, residual_threshold_wei, "
   + "params_json, params_digest, p0_e18, arm_block, levels, clip_u_wei, idle_u_wei, "
   + "last_observed_block, last_observed_hash, stale_observations, hold_code, hold_count, "
   + "last_job_read_at_ms, reported_at_ms, report_attempts, row_version, created_at_ms, updated_at_ms, "
@@ -2863,6 +2880,7 @@ function rowToJob(row: JobRowShape): QuantJobRow {
     permissionsDigest: text(row["permissions_digest"]) as Hex | null,
     projectionDigest: text(row["projection_digest"]) as Hex | null,
     admittedAtMs: intOrNull(row["admitted_at_ms"]),
+    claimGeneration: numOrNull(row["claim_generation"]),
     chainCheckedAtMs: intOrNull(row["chain_checked_at_ms"]),
     wbnbCapMinLimitWei: num(row["wbnb_cap_min_limit_wei"]),
     residualThresholdWei: num(row["residual_threshold_wei"]),
@@ -3323,8 +3341,8 @@ export class PostgresQuantJobStore implements QuantJobStore {
       fence.publishTruthVerdict(input));
   }
 
-  async admitJob(input: AdmitQuantJobInput): Promise<QuantCasResult<QuantJobRow>> {
-    return this.#sql.transaction(async (tx) => {
+  async admitJob(input: AdmitQuantJobInput, outerTx?: SqlClient): Promise<QuantCasResult<QuantJobRow>> {
+    const admitOn = async (tx: SqlClient): Promise<QuantCasResult<QuantJobRow>> => {
       await tx.query(
         `/* quantJobs.fence */ select pg_advisory_xact_lock($1::integer, hashtext($2))`,
         [QUANT_LOCK_CLASSID, input.quantJobId],
@@ -3334,7 +3352,7 @@ export class PostgresQuantJobStore implements QuantJobStore {
          update quant_jobs
          set status = 'armed', session_public_key = $3, session_expiry = $4::bigint,
              permissions_digest = $5, projection_digest = $6,
-             admitted_at_ms = $7::bigint, chain_checked_at_ms = $7::bigint,
+             admitted_at_ms = $7::bigint, claim_generation = $19::numeric, chain_checked_at_ms = $7::bigint,
              wbnb_cap_min_limit_wei = $8::numeric, residual_threshold_wei = $9::numeric,
              params_json = $10, params_digest = $11, p0_e18 = $12::numeric,
              arm_block = $13::numeric, levels = $14::int, clip_u_wei = $15::numeric,
@@ -3358,6 +3376,7 @@ export class PostgresQuantJobStore implements QuantJobStore {
           // (line ~933) and PostgreSQL did not, so the first live re-centre read
           // an empty cap set and refused `recenter-cap-too-small`.
           input.capRowsJson ?? null,
+          input.claimGeneration?.toString(10) ?? null,
         ],
       );
       const row = result.rows[0];
@@ -3400,7 +3419,8 @@ export class PostgresQuantJobStore implements QuantJobStore {
       });
       const current = await this.#getJobOn(tx, input.quantJobId);
       return { kind: "ok" as const, record: current ?? rowToJob(row) };
-    });
+    };
+    return outerTx === undefined ? this.#sql.transaction(admitOn) : admitOn(outerTx);
   }
 
   async getJob(quantJobId: string): Promise<QuantJobRow | null> {
@@ -3597,16 +3617,23 @@ export class PostgresQuantJobStore implements QuantJobStore {
   async markActionSubmitted(input: {
     readonly journalKey: string;
     readonly expectedRowVersion: number;
+    readonly claimGeneration?: bigint | null;
     readonly submitFinalizedNumber: bigint;
     readonly submitFinalizedHash: Hex;
     readonly nowMs: number;
-  }): Promise<QuantCasResult<QuantActionRow>> {
-    return this.#sql.transaction(async (tx) => {
+  }, outerTx?: SqlClient): Promise<QuantCasResult<QuantActionRow>> {
+    const markOn = async (tx: SqlClient): Promise<QuantCasResult<QuantActionRow>> => {
       const actionRead = await tx.query<JobRowShape>(`/* quantActions.get */ select ${ACTION_COLUMNS} from quant_actions where journal_key = $1`, [input.journalKey]);
       const before = actionRead.rows[0];
       if (before === undefined) return { kind: "conflict" as const, record: null };
       const actionBefore = rowToAction(before);
       await tx.query(`/* quantJobs.fence */ select pg_advisory_xact_lock($1::integer, hashtext($2))`, [QUANT_LOCK_CLASSID, actionBefore.quantJobId]);
+      if (input.claimGeneration !== undefined) {
+        const job = await this.#getJobOn(tx, actionBefore.quantJobId);
+        if (job === null || job.claimGeneration !== input.claimGeneration) {
+          return { kind: "conflict" as const, record: actionBefore };
+        }
+      }
       const result = await tx.query<JobRowShape>(
         `/* quantActions.markSubmitted */
          update quant_actions
@@ -3650,7 +3677,8 @@ export class PostgresQuantJobStore implements QuantJobStore {
         [actionBefore.quantJobId, input.nowMs],
       );
       return { kind: "ok" as const, record: rowToAction(row) };
-    });
+    };
+    return outerTx === undefined ? this.#sql.transaction(markOn) : markOn(outerTx);
   }
 
   async abortIntent(input: {
@@ -4238,8 +4266,9 @@ export class PostgresQuantJobStore implements QuantJobStore {
   async withQuantFence<T>(
     quantJobId: string,
     work: (fence: QuantFence) => Promise<T>,
+    outerTx?: SqlClient,
   ): Promise<T> {
-    return this.#sql.transaction(async (tx) => {
+    const run = async (tx: SqlClient): Promise<T> => {
       await tx.query(
         `/* quantJobs.fence */ select pg_advisory_xact_lock($1::integer, hashtext($2))`,
         [QUANT_LOCK_CLASSID, quantJobId],
@@ -4570,7 +4599,8 @@ export class PostgresQuantJobStore implements QuantJobStore {
           );
         },
       });
-    });
+    };
+    return outerTx === undefined ? this.#sql.transaction(run) : run(outerTx);
   }
 
   async #acceptObservationOn(

@@ -27,7 +27,8 @@
  * granted session passes through `serializeGrantedSession` as an argument and
  * is never stored on any object this module keeps.
  */
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { getAddress, type Address, type Hex } from "viem";
 import type { SessionSpec } from "../core/types.js";
 import { validateSessionSpec } from "../core/session.js";
@@ -173,8 +174,10 @@ export function readSelfTestFile(path: string): QuantSelfTestFile {
 
 /** Atomic: write a sibling temp file, then rename over the target (R4). */
 export function writeSelfTestFile(path: string, file: QuantSelfTestFile): void {
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const fd = openSync(temp, "wx", 0o600);
+  try { writeFileSync(fd, `${JSON.stringify(file, null, 2)}\n`); fsyncSync(fd); }
+  finally { closeSync(fd); }
   renameSync(temp, path);
 }
 
@@ -212,12 +215,13 @@ export class FileQuantTransport implements QuantTransport {
    * grant has written the file (so `config-check`, `keypair` and a dry-run
    * cycle work first); once the file exists it is the only source.
    */
-  constructor(path: string, venue: { readonly u: Address; readonly wbnb: Address; readonly router: Address }) {
+  constructor(path: string, venue: { readonly u: Address; readonly wbnb: Address; readonly router: Address },
+    fileConfig?: QuantConfigBlock) {
     if (path.trim() === "") throw new Error("The self-test transport needs a file path.");
     this.#path = path;
     this.#defaults = {
       version: 1,
-      config: {
+      config: fileConfig ?? {
         chainId: 56, u: getAddress(venue.u), uDecimals: 18,
         tradableTokens: [{ address: getAddress(venue.wbnb), decimals: 18, priceRoute: "direct" }],
         venueAllowlist: [getAddress(venue.router), getAddress(venue.u), getAddress(venue.wbnb)],

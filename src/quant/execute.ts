@@ -37,7 +37,7 @@
  * idempotent.
  */
 import { getAddress, keccak256, stringToHex, type Address, type Hex } from "viem";
-import { publicKeyToAddress } from "viem/accounts";
+import { privateKeyToAddress, publicKeyToAddress } from "viem/accounts";
 import {
   accountKeyHashForAddress, agentAuthorityFromPrivateKey, RELAY_SUBMIT_TIMEOUT_PREFIX,
 } from "../wallet/altana.js";
@@ -50,6 +50,7 @@ import type {
   WalletProvider,
 } from "../core/types.js";
 import type { ExecutionJournal } from "../store/journal.js";
+import type { QuantWalletClaimStore } from "../store/quantWalletClaims.js";
 import type { QuantActionRow, QuantJobRow, QuantJobStore } from "../store/quantJobs.js";
 import {
   descriptorOf,
@@ -64,6 +65,11 @@ import type { QuantChainReader } from "./readers.js";
 import { callsDigest } from "./receipt.js";
 import { callsEqual } from "./receipt.js";
 import { buildPancakeTokenSwap } from "../ops/pancakeTokens.js";
+import type { QuantRebalanceActionRow, QuantRebalanceJobRow } from "./rebalanceTypes.js";
+import type { QuantJobRecord } from "./types.js";
+import type { QuantRebalanceStore } from "../store/quantRebalance.js";
+import { buildRebalanceCalls, validateRebalanceCalls } from "./rebalanceRoutes.js";
+import { REBALANCE_ROUTER, REBALANCE_MAX_BLOCK_LAG, REBALANCE_MAX_QUOTE_AGE_MS } from "./rebalancePolicy.js";
 
 /* -------------------------------------------------------------------------- */
 /* Errors                                                                     */
@@ -84,7 +90,11 @@ export type QuantExecuteCode =
   | "no-gas"
   | "store-conflict"
   | "submit-ambiguous"
-  | "submit-failed";
+  | "submit-failed"
+  | "quote-stale"
+  | "price-moved"
+  | "worker-lease-lost"
+  | "wire-changed";
 
 /**
  * The ONE error this module throws.
@@ -120,6 +130,10 @@ const QUANT_EXECUTE_MESSAGES: Readonly<Record<QuantExecuteCode, string>> = Objec
   "store-conflict": "Another process owns this action.",
   "submit-ambiguous": "The relay's answer is unknown; the action is held.",
   "submit-failed": "The relay reported the submission failed.",
+  "quote-stale": "The rebalancing quote is stale and must be refreshed.",
+  "price-moved": "The route or reference price changed before the submit claim.",
+  "worker-lease-lost": "The worker lease was lost before the submit claim.",
+  "wire-changed": "The authenticated TermiX job is no longer eligible for submission.",
 });
 
 /**
@@ -142,6 +156,7 @@ export function ambiguousCause(error: unknown): string {
 
 export type QuantExecuteDeps = {
   readonly store: QuantJobStore;
+  readonly claims?: QuantWalletClaimStore;
   readonly journal: ExecutionJournal;
   readonly provider: WalletProvider;
   readonly reader: QuantChainReader;
@@ -380,7 +395,7 @@ export async function submitQuantAction(
     await failPreSubmit(deps, action, "session-not-admissible", nowMs);
     return { kind: "rolled-back", code: "session-not-admissible" };
   }
-  const begun = await deps.journal.beginWithSpend({
+  const beginInput = {
     idempotencyKey: action.journalKey,
     agentId: job.quantJobId,
     ownerAddress: getAddress(job.tradingWallet),
@@ -395,7 +410,23 @@ export async function submitQuantAction(
     // by us, so a non-zero figure here would double-count it against a cap this
     // plane does not own.
     nativeSpendWei: 0n,
-  }, nowMs);
+  } as const;
+  let begun: Awaited<ReturnType<ExecutionJournal["beginWithSpend"]>> | null;
+  if (deps.claims === undefined) {
+    begun = await deps.journal.beginWithSpend(beginInput, nowMs);
+  } else if (job.claimGeneration === undefined || job.claimGeneration === null) {
+    begun = null;
+  } else {
+    begun = await deps.claims.withWalletFence(getAddress(job.tradingWallet), async (tx) => {
+      const active = await deps.claims?.isActive({ wallet: getAddress(job.tradingWallet), strategyKind: "grid",
+        strategyId: job.strategyId, jobId: job.quantJobId, generation: job.claimGeneration! }, tx) ?? false;
+      return active ? deps.journal.beginWithSpend(beginInput, nowMs) : null;
+    });
+  }
+  if (begun === null) {
+    await failPreSubmit(deps, action, "store-conflict", nowMs);
+    return { kind: "rolled-back", code: "store-conflict" };
+  }
   if (!begun.created) {
     // The recovery table owns this key. Never re-open, never re-submit.
     return { kind: "replay" };
@@ -441,13 +472,24 @@ export async function submitQuantAction(
       // persisted IN it, so a later positive resolution has a lower bound that
       // `latest` could never give it.
       const finalized = await deps.reader.finalizedBlock();
-      const claimed = await deps.store.markActionSubmitted({
+      const claimInput = {
         journalKey: action.journalKey,
         expectedRowVersion: action.rowVersion,
+        ...(deps.claims === undefined ? {} : { claimGeneration: job.claimGeneration ?? null }),
         submitFinalizedNumber: finalized.number,
         submitFinalizedHash: finalized.hash,
         nowMs: deps.nowMs(),
-      });
+      } as const;
+      const claimed = deps.claims === undefined
+        ? await deps.store.markActionSubmitted(claimInput)
+        : job.claimGeneration === undefined || job.claimGeneration === null
+          ? { kind: "conflict" as const, record: await deps.store.getAction(action.journalKey) }
+          : await deps.claims.withWalletFence(getAddress(job.tradingWallet), async (tx) => {
+            const active = await deps.claims?.isActive({ wallet: getAddress(job.tradingWallet), strategyKind: "grid",
+              strategyId: job.strategyId, jobId: job.quantJobId, generation: job.claimGeneration! }, tx) ?? false;
+            if (!active) return { kind: "conflict" as const, record: await deps.store.getAction(action.journalKey) };
+            return deps.store.markActionSubmitted(claimInput, tx);
+          });
       // A store failure HERE is still PRE-SUBMIT and aborts the submit: nothing
       // has been sent, so the honest outcome is a rollback, not a hold.
       if (claimed.kind !== "ok") throw new QuantExecuteError("store-conflict");
@@ -563,6 +605,17 @@ export function quantKeypairFromSeed(seedHex: string): QuantKeypair {
   return deriveKeypair(seedHex);
 }
 
+/** BC12 admission opener for the rebalancer; callers never import `openSession`. */
+export function openQuantRebalanceEnvelope(
+  envelopeJson: string | null,
+  keypair: QuantKeypair,
+): ReturnType<typeof openSession> {
+  if (envelopeJson === null) return { ok: false, code: "envelope-missing" };
+  let envelope: unknown;
+  try { envelope = JSON.parse(envelopeJson); } catch { return { ok: false, code: "envelope-invalid" }; }
+  return openSession(envelope as Parameters<typeof openSession>[0], keypair);
+}
+
 /** The deterministic journal key / decision id for one action (R2.2). */
 export function quantJournalKey(
   quantJobId: string,
@@ -570,4 +623,280 @@ export function quantJournalKey(
   actionSeq: number,
 ): string {
   return keccak256(stringToHex(`quant:v1|${quantJobId}|${levelIndex}|${actionSeq}`));
+}
+
+export type OpenedQuantRebalanceSession = {
+  readonly session: SessionRef;
+  readonly walletAddress: Address;
+  readonly publicKey: Hex;
+  readonly keyHash: Hex;
+};
+
+/** The same narrow key closure for the rebalancing session. */
+export async function withRebalanceJobSession<T>(
+  deps: Pick<QuantExecuteDeps, "provider" | "keypair" | "nowMs" | "signal">,
+  job: QuantRebalanceJobRow,
+  work: (opened: OpenedQuantRebalanceSession) => Promise<T>,
+): Promise<T> {
+  if (job.envelopeJson === null || job.sessionPublicKey === null || job.permissionsDigest === null || job.projectionDigest === null) {
+    throw new QuantExecuteError("envelope-missing");
+  }
+  let envelope: unknown;
+  try { envelope = JSON.parse(job.envelopeJson); } catch { throw new QuantExecuteError("envelope-invalid"); }
+  const opened = openSession(envelope as Parameters<typeof openSession>[0], deps.keypair);
+  if (!opened.ok) throw new QuantExecuteError("envelope-invalid");
+  const plaintext = opened.session;
+  if (!addressEqual(plaintext.walletAddress, job.tradingWallet)
+    || plaintext.publicKey.toLowerCase() !== job.sessionPublicKey.toLowerCase()
+    || plaintext.expiry !== job.sessionExpirySec
+    || permissionsDigest(plaintext.permissions).toLowerCase() !== job.permissionsDigest.toLowerCase()) {
+    throw new QuantExecuteError("session-changed");
+  }
+  try {
+    if (privateKeyToAddress(plaintext.signerPrivateKey).toLowerCase()
+      !== publicKeyToAddress(plaintext.publicKey).toLowerCase()) throw new Error("identity");
+  } catch { throw new QuantExecuteError("session-changed"); }
+  const nowSeconds = Math.floor(deps.nowMs() / 1_000);
+  const projection = projectGrantedPermissions(plaintext.permissions, {
+    expiry: plaintext.expiry, nowSeconds, termDays: job.termDays,
+    walletAddress: plaintext.walletAddress,
+  });
+  if (!projection.ok || specDigest(projection.spec).toLowerCase() !== job.projectionDigest.toLowerCase()) {
+    throw new QuantExecuteError("session-changed");
+  }
+  if (deps.provider.restoreGrantedSession === undefined) throw new QuantExecuteError("session-restore-unsupported");
+  let session: SessionRef;
+  try {
+    session = deps.provider.restoreGrantedSession({
+      walletAddress: plaintext.walletAddress, publicKey: plaintext.publicKey,
+      expiresAt: plaintext.expiry, permissions: descriptorOf(plaintext), spec: projection.spec,
+      agent: agentAuthorityFromPrivateKey(plaintext.signerPrivateKey),
+    });
+  } catch { throw new QuantExecuteError("session-restore-refused"); }
+  return work({
+    session, walletAddress: plaintext.walletAddress, publicKey: plaintext.publicKey,
+    keyHash: accountKeyHashForAddress(publicKeyToAddress(plaintext.publicKey)),
+  });
+}
+
+function addressEqual(a: string, b: string): boolean { return getAddress(a).toLowerCase() === getAddress(b).toLowerCase(); }
+
+export type QuantRebalanceSubmitOutcome =
+  | { readonly kind: "replay" }
+  | { readonly kind: "committed"; readonly receipt: ExecutionReceipt }
+  | { readonly kind: "pending"; readonly receipt: ExecutionReceipt }
+  | { readonly kind: "unknown"; readonly code: string }
+  | { readonly kind: "refused"; readonly code: string };
+
+/** Worker singleton cancellation is a pre-submit refusal until execute entry. */
+export function quantRebalanceWorkerLeaseOpen(signal?: AbortSignal): boolean {
+  return signal?.aborted !== true;
+}
+
+/** Immutable row identity plus mutable TermiX liveness at the submit boundary. */
+export function quantRebalanceWireMatchesJob(job: QuantRebalanceJobRow, wire: QuantJobRecord | null): boolean {
+  return wire !== null && wire.status === "ACTIVE" && wire.revokedAtMs === null
+    && wire.id === job.jobId && wire.strategyId === job.strategyId
+    && wire.tradingWalletAddress.toLowerCase() === job.tradingWallet.toLowerCase()
+    && wire.allocationUWei === job.allocationWei && wire.dailyCapUWei === job.dailyCapWei
+    && wire.termDays === job.termDays && wire.startedAtMs === job.startedAtMs
+    && wire.endsAtMs === job.endsAtMs && wire.sessionExpiresAtMs === job.sessionExpiresAtMs;
+}
+
+export type QuantRebalanceExecuteDeps = {
+  readonly store: QuantRebalanceStore;
+  readonly journal: ExecutionJournal;
+  readonly provider: WalletProvider;
+  readonly reader: QuantChainReader;
+  readonly keypair: QuantKeypair;
+  readonly nowMs: () => number;
+  /** Hash-pinned route/reference, balance and accounting re-read immediately before the claim. */
+  readonly revalidatePlan: (input: { readonly job: QuantRebalanceJobRow; readonly action: QuantRebalanceActionRow; readonly finalized: Awaited<ReturnType<QuantChainReader["finalizedBlock"]>> }) => Promise<boolean>;
+  /** Authenticated public job wire reread at the submit boundary. */
+  readonly readCurrentWire: (job: QuantRebalanceJobRow) => Promise<QuantJobRecord | null>;
+  readonly signal?: AbortSignal;
+};
+
+/** Journal-first execute closure for one already-persisted rebalancing action. */
+export async function submitQuantRebalanceAction(
+  deps: QuantRebalanceExecuteDeps,
+  input: {
+    readonly job: QuantRebalanceJobRow;
+    readonly action: QuantRebalanceActionRow;
+    readonly calls: readonly WalletCall[];
+    readonly requiredNativeWei: bigint;
+  },
+): Promise<QuantRebalanceSubmitOutcome> {
+  const { job, action } = input;
+  const persistedAction = await deps.store.getAction(action.actionId);
+  if (persistedAction === null) return { kind: "refused", code: "action-missing" };
+  if (!(persistedAction.state === "intended" && persistedAction.rowVersion === action.rowVersion)) {
+    return { kind: "refused", code: "action-terminal-or-stale" };
+  }
+  if (job.sessionPublicKey === null || job.policyDigest === null || job.permissionsDigest === null || job.projectionDigest === null) {
+    return { kind: "refused", code: "session-not-admissible" };
+  }
+  const paramsHash = keccak256(stringToHex(JSON.stringify({
+    strategy: job.strategyId, job: job.jobId, policy: job.policyDigest, check: action.checkId,
+    sequence: action.sequence.toString(10), side: action.side, asset: action.asset,
+    tokenIn: action.tokenIn.toLowerCase(), tokenOut: action.tokenOut.toLowerCase(),
+    path: action.path.map((token) => token.toLowerCase()), amountIn: action.amountInWei.toString(10),
+    minOut: action.minOutWei.toString(10), deadline: action.deadlineSec,
+  })));
+  const journalBegin = {
+    idempotencyKey: action.journalKey, agentId: job.jobId, ownerAddress: getAddress(job.tradingWallet),
+    kind: "quantTrade", decisionId: action.journalKey,
+    externalRef: { paramsHash, callsHash: callsDigest(input.calls), publicKey: job.sessionPublicKey },
+    nativeSpendWei: 0n,
+  } as const;
+  let journalStarted: Awaited<ReturnType<typeof deps.store.beginJournalForIntended>>;
+  try {
+    journalStarted = await deps.store.beginJournalForIntended({ actionId: action.actionId,
+      expectedRowVersion: action.rowVersion, claimGeneration: action.claimGeneration,
+      journalBegin: { journal: deps.journal, input: journalBegin, sinceMs: 0 }, nowMs: deps.nowMs() });
+  } catch { return { kind: "refused", code: "journal-begin-failed" }; }
+  if (journalStarted.kind !== "ok") return journalStarted.kind === "inconsistent" && journalStarted.code === "action-unresolved"
+    ? { kind: "replay" }
+    : { kind: "refused", code: journalStarted.kind === "inconsistent" ? journalStarted.code : "action-state-changed" };
+  const afterJournalBegin = await deps.store.getAction(action.actionId);
+  if (afterJournalBegin === null || afterJournalBegin.state !== "intended"
+    || afterJournalBegin.rowVersion !== action.rowVersion) return { kind: "refused", code: "action-state-changed" };
+
+  let submitEntered = false;
+  try {
+    if (!quantRebalanceWorkerLeaseOpen(deps.signal)) throw new QuantExecuteError("worker-lease-lost");
+    const receipt = await withRebalanceJobSession(deps, job, async (opened) => {
+      const built = buildRebalanceCalls({
+        router: REBALANCE_ROUTER, path: action.path, amountInWei: action.amountInWei,
+        quoteOutWei: action.quoteOutWei, recipient: opened.walletAddress,
+        deadlineSec: action.deadlineSec, actionSequence: action.sequence,
+      });
+      const persistedCalls = parsePersistedCalls(action.callsJson);
+      if (built.minOutWei !== action.minOutWei || persistedCalls === null
+        || !callsEqual(input.calls, persistedCalls) || !callsEqual(built.calls, persistedCalls)
+        || validateRebalanceCalls({ calls: persistedCalls, router: REBALANCE_ROUTER,
+          wallet: opened.walletAddress, path: action.path, amountInWei: action.amountInWei,
+          minOutWei: action.minOutWei, deadlineSec: action.deadlineSec }) === null) {
+        throw new QuantExecuteError("calls-mismatch");
+      }
+      await deps.provider.preflightExecute({ session: opened.session, calls: built.calls,
+        ...(deps.signal === undefined ? {} : { signal: deps.signal }) });
+      const meters = await checkQuantMeters({
+        provider: deps.provider, walletAddress: opened.walletAddress, publicKey: opened.publicKey,
+        tokenIn: action.tokenIn, amountInWei: action.amountInWei, requiredNativeWei: input.requiredNativeWei,
+        ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      });
+      if (!meters.ok) throw new QuantExecuteError(meters.code);
+      if (!quantRebalanceWorkerLeaseOpen(deps.signal)) throw new QuantExecuteError("worker-lease-lost");
+      const finalized = await deps.reader.finalizedBlock();
+      if (deps.reader.nativeBalanceAtHash === undefined) throw new QuantExecuteError("meter-unreadable");
+      const nativeBalance = await deps.reader.nativeBalanceAtHash(opened.walletAddress, finalized.hash);
+      if (nativeBalance < input.requiredNativeWei) throw new QuantExecuteError("no-gas");
+      if (finalized.number < action.quoteBlockNumber || finalized.number - action.quoteBlockNumber > REBALANCE_MAX_BLOCK_LAG
+        || action.quoteBlockNumber !== action.referenceBlockNumber
+        || action.quoteBlockHash.toLowerCase() !== action.referenceBlockHash.toLowerCase()
+        || deps.nowMs() - action.quoteObservedAtMs > REBALANCE_MAX_QUOTE_AGE_MS
+        || deps.nowMs() - action.referenceObservedAtMs > REBALANCE_MAX_QUOTE_AGE_MS
+        || finalized.timestampSec * 1_000n > BigInt(deps.nowMs() + 1_000)
+        || BigInt(deps.nowMs()) - finalized.timestampSec * 1_000n > BigInt(REBALANCE_MAX_QUOTE_AGE_MS)) {
+        throw new QuantExecuteError("quote-stale");
+      }
+      if (!(await deps.revalidatePlan({ job, action, finalized }))) throw new QuantExecuteError("price-moved");
+      const latestWire = await deps.readCurrentWire(job);
+      if (latestWire === null || !quantRebalanceWireMatchesJob(job, latestWire)) throw new QuantExecuteError("wire-changed");
+      const acceptedWire = latestWire;
+      if (!quantRebalanceWorkerLeaseOpen(deps.signal)) throw new QuantExecuteError("worker-lease-lost");
+      const chainReadAtMs = deps.nowMs();
+      const claimed = await deps.store.markSubmitted({
+        actionId: action.actionId, expectedRowVersion: action.rowVersion,
+        claimGeneration: action.claimGeneration, blockNumber: finalized.number,
+        blockHash: finalized.hash, nowMs: chainReadAtMs,
+        revalidate: async (snapshot) => quantRebalanceWorkerLeaseOpen(deps.signal)
+          && snapshot.job.jobId === job.jobId
+          && snapshot.job.status === "admitted" && snapshot.job.platformStatus === acceptedWire.status
+          && snapshot.job.revokedAtMs === acceptedWire.revokedAtMs
+          && snapshot.job.tradingWallet.toLowerCase() === acceptedWire.tradingWalletAddress.toLowerCase()
+          && snapshot.job.allocationWei === acceptedWire.allocationUWei
+          && snapshot.job.dailyCapWei === acceptedWire.dailyCapUWei
+          && snapshot.job.termDays === acceptedWire.termDays
+          && snapshot.job.startedAtMs === acceptedWire.startedAtMs
+          && snapshot.job.endsAtMs === acceptedWire.endsAtMs
+          && snapshot.job.sessionExpiresAtMs === acceptedWire.sessionExpiresAtMs
+          && snapshot.job.rowVersion === job.rowVersion
+          && snapshot.job.accountingRev === action.plannedAccountingRev + 1n
+          && snapshot.check.checkId === action.checkId
+          && snapshot.check.rowVersion === action.plannedCheckVersion
+          && snapshot.check.state === "rebalancing"
+          && !snapshot.check.takenAssets.includes(action.asset)
+          && snapshot.action.actionId === action.actionId
+          && snapshot.action.rowVersion === action.rowVersion
+          && snapshot.action.claimGeneration === job.claimGeneration
+          && snapshot.job.policyDigest?.toLowerCase() === action.policyDigest.toLowerCase()
+          && snapshot.job.permissionsDigest?.toLowerCase() === action.permissionsDigest.toLowerCase()
+          && snapshot.job.projectionDigest?.toLowerCase() === action.projectionDigest.toLowerCase()
+          && snapshot.job.revokedAtMs === null && snapshot.job.endsAtMs > chainReadAtMs
+          && snapshot.job.sessionExpiresAtMs > chainReadAtMs
+          && deps.nowMs() - chainReadAtMs <= REBALANCE_MAX_QUOTE_AGE_MS,
+      });
+      if (claimed.kind !== "ok") throw new QuantExecuteError("store-conflict");
+      submitEntered = true;
+      if (!quantRebalanceWorkerLeaseOpen(deps.signal)) throw new QuantExecuteError("worker-lease-lost");
+      return deps.provider.executeViaSession({
+        session: opened.session, calls: built.calls, bypassLocalPolicyCheck: false,
+        ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      });
+    });
+    const currentAction = await deps.store.getAction(action.actionId);
+    if (currentAction === null || !(currentAction.state === "submitted" || currentAction.state === "unknown"
+      || currentAction.state === "committed-unverified")) return { kind: "refused", code: "action-terminal" };
+    if (receipt.callsId !== undefined) await deps.journal.markInProgress(action.journalKey, { callsId: receipt.callsId });
+    if (receipt.status === "CONFIRMED") {
+      await deps.journal.markCommitted(action.journalKey, receipt.transactionHash === undefined ? {} : { txHash: receipt.transactionHash });
+      if (currentAction !== null) await deps.store.markAmbiguous({ actionId: action.actionId, expectedRowVersion: currentAction.rowVersion,
+        state: "committed-unverified", cause: "receipt-unverified",
+        ...(receipt.transactionHash === undefined ? {} : { txHash: receipt.transactionHash }), nowMs: deps.nowMs() });
+      return { kind: "committed", receipt };
+    }
+    if (receipt.status === "FAILED") {
+      await deps.journal.markUnknown(action.journalKey, "Quant submit returned FAILED; awaiting matched failure proof.");
+      if (currentAction !== null) await deps.store.markAmbiguous({ actionId: action.actionId, expectedRowVersion: currentAction.rowVersion,
+        state: "unknown", cause: "provider-failed-unproven", nowMs: deps.nowMs() });
+      return { kind: "unknown", code: "provider-failed-unproven" };
+    }
+    if (receipt.callsId === undefined) {
+      await deps.journal.markUnknown(action.journalKey, "Quant submit returned PENDING without a callsId.");
+      if (currentAction !== null) await deps.store.markAmbiguous({ actionId: action.actionId, expectedRowVersion: currentAction.rowVersion,
+        state: "unknown", cause: "pending-without-calls-id", nowMs: deps.nowMs() });
+      return { kind: "unknown", code: "pending-without-calls-id" };
+    }
+    return { kind: "pending", receipt };
+  } catch (error) {
+    const code = error instanceof QuantExecuteError ? error.code : "submit-ambiguous";
+    const current = await deps.store.getAction(action.actionId);
+    if (current === null || current.state === "aborted" || current.state === "failed"
+      || current.state === "settled" || current.state === "retired") return { kind: "refused", code: "action-terminal" };
+    if (!submitEntered && current.state === "intended") {
+      const journal = await deps.journal.get(action.journalKey);
+      const journalState = journal === null ? "absent"
+        : journal.state === "PENDING" || journal.state === "ROLLED_BACK" ? journal.state : null;
+      if (journalState === null || journal !== null
+        && (journal.externalRef.callsId !== undefined || journal.externalRef.txHash !== undefined)) {
+        return { kind: "refused", code: "journal-entry-evidence" };
+      }
+      const aborted = await deps.store.abortIntendedAction({ actionId: action.actionId,
+        expectedRowVersion: current.rowVersion, expectedJournalState: journalState, reasonCode: code, nowMs: deps.nowMs() });
+      return aborted.kind === "ok" ? { kind: "refused", code }
+        : { kind: "refused", code: aborted.kind === "inconsistent" ? aborted.code : "store-conflict" };
+    }
+    if (!(current.state === "submitted" || current.state === "unknown" || current.state === "committed-unverified")) {
+      return { kind: "refused", code: "action-state-changed" };
+    }
+    await deps.journal.markUnknown(action.journalKey, `Quant rebalancing submit outcome unknown: ${ambiguousCause(error)}.`);
+    const latest = await deps.store.getAction(action.actionId);
+    if (latest?.state === "submitted") {
+      await deps.store.markAmbiguous({ actionId: action.actionId, expectedRowVersion: latest.rowVersion,
+        state: "unknown", cause: ambiguousCause(error), nowMs: deps.nowMs() });
+    }
+    return { kind: "unknown", code: "submit-ambiguous" };
+  }
 }

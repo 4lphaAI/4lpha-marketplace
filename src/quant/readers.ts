@@ -60,6 +60,13 @@ export const V2_PAIR_ABI = [
     inputs: [],
     outputs: [{ type: "address" }],
   },
+  {
+    type: "function",
+    name: "token1",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ type: "address" }],
+  },
 ] as const satisfies Abi;
 
 export const V2_FACTORY_ABI = [
@@ -111,6 +118,8 @@ export interface QuantChainReader {
   /** Hash-pinned EIP-1898 reads; optional for legacy offline harnesses. */
   readonly reservesAtHash?: (pair: Address, blockHash: Hex) => Promise<QuantReserves>;
   pairToken0(pair: Address): Promise<Address>;
+  /** Immutable pair identity cross-check; optional only for legacy offline readers. */
+  readonly pairToken1?: (pair: Address) => Promise<Address>;
   getPair(factory: Address, tokenA: Address, tokenB: Address): Promise<Address>;
   /** `getAmountsOut` at an EXPLICIT height (R3.9). */
   quoteV2At(
@@ -125,6 +134,13 @@ export interface QuantChainReader {
     amountInWei: bigint,
     blockHash: Hex,
   ) => Promise<bigint>;
+  /** Full `getAmountsOut` vector for multi-hop route validation, hash-pinned. */
+  readonly quoteV2AmountsAtHash?: (
+    router: Address,
+    path: readonly Address[],
+    amountInWei: bigint,
+    blockHash: Hex,
+  ) => Promise<readonly bigint[]>;
   tokenBalanceAt(token: Address, account: Address, blockNumber?: bigint): Promise<bigint>;
   readonly tokenBalanceAtHash?: (token: Address, account: Address, blockHash: Hex) => Promise<bigint>;
   nativeBalanceAt(account: Address, blockNumber?: bigint): Promise<bigint>;
@@ -225,6 +241,11 @@ export function createQuantChainReader(input: {
         address: getAddress(pair), abi: V2_PAIR_ABI, functionName: "token0",
       }));
     },
+    async pairToken1(pair) {
+      return getAddress(await client.readContract({
+        address: getAddress(pair), abi: V2_PAIR_ABI, functionName: "token1",
+      }));
+    },
     async getPair(factory, tokenA, tokenB) {
       return getAddress(await client.readContract({
         address: getAddress(factory), abi: V2_FACTORY_ABI, functionName: "getPair",
@@ -258,6 +279,20 @@ export function createQuantChainReader(input: {
       const out = amounts.at(-1);
       if (out === undefined) throw new Error("Pancake V2 returned no output amount.");
       return out;
+    },
+    async quoteV2AmountsAtHash(router, path, amountInWei, blockHash) {
+      const raw = await hashCall(
+        getAddress(router),
+        encodeFunctionData({
+          abi: V2_ROUTER_QUOTER_ABI, functionName: "getAmountsOut",
+          args: [amountInWei, path.map((token) => getAddress(token))],
+        }),
+        blockHash,
+      );
+      const amounts = decodeFunctionResult({
+        abi: V2_ROUTER_QUOTER_ABI, functionName: "getAmountsOut", data: raw,
+      });
+      return amounts.map((amount) => BigInt(amount));
     },
     async tokenBalanceAt(token, account, blockNumber) {
       return client.readContract({

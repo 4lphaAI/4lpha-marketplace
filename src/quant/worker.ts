@@ -20,10 +20,13 @@
  *
  * Per-job errors are caught into the run row: one job cannot blind the others.
  */
+import { randomUUID } from "node:crypto";
 import { getAddress, keccak256, stringToHex, type Address, type Hex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import { accountKeyHashForAddress } from "../wallet/altana.js";
 import type { ExecutionJournal } from "../store/journal.js";
+import type { SqlClient } from "../store/sql.js";
+import type { QuantWalletClaimStore } from "../store/quantWalletClaims.js";
 import type {
   QuantActionRow,
   QuantFence,
@@ -87,6 +90,8 @@ type GasEvidence = {
 
 export type QuantWorkerDeps = {
   readonly store: QuantJobStore;
+  /** Present in the migration-enforced shared-claim runtime; omitted by legacy/offline fixtures. */
+  readonly claims?: QuantWalletClaimStore;
   readonly journal: ExecutionJournal;
   readonly provider: WalletProvider;
   readonly reader: QuantChainReader;
@@ -187,6 +192,12 @@ export async function runQuantWorkerOnce(
   let actions = 0;
   let holds = 0;
   let errors = 0;
+
+  // Do not even discover new inbox rows under an absent/stale cross-strategy
+  // cutover. The migration writer is deliberately outside the worker.
+  if (deps.claims !== undefined && !(await deps.claims.migrationInstalled())) {
+    throw new Error("wallet-claim-migration-not-installed");
+  }
 
   if (!dryRun) {
     try {
@@ -420,6 +431,21 @@ async function runOneJob(
   }
   const admittedDeps: QuantAdmittedWorkerDeps = { ...deps, params: parsedParams };
 
+  // Once the shared-claim composition is installed, a legacy/null generation
+  // can never reopen the money path. Reconciliation already ran above; this
+  // gate is immediately before new observation/intent planning.
+  if (deps.claims !== undefined) {
+    const generation = job.claimGeneration;
+    const active = generation !== undefined && generation !== null
+      && await deps.claims.isActive({ wallet: getAddress(job.tradingWallet), strategyKind: "grid",
+        strategyId: job.strategyId, jobId: job.quantJobId, generation });
+    if (!active) {
+      await hold(deps, job.quantJobId, "claim-inconsistent");
+      notes.push(`${job.quantJobId}:claim-inconsistent`);
+      return { actions: 0, holds: 1, notes };
+    }
+  }
+
   /* Observation. */
   let observation: QuantObservation;
   try {
@@ -515,7 +541,7 @@ async function runOneJob(
   /* Decide, claim, release, submit — ONE submission per job per cycle. */
   const planned = await planOneAction(admittedDeps, accepted, gas);
   if (planned.kind === "hold") {
-    if (planned.code === "gas-price-unavailable" || planned.code === "gas-price-implausible"
+    if (planned.code === "claim-inconsistent" || planned.code === "gas-price-unavailable" || planned.code === "gas-price-implausible"
       || planned.code === "gas-price-moved") {
       await hold(admittedDeps, job.quantJobId, planned.code);
       notes.push(`${job.quantJobId}:${planned.code}`);
@@ -555,6 +581,7 @@ async function runOneJob(
     store: admittedDeps.store, journal: admittedDeps.journal, provider: admittedDeps.provider,
     reader: admittedDeps.reader, keypair: admittedDeps.keypair, params: admittedDeps.params,
     venue: admittedDeps.venue, nowMs: admittedDeps.nowMs,
+    ...(admittedDeps.claims === undefined ? {} : { claims: admittedDeps.claims }),
     ...(admittedDeps.signal === undefined ? {} : { signal: admittedDeps.signal }),
   };
   const outcome = await submitQuantAction(executeDeps, {
@@ -777,6 +804,52 @@ async function admitJob(
   dryRun: boolean,
 ): Promise<{ readonly ok: boolean; readonly note: string }> {
   if (dryRun) return { ok: false, note: "dry-run" };
+  if (deps.claims === undefined) return admitJobCore(deps, job, dryRun, null);
+  const attemptId = randomUUID();
+  let acquired;
+  try {
+    acquired = await deps.claims.claimProvisional({
+      wallet: getAddress(job.tradingWallet), strategyKind: "grid", strategyId: job.strategyId,
+      jobId: job.quantJobId, attemptId, nowMs: deps.nowMs(),
+    });
+  } catch {
+    await hold(deps, job.quantJobId, "wallet-shared");
+    return { ok: false, note: "claim-unavailable" };
+  }
+  if (acquired.kind !== "acquired") {
+    await hold(deps, job.quantJobId, "wallet-shared");
+    return { ok: false, note: acquired.kind === "held" ? "wallet-shared" : "claim-inconsistent" };
+  }
+  const claim = { attemptId, generation: acquired.claim.generation };
+  let result: { readonly ok: boolean; readonly note: string };
+  try {
+    result = await admitJobCore(deps, job, false, claim);
+  } catch {
+    result = { ok: false, note: "admission-refused" };
+  }
+  if (result.ok) return result;
+  let released: "released" | "stale" | "claim-inconsistent";
+  try {
+    released = await deps.claims.releaseProvisional({
+      wallet: getAddress(job.tradingWallet), strategyKind: "grid", strategyId: job.strategyId,
+      jobId: job.quantJobId, attemptId, generation: claim.generation,
+      refusal: /^[a-z0-9-]{1,64}$/u.test(result.note) ? result.note : "admission-refused", nowMs: deps.nowMs(),
+    });
+  } catch { released = "claim-inconsistent"; }
+  if (released === "claim-inconsistent") {
+    await hold(deps, job.quantJobId, "claim-inconsistent");
+    return { ok: false, note: "claim-inconsistent" };
+  }
+  return result;
+}
+
+async function admitJobCore(
+  deps: QuantWorkerDeps,
+  job: QuantJobRow,
+  dryRun: boolean,
+  claim: { readonly attemptId: string; readonly generation: bigint } | null,
+): Promise<{ readonly ok: boolean; readonly note: string }> {
+  if (dryRun) return { ok: false, note: "dry-run" };
   const holder = walletSharedHolder(job, await deps.store.listJobs());
   if (holder !== null) {
     await hold(deps, job.quantJobId, "wallet-shared");
@@ -967,9 +1040,10 @@ async function admitJob(
       : deps.reader.nativeBalanceAtHash(getAddress(job.tradingWallet), observation.blockHash),
   ]);
 
-  const result = await deps.store.admitJob({
+  const admissionInput = {
     quantJobId: job.quantJobId,
     expectedRowVersion: job.rowVersion,
+    claimGeneration: claim?.generation ?? null,
     sessionPublicKey: plaintext.publicKey,
     sessionExpiry: plaintext.expiry,
     permissionsDigest: permissionsDigest(plaintext.permissions),
@@ -1008,8 +1082,22 @@ async function admitJob(
     }))),
     recenterBudget: Math.ceil(job.termDays / params.recenterBudgetDays),
     nowMs,
-  });
-  return result.kind === "ok"
+  } as const;
+  let admitted: boolean;
+  if (claim === null) {
+    // The old Grid-only composition remains available to pre-cutover fixtures.
+    admitted = (await deps.store.admitJob(admissionInput)).kind === "ok";
+  } else {
+    const promoted = await deps.claims?.promoteProvisional({
+      wallet: getAddress(job.tradingWallet), strategyKind: "grid", strategyId: job.strategyId,
+      jobId: job.quantJobId, attemptId: claim.attemptId, generation: claim.generation, nowMs: deps.nowMs(),
+    }, async (tx) => {
+      const result = await deps.store.admitJob(admissionInput, tx);
+      return result.kind === "ok" ? result.record : null;
+    });
+    admitted = promoted?.promoted === true;
+  }
+  return admitted
     ? { ok: true, note: "armed" }
     : { ok: false, note: "admit-conflict" };
 }
@@ -1220,7 +1308,7 @@ type PlanContext = {
 
 type InsertIntentResult = QuantActionRow | {
   readonly kind: "hold";
-  readonly code: "gas-price-unavailable" | "gas-price-implausible" | "gas-price-moved";
+  readonly code: "gas-price-unavailable" | "gas-price-implausible" | "gas-price-moved" | "claim-inconsistent";
 } | null;
 
 /**
@@ -1622,8 +1710,8 @@ async function insertIntent(
     bandBps: deps.params.bandBps,
     evidenceKind: input.seed === true ? "seed" : "crossing",
   }).slice(0, 2_000);
-  let preClaimCode: "gas-price-unavailable" | "gas-price-implausible" | "gas-price-moved" | null = null;
-  const result = await deps.store.withQuantFence(job.quantJobId, async (fence: QuantFence) => {
+  let preClaimCode: "gas-price-unavailable" | "gas-price-implausible" | "gas-price-moved" | "claim-inconsistent" | null = null;
+  const runWithJobFence = (tx?: SqlClient) => deps.store.withQuantFence(job.quantJobId, async (fence: QuantFence) => {
     // RE-READ inside the fence. The trigger latch was written earlier in this
     // cycle, which bumped the level's `row_version`, so the row this decision
     // started from is already stale — and an intent CAS'd against a stale
@@ -1639,6 +1727,11 @@ async function insertIntent(
       .find((row) => row.levelIndex === level.levelIndex);
     if (fencedJob === null || current === undefined) {
       return { kind: "conflict" as const, record: null };
+    }
+    if (deps.claims !== undefined && (job.claimGeneration === undefined || job.claimGeneration === null
+      || fencedJob.claimGeneration !== job.claimGeneration)) {
+      preClaimCode = "claim-inconsistent";
+      return null;
     }
     let refreshedGas: bigint;
     try {
@@ -1741,7 +1834,21 @@ async function insertIntent(
       maxQuoteLagBlocks: deps.params.maxQuoteLagBlocks,
       nowMs: input.nowMs,
     });
-  });
+  }, tx);
+  let result: Awaited<ReturnType<typeof runWithJobFence>> | null;
+  if (deps.claims === undefined) {
+    result = await runWithJobFence();
+  } else if (job.claimGeneration === undefined || job.claimGeneration === null) {
+    preClaimCode = "claim-inconsistent";
+    result = null;
+  } else {
+    result = await deps.claims.withWalletFence(getAddress(job.tradingWallet), async (tx) => {
+      const active = await deps.claims?.isActive({ wallet: getAddress(job.tradingWallet), strategyKind: "grid",
+        strategyId: job.strategyId, jobId: job.quantJobId, generation: job.claimGeneration! }, tx) ?? false;
+      if (!active) { preClaimCode = "claim-inconsistent"; return null; }
+      return runWithJobFence(tx);
+    });
+  }
   if (preClaimCode !== null) return { kind: "hold", code: preClaimCode };
   if (result === null) return null;
   return result.kind === "ok" ? result.record : null;

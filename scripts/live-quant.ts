@@ -65,6 +65,7 @@ import {
   admittedParams, notExecutedProof, retirementAllowed, verifyAndSettle, type QuantReconcileDeps,
 } from "../src/quant/reconcile.js";
 import { createQuantJobStore, type QuantJobStore, type QuantLevelRow } from "../src/store/quantJobs.js";
+import { createQuantWalletClaimStore, type QuantWalletClaimStore } from "../src/store/quantWalletClaims.js";
 import { createJournal, type ExecutionJournal } from "../src/store/journal.js";
 import { AltanaProvider } from "../src/wallet/altana.js";
 import { KEYSTORE_ABI } from "../src/wallet/abis.js";
@@ -158,6 +159,7 @@ function formatGwei(wei: bigint): string {
 type Context = {
   readonly config: QuantRuntimeConfig;
   readonly store: QuantJobStore;
+  readonly claims: QuantWalletClaimStore;
   readonly journal: ExecutionJournal;
   readonly transport: QuantTransport;
   readonly reader: QuantChainReader;
@@ -171,6 +173,7 @@ async function openContext(): Promise<Context> {
   }
   const config = resolveQuantRuntimeConfig(process.env, { publicRpcUrl: BNB.publicRpcUrl });
   const store = await createQuantJobStore();
+  const claims = await createQuantWalletClaimStore({ databaseUrl: config.databaseUrl });
   const journal = await createJournal();
   // R2.10: the self-test file transport and the production HTTPS transport are
   // selected by config, which already refused any process that has both.
@@ -180,9 +183,9 @@ async function openContext(): Promise<Context> {
   const reader = createQuantChainReader({ rpcUrls: config.rpcUrls });
   const provider = new AltanaProvider({ network: BNB, rpcUrls: [...config.rpcUrls] });
   return {
-    config, store, journal, transport, reader, provider,
+    config, store, claims, journal, transport, reader, provider,
     async close() {
-      for (const closable of [store, journal]) {
+      for (const closable of [store, journal, claims]) {
         try { await closable.close(); } catch { /* independent close */ }
       }
     },
@@ -259,7 +262,9 @@ async function commandConfigCheck(context: Context): Promise<void> {
     ...(block.data.tradableTokens.length > 1
       ? [`grid facts       ${gridTradableSetRefusal(block.data.tradableTokens, context.config.wbnb) ?? "ok"}`]
       : []),
-    `venueAllowlist   ${block.data.venueAllowlist.join(", ")} (expect includes ${context.config.router})`,
+    // An expanded parse leaves the address list empty; print the raw row addresses instead.
+    `venueAllowlist   ${(block.data.venueAllowlist.length > 0
+      ? block.data.venueAllowlist : (block.data.venueRows ?? []).map((row) => row.address)).join(", ")} (expect includes ${context.config.router})`,
   ];
   const pair = await context.reader.getPair(
     context.config.factory, context.config.u, context.config.wbnb,
@@ -344,6 +349,9 @@ async function commandWorker(args: Args, context: Context): Promise<void> {
       ? "Running ONE LIVE cycle. This can submit a mainnet transaction from the client's wallet."
       : "Rehearsing one cycle (dry-run). Pass --yes-live to submit.",
   );
+  if (!(await context.claims.schemaInstalled()) || !(await context.claims.migrationInstalled())) {
+    throw new Error("wallet-claim-migration-not-installed; worker did not discover jobs or trade.");
+  }
   // The CLI takes the SAME singleton role as the daemon, so "one replica" and
   // "no concurrent CLI" are one guarantee rather than two (R2.13).
   const { acquireWorkerSingleton } = await import("../src/deployment/workerSingleton.js");

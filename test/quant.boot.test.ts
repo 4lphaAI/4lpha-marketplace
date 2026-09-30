@@ -7,6 +7,10 @@ import type { QuantRuntimeConfig } from "../src/quant/config.js";
 import { QUANT_ROUTER_56, QUANT_U_56, QUANT_U_WBNB_PAIR_56, QUANT_WBNB_56 } from "../src/quant/config.js";
 import { quantKeypairFromSeed } from "../src/quant/execute.js";
 import type { QuantChainReader } from "../src/quant/readers.js";
+import {
+  normalizeExpandedQuantConfig, QUANT_EXPANDED_CONFIG_PROFILES,
+  type QuantExpandedConfigProfile, type QuantExpandedConfigProjection,
+} from "../src/quant/rebalanceConfig.js";
 import { parseConfigBlock, type QuantConfigBlock, type QuantTransport } from "../src/quant/termix.js";
 import type { WalletProvider } from "../src/core/types.js";
 
@@ -200,11 +204,8 @@ describe("R14.6 assertQuantBoot on the expanded config (BC-S228..S231)", () => {
         },
         "Boot refused: the pinned Pancake V2 router is not in the venue allowlist.",
       ],
-      [
-        "empty tradable set",
-        (wire) => { wire.quant.tradableTokens = []; },
-        "Boot refused: the tradable set is not exactly one token.",
-      ],
+      // Master routes an empty set through the expanded-config gate's refusal.
+      ["empty tradable set", (wire) => { wire.quant.tradableTokens = []; }, "Boot refused: platform-config-invalid."],
     ];
     for (const [label, edit, message] of cases) {
       await assert.rejects(assertQuantBoot(bootInput(expandedBlock(edit))), { message }, label);
@@ -248,12 +249,62 @@ describe("R14.6 assertQuantBoot on the expanded config (BC-S228..S231)", () => {
       [
         "a non-WBNB token duplicated",
         (wire) => { wire.quant.tradableTokens.push({ address: CAKE, decimals: 18, priceRoute: "via_wbnb" }); },
-        DUPLICATE_TOKEN,
+        // Master's expanded-config normalization refuses duplicate tokens before
+        // the Grid fallback runs (spec 3b); the duplicate message is boot-reachable
+        // on the deployed tree only, and covered as a helper case here (BC-S226).
+        "Boot refused: platform-config-invalid.",
       ],
     ];
     for (const [label, edit, message] of cases) {
       await assert.rejects(assertQuantBoot(bootInput(expandedBlock(edit))), { message }, label);
     }
+  });
+});
+
+describe("R14.6 reviewed-profile seam (BC-S232, master only)", () => {
+  function projectionOf(block: QuantConfigBlock): QuantExpandedConfigProjection {
+    const normalized = normalizeExpandedQuantConfig(block);
+    if (!normalized.ok) throw new Error(normalized.code);
+    return normalized.projection;
+  }
+  function profileFor(projection: QuantExpandedConfigProjection): QuantExpandedConfigProfile {
+    return {
+      id: "r146-test",
+      capturedEvidenceRef: "test/fixtures/quant/termix-config-2026-09-30.json",
+      capturedEvidenceDigest: `0x${"ab".repeat(32)}`,
+      expected: projection,
+      expectedVenueRowCount: projection.venueRows.length,
+      expectedUniqueVenueTargetCount: new Set(projection.venueRows.map((row) => row.address)).size,
+    };
+  }
+
+  it("BC-S232: an empty registry boots the live fixture through the Grid fallback; the default registry boots it too", async () => {
+    // Listing prep B1 put the reviewed TermiX capture into the default registry, so the empty-registry
+    // fallback is now exercised by injecting `profiles: []`; the default registry matches the live fixture.
+    await assertQuantBoot({ ...bootInput(expandedBlock()), profiles: [] });
+    assert.ok(QUANT_EXPANDED_CONFIG_PROFILES.length > 0);
+    await assertQuantBoot(bootInput(expandedBlock()));
+  });
+
+  it("BC-S232: an injected matching profile takes the profile path, not the fallback", async () => {
+    const live = expandedBlock();
+    await assertQuantBoot({ ...bootInput(live), profiles: [profileFor(projectionOf(live))] });
+    // The profile path keeps its own WBNB diagnostic; the fallback's differs.
+    const viaWbnb = expandedBlock((wire) => { wbnbRow(wire).priceRoute = "via_wbnb"; });
+    await assert.rejects(
+      assertQuantBoot({ ...bootInput(viaWbnb), profiles: [profileFor(projectionOf(viaWbnb))] }),
+      { message: "Boot refused: expanded profile does not preserve Grid's WBNB direct facts." },
+    );
+    await assert.rejects(assertQuantBoot(bootInput(viaWbnb)), { message: WBNB_FACTS });
+  });
+
+  it("BC-S232: a non-matching profile falls back, and a config lacking WBNB gets the WBNB refusal", async () => {
+    const other = expandedBlock((wire) => { wire.quant.tradableTokens.pop(); });
+    const profiles = [profileFor(projectionOf(other))];
+    await assertQuantBoot({ ...bootInput(expandedBlock()), profiles });
+    const noWbnb = expandedBlock(withoutWbnb);
+    await assert.rejects(assertQuantBoot({ ...bootInput(noWbnb), profiles }), { message: WBNB_FACTS });
+    await assert.rejects(assertQuantBoot(bootInput(noWbnb)), { message: WBNB_FACTS });
   });
 });
 
@@ -266,5 +317,10 @@ describe("R14.6 config-check (BC-S233, source scan: the script runs main() on im
       '`grid facts       ${gridTradableSetRefusal(block.data.tradableTokens, context.config.wbnb) ?? "ok"}`',
     ));
     assert.ok(source.includes("...(block.data.tradableTokens.length > 1"));
+  });
+
+  it("BC-S233: the venueAllowlist line falls back to the raw venue-row addresses", () => {
+    assert.ok(source.includes("block.data.venueAllowlist.length > 0"));
+    assert.ok(source.includes("(block.data.venueRows ?? []).map((row) => row.address)"));
   });
 });

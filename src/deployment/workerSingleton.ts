@@ -9,13 +9,15 @@ export type WorkerSingletonRole =
   // QUANT-GRID R3.8/R4.6. The daemon AND `live-quant worker --yes-live` take
   // this same lock for their process lifetime, so one replica and no concurrent
   // CLI are the same guarantee rather than two.
-  | "quant-worker";
+  | "quant-worker"
+  | "quant-rebalance-worker";
 
-const ROLE_KEYS: Readonly<Record<WorkerSingletonRole, 1 | 2 | 3 | 4>> = Object.freeze({
+const ROLE_KEYS: Readonly<Record<WorkerSingletonRole, 1 | 2 | 3 | 4 | 5>> = Object.freeze({
   "lp-worker": 1,
   "venus-worker": 2,
   "billing-worker-once": 3,
   "quant-worker": 4,
+  "quant-rebalance-worker": 5,
 });
 
 const LOCK_SQL = "SELECT pg_try_advisory_lock($1::integer, $2::integer) AS locked";

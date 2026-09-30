@@ -1,0 +1,39 @@
+{
+  "quant": {
+    "chainId": 56,
+    "token": {
+      "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+      "symbol": "USDC",
+      "decimals": 18,
+      "protocol": null,
+      "verified": true,
+      "auditUrl": null,
+      "officialUrl": "https://www.circle.com/usdc"
+    },
+    "tradableTokens": [
+      { "address": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", "symbol": "WBNB", "decimals": 18, "priceRoute": "direct", "verified": true, "auditUrl": null, "officialUrl": "https://www.bnbchain.org", "protocol": null },
+      { "address": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82", "symbol": "Cake", "decimals": 18, "priceRoute": "via_wbnb", "verified": true, "auditUrl": null, "officialUrl": "https://pancakeswap.finance", "protocol": null },
+      { "address": "0x1D2F0da169ceB9fC7B3144628dB156f3F6c60dBE", "symbol": "XRP", "decimals": 18, "priceRoute": "via_wbnb", "verified": true, "auditUrl": null, "officialUrl": "https://xrpl.org", "protocol": null },
+      { "address": "0x2170Ed0880ac9A755fd29B2688956BD959F933F8", "symbol": "ETH", "decimals": 18, "priceRoute": "via_wbnb", "verified": true, "auditUrl": null, "officialUrl": "https://ethereum.org", "protocol": null },
+      { "address": "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c", "symbol": "BTCB", "decimals": 18, "priceRoute": "via_wbnb", "verified": true, "auditUrl": null, "officialUrl": "https://www.bnbchain.org", "protocol": null },
+      { "address": "0xbA2aE424d960c26247Dd6c32edC70B295c744C43", "symbol": "DOGE", "decimals": 8, "priceRoute": "via_wbnb", "verified": true, "auditUrl": null, "officialUrl": "https://dogecoin.com", "protocol": null },
+      { "address": "0xF8A0BF9cF54Bb92F17374d9e9A321E6a111a51bD", "symbol": "LINK", "decimals": 18, "priceRoute": "via_wbnb", "verified": true, "auditUrl": null, "officialUrl": "https://chain.link", "protocol": null }
+    ],
+    "venueAllowlist": [
+      { "label": "PancakeSwap V2 Router", "address": "0x10ED43C718714eb63d5aA57B78B54704E256024E", "kind": "venue", "protocol": "PancakeSwap V2", "verified": true, "auditUrl": "https://docs.pancakeswap.finance/developers/audits", "officialUrl": "https://pancakeswap.finance" },
+      { "label": "USDC token", "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://www.circle.com/usdc" },
+      { "label": "WBNB", "address": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://www.bnbchain.org" },
+      { "label": "Cake", "address": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://pancakeswap.finance" },
+      { "label": "XRP", "address": "0x1D2F0da169ceB9fC7B3144628dB156f3F6c60dBE", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://xrpl.org" },
+      { "label": "ETH", "address": "0x2170Ed0880ac9A755fd29B2688956BD959F933F8", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://ethereum.org" },
+      { "label": "BTCB", "address": "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://www.bnbchain.org" },
+      { "label": "DOGE", "address": "0xbA2aE424d960c26247Dd6c32edC70B295c744C43", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://dogecoin.com" },
+      { "label": "LINK", "address": "0xF8A0BF9cF54Bb92F17374d9e9A321E6a111a51bD", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://chain.link" },
+      { "label": "Venus Comptroller", "address": "0xfd36e2c2a6789db23113685031d7f16329158384", "kind": "venue", "protocol": "Venus Core Pool", "verified": true, "auditUrl": "https://docs-v4.venus.io/links/security-and-audits", "officialUrl": "https://venus.io" },
+      { "label": "Venus vBTC", "address": "0x882C173bC7Ff3b7786CA16dfeD3DFFfb9Ee7847B", "kind": "money-market", "protocol": "Venus Core Pool", "verified": true, "auditUrl": null, "officialUrl": "https://app.venus.io/" },
+      { "label": "vBTC", "address": "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://app.venus.io/" },
+      { "label": "Venus vUSDC", "address": "0xecA88125a5ADbe82614ffC12D0DB554E2e2867C8", "kind": "money-market", "protocol": "Venus Core Pool", "verified": true, "auditUrl": null, "officialUrl": "https://app.venus.io/" },
+      { "label": "vUSDC", "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", "kind": "token", "protocol": null, "verified": true, "auditUrl": null, "officialUrl": "https://app.venus.io/" }
+    ]
+  }
+}

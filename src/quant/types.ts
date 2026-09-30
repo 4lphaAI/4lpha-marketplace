@@ -81,6 +81,7 @@ export type QuantHoldCode =
   | "inbox-unavailable"
   | "job-not-tradable"
   | "wallet-shared"
+  | "claim-inconsistent"
   | "meter-exhausted"
   | "meter-unreadable"
   | "needs-operator"
