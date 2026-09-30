@@ -347,6 +347,20 @@ function byKey<T>(key: (value: T) => string) {
 }
 
 /**
+ * A copy of `permissions` in the order `validateSessionSpec` returns them. A granted
+ * descriptor arrives in its granter's order; sort it here before comparing it with a
+ * validated one, so the order it was written in never decides equality. Rules and caps
+ * are only reordered, never dropped or merged.
+ */
+export function sortProviderPermissions(permissions: ProviderPermissions): ProviderPermissions {
+  return {
+    ...permissions,
+    calls: [...permissions.calls].sort(byKey(callSortKey)),
+    spend: [...permissions.spend].sort(byKey(spendSortKey)),
+  };
+}
+
+/**
  * Validate a SessionSpec and translate it into provider permissions.
  *
  * Throws `InvalidSessionSpecError` before any network call is attempted. The
@@ -420,12 +434,10 @@ export function validateSessionSpec(
 
   assertTokenMoversAreCapped(validatedCalls, spend);
 
-  return {
-    calls: validatedCalls
-      .map((entry) => entry.permission)
-      .sort(byKey(callSortKey)),
-    spend: [...spend].sort(byKey(spendSortKey)),
-  };
+  return sortProviderPermissions({
+    calls: validatedCalls.map((entry) => entry.permission),
+    spend,
+  });
 }
 
 /**

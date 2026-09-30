@@ -9,7 +9,7 @@ import type { ExecutionJournal, JournalResolutionEvidence } from "../src/store/j
 import type { QuantWalletClaimStore } from "../src/store/quantWalletClaims.js";
 import type { QuantRebalanceStore } from "../src/store/quantRebalance.js";
 import type { SessionSpec, WalletCall, WalletProvider } from "../src/core/types.js";
-import { validateSessionSpec, type ProviderPermissions } from "../src/core/session.js";
+import { sortProviderPermissions, validateSessionSpec, type ProviderPermissions } from "../src/core/session.js";
 import { accountKeyHashForAddress } from "../src/wallet/altana.js";
 import { decodeJsonb } from "../src/store/codec.js";
 import { ACCOUNT_ABI, KEYSTORE_ABI } from "../src/wallet/abis.js";
@@ -351,7 +351,9 @@ export function buildQuantRebalanceWorkerDeps(input: {
       const nowSec = Math.floor(quotedAtMs / 1_000);
       if (facts.expiry <= nowSec || facts.spec.expiresAt !== facts.expiry) return null;
       const validated = validateSessionSpec(facts.spec, { nowSeconds: nowSec, minSessionSeconds: 0 });
-      if (canonicalProviderPermissionsV1(validated) !== canonicalProviderPermissionsV1(facts.permissions)) return null;
+      // The granted descriptor keeps its granter's order (the wizard's is not sorted); the validated form is sorted.
+      if (canonicalProviderPermissionsV1(validated)
+        !== canonicalProviderPermissionsV1(sortProviderPermissions(facts.permissions as ProviderPermissions))) return null;
       if (permissionsDigest(facts.permissions as ProviderPermissions as Parameters<typeof permissionsDigest>[0]).toLowerCase()
         !== facts.permissionsDigest.toLowerCase()
         || specDigest(facts.spec).toLowerCase() !== facts.projectionDigest.toLowerCase()) return null;

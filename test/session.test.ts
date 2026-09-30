@@ -10,6 +10,7 @@ import { parseEther, toFunctionSelector } from "viem";
 import {
   DEFAULT_MAX_SESSION_SECONDS,
   isSessionExpired,
+  sortProviderPermissions,
   validateSessionSpec,
 } from "../src/core/session.js";
 import { InvalidSessionSpecError, type SessionSpec } from "../src/core/types.js";
@@ -314,6 +315,35 @@ describe("flat-signature regression pin (PHASE3 R1)", () => {
         { limit: 100_000_000_000_000_000n, period: "day" },
       ],
     });
+  });
+});
+
+describe("sortProviderPermissions", () => {
+  it("puts a frozen, unsorted descriptor in the validator's order without changing it or dropping a row", () => {
+    // TOKEN appears twice: a repeated rule is a rule, not noise.
+    const canonical = validateSessionSpec(spec({
+      allowedCalls: [{ to: TOKEN }, { to: TARGET }, { to: TOKEN }],
+      spendCaps: [{ limit: 3n, period: "week", token: TOKEN }, { limit: parseEther("0.1"), period: "day" },
+        { limit: 2n, period: "day", token: TOKEN }],
+    }), { nowSeconds: NOW });
+    assert.equal(canonical.calls.length, 3);
+    const frozen = Object.freeze({
+      calls: Object.freeze([...canonical.calls].reverse().map((row) => Object.freeze({ ...row }))),
+      spend: Object.freeze([...canonical.spend].reverse().map((cap) => Object.freeze({ ...cap }))),
+      extra: Object.freeze({ kept: true }),
+    });
+    const before = structuredClone(frozen);
+    assert.notDeepEqual(frozen.calls, canonical.calls);
+    assert.notDeepEqual(frozen.spend, canonical.spend);
+
+    const sorted = sortProviderPermissions(frozen);
+
+    assert.deepEqual(sorted.calls, canonical.calls);
+    assert.deepEqual(sorted.spend, canonical.spend);
+    assert.deepEqual(frozen, before);
+    assert.notEqual(sorted.calls, frozen.calls);
+    assert.notEqual(sorted.spend, frozen.spend);
+    assert.deepEqual((sorted as unknown as { extra: unknown }).extra, { kept: true });
   });
 });
 

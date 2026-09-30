@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { getAddress, keccak256, type Hex } from "viem";
+import { decodeFunctionData, encodeFunctionResult, getAddress, keccak256, type Hex } from "viem";
+import { publicKeyToAddress } from "viem/accounts";
 import { parseConfigBlock } from "../src/quant/termix.js";
 import {
   assertProductionRebalanceProfiles, assertProductionRebalanceRegistries, findCapabilityProfile,
@@ -22,11 +23,12 @@ import {
   rebalancePolicyProjection, rebalanceTierForProfile, requiredNativeReserve,
 } from "../src/quant/rebalancePolicy.js";
 import { admitRebalanceSession } from "../src/quant/rebalanceAdmission.js";
-import { parseSessionPlaintext } from "../src/quant/admission.js";
+import { planRebalanceLeg } from "../src/quant/rebalancePortfolio.js";
+import { parseSessionPlaintext, permissionsDigest, projectGrantedPermissions, specDigest } from "../src/quant/admission.js";
 import { quantKeypairFromSeed } from "../src/quant/execute.js";
 import { seal } from "../src/quant/envelope.js";
 import { runQuantRebalanceWorkerOnce, type QuantRebalanceWorkerDeps } from "../src/quant/rebalanceWorker.js";
-import type { QuantRebalanceJobRow } from "../src/quant/rebalanceTypes.js";
+import type { QuantRebalanceActionRow, QuantRebalanceJobRow } from "../src/quant/rebalanceTypes.js";
 import type { QuantJobRecord } from "../src/quant/types.js";
 import { MemoryQuantRebalanceStore, type QuantRebalanceStore } from "../src/store/quantRebalance.js";
 import { MemoryQuantWalletClaimStore, type QuantWalletClaimStore } from "../src/store/quantWalletClaims.js";
@@ -35,7 +37,12 @@ import type { QuantChainReader } from "../src/quant/readers.js";
 import type { ExecutionJournal } from "../src/store/journal.js";
 import type { WalletProvider } from "../src/core/types.js";
 import { main as daemonMain } from "../scripts/quant-rebalance-worker.js";
-import { assertQuantRebalanceBoot } from "../scripts/quantRebalanceWorkerDeps.js";
+import { assertQuantRebalanceBoot, buildQuantRebalanceWorkerDeps, type RebalanceRevalidationRefusal } from "../scripts/quantRebalanceWorkerDeps.js";
+import { encodeLpFinalCallsV1 } from "../src/lp/preparedIntentWitness.js";
+import { QUANT_ORCHESTRATOR_56 } from "../src/quant/receipt.js";
+import type { FileQuantTransport } from "../src/quant/selftest.js";
+import { ACCOUNT_ABI, KEYSTORE_ABI } from "../src/wallet/abis.js";
+import { accountKeyHashForAddress } from "../src/wallet/altana.js";
 
 const CONFIG_ID = "termix-quant-config-2026-09-27-v1";
 const CAPABILITY_ID = "termix-rebalance-wizard-v1";
@@ -89,7 +96,7 @@ describe("B2: the production capability profile", () => {
     assert.equal(profile.capturedConfigProfileId, CONFIG_ID);
     assert.equal(profile.wireVersion, "quant-job-v1");
     assert.deepEqual(profile.grantShapes, ["whole-contract"]);
-    assert.deepEqual(profile.toleratedGrantTargets, []);
+    assert.deepEqual(profile.toleratedGrantTargets, [REBALANCE_ETH, REBALANCE_CAKE]);
     assert.deepEqual(profile.duplicateWholeGrantTargets, [REBALANCE_USDC]);
     // Exactly the routes the G2 rehearsals executed, and the reference paths they were compared against.
     const rehearsed = loadG2FileProfiles().capability;
@@ -175,6 +182,286 @@ describe("B2: the production capability profile", () => {
     ];
     const admittedHigh = admit(high, 75n * E18);
     assert.equal(admittedHigh.ok, true, admittedHigh.ok ? "" : admittedHigh.code);
+  });
+});
+
+describe("B2: the wizard grants every strategy token to every job (R4 operator ruling 2026-09-30)", () => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/quant/admissible-session.json", import.meta.url), "utf8")) as { session: Record<string, unknown> };
+  const wizard = JSON.parse(readFileSync(new URL("./fixtures/quant/wizard-session-shape.json", import.meta.url), "utf8")) as
+    { permissions: { calls: { to: string }[] } };
+  const BTCB = "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c";
+  const nowMs = (1_800_000_000 - 2 * 86_400) * 1_000;
+  const amount = (value: bigint) => ({ $bigint: value.toString() });
+  /** The wizard's own calls plus ETH and CAKE, with a day cap for each token and native. */
+  const grant = (allocation: bigint) => ({
+    calls: [...wizard.permissions.calls, { to: REBALANCE_ETH }, { to: REBALANCE_CAKE }],
+    spend: [
+      { token: REBALANCE_USDC, limit: amount(allocation), period: "day" },
+      { limit: amount(50_000_000_000_000_000n), period: "day" },
+      { token: REBALANCE_WBNB, limit: amount(100n * E18), period: "day" },
+      { token: REBALANCE_ETH, limit: amount(100n * E18), period: "day" },
+      { token: REBALANCE_CAKE, limit: amount(100n * E18), period: "day" },
+    ] as Record<string, unknown>[],
+  });
+  const admit = (permissions: unknown, allocation: bigint) => {
+    const parsed = parseSessionPlaintext(JSON.stringify({ ...fixture.session, permissions }));
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.code);
+    if (!parsed.ok) throw new Error("session");
+    const s = parsed.session;
+    const job: QuantJobRecord = {
+      id: "prod-basket", status: "ACTIVE", strategyId: "strategy-prod", tradingWalletAddress: getAddress(s.walletAddress),
+      allocationUWei: allocation, dailyCapUWei: allocation, termDays: 30, startedAtMs: nowMs - 60_000,
+      endsAtMs: s.expiry * 1_000, sessionExpiresAtMs: s.expiry * 1_000, revokedAtMs: null,
+    };
+    return admitRebalanceSession({ session: s, job, capabilityProfile: PRODUCTION_REBALANCE_CAPABILITY_PROFILE, nowMs });
+  };
+
+  it("admits a low-tier job carrying ETH and CAKE, whose plan stays on WBNB", () => {
+    for (const allocation of [10n * E18, 74_990_000_000_000_000_000n]) {
+      const result = admit(grant(allocation), allocation);
+      assert.equal(result.ok, true, result.ok ? "" : result.code);
+      if (!result.ok) return;
+      assert.equal(result.tier, LOW_TIER);
+      assert.equal(result.grantShape, "whole-contract");
+      const plan = (usdc: bigint, wbnb: bigint) => planRebalanceLeg({ managed: { USDC: usdc, WBNB: wbnb, ETH: 0n, CAKE: 0n },
+        values: { USDC: usdc, WBNB: wbnb, ETH: 0n, CAKE: 0n }, tier: result.tier, takenAssets: new Set(), checkMode: "candidate" });
+      const buy = plan(allocation, 0n);
+      assert.ok(buy.kind === "buy" && buy.asset === "WBNB");
+      const sell = plan(0n, allocation);
+      assert.ok(sell.kind === "sell" && sell.asset === "WBNB");
+      assert.equal(plan(allocation / 2n, allocation / 2n).kind, "none");
+    }
+  });
+
+  it("still refuses any other token, in the calls or in the caps", () => {
+    const extraCall = grant(10n * E18); extraCall.calls.push({ to: BTCB });
+    const excess = admit(extraCall, 10n * E18);
+    assert.equal(excess.ok, false); if (!excess.ok) assert.equal(excess.code, "session-grant-excess");
+    const extraCap = grant(10n * E18); extraCap.spend.push({ token: BTCB, limit: amount(100n * E18), period: "day" });
+    const capExcess = admit(extraCap, 10n * E18);
+    assert.equal(capExcess.ok, false); if (!capExcess.ok) assert.equal(capExcess.code, "session-cap-excess");
+  });
+
+  it("still requires ETH and CAKE, grant and cap, at the high tier", () => {
+    const admitted = admit(grant(75n * E18), 75n * E18);
+    assert.equal(admitted.ok, true, admitted.ok ? "" : admitted.code);
+    for (const token of [REBALANCE_ETH, REBALANCE_CAKE]) {
+      const noCall = grant(75n * E18); noCall.calls = noCall.calls.filter((row) => row.to !== token);
+      const missingGrant = admit(noCall, 75n * E18);
+      assert.equal(missingGrant.ok, false, token); if (!missingGrant.ok) assert.equal(missingGrant.code, "session-missing-grant-approve", token);
+      const noCap = grant(75n * E18); noCap.spend = noCap.spend.filter((row) => row["token"] !== token);
+      const missingCap = admit(noCap, 75n * E18);
+      assert.equal(missingCap.ok, false, token); if (!missingCap.ok) assert.equal(missingCap.code, "session-cap-missing", token);
+    }
+  });
+
+  it("refuses a repeated ETH or CAKE call and a repeated token and period cap", () => {
+    for (const token of [REBALANCE_ETH, REBALANCE_CAKE]) {
+      const twice = grant(10n * E18); twice.calls.push({ to: token });
+      const duplicateCall = admit(twice, 10n * E18);
+      assert.equal(duplicateCall.ok, false, token); if (!duplicateCall.ok) assert.equal(duplicateCall.code, "session-grant-duplicate", token);
+      const repeated = grant(10n * E18); repeated.spend.push({ token, limit: amount(50n * E18), period: "day" });
+      const duplicateCap = admit(repeated, 10n * E18);
+      assert.equal(duplicateCap.ok, false, token); if (!duplicateCap.ok) assert.equal(duplicateCap.code, "session-cap-duplicate-period", token);
+    }
+  });
+
+  it("admits a low-tier grant whose ETH cap, CAKE cap or both are absent, because those tokens are never traded", () => {
+    for (const absent of [[REBALANCE_ETH], [REBALANCE_CAKE], [REBALANCE_ETH, REBALANCE_CAKE]]) {
+      const capped = grant(10n * E18);
+      capped.spend = capped.spend.filter((row) => !absent.some((token) => row["token"] === token));
+      const result = admit(capped, 10n * E18);
+      assert.equal(result.ok, true, result.ok ? "" : result.code);
+    }
+  });
+
+  /**
+   * The real production dependencies over a mocked reader, RPC and relay, for a session granted with `permissions`
+   * exactly as given (never reordered). Every token the two tiers trade has a 1:1 pair with every other.
+   */
+  function chainFor(allocation: bigint, permissions: unknown) {
+    const realNowMs = Date.now();
+    const expiry = Math.floor(realNowMs / 1_000) + 2 * 86_400;
+    const parsed = parseSessionPlaintext(JSON.stringify({ ...fixture.session, expiry, permissions }));
+    assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.code);
+    if (!parsed.ok) throw new Error("session");
+    const session = parsed.session;
+    const wallet = getAddress(session.walletAddress);
+    const job: QuantJobRecord = {
+      id: "prod-chain", status: "ACTIVE", strategyId: "strategy-prod", tradingWalletAddress: wallet,
+      allocationUWei: allocation, dailyCapUWei: allocation, termDays: 30, startedAtMs: realNowMs - 1_000,
+      endsAtMs: expiry * 1_000, sessionExpiresAtMs: expiry * 1_000, revokedAtMs: null,
+    };
+    const finalized = { number: 100n, hash: HASH, timestampSec: BigInt(Math.floor(realNowMs / 1_000)) };
+    const tokens = [REBALANCE_USDC, REBALANCE_WBNB, REBALANCE_USDT, REBALANCE_ETH, REBALANCE_CAKE];
+    const pairRows = new Map<string, { address: `0x${string}`; token0: `0x${string}`; token1: `0x${string}` }>();
+    for (let i = 0; i < tokens.length; i += 1) for (let j = i + 1; j < tokens.length; j += 1) {
+      pairRows.set([tokens[i]!, tokens[j]!].sort().join(":").toLowerCase(),
+        { address: getAddress(`0x${(i * 5 + j).toString(16).padStart(2, "0").repeat(20)}`), token0: tokens[i]!, token1: tokens[j]! });
+    }
+    const readerWith = (balances: Record<string, bigint>) => ({
+      chainId: async () => 56, finalizedBlock: async () => finalized, blockAt: async () => finalized,
+      tokenBalanceAtHash: async (token: `0x${string}`) => balances[getAddress(token)] ?? 0n,
+      nativeBalanceAtHash: async () => 10n ** 16n, gasPriceWei: async () => 50_000_000n,
+      getPair: async (_factory: `0x${string}`, from: `0x${string}`, to: `0x${string}`) => pairRows.get([from, to].sort().join(":").toLowerCase())!.address,
+      pairToken1: async (address: `0x${string}`) => [...pairRows.values()].find((pair) => pair.address === address)!.token1,
+      reservesAtHash: async (address: `0x${string}`, blockHash: Hex) => {
+        const pair = [...pairRows.values()].find((item) => item.address === address)!;
+        return { token0: pair.token0, reserve0: 1_000_000n * E18, reserve1: 1_000_000n * E18, blockHash };
+      },
+      quoteV2AmountsAtHash: async (_router: `0x${string}`, path: readonly `0x${string}`[], value: bigint) => path.map(() => value),
+    } as unknown as QuantChainReader);
+    const provider = { readSpendInfos: async () => session.permissions.spend.map((cap) => ({
+      token: cap.token ?? null, period: cap.period, periodCode: 2, limitWei: cap.limit, currentSpentWei: 0n })) } as unknown as WalletProvider;
+    const depsFor = (reader: QuantChainReader, onRevalidationRefusal?: (reason: RebalanceRevalidationRefusal) => void) => buildQuantRebalanceWorkerDeps({
+      config: { chainId: 56, databaseUrl: "", envelopeKey: "", apiKey: "", agentId: "prod", strategyId: job.strategyId,
+        apiBaseUrl: "https://offline.invalid", rpcUrls: ["https://offline.invalid"], intervalMs: 300_000 },
+      capabilityProfile: PRODUCTION_REBALANCE_CAPABILITY_PROFILE, store: {} as MemoryQuantRebalanceStore,
+      claims: {} as MemoryQuantWalletClaimStore, journal: {} as ExecutionJournal, transport: {} as FileQuantTransport,
+      reader, provider, keypair: {} as never, ...(onRevalidationRefusal === undefined ? {} : { onRevalidationRefusal }) });
+    return { session, wallet, expiry, job, finalized, readerWith, depsFor };
+  }
+
+  /** Answers the key-store, account and relay calls admission and fee quoting make. */
+  async function withRelay<T>(chain: ReturnType<typeof chainFor>, work: () => Promise<T>): Promise<T> {
+    const { session, wallet, expiry } = chain;
+    const priorFetch = globalThis.fetch;
+    globalThis.fetch = async (_request, init) => {
+      const body = JSON.parse(String(init?.body)) as { id: number; method: string;
+        params: [{ data?: Hex; calls?: { to: `0x${string}`; data: Hex; value: Hex }[] }] };
+      let result: unknown;
+      if (body.method === "eth_call") {
+        const data = body.params[0].data!;
+        try {
+          decodeFunctionData({ abi: KEYSTORE_ABI, data });
+          result = encodeFunctionResult({ abi: KEYSTORE_ABI, functionName: "isValidKey", result: true });
+        } catch {
+          const decoded = decodeFunctionData({ abi: ACCOUNT_ABI, data });
+          result = decoded.functionName === "getKeys"
+            ? encodeFunctionResult({ abi: ACCOUNT_ABI, functionName: "getKeys", result: [[{ expiry, keyType: 0, isSuperAdmin: false,
+              publicKey: session.publicKey }], [accountKeyHashForAddress(publicKeyToAddress(session.publicKey))]] })
+            : encodeFunctionResult({ abi: ACCOUNT_ABI, functionName: "canExecute", result: true });
+        }
+      } else if (body.method === "wallet_getCapabilities") {
+        const contract = { address: QUANT_ORCHESTRATOR_56 };
+        result = { "0x38": { contracts: { accountImplementation: contract, accountProxy: contract,
+          legacyAccountImplementations: [], legacyOrchestrators: [], orchestrator: contract, simulator: contract },
+          fees: { quoteConfig: { rateTtl: 120, ttl: 120 }, recipient: wallet, tokens: [] } } };
+      } else {
+        const calls = body.params[0].calls!;
+        result = { capabilities: {}, context: { quote: { hash: `0x${"12".repeat(32)}`,
+          r: `0x${"13".repeat(32)}`, s: `0x${"14".repeat(32)}`, ttl: Math.floor(Date.now() / 1_000) + 120,
+          quotes: [{ chainId: "0x38", ethPrice: "0x1", extraPayment: "0x0", feeTokenDeficit: "0x0",
+            intent: { combinedGas: "0x1", encodedFundTransfers: [], encodedPreCalls: [], eoa: wallet,
+              executionData: encodeLpFinalCallsV1(calls.map((call) => ({ to: call.to, data: call.data,
+                value: BigInt(call.value) }))), expiry: "0x0", funder: "0x0000000000000000000000000000000000000000", funderSignature: "0x",
+              isMultichain: false, nonce: "0x1", payer: wallet, paymentAmount: "0x193d889278c0",
+              paymentMaxAmount: "0x193d889278c0", paymentRecipient: wallet, paymentSignature: "0x",
+              paymentToken: "0x0000000000000000000000000000000000000000", settler: wallet,
+              settlerContext: "0x", signature: "0x", supportedAccountImplementation: wallet },
+            nativeFeeEstimate: { maxFeePerGas: "0x2faf080", maxPriorityFeePerGas: "0x1" },
+            orchestrator: QUANT_ORCHESTRATOR_56, paymentTokenDecimals: 18, txGas: "0x683cb" }] } },
+          digest: `0x${"15".repeat(32)}`, key: null, signature: "0x",
+          typedData: { domain: {}, message: {}, primaryType: "Intent", types: {} } };
+      }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), { headers: { "content-type": "application/json" } });
+    };
+    try { return await work(); } finally { globalThis.fetch = priorFetch; }
+  }
+
+  it("prepares a fee quote for the wizard's own unsorted grant order, at both tiers", async () => {
+    for (const [allocation, tier] of [[10n * E18, LOW_TIER], [75n * E18, HIGH_TIER]] as const) {
+      const permissions = grant(allocation);
+      const targets = permissions.calls.map((row) => row.to.toLowerCase());
+      assert.notDeepEqual(targets, [...targets].sort(), "the fixture must keep the wizard's order");
+      const chain = chainFor(allocation, permissions);
+      const admitted = await withRelay(chain, () => chain.depsFor(chain.readerWith({ [REBALANCE_USDC]: allocation })).admitChain({
+        job: chain.job, session: chain.session, grantShape: "whole-contract", tier, capabilityProfile: PRODUCTION_REBALANCE_CAPABILITY_PROFILE }));
+      assert.equal(admitted.ok, true, admitted.ok ? "" : admitted.code);
+    }
+  });
+
+  it("keeps a low-tier job's pre-existing ETH and CAKE protected, and a later foreign transfer refuses planning", async () => {
+    const allocation = 10n * E18;
+    const held = { ETH: 3n * E18, CAKE: 7n * E18 };
+    const baseline = { [REBALANCE_USDC]: allocation, [REBALANCE_ETH]: held.ETH, [REBALANCE_CAKE]: held.CAKE };
+    const chain = chainFor(allocation, grant(allocation));
+    await withRelay(chain, async () => {
+      const admitted = await chain.depsFor(chain.readerWith(baseline)).admitChain({ job: chain.job, session: chain.session,
+        grantShape: "whole-contract", tier: LOW_TIER, capabilityProfile: PRODUCTION_REBALANCE_CAPABILITY_PROFILE });
+      assert.equal(admitted.ok, true, admitted.ok ? "" : admitted.code);
+      if (!admitted.ok) return;
+      // Only the allocation is managed; everything else the wallet already held, ETH and CAKE included, is protected.
+      assert.deepEqual(admitted.protectedBalances, { USDC: 0n, WBNB: 0n, ETH: held.ETH, CAKE: held.CAKE, USDT: 0n });
+      const encode = (vector: object) => JSON.stringify(vector, (_key, value: unknown) =>
+        typeof value === "bigint" ? { $bigint: value.toString() } : value);
+      const row: QuantRebalanceJobRow = { ...storedRow({ jobId: chain.job.id, profileId: CAPABILITY_ID, status: "admitted" }),
+        tradingWallet: chain.wallet, endsAtMs: chain.expiry * 1_000, sessionExpirySec: chain.expiry, protectedBaselineJson: encode(admitted.protectedBalances) };
+      const portfolio = (balances: Record<string, bigint>) => chain.depsFor(chain.readerWith(balances)).readPortfolio({ job: row, tier: LOW_TIER, nowMs: Date.now() });
+      const untouched = await portfolio(baseline);
+      assert.equal(untouched.ok, true, untouched.ok ? "" : untouched.code);
+      if (!untouched.ok) return;
+      assert.equal(untouched.observation.values.ETH, 0n);
+      assert.equal(untouched.observation.values.CAKE, 0n);
+      const leg = planRebalanceLeg({ managed: row.managed!, values: untouched.observation.values, tier: LOW_TIER,
+        takenAssets: new Set(), checkMode: "candidate" });
+      assert.ok(leg.kind === "buy" && leg.asset === "WBNB");
+      for (const token of [REBALANCE_ETH, REBALANCE_CAKE]) {
+        const foreign = await portfolio({ ...baseline, [token]: (baseline as Record<string, bigint>)[token]! + 1n });
+        assert.deepEqual(foreign, { ok: false, code: "external-activity" }, token);
+      }
+    });
+  });
+
+  it("re-prices from a stored descriptor in the wizard's order, and refuses one whose rules or caps differ from its projection", async () => {
+    const allocation = 10n * E18;
+    const chain = chainFor(allocation, grant(allocation));
+    const descriptor = chain.session.permissions;
+    const projection = projectGrantedPermissions(descriptor, { expiry: chain.expiry, nowSeconds: Math.floor(Date.now() / 1_000),
+      termDays: 30, walletAddress: chain.wallet });
+    assert.equal(projection.ok, true);
+    if (!projection.ok) return;
+    const zero = { USDC: 0n, WBNB: 0n, ETH: 0n, CAKE: 0n, USDT: 0n };
+    // Its own digest is recorded for each variant, so only the comparison with the projection can refuse it.
+    const rowFor = (stored: typeof descriptor): QuantRebalanceJobRow => ({
+      ...storedRow({ jobId: chain.job.id, profileId: CAPABILITY_ID, status: "admitted" }),
+      tradingWallet: chain.wallet, descriptorJson: encodeJsonbParam(stored), projectionJson: encodeJsonbParam(projection.spec),
+      sessionPublicKey: chain.session.publicKey, sessionExpirySec: chain.expiry, permissionsDigest: permissionsDigest(stored),
+      projectionDigest: specDigest(projection.spec), protectedBaselineJson: encodeJsonbParam(zero),
+    });
+    const now = Date.now();
+    const action = { asset: "WBNB", side: "buy", sequence: 1n, path: [REBALANCE_USDC, REBALANCE_WBNB], amountInWei: allocation / 2n,
+      minOutWei: 0n, deadlineSec: Math.floor(now / 1_000) + 600, quoteBlockNumber: 100n, quoteObservedAtMs: now,
+      gasEvidenceJson: JSON.stringify({ feeQuoteExpiresAtSec: Math.floor(now / 1_000) + 60, feeQuoteObservedAtMs: now,
+        feeQuoteCreatedAtMs: now, requiredNativeWei: E18.toString() }) } as unknown as QuantRebalanceActionRow;
+    const revalidate = async (stored: typeof descriptor) => {
+      const reasons: RebalanceRevalidationRefusal[] = [];
+      const deps = chain.depsFor(chain.readerWith({ [REBALANCE_USDC]: allocation }), (reason) => { reasons.push(reason); });
+      const ok = await withRelay(chain, () => deps.revalidatePlan({ job: rowFor(stored), action, finalized: chain.finalized }));
+      return { ok, reasons };
+    };
+    assert.deepEqual(await revalidate(descriptor), { ok: true, reasons: [] });
+    // The wizard lists USDC twice, and its first cap is USDC.
+    const usdcRule = descriptor.calls.findIndex((row) => row.to?.toLowerCase() === REBALANCE_USDC.toLowerCase());
+    const firstCap = (change: object) => descriptor.spend.map((cap, index) => index === 0 ? { ...cap, ...change } : cap);
+    const variants: Record<string, typeof descriptor> = {
+      "an extra rule": { ...descriptor, calls: [...descriptor.calls, { to: getAddress(BTCB) }] },
+      "a missing rule": { ...descriptor, calls: descriptor.calls.slice(0, -1) },
+      "one of the two USDC rules removed": { ...descriptor, calls: descriptor.calls.filter((_row, index) => index !== usdcRule) },
+      "a third USDC rule": { ...descriptor, calls: [...descriptor.calls, descriptor.calls[usdcRule]!] },
+      "a repeated CAKE rule": { ...descriptor, calls: [...descriptor.calls, descriptor.calls.at(-1)!] },
+      "a different cap limit": { ...descriptor, spend: firstCap({ limit: descriptor.spend[0]!.limit + 1n }) },
+      "a different cap period": { ...descriptor, spend: firstCap({ period: "week" }) },
+      "a different cap token": { ...descriptor, spend: firstCap({ token: getAddress(BTCB) }) },
+      "an extra cap": { ...descriptor, spend: [...descriptor.spend, { token: getAddress(BTCB), limit: 1n, period: "day" }] },
+      "a missing cap": { ...descriptor, spend: descriptor.spend.slice(0, -1) },
+      "an extra descriptor key": { ...descriptor, unexpected: true } as unknown as typeof descriptor,
+      "an extra rule key": { ...descriptor, calls: descriptor.calls.map((row, index) => index === 0 ? { ...row, unexpected: true } : row) } as unknown as typeof descriptor,
+      "an extra cap key": { ...descriptor, spend: firstCap({ unexpected: true }) } as unknown as typeof descriptor,
+    };
+    for (const [name, stored] of Object.entries(variants)) {
+      assert.deepEqual(await revalidate(stored), { ok: false, reasons: ["route-or-fee-unavailable"] }, name);
+    }
   });
 });
 

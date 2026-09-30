@@ -63,7 +63,9 @@ export const PRODUCTION_REBALANCE_CAPABILITY_PROFILE: QuantRebalanceCapabilityPr
   capturedConfigProfileId: PRODUCTION_EXPANDED_CONFIG_PROFILE.id,
   wireVersion: "quant-job-v1",
   grantShapes: ["whole-contract"],
-  toleratedGrantTargets: [],
+  // The wizard grants every strategy token (WBNB, ETH, CAKE) to every job whatever its allocation
+  // (R4 operator ruling 2026-09-30), so a low-tier job carries ETH and CAKE it never trades.
+  toleratedGrantTargets: [REBALANCE_ETH, REBALANCE_CAKE],
   duplicateWholeGrantTargets: [REBALANCE_USDC],
   executionRoutes: [
     rebalancePathKey([REBALANCE_USDC, REBALANCE_WBNB]), rebalancePathKey([REBALANCE_WBNB, REBALANCE_USDC]),
