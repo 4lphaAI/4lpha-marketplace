@@ -5,7 +5,7 @@
  * two compositions is how a CLI ends up running a slightly different worker).
  */
 import { BNB } from "@altananetwork/sdk";
-import { createPublicClient, fallback, getAddress, http } from "viem";
+import { createPublicClient, fallback, getAddress, http, type Address } from "viem";
 import { bsc } from "viem/chains";
 import type { ExecutionJournal } from "../src/store/journal.js";
 import type { QuantJobStore } from "../src/store/quantJobs.js";
@@ -83,6 +83,30 @@ export async function buildWorkerDeps(
 }
 
 /**
+ * R14.6: Grid trades one pair, so an expanded platform tradable set is fine as
+ * long as WBNB is still there once, `direct`, 18 decimals. Other rows are not
+ * inspected — Grid never quotes, sizes or trades them. `assertQuantBoot` and
+ * `live-quant config-check` both call this, so the two cannot diverge.
+ * Refusal message for a set Grid cannot run against, or null.
+ */
+export function gridTradableSetRefusal(
+  tradable: readonly { readonly address: Address; readonly decimals: number; readonly priceRoute: string }[],
+  wbnb: Address,
+): string | null {
+  const seen = new Set<string>();
+  for (const token of tradable) {
+    const key = token.address.toLowerCase();
+    if (seen.has(key)) return "Boot refused: the tradable set has a duplicate token.";
+    seen.add(key);
+  }
+  const grid = tradable.find((token) => token.address.toLowerCase() === wbnb.toLowerCase());
+  if (grid === undefined || grid.decimals !== 18 || grid.priceRoute !== "direct") {
+    return "Boot refused: the tradable set does not preserve Grid's WBNB direct facts.";
+  }
+  return null;
+}
+
+/**
  * The boot assertions the daemon AND the CLI run before a cycle (QUANT-SELFTEST
  * R5): the registry block is checked never adapted to (§2.1), the pair is
  * derived from the factory and cross-checked (§4.3), and the registered key
@@ -118,17 +142,22 @@ export async function assertQuantBoot(input: {
   if (block.data.uDecimals !== 18) {
     throw new Error("Boot refused: the settlement token does not have 18 decimals.");
   }
-  if (block.data.tradableTokens.length !== 1) {
+  if (block.data.tradableTokens.length === 1) {
+    // Keep the verified legacy one-token predicate intact.
+    const token = block.data.tradableTokens[0];
+    if (token === undefined
+      || getAddress(token.address) !== getAddress(config.wbnb)
+      || token.priceRoute !== "direct") {
+      throw new Error("Boot refused: the tradable token is not WBNB with a direct route.");
+    }
+    if (token.decimals !== 18) {
+      throw new Error("Boot refused: the tradable token does not have 18 decimals.");
+    }
+  } else if (block.data.tradableTokens.length > 1) {
+    const refusal = gridTradableSetRefusal(block.data.tradableTokens, config.wbnb);
+    if (refusal !== null) throw new Error(refusal);
+  } else {
     throw new Error("Boot refused: the tradable set is not exactly one token.");
-  }
-  const token = block.data.tradableTokens[0];
-  if (token === undefined
-    || getAddress(token.address) !== getAddress(config.wbnb)
-    || token.priceRoute !== "direct") {
-    throw new Error("Boot refused: the tradable token is not WBNB with a direct route.");
-  }
-  if (token.decimals !== 18) {
-    throw new Error("Boot refused: the tradable token does not have 18 decimals.");
   }
   const venues = block.data.venueAllowlist.map((address) => getAddress(address).toLowerCase());
   if (!venues.includes(getAddress(config.router).toLowerCase())) {

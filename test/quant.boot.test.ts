@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { getAddress, type Address } from "viem";
-import { assertQuantBoot } from "../scripts/quantWorkerDeps.js";
+import { assertQuantBoot, gridTradableSetRefusal } from "../scripts/quantWorkerDeps.js";
 import type { QuantRuntimeConfig } from "../src/quant/config.js";
 import { QUANT_ROUTER_56, QUANT_U_56, QUANT_U_WBNB_PAIR_56, QUANT_WBNB_56 } from "../src/quant/config.js";
 import { quantKeypairFromSeed } from "../src/quant/execute.js";
 import type { QuantChainReader } from "../src/quant/readers.js";
-import type { QuantConfigBlock, QuantTransport } from "../src/quant/termix.js";
+import { parseConfigBlock, type QuantConfigBlock, type QuantTransport } from "../src/quant/termix.js";
 import type { WalletProvider } from "../src/core/types.js";
 
 /**
@@ -90,5 +91,180 @@ describe("quant boot cross-checks (bn-6 / USDC re-pin review)", () => {
       assertQuantBoot(bootInput(liveBlock({ venueAllowlist: [QUANT_U_56, QUANT_WBNB_56] }))),
       /router is not in the venue allowlist/u,
     );
+  });
+});
+
+/**
+ * R14.6 (BC-S225..S234): the platform config grew to seven tradable tokens on
+ * 2026-09-30 and the one-token predicate stopped the Grid worker. Grid trades
+ * one pair, so it needs only WBNB present once, `direct`, 18 decimals.
+ */
+type LiveWire = {
+  quant: {
+    chainId: number;
+    token: { address: string; decimals: number };
+    tradableTokens: { address: string; decimals: number; priceRoute: string }[];
+    venueAllowlist: { address: string }[];
+  };
+};
+
+const WBNB_FACTS = "Boot refused: the tradable set does not preserve Grid's WBNB direct facts.";
+const DUPLICATE_TOKEN = "Boot refused: the tradable set has a duplicate token.";
+const CAKE: Address = getAddress("0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82");
+const isWbnb = (row: { readonly address: string }): boolean => row.address.toLowerCase() === QUANT_WBNB_56.toLowerCase();
+
+/** The captured 2026-09-30 response, edited on the wire shape so either parser sees the same change. */
+function expandedBlock(edit: (wire: LiveWire) => void = () => undefined): QuantConfigBlock {
+  const wire = JSON.parse(readFileSync(
+    new URL("./fixtures/quant/termix-config-2026-09-30.json", import.meta.url), "utf8",
+  )) as LiveWire;
+  edit(wire);
+  const parsed = parseConfigBlock(wire);
+  if (!parsed.ok) throw new Error(`fixture did not parse: ${parsed.code}`);
+  return parsed.data;
+}
+
+function wbnbRow(wire: LiveWire): LiveWire["quant"]["tradableTokens"][number] {
+  const row = wire.quant.tradableTokens.find(isWbnb);
+  if (row === undefined) throw new Error("fixture has no WBNB row");
+  return row;
+}
+
+const withoutWbnb = (wire: LiveWire): void => {
+  wire.quant.tradableTokens = wire.quant.tradableTokens.filter((row) => !isWbnb(row));
+};
+
+describe("R14.6 gridTradableSetRefusal (BC-S225..S227)", () => {
+  const live = expandedBlock().tradableTokens;
+  const wbnb = live[0]!;
+  const cake = live[1]!;
+
+  it("BC-S225: the live seven-token list has no refusal", () => {
+    assert.equal(live.length, 7);
+    assert.ok(isWbnb(wbnb));
+    assert.equal(gridTradableSetRefusal(live, QUANT_WBNB_56), null);
+  });
+
+  it("BC-S226: every way the set can lose Grid's WBNB facts is refused, a duplicate first", () => {
+    const others = live.filter((row) => !isWbnb(row));
+    const cases: readonly (readonly [string, QuantConfigBlock["tradableTokens"], string])[] = [
+      ["WBNB missing", others, WBNB_FACTS],
+      ["WBNB via_wbnb", [{ ...wbnb, priceRoute: "via_wbnb" }, ...others], WBNB_FACTS],
+      ["WBNB 8 decimals", [{ ...wbnb, decimals: 8 }, ...others], WBNB_FACTS],
+      ["WBNB listed twice", [wbnb, wbnb, ...others], DUPLICATE_TOKEN],
+      [
+        "WBNB twice in different letter case",
+        [wbnb, { ...wbnb, address: wbnb.address.toLowerCase() as Address }, ...others],
+        DUPLICATE_TOKEN,
+      ],
+      ["a non-WBNB token listed twice", [...live, cake], DUPLICATE_TOKEN],
+    ];
+    for (const [label, tokens, expected] of cases) {
+      assert.equal(gridTradableSetRefusal(tokens, QUANT_WBNB_56), expected, label);
+    }
+  });
+
+  it("BC-S227: rows other than WBNB are not inspected", () => {
+    assert.equal(gridTradableSetRefusal([
+      wbnb,
+      { address: cake.address, decimals: 8, priceRoute: "mystery" },
+      { address: getAddress("0x00000000000000000000000000000000000000aa"), decimals: 0, priceRoute: "" },
+    ], QUANT_WBNB_56), null);
+  });
+});
+
+describe("R14.6 assertQuantBoot on the expanded config (BC-S228..S231)", () => {
+  it("BC-S228: the live fixture boots", async () => {
+    await assertQuantBoot(bootInput(expandedBlock()));
+  });
+
+  it("BC-S229: chain, U, U decimals, router, pair and an empty tradable set keep their refusals", async () => {
+    const cases: readonly (readonly [string, (wire: LiveWire) => void, string])[] = [
+      ["chain", (wire) => { wire.quant.chainId = 97; }, "Boot refused: the venue block reports a chain other than 56."],
+      [
+        "U address",
+        (wire) => { wire.quant.token.address = OLD_U; },
+        "Boot refused: the venue block's U address is not the pinned constant.",
+      ],
+      [
+        "U decimals",
+        (wire) => { wire.quant.token.decimals = 6; },
+        "Boot refused: the settlement token does not have 18 decimals.",
+      ],
+      [
+        "router",
+        (wire) => {
+          wire.quant.venueAllowlist = wire.quant.venueAllowlist.filter(
+            (row) => row.address.toLowerCase() !== QUANT_ROUTER_56.toLowerCase(),
+          );
+        },
+        "Boot refused: the pinned Pancake V2 router is not in the venue allowlist.",
+      ],
+      [
+        "empty tradable set",
+        (wire) => { wire.quant.tradableTokens = []; },
+        "Boot refused: the tradable set is not exactly one token.",
+      ],
+    ];
+    for (const [label, edit, message] of cases) {
+      await assert.rejects(assertQuantBoot(bootInput(expandedBlock(edit))), { message }, label);
+    }
+    const wrongPair = {
+      async chainId() { return 56; },
+      async getPair() { return OLD_U; },
+    } as unknown as QuantChainReader;
+    await assert.rejects(
+      assertQuantBoot({ ...bootInput(expandedBlock()), reader: wrongPair }),
+      { message: "Boot refused: the V2 factory's U/WBNB pair does not equal the pinned pair address." },
+    );
+  });
+
+  it("BC-S230: the single-token legacy config resolves and keeps its three refusals", async () => {
+    await assertQuantBoot(bootInput(liveBlock()));
+    const notWbnb = "Boot refused: the tradable token is not WBNB with a direct route.";
+    await assert.rejects(
+      assertQuantBoot(bootInput(liveBlock({ tradableTokens: [{ address: CAKE, decimals: 18, priceRoute: "direct" }] }))),
+      { message: notWbnb },
+    );
+    await assert.rejects(
+      assertQuantBoot(bootInput(liveBlock({
+        tradableTokens: [{ address: QUANT_WBNB_56, decimals: 18, priceRoute: "via_wbnb" }],
+      }))),
+      { message: notWbnb },
+    );
+    await assert.rejects(
+      assertQuantBoot(bootInput(liveBlock({
+        tradableTokens: [{ address: QUANT_WBNB_56, decimals: 6, priceRoute: "direct" }],
+      }))),
+      { message: "Boot refused: the tradable token does not have 18 decimals." },
+    );
+  });
+
+  it("BC-S231: boot refuses the live fixture once WBNB's facts break or a token is duplicated", async () => {
+    const cases: readonly (readonly [string, (wire: LiveWire) => void, string])[] = [
+      ["WBNB removed", withoutWbnb, WBNB_FACTS],
+      ["WBNB via_wbnb", (wire) => { wbnbRow(wire).priceRoute = "via_wbnb"; }, WBNB_FACTS],
+      ["WBNB 8 decimals", (wire) => { wbnbRow(wire).decimals = 8; }, WBNB_FACTS],
+      [
+        "a non-WBNB token duplicated",
+        (wire) => { wire.quant.tradableTokens.push({ address: CAKE, decimals: 18, priceRoute: "via_wbnb" }); },
+        DUPLICATE_TOKEN,
+      ],
+    ];
+    for (const [label, edit, message] of cases) {
+      await assert.rejects(assertQuantBoot(bootInput(expandedBlock(edit))), { message }, label);
+    }
+  });
+});
+
+describe("R14.6 config-check (BC-S233, source scan: the script runs main() on import)", () => {
+  const source = readFileSync("scripts/live-quant.ts", "utf8");
+
+  it("BC-S233: the grid facts line is the boot function's own verdict, printed for expanded sets only", () => {
+    assert.ok(source.includes('import { gridTradableSetRefusal } from "./quantWorkerDeps.js";'));
+    assert.ok(source.includes(
+      '`grid facts       ${gridTradableSetRefusal(block.data.tradableTokens, context.config.wbnb) ?? "ok"}`',
+    ));
+    assert.ok(source.includes("...(block.data.tradableTokens.length > 1"));
   });
 });

@@ -70,6 +70,7 @@ import { AltanaProvider } from "../src/wallet/altana.js";
 import { KEYSTORE_ABI } from "../src/wallet/abis.js";
 import { createPublicClient, fallback, http } from "viem";
 import { bsc } from "viem/chains";
+import { gridTradableSetRefusal } from "./quantWorkerDeps.js";
 
 type Args = {
   readonly command: string;
@@ -254,6 +255,10 @@ async function commandConfigCheck(context: Context): Promise<void> {
     `U                ${block.data.u} (expect ${context.config.u})`,
     `tradable         ${block.data.tradableTokens.map((token) =>
       `${token.address}:${token.priceRoute}`).join(", ")} (expect ${context.config.wbnb}:direct)`,
+    // The same function boot runs, so this line cannot disagree with it (R14.6).
+    ...(block.data.tradableTokens.length > 1
+      ? [`grid facts       ${gridTradableSetRefusal(block.data.tradableTokens, context.config.wbnb) ?? "ok"}`]
+      : []),
     `venueAllowlist   ${block.data.venueAllowlist.join(", ")} (expect includes ${context.config.router})`,
   ];
   const pair = await context.reader.getPair(
