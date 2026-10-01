@@ -80,7 +80,13 @@ export function createProvisioningWorker(input: {
             signal: AbortSignal.timeout(PROVISIONING_EVIDENCE_TIMEOUT_MS),
           });
           if (converged.phase === "done" && converged.agent?.renewalCleanupPending === true) {
-            const markersCleared = input.clearRenewalMarkers === undefined
+            // Renewal markers live only in trade positions behind the trade-settings
+            // fence. A known non-trade preset has neither, so there is nothing to
+            // clear; calling the trade seam for it threw "Trade settings are
+            // unavailable." on every sweep and left the flag set forever.
+            const preset = converged.agent.sessionFacts?.hireSizing?.name;
+            const nonTrade = preset === "grid-v1" || preset === "grid-shift-v1" || preset === "lp-v1" || preset === "lending-v1";
+            const markersCleared = input.clearRenewalMarkers === undefined || nonTrade
               ? true
               : await input.clearRenewalMarkers(converged.agent);
             if (markersCleared) {

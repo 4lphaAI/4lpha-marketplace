@@ -6,6 +6,8 @@ import { MemoryAgentStore, PostgresAgentStore, type AgentStore, type PendingRene
 import { createPgSqlClient } from "../src/store/sql.js";
 import { localPostgres } from "./support/localPostgres.js";
 import { DRAFT_KEY, pendingDraft } from "./support/provisioningDraft.js";
+import { createProvisioningWorker } from "../src/wallet/provisioningWorker.js";
+import type { GrantEvidenceReader } from "../src/wallet/grantEvidence.js";
 
 const OWNER = getAddress("0x1111111111111111111111111111111111111111");
 const WALLET = getAddress("0x2222222222222222222222222222222222222222");
@@ -300,5 +302,62 @@ describe("session renewal agent store", () => {
         assert.equal(newAfterReopen.kind, "created", `${label}: new-tab attempt may invoke after reopen`);
       }
     } finally { await fixture.close(); }
+  });
+});
+
+describe("renewal cleanup sweep for non-trade agents (2026-10-01 production loop)", () => {
+  async function renewedWithCleanup(store: MemoryAgentStore, id: string, preset: "trade-v1" | "lp-v1" | "grid-shift-v1" | "grid-v1" | "absent") {
+    const base = facts(privateKeyToAccount(OLD_KEY).publicKey, NOW_SEC - 1);
+    const { hireSizing: _dropped, ...withoutSizing } = base;
+    const oldFacts: SessionFacts = preset === "absent" ? withoutSizing : { ...base, hireSizing: { name: preset, version: 1, openNativeBudgetWei: "0" } };
+    const agent = await store.createAgent({ id, ownerAddress: OWNER, walletAddress: MATRIX_WALLETS[["trade-v1", "lp-v1", "grid-shift-v1", "grid-v1", "absent"].indexOf(preset)]!, custodyModel: "self-eoa", sessionFacts: oldFacts, status: "armed" });
+    await store.putAgentSessionKey(OWNER, agent.id, OLD_KEY);
+    const renewal = { ...pending(oldFacts), sizing: { ...pending(oldFacts).sizing, sizingPreset: preset === "absent" ? "trade-v1" as const : preset } };
+    const created = await store.createPendingRenewalCas({ ownerAddress: OWNER, agentId: agent.id, expectedRowVersion: agent.rowVersion + 1, nowSec: NOW_SEC, pendingRenewal: renewal, sessionKey: NEW_KEY, checkQuiescent: async () => ({ quiescent: true }) });
+    assert.equal(created.kind, "updated");
+    const swapped = await store.swapSessionCas({ ownerAddress: OWNER, agentId: agent.id, expectedRowVersion: created.kind === "updated" ? created.agent.rowVersion : 0, expectedGrantDigest: renewal.grantDigest,
+      sessionFacts: { ...oldFacts, spec: renewal.sessionSpec, permissions: renewal.permissions, publicKey: renewal.sessionPublicKey, expiry: renewal.expiresAt, generation: 1, grantedAtSec: NOW_SEC, renewActionId: renewal.renewActionId, renewalHistory: [{ renewActionId: renewal.renewActionId, grantDigest: renewal.grantDigest, completedAtSec: NOW_SEC }], renewals: 1 },
+      checkQuiescent: async () => ({ quiescent: true }) });
+    assert.equal(swapped.kind, "updated");
+    assert.equal((await store.getAgent(OWNER, agent.id))?.renewalCleanupPending, true);
+  }
+  const noEvidence: GrantEvidenceReader = { readFunding: async () => assert.fail("no funding read for a finished renewal"), readGrant: async () => assert.fail("no grant read for a finished renewal") };
+
+  it("clears the flag for LP and grid agents without calling the trade marker seam", async () => {
+    const store = new MemoryAgentStore(Buffer.alloc(32, 7), () => NOW_MS);
+    await renewedWithCleanup(store, "cleanup-lp", "lp-v1");
+    await renewedWithCleanup(store, "cleanup-grid", "grid-shift-v1");
+    await renewedWithCleanup(store, "cleanup-grid-v1", "grid-v1");
+    const called: string[] = []; const errors: string[] = [];
+    const worker = createProvisioningWorker({ store, evidence: noEvidence, keyStore: WALLET, nowSec: () => NOW_SEC,
+      clearRenewalMarkers: async (agent) => { called.push(agent.id); throw new Error("Trade settings are unavailable."); },
+      onError: (message) => errors.push(message) });
+    await worker.sweep();
+    assert.deepEqual(called, []);
+    assert.deepEqual(errors, []);
+    assert.equal((await store.getAgent(OWNER, "cleanup-lp"))?.renewalCleanupPending, false);
+    assert.equal((await store.getAgent(OWNER, "cleanup-grid"))?.renewalCleanupPending, false);
+    assert.equal((await store.getAgent(OWNER, "cleanup-grid-v1"))?.renewalCleanupPending, false);
+    await store.close();
+  });
+
+  it("still routes a trade agent through the marker seam and keeps the flag until it reports cleared", async () => {
+    const store = new MemoryAgentStore(Buffer.alloc(32, 7), () => NOW_MS);
+    await renewedWithCleanup(store, "cleanup-trade", "trade-v1");
+    await renewedWithCleanup(store, "cleanup-absent", "absent");
+    let cleared = false; const called: string[] = [];
+    const worker = createProvisioningWorker({ store, evidence: noEvidence, keyStore: WALLET, nowSec: () => NOW_SEC,
+      clearRenewalMarkers: async (agent) => { called.push(agent.id); return cleared; } });
+    await worker.sweep();
+    // An absent hireSizing is not a known non-trade preset: it keeps the seam too.
+    assert.deepEqual([...called].sort(), ["cleanup-absent", "cleanup-trade"]);
+    assert.equal((await store.getAgent(OWNER, "cleanup-trade"))?.renewalCleanupPending, true, "not cleared while markers remain");
+    assert.equal((await store.getAgent(OWNER, "cleanup-absent"))?.renewalCleanupPending, true);
+    cleared = true;
+    await worker.sweep();
+    assert.equal(called.length, 4);
+    assert.equal((await store.getAgent(OWNER, "cleanup-trade"))?.renewalCleanupPending, false);
+    assert.equal((await store.getAgent(OWNER, "cleanup-absent"))?.renewalCleanupPending, false);
+    await store.close();
   });
 });
