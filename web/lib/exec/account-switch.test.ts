@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { accountTransition, activateAccount, publicAccount, rememberAccount, rememberedAccounts, subscribeAccountNavigation, retainUnsavedAccount } from "./account-switch";
+import { accountTransition, activateAccount, publicAccount, rememberAccount, rememberedAccounts, renameAccount, savedAccountLabel, subscribeAccountNavigation, retainUnsavedAccount, validAccountLabel } from "./account-switch";
 import { activePasskeyGuard, PASSKEY_STORAGE_KEY, type StoredPasskey } from "./passkey";
 
 const a: StoredPasskey = { x: `0x${"11".repeat(32)}`, y: `0x${"22".repeat(32)}`, credentialId: "YQ", rpId: "localhost", createdAt: 1, label: "First", walletAddress: "0x1111111111111111111111111111111111111111" };
@@ -85,5 +85,39 @@ describe("account directory and activation", () => {
     expect(rememberedAccounts()).toContainEqual(b);
     window.dispatchEvent(new StorageEvent("storage", { key: PASSKEY_STORAGE_KEY }));
     expect(navigate).toHaveBeenCalledOnce(); stop();
+  });
+});
+
+describe("account rename", () => {
+  it("renames the active account in the directory without touching the active selection", async () => {
+    const raw = localStorage.getItem(PASSKEY_STORAGE_KEY);
+    const check = activePasskeyGuard(a);
+    const renamed = await accountTransition(async () => renameAccount(a, "  Main wallet  "));
+    expect(renamed).toEqual({ ...a, label: "Main wallet" });
+    expect(localStorage.getItem(PASSKEY_STORAGE_KEY)).toBe(raw);
+    expect(check).not.toThrow();
+    expect(rememberedAccounts()).toEqual([{ ...a, label: "Main wallet" }]);
+    expect(savedAccountLabel(a)).toBe("Main wallet");
+  });
+  it("renames a saved non-active account and carries the name into the next activation", async () => {
+    rememberAccount(b);
+    renameAccount(b, "Second");
+    expect(rememberedAccounts()).toEqual([a, { ...b, label: "Second" }]);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 200 })));
+    vi.stubGlobal("location", { replace: vi.fn() });
+    await accountTransition(() => activateAccount(b));
+    expect(JSON.parse(localStorage.getItem(PASSKEY_STORAGE_KEY)!)).toMatchObject({ credentialId: b.credentialId, label: "Second" });
+  });
+  it("refuses invalid names and identity conflicts without writing", () => {
+    rememberAccount(a);
+    const before = JSON.stringify(Object.entries(localStorage));
+    for (const bad of ["", "   ", "x".repeat(65), "a\nb", "a\u007fb"]) expect(() => renameAccount(a, bad)).toThrow(/up to 64/);
+    expect(() => renameAccount({ ...a, walletAddress: b.walletAddress }, "Other")).toThrow(/conflicts/);
+    expect(JSON.stringify(Object.entries(localStorage))).toBe(before);
+    expect(validAccountLabel(" ok ")).toBe("ok");
+  });
+  it("falls back to the active record label when the directory hint is unreadable", () => {
+    localStorage.setItem("4lpha:account:v1:localhost:YQ", "not-json");
+    expect(savedAccountLabel(a)).toBe("First");
   });
 });

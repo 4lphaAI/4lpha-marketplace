@@ -2,9 +2,10 @@
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-const api = vi.hoisted(() => ({ create: vi.fn(), recover: vi.fn(), activate: vi.fn(), records: [] as unknown[] }));
+const api = vi.hoisted(() => ({ create: vi.fn(), recover: vi.fn(), activate: vi.fn(), rename: vi.fn(), records: [] as unknown[] }));
 vi.mock("@/lib/altana/client", () => ({ createPasskeyWallet: api.create, recoverWalletFromPasskey: api.recover }));
-vi.mock("@/lib/exec/account-switch", () => ({ accountTransition: (run: () => Promise<void>) => run(), activateAccount: api.activate, retainUnsavedAccount: vi.fn(), rememberedAccounts: () => api.records }));
+vi.mock("@/lib/exec/account-switch", () => ({ accountTransition: (run: () => Promise<void>) => run(), activateAccount: api.activate, retainUnsavedAccount: vi.fn(), rememberedAccounts: () => api.records, renameAccount: api.rename,
+  savedAccountLabel: (r: { label?: string }) => r.label, validAccountLabel: (raw: string) => (raw.trim() && raw.trim().length <= 64 ? raw.trim() : null) }));
 import { AccountSwitcher } from "./AccountSwitcher";
 const record = { x: `0x${"11".repeat(32)}`, y: `0x${"22".repeat(32)}`, credentialId: "YQ", rpId: "localhost", createdAt: 1, label: "First", walletAddress: "0x1111111111111111111111111111111111111111" } as const;
 let container: HTMLDivElement;
@@ -50,4 +51,43 @@ it("cancellation during recovery leaves selection alone and never creates", asyn
 it("disables account actions while the funds dialog is open", async () => {
   await act(async () => root.render(<AccountSwitcher active={record} disabled />));
   expect([...container.querySelectorAll("button")].every((button) => button.disabled)).toBe(true);
+});
+async function type(input: HTMLInputElement, value: string) {
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+it("renames from an icon-only button without activating or creating an account", async () => {
+  api.rename.mockImplementation((r: object, label: string) => { api.records = [{ ...r, label }]; });
+  await click("Switch account");
+  const pencil = container.querySelector<HTMLButtonElement>('button[aria-label="Rename First"]')!;
+  expect(pencil.textContent).toBe("");
+  await act(async () => pencil.click());
+  const input = container.querySelector<HTMLInputElement>('input[aria-label="Account name"]')!;
+  expect(input.value).toBe("First");
+  await type(input, "Main wallet");
+  await act(async () => input.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  expect(api.rename).toHaveBeenCalledWith(record, "Main wallet");
+  expect(container.textContent).toContain("Main wallet · 0x1111");
+  expect(container.querySelector('input[aria-label="Account name"]')).toBeNull();
+  expect(api.activate).not.toHaveBeenCalled(); expect(api.create).not.toHaveBeenCalled();
+});
+it("keeps the editor open and shows the reason when a name is invalid or the save fails", async () => {
+  await click("Switch account");
+  await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Rename First"]')!.click());
+  const input = container.querySelector<HTMLInputElement>('input[aria-label="Account name"]')!;
+  await type(input, "   ");
+  await act(async () => input.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  expect(api.rename).not.toHaveBeenCalled(); expect(container.textContent).toContain("up to 64 characters");
+  api.rename.mockImplementationOnce(() => { throw new Error("storage blocked"); });
+  await type(input, "Ok");
+  await act(async () => input.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  expect(container.textContent).toContain("storage blocked");
+  expect(container.querySelector('input[aria-label="Account name"]')).not.toBeNull();
+});
+it("disables rename while the funds dialog is open", async () => {
+  await click("Switch account");
+  await act(async () => root.render(<AccountSwitcher active={record} disabled />));
+  expect(container.querySelector<HTMLButtonElement>('button[aria-label="Rename First"]')!.disabled).toBe(true);
 });

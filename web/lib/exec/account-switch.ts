@@ -43,6 +43,34 @@ export function rememberAccount(record: StoredPasskey, storage = localStorage): 
   }
   checkedWrite(storage, key(clean), JSON.stringify(clean));
 }
+/** Same rule the create form enforces; returns the trimmed name or null. */
+export function validAccountLabel(raw: string): string | null {
+  const label = raw.trim();
+  return label && label.length <= 64 && !/[\x00-\x1f\x7f]/u.test(label) ? label : null;
+}
+/**
+ * Renames only the saved directory entry. The active selection record is never
+ * rewritten here: an operation waiting for a signature keeps its guard and other
+ * tabs do not reload. The name reaches the active record on the next switch to it.
+ */
+export function renameAccount(record: StoredPasskey, raw: string, storage = localStorage): StoredPasskey {
+  const label = validAccountLabel(raw);
+  if (label === null) throw new Error("Enter an account name, up to 64 characters.");
+  rememberAccount(record, storage);
+  const saved = publicAccount(JSON.parse(storage.getItem(key(record)) ?? "null"));
+  if (!saved || !same(saved, record)) throw new Error("Saved account changed. Open the list again.");
+  const next = { ...saved, label };
+  checkedWrite(storage, key(next), JSON.stringify(next));
+  return next;
+}
+/** The saved directory name wins over the label frozen into the active record. */
+export function savedAccountLabel(record: StoredPasskey, storage = localStorage): string | undefined {
+  try {
+    const row = publicAccount(JSON.parse(storage.getItem(key(record)) ?? "null"));
+    if (row && same(row, record) && row.label !== undefined) return row.label;
+  } catch { /* unreadable hint falls back to the active record */ }
+  return record.label;
+}
 export function rememberedAccounts(storage = localStorage): StoredPasskey[] {
   const rows: StoredPasskey[] = [];
   for (let i = 0; i < storage.length; i++) {
