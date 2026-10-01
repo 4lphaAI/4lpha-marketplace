@@ -283,6 +283,8 @@ export default defineRailway(() => {
     },
     env: {
       ...plane,
+      // TermiX-owned job: keeps its own fee; the plane-wide FEE_BPS "0" (2026-10-01) does not apply here.
+      FEE_BPS: "100",
       QUANT_ENABLED: "true",
       QUANT_AGENT_ID: "cmts7ra5uhegyue01o61kdyo1",
       QUANT_STRATEGY_ID: "cmu3uiys20lh2v001fv68jbto",
