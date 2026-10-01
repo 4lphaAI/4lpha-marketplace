@@ -669,6 +669,21 @@ describe("resolveTradeConfig", () => {
     });
   });
 
+  it("FEE_BPS=0 keeps the treasury and charges nothing", () => {
+    const config = resolveTradeConfig(
+      { FEE_TREASURY_ADDRESS: TREASURY, FEE_BPS: "0" },
+      BOOT,
+    );
+    assert.equal(config.feeTreasury, TREASURY);
+    assert.equal(config.feeBps, 0);
+    assert.equal(config.feePolicy(FEE_CONTEXT), null);
+    assert.equal(config.feePolicy({ ...FEE_CONTEXT, side: "sell" }), null);
+    // FEE_BPS=0 without the treasury is still half a configuration.
+    assert.throws(() => resolveTradeConfig({ FEE_BPS: "0" }, BOOT), /must be set together/);
+    // A negative rate is still refused.
+    assert.throws(() => resolveTradeConfig({ FEE_TREASURY_ADDRESS: TREASURY, FEE_BPS: "-1" }, BOOT), /FEE_BPS/);
+  });
+
   it("refuses half a fee configuration", () => {
     assert.throws(
       () => resolveTradeConfig({ FEE_TREASURY_ADDRESS: TREASURY }, BOOT),

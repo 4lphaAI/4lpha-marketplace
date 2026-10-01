@@ -895,10 +895,16 @@ export function resolveTradeConfig(
     };
   }
 
-  const feeBps = readInt(env, "FEE_BPS", 0, 1, MAX_FEE_BPS);
+  // Operator ruling 2026-09-30: `FEE_BPS=0` is the deliberate fee-free setting. The treasury
+  // stays set (hire boot requires it and the session grant still allowlists it), but nothing
+  // is charged: a zero rate uses the no-fee policy, and every TradFi v2 path already treats
+  // a zero `feeBps` as no fee call.
+  const feeBps = readInt(env, "FEE_BPS", 0, 0, MAX_FEE_BPS);
   // Constructing the policy re-validates the rate; the duplication is deliberate
   // so the policy cannot be built unvalidated from anywhere else either.
-  const feePolicy = createBpsFeePolicy({ treasury: feeTreasury, bps: feeBps });
+  const feePolicy = feeBps === 0
+    ? createNoFeePolicy()
+    : createBpsFeePolicy({ treasury: feeTreasury, bps: feeBps });
 
   const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000);
   const buildTemplate = options.buildTemplate ?? tradeSessionSpec;
