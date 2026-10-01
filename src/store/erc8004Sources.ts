@@ -53,6 +53,12 @@ export class PostgresIdentitySources implements IdentitySources {
     return this.sql.transaction(async (tx) => {
       const result = await tx.query<SourceRow>(`/* erc8004.enrollRead */ select ${COLUMNS} from agents where id=$1 for update`, [id]);
       const row = result.rows[0]; if (!row) fail("not_found");
+      const table = await tx.query<{ name: string | null }>(`select to_regclass('trade_settings') as name`);
+      if (table.rows[0]?.name != null) {
+        const settings = await tx.query<{ params: unknown }>(`select params from trade_settings where agent_id=$1 and lower(owner_address)=lower($2)`, [id, row.owner_address]);
+        const params = decodeJsonb(settings.rows[0]?.params);
+        if (isObject(params) && params.executionModel === "tradfi") fail("ineligible");
+      }
       const source = fromRow(row);
       if (source.identity !== null || source.existingId !== null) fail("conflict");
       // Legacy inference needs explicit category and matching immutable runtime facts.

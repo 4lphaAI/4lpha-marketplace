@@ -31,7 +31,7 @@ import {
 import { createPgSqlClient, type SqlClient } from "./sql.js";
 import type { TradeSettingsRaw } from "../trade/settings.js";
 import type { SessionRevocationEvidenceV1 } from "../account/keyStoreReader.js";
-import { categoryForPreset, decodeIdentity, fail as identityFail, newIdentity, type StoredIdentity, type IdentityCategory, type IdentitySource, type Erc8004IdentitySummary, type IdentityFence } from "../identity/types.js";
+import { categoryForHire, decodeIdentity, fail as identityFail, newIdentity, type StoredIdentity, type IdentityCategory, type IdentitySource, type Erc8004IdentitySummary, type IdentityFence } from "../identity/types.js";
 import { IDENTITY_AGENT_MIGRATION, IDENTITY_AGENT_INDEX, projectionAllowed, sourceFromRecord } from "./erc8004Sources.js";
 
 /** Injectable clock; defaults to `Date.now`. */
@@ -1103,8 +1103,8 @@ export class MemoryAgentStore implements AgentStore {
       entry.record = structuredClone({
         ...entry.record,
         status: "armed",
-        erc8004Identity: entry.record.erc8004Identity ?? (entry.record.erc8004AgentId === null && categoryForPreset(entry.record.pendingGrant?.sizing.sizingPreset) !== null
-          ? newIdentity(categoryForPreset(entry.record.pendingGrant?.sizing.sizingPreset)!) : null),
+        erc8004Identity: entry.record.erc8004Identity ?? (entry.record.erc8004AgentId === null && categoryForHire(entry.record.pendingGrant?.sizing.sizingPreset, entry.record.pendingGrant?.initialTradeSettings?.params) !== null
+          ? newIdentity(categoryForHire(entry.record.pendingGrant?.sizing.sizingPreset, entry.record.pendingGrant?.initialTradeSettings?.params)!) : null),
         sessionFacts: structuredClone(input.sessionFacts),
         pendingGrant: null,
         rowVersion: entry.record.rowVersion + 1,
@@ -2212,7 +2212,7 @@ export class PostgresAgentStore implements AgentStore {
          returning id`,
         [input.agentId, owner, input.expectedRowVersion,
           input.expectedGrantDigest, encodeJsonbParam(input.sessionFacts), new Date(this.#now()),
-          categoryForPreset(current.pendingGrant?.sizing.sizingPreset) === null ? null : JSON.stringify(newIdentity(categoryForPreset(current.pendingGrant?.sizing.sizingPreset)!))],
+          categoryForHire(current.pendingGrant?.sizing.sizingPreset, current.pendingGrant?.initialTradeSettings?.params) === null ? null : JSON.stringify(newIdentity(categoryForHire(current.pendingGrant?.sizing.sizingPreset, current.pendingGrant?.initialTradeSettings?.params)!))],
       );
       return result.rows[0] === undefined
         ? { updated: false, failure: "state_changed" } as const

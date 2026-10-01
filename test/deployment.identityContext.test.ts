@@ -8,16 +8,19 @@ import { verifyRailwayDockerContext } from "../src/deployment/dockerContext.js";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const CLI = "scripts/erc8004-minter-migration.ts";
+const RESYNC_CLI = "scripts/erc8004-nonce-resync.ts";
 const run = promisify(execFile);
 
 test("deployment context includes the separate recovery CLI and every services-image COPY source", async () => {
   const context = await verifyRailwayDockerContext(ROOT);
   assert.ok(context.includes(CLI));
+  assert.ok(context.includes(RESYNC_CLI));
+  assert.ok(context.includes("src/identity/nonceResync.ts"));
   assert.ok(context.includes("scripts/erc8004-identity.ts"));
   for (const line of (await readFile(join(ROOT, "Dockerfile.services"), "utf8")).split(/\r?\n/).filter((line) => line.startsWith("COPY "))) {
     for (const source of line.split(/\s+/).slice(1, -1)) assert.ok(context.includes(source.replace(/\/$/, "")), source);
   }
-  assert.equal(context.some((path) => /(^|\/)(?:\.env[^/]*|test|\.agents|\.git)(?:\/|$)/.test(path)), false);
+  assert.equal(context.some((path) => /(^|\/)(?:\.env[^/]*|test|\.agents|\.git|MD here|state|memory)(?:\/|$)/.test(path)), false);
 });
 
 test("packaged recovery entry imports using only the closed context, without running DB/RPC work", async () => {
@@ -35,11 +38,12 @@ test("packaged recovery entry imports using only the closed context, without run
     const result = await run(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
       `import pg from 'pg'; pg.Pool = class { constructor() { throw new Error('Unexpected database access'); } };
        globalThis.fetch = () => { throw new Error('Unexpected network access'); };
-       await import('./${CLI}'); process.stdout.write('packaged-entry-ok');`],
+       await import('./${CLI}'); await import('./${RESYNC_CLI}'); process.stdout.write('packaged-entry-ok');`],
     { cwd: staged, windowsHide: true, timeout: 30_000, env: { SystemRoot: "C:\\Windows" } });
     assert.equal(result.stdout, "packaged-entry-ok"); assert.equal(result.stderr, "");
     for (const path of [".dockerignore", "Dockerfile"]) await copyFile(join(ROOT, path), join(staged, path));
     assert.ok((await verifyRailwayDockerContext(staged)).includes(CLI));
+    assert.ok((await verifyRailwayDockerContext(staged)).includes(RESYNC_CLI));
     const ignore = await readFile(join(staged, ".dockerignore"), "utf8");
     await writeFile(join(staged, ".dockerignore"), ignore.split(/\r?\n/).filter((line) => line !== `!${CLI}`).join("\n"));
     await assert.rejects(verifyRailwayDockerContext(staged), /closed allowlist/);

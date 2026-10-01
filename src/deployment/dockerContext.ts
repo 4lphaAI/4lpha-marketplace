@@ -14,6 +14,7 @@ const EXACT_SCRIPTS = Object.freeze([
   "scripts/erc8004-worker.ts",
   "scripts/erc8004-identity.ts",
   "scripts/erc8004-minter-migration.ts",
+  "scripts/erc8004-nonce-resync.ts",
 ]);
 
 const EXPECTED_DOCKERIGNORE = Object.freeze([
