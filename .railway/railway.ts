@@ -119,6 +119,12 @@ export default defineRailway(() => {
     VENUS_VBNB_ADDRESS: "0xA07c5b74C9B40447a954e1466938b865b6BBea36",
     VENUS_PRIME_ADDRESS: "0x059eaba8676b03e4e8f009efb7f587c28450f50f",
     LENDING_SWAP_FEE_TIER: "100",
+    // 2026-10-01: bsc-rpc.publicnode.com times out on every request from Railway
+    // egress (5/5 from inside execution-api; dataseed answers in ~400 ms), so the
+    // boot reads above (underlying, fee-tier pool) failed and execution-api never
+    // became healthy. `resolveLendingRpcUrls` puts this override first and keeps
+    // the SDK's publicnode as the fallback.
+    LENDING_RPC_URL: "https://bsc-dataseed.bnbchain.org",
   };
 
   const api = service("execution-api", {
