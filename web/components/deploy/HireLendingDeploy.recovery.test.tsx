@@ -340,7 +340,7 @@ describe("lending durable grant recovery", () => {
       { view: { ...provisioning(false), missing: ["account-key"] }, expectedButton: "Check hire status" },
       { view: { ...provisioning(false), missing: ["permissions-differ"] }, expectedButton: "Start a new hire" },
       { view: { ...provisioning(false), cancelRequested: true }, expectedButton: "Start a new hire", pointerCleared: true },
-      { view: { status: "retired" }, expectedButton: "Deploy Lending Agent", pointerCleared: true },
+      { view: { status: "retired" }, expectedButton: "Sign hire and create the session key", pointerCleared: true },
     ];
     for (const testCase of cases) {
       await act(async () => { root!.unmount(); });
@@ -374,7 +374,7 @@ describe("lending hire gates", () => {
   it("surfaces a plane wallet refusal after the hire signature without a wallet ceremony", async () => {
     provisionResponse = new Response(JSON.stringify({ error: { code: "wallet_in_use", message: "Remove the existing agent before deploying Lending Agent." } }), { status: 409 });
     await mount();
-    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
 
     const signedActions = mocks.signEnvelope.mock.calls.map(([action]) => action);
     expect(signedActions).toContain("provisionAgent");
@@ -397,7 +397,7 @@ describe("lending hire gates", () => {
    */
   it("starts with the hire signature without an owner list read", async () => {
     await mount();
-    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
 
     const listOrder = fetchMock.mock.calls
       .map((call, index) => ({ url: String(call[0]), order: fetchMock.mock.invocationCallOrder[index]! }))
@@ -417,14 +417,14 @@ describe("lending hire gates", () => {
 
   it("disables Deploy with the plane's refusal when the account is NOT guardable", async () => {
     await mount({ guarded: guarded({ view: guardableView(false) as unknown as GuardedAccountState["view"] }) });
-    expect(button("Deploy Lending Agent").disabled).toBe(true);
+    expect(button("Sign hire and create the session key").disabled).toBe(true);
     expect(host.textContent).toContain("owes nothing on Venus");
     expect(mocks.signEnvelope).not.toHaveBeenCalled();
   });
 
   it("disables Deploy until the irreversibility tick is ticked", async () => {
     await mount({ guarded: guarded({ confirmed: false }) });
-    expect(button("Deploy Lending Agent").disabled).toBe(true);
+    expect(button("Sign hire and create the session key").disabled).toBe(true);
     expect(host.textContent).toContain("I understand repayments to this address cannot be reversed");
   });
 
@@ -445,7 +445,7 @@ describe("lending hire gates", () => {
 describe("the S1 envelope", () => {
   it("signs the complete hire — receipt, settings, caps and pinned market — in one action", async () => {
     await mount();
-    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
     const call = mocks.signEnvelope.mock.calls.find(([action]) => action === "provisionAgent");
     expect(call, host.textContent ?? "").toBeDefined();
     const params = call?.[2] as Record<string, unknown>;
@@ -596,7 +596,7 @@ describe("lending arm browser boundary", () => {
 
   it("does not create a new hire whose max repay exceeds the preview grant cap", async () => {
     await mount({ maxRepayUsd: "240" });
-    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
     expect(host.textContent).toContain("proposed session cap of 48.4 USDT");
     expect(mocks.signEnvelope.mock.calls.map(([action]) => action)).not.toContain("provisionAgent");
   });
@@ -604,7 +604,7 @@ describe("lending arm browser boundary", () => {
   it("admits a new repay ceiling within the padded grant and discloses that same cap", async () => {
     await mount({ maxRepayUsd: "46" });
     expect(host.querySelector("[data-testid='lending-grant-cap']")?.textContent).toContain("48.4 USDT");
-    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
     const signed = mocks.signEnvelope.mock.calls.find(([action]) => action === "provisionAgent")?.[2] as Record<string, unknown>;
     expect(signed["reserveCapWei"]).toBe("48400000000000000000");
     expect(signed["capDayWei"]).toBe("90000000000000000");
@@ -773,7 +773,7 @@ describe("the arm signs the S1 values, across a reload", () => {
 
   it("persists the S1 values as part of the hire, and clears them with the pointer", async () => {
     await mount();
-    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
     const stored = JSON.parse(localStorage.getItem(`${LENDING_ARM_PARAMS_STORAGE_PREFIX}${ID}`) ?? "null") as Record<string, unknown>;
     const s1 = mocks.signEnvelope.mock.calls.find(([action]) => action === "provisionAgent")?.[2] as Record<string, unknown>;
     expect(stored, host.textContent ?? "").not.toBeNull();
@@ -1054,7 +1054,7 @@ async function runLendingLedger(scenario: {
     throw new Error(`Unexpected URL ${url}`);
   });
   await mount();
-  await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+  await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
   for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); });
   if (scenario.fundingWait) {
     await act(async () => { await vi.advanceTimersByTimeAsync(6_001); });
@@ -1153,7 +1153,7 @@ describe("HIRE-SIGNATURES-BC lending prompt ledger", () => {
       throw new Error(`Unexpected URL ${url}`);
     });
     await mount();
-    await act(async () => { button("Deploy Lending Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
     for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
     expect(posts).toBe(1);
     expect(lendingLedger()).toEqual(["provisionAgent", "createAccountReadSession", "lendingArm"]);

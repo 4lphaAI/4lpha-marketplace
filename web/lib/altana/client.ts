@@ -410,33 +410,50 @@ export async function closeLpPositionWithPasskey(input: {
   readonly amount1Min: bigint;
   readonly deadlineSec: bigint;
 }): Promise<WithdrawResult> {
+  return closeLpPositionsWithPasskey({ record: input.record, nfpm: input.nfpm, deadlineSec: input.deadlineSec,
+    positions: [{ tokenId: input.tokenId, liquidity: input.liquidity, amount0Min: input.amount0Min, amount1Min: input.amount1Min }] });
+}
+
+/**
+ * AUTO-DCA R2.11: {@link closeLpPositionWithPasskey} for up to three positions,
+ * `[decreaseLiquidity, collect(→ wallet)]` per position in ONE batch — one
+ * passkey prompt. The batch is all-or-nothing (REVIEW2 condition 16): one
+ * failing position reverts the others; the one-position form is the fallback.
+ */
+export async function closeLpPositionsWithPasskey(input: {
+  readonly record: StoredPasskey;
+  readonly nfpm: Address;
+  readonly positions: readonly { readonly tokenId: bigint; readonly liquidity: bigint; readonly amount0Min: bigint; readonly amount1Min: bigint }[];
+  readonly deadlineSec: bigint;
+}): Promise<WithdrawResult> {
   const walletAddress = input.record.walletAddress;
   if (!walletAddress) throw new Error("This passkey has no agent wallet yet.");
-  if (input.liquidity <= 0n) throw new Error("This position holds no liquidity.");
+  if (input.positions.length === 0 || input.positions.length > 3) throw new Error("Pull one to three positions at a time.");
+  if (input.positions.some((position) => position.liquidity <= 0n)) throw new Error("This position holds no liquidity.");
   const signer = selectedSigner(input.record);
-  const decrease = encodeFunctionData({
-    abi: [{ type: "function", name: "decreaseLiquidity", stateMutability: "payable", inputs: [{ name: "params", type: "tuple", components: [
-      { name: "tokenId", type: "uint256" }, { name: "liquidity", type: "uint128" },
-      { name: "amount0Min", type: "uint256" }, { name: "amount1Min", type: "uint256" },
-      { name: "deadline", type: "uint256" }] }], outputs: [{ name: "amount0", type: "uint256" }, { name: "amount1", type: "uint256" }] }],
-    functionName: "decreaseLiquidity",
-    args: [{ tokenId: input.tokenId, liquidity: input.liquidity, amount0Min: input.amount0Min, amount1Min: input.amount1Min, deadline: input.deadlineSec }],
-  });
-  const collect = encodeFunctionData({
-    abi: [{ type: "function", name: "collect", stateMutability: "payable", inputs: [{ name: "params", type: "tuple", components: [
-      { name: "tokenId", type: "uint256" }, { name: "recipient", type: "address" },
-      { name: "amount0Max", type: "uint128" }, { name: "amount1Max", type: "uint128" }] }], outputs: [{ name: "amount0", type: "uint256" }, { name: "amount1", type: "uint256" }] }],
-    functionName: "collect",
-    args: [{ tokenId: input.tokenId, recipient: walletAddress as `0x${string}`, amount0Max: UINT128_MAX, amount1Max: UINT128_MAX }],
+  const calls = input.positions.flatMap((position) => {
+    const decrease = encodeFunctionData({
+      abi: [{ type: "function", name: "decreaseLiquidity", stateMutability: "payable", inputs: [{ name: "params", type: "tuple", components: [
+        { name: "tokenId", type: "uint256" }, { name: "liquidity", type: "uint128" },
+        { name: "amount0Min", type: "uint256" }, { name: "amount1Min", type: "uint256" },
+        { name: "deadline", type: "uint256" }] }], outputs: [{ name: "amount0", type: "uint256" }, { name: "amount1", type: "uint256" }] }],
+      functionName: "decreaseLiquidity",
+      args: [{ tokenId: position.tokenId, liquidity: position.liquidity, amount0Min: position.amount0Min, amount1Min: position.amount1Min, deadline: input.deadlineSec }],
+    });
+    const collect = encodeFunctionData({
+      abi: [{ type: "function", name: "collect", stateMutability: "payable", inputs: [{ name: "params", type: "tuple", components: [
+        { name: "tokenId", type: "uint256" }, { name: "recipient", type: "address" },
+        { name: "amount0Max", type: "uint128" }, { name: "amount1Max", type: "uint128" }] }], outputs: [{ name: "amount0", type: "uint256" }, { name: "amount1", type: "uint256" }] }],
+      functionName: "collect",
+      args: [{ tokenId: position.tokenId, recipient: walletAddress as `0x${string}`, amount0Max: UINT128_MAX, amount1Max: UINT128_MAX }],
+    });
+    return [{ to: input.nfpm, value: 0n, data: decrease }, { to: input.nfpm, value: 0n, data: collect }];
   });
   const result = await createAltanaClient().execute({
     wallet: { address: walletAddress },
     signer,
     chainId: ALTANA_CHAIN_ID,
-    calls: [
-      { to: input.nfpm, value: 0n, data: decrease },
-      { to: input.nfpm, value: 0n, data: collect },
-    ],
+    calls,
   });
   return {
     status: result.status,

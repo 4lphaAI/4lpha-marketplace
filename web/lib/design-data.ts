@@ -81,11 +81,11 @@ export const AGENTS: Agent[] = [
   { id: "aegis-lp", name: "Aegis LP", categoryId: "lp", protocol: "PancakeSwap v3", tier: "registry", status: "paused", explainer: "compound",
     tagline: "Collects fees earns and adds them back into the same position.",
     metricValue: "+$180 vs -$40 IL", metricTone: "profit", hiredCount: 64, price: "1.0%", priceUnit: "performance fee" },
-  { id: "yield-router", name: "Sigma Trader", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["fourmeme", "flapsh", "bstocks"],
+  { id: "yield-router", name: "AI Stocks Trader", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks", "ondo"],
     tier: "verified", status: "live", explainer: "trade",
-    tagline: "Machine learning find Runner on Four.meme, Flap.sh & bStocks.",
+    tagline: "Screens tokenized US stocks and manages entries.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 289, price: "10%", priceUnit: "of profit",
-    pair: "BNB / USDT", dailyCap: "500 USDT",
+    pair: "NVDAB / USDT", dailyCap: "500 USDT",
     metrics: [
       { label: "30d PnL", value: "+14.2%", tone: "profit", note: "net of fees" },
       { label: "Trades / week", value: "48", note: "median 7 per day" },
@@ -93,25 +93,25 @@ export const AGENTS: Agent[] = [
       { label: "Fee", value: "10%", note: "of profit" },
     ],
     statusLine: "2 of 3 positions open · last entry 41m ago" },
-  { id: "vector-trader", name: "Vector Trader", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["fourmeme", "flapsh"],
-    tier: "verified", status: "live", explainer: "trade",
-    tagline: "Targets $10M–$1B markets with filters.",
+  { id: "vector-trader", name: "Tradfi Recurring Buy", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks"],
+    tier: "verified", status: "live", explainer: "schedule",
+    tagline: "Buys a fixed amount of one tokenized stock on a set frequency.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 156, price: "0 Fees", priceUnit: "this month" },
-  { id: "degen-trader", name: "Degen Trader", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["fourmeme", "flapsh"],
-    tier: "verified", status: "live", explainer: "trade",
-    tagline: "Hunts runners from Four.meme & Flap.sh.",
-    metricValue: "14.2%", metricTone: "profit", hiredCount: 89, price: "0 Fees", priceUnit: "this month" },
-  { id: "atlas-trader", name: "Atlas Trader", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks"],
-    tier: "verified", status: "live", explainer: "trade",
-    tagline: "Trades established $1B+ tokens and bStocks with filters.",
+  { id: "atlas-trader", name: "Auto DCA Agent", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks"],
+    tier: "verified", status: "live", explainer: "dca",
+    tagline: "Buys a fixed amount on a schedule, or on every dip.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 203, price: "0 Fees", priceUnit: "this month" },
+  { id: "smart-portfolio", name: "Smart Portfolio Agent", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks"],
+    tier: "verified", status: "live", explainer: "smart",
+    tagline: "Holds a weighted basket and rebalances back to target.",
+    metricValue: "14.2%", metricTone: "profit", hiredCount: 74, price: "0 Fees", priceUnit: "this month" },
   // MARKETPLACE-LENDING-AGENT §2.3: the mock's "37 positions saved", 1204
   // hires, "$8 per month" and "Repaying 240 USDT — health factor hit 1.18" were
   // design chrome with no source. Rescues saved are not tracked as a catalogue
   // metric, nobody has hired this yet (`LENDING_ENABLED` is off), and v1 charges
   // no fee — so the card says each of those instead of inventing a number.
   { id: "health-guard", name: "Health Guard", categoryId: "health", protocol: "Venus", tier: "verified", status: "live", explainer: "lending",
-    tagline: "Repays your Venus debt from a reserve before liquidation reaches you.",
+    tagline: "Repays your debt from a reserve before liquidation.",
     metricValue: "—", metricTone: "flat", metricLabel: "RESCUES (NOT TRACKED)", hiredCount: 0, price: "0 Fees", priceUnit: "this month" },
 ];
 

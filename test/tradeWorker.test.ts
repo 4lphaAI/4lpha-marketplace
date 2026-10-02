@@ -1,14 +1,25 @@
 import { featureFixture } from "./support/tradeFeatures.js";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getAddress, type Address, type Hex } from "viem";
+import { concatHex, encodeAbiParameters, encodeFunctionData, getAddress, keccak256, padHex, parseAbi,
+  stringToBytes, toHex, type Address, type Hex } from "viem";
+import { publicKeyToAddress } from "viem/accounts";
+import { accountKeyHashForAddress } from "../src/wallet/altana.js";
 import { validateSessionSpec } from "../src/core/session.js";
 import { MemoryAgentStore, type AgentRecord } from "../src/store/agents.js";
 import { MemoryTradePositionStore } from "../src/store/tradePositions.js";
 import { MemoryTradeSettingsStore } from "../src/store/tradeSettings.js";
 import { MemoryTradeIntentStore } from "../src/store/tradeIntents.js";
 import { MemoryExecutionJournal } from "../src/store/journal.js";
-import type { TradeDataPlaneReads, UniverseRow } from "../src/trade/dataPlaneReads.js";
+import { canonicalPreparedIntentIdentityV1, encodeLpFinalCallsV1, fingerprintLpFinalCallsV1,
+  PORTO_INTENT_SCHEME, PORTO_V055_DECODER, PORTO_V055_ORCHESTRATOR, PORTO_V055_VERSION } from "../src/lp/preparedIntent.js";
+import { INTENT_EXECUTED_TOPIC, PORTO_V055_INTENT_PARAMETERS } from "../src/lp/intentDecoder.js";
+import { verifyTradfiV2Receipt, type TradfiReceiptObservation } from "../src/trade/receipt.js";
+import { USDT_56 } from "../src/trade/settlement.js";
+import { hashCalls } from "../src/http/wire.js";
+import type { TradeUnknownReads } from "../src/trade/unknownResolve.js";
+import type { TradeDataPlaneReads, TokenBatchRow, UniverseRow, VenueRow } from "../src/trade/dataPlaneReads.js";
+import type { RwaFact } from "../src/trade/rwa.js";
 import type { TradeLlm } from "../src/trade/llm.js";
 import type { RouteQuoteReader } from "../src/trade/route.js";
 import { DEFAULT_TRADE_SETTINGS, tradeSettingsDigest, type TradeSettings } from "../src/trade/settings.js";
@@ -80,6 +91,8 @@ function quoteReader(quoteV2?: RouteQuoteReader["quoteV2"]): RouteQuoteReader {
     quoteV2: quoteV2 ?? (async (_path, amount) => amount * 2n),
     async quoteV3Single(_tokenIn, _tokenOut, _fee, amount) { return amount * 2n; },
     async quoteV3Path(_path, amount) { return amount * 2n; },
+    async quoteUniV3Single(_tokenIn, _tokenOut, _fee, amount) { return amount * 2n; },
+    async quoteUniV3Path(_path, amount) { return amount * 2n; },
   };
 }
 
@@ -100,6 +113,14 @@ function routeReaderExcept(blocked: Address): RouteQuoteReader {
       if (isBlocked(pathToken(path))) throw new Error("no route");
       return amount * 2n;
     },
+    async quoteUniV3Single(_tokenIn, tokenOut, _fee, amount) {
+      if (isBlocked(tokenOut)) throw new Error("no route");
+      return amount * 2n;
+    },
+    async quoteUniV3Path(path, amount) {
+      if (isBlocked(pathToken(path))) throw new Error("no route");
+      return amount * 2n;
+    },
   };
 }
 
@@ -108,6 +129,8 @@ function unavailableRouteReader(): RouteQuoteReader {
     async quoteV2() { throw new Error("no route"); },
     async quoteV3Single() { throw new Error("no route"); },
     async quoteV3Path() { throw new Error("no route"); },
+    async quoteUniV3Single() { throw new Error("no route"); },
+    async quoteUniV3Path() { throw new Error("no route"); },
   };
 }
 
@@ -323,6 +346,8 @@ describe("trade worker cycle", () => {
       async quoteV2() { throw new Error("no route"); },
       async quoteV3Single() { throw new Error("no route"); },
       async quoteV3Path() { throw new Error("no route"); },
+      async quoteUniV3Single() { throw new Error("no route"); },
+      async quoteUniV3Path() { throw new Error("no route"); },
     };
     const h = await harness({ settings: settings({ maxOpenPositions: 1 }), routeReader: unavailable });
     await openPosition(h, address(906), "unquotable");
@@ -406,17 +431,17 @@ describe("trade worker cycle", () => {
   it("filters an excluded legacy-grant target before the entry LLM", async () => {
     const usdt = getAddress("0x55d398326f99059fF775485246999027B3197955");
     const base = dataPlane(5);
-    const validRows = await base.universe("meme");
+    const validRows = await base.universe("meme") ?? [];
     const rows: UniverseRow[] = [{ address: usdt, symbol: "USDT", lane: "meme", source: "fixture" }, ...validRows];
     const byAddress = new Map(rows.map((row) => [row.address.toLowerCase(), row]));
     const reads: TradeDataPlaneReads = {
       ...base,
       async universe(lane) { return lane === "meme" ? rows : []; },
-      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => ({
-        address,
-        symbol: byAddress.get(address.toLowerCase())?.symbol,
-        priceUsd: 1, marketCapUsd: 1_000, volume24hUsd: 1, holders: 1, priceChange24hPct: 1,
-      })); },
+      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => {
+        const symbol = byAddress.get(address.toLowerCase())?.symbol;
+        return { address, ...(symbol === undefined ? {} : { symbol }),
+          priceUsd: 1, marketCapUsd: 1_000, volume24hUsd: 1, holders: 1, priceChange24hPct: 1 };
+      }); },
       async eligibilityBatch(addresses) { return addresses.map((address) => ({
         address, eligible: true, reason: "allowlist", source: "allowlist" as const, venue: null,
       })); },
@@ -527,6 +552,16 @@ describe("trade worker cycle", () => {
         if (quoteCalls > 48) throw new Error("route disappeared");
         return amount * 2n;
       },
+      async quoteUniV3Single(_tokenIn, _tokenOut, _fee, amount) {
+        quoteCalls += 1;
+        if (quoteCalls > 48) throw new Error("route disappeared");
+        return amount * 2n;
+      },
+      async quoteUniV3Path(_path, amount) {
+        quoteCalls += 1;
+        if (quoteCalls > 48) throw new Error("route disappeared");
+        return amount * 2n;
+      },
     };
     const counter = { calls: 0 };
     const h = await harness({ llmCounter: counter, routeReader: expiring });
@@ -572,7 +607,7 @@ describe("trade worker cycle", () => {
     assert.match(run?.reason ?? "", /^agent-error:.*abort/u);
   });
 
-  it("uses at most 18 data-plane reads for a Sigma cycle", async () => {
+  it("uses at most 24 data-plane reads for a Sigma cycle", async () => {
     let reads = 0;
     const base = dataPlane(25);
     const counted: TradeDataPlaneReads = {
@@ -584,7 +619,7 @@ describe("trade worker cycle", () => {
     const h = await harness({ reads: counted });
     const before = reads;
     await runTradeWorkerOnce(h.deps);
-    assert.ok(reads - before <= 18, `worker used ${reads - before} data-plane reads`);
+    assert.ok(reads - before <= 24, `worker used ${reads - before} data-plane reads`);
   });
 
   it("persists a committed buy before any later balance read", async () => {
@@ -622,7 +657,7 @@ describe("trade worker cycle", () => {
     const token = address(100);
     await h.intents.create({
       decisionId: "lost-response", idempotencyKey: HASH2, agentId: "agent-a", ownerAddress: OWNER,
-      side: "buy", token, route: { hops: [], fees: [] }, amountWei: 100n, entryWei: 107n,
+      side: "buy", token, route: { hops: [], fees: [3000] }, venue: "uniswap_v3", amountWei: 100n, entryWei: 107n,
       positionId: "lost-response", closeReason: null,
     });
     await h.journal.begin({ idempotencyKey: HASH2, agentId: "agent-a", ownerAddress: OWNER,
@@ -634,6 +669,7 @@ describe("trade worker cycle", () => {
     const projected = await h.positions.get(OWNER, "agent-a", "lost-response");
     assert.equal(projected?.entryWei, 107n);
     assert.equal(projected?.entryTxHash, HASH2);
+    assert.equal(projected?.venue, "uniswap_v3");
     assert.equal((await h.intents.listUnsettled(OWNER, "agent-a")).length, 0);
   });
 
@@ -724,7 +760,10 @@ describe("trade worker cycle", () => {
     assert.notEqual(opened?.entryWei, 0n);
     balance = 321n;
     await runTradeWorkerOnce(h.deps);
-    assert.equal((await h.positions.get(OWNER, "agent-a", opened?.positionId ?? ""))?.fillStatus, "verified");
+    const recovered = await h.positions.get(OWNER, "agent-a", opened?.positionId ?? "");
+    assert.equal(recovered?.fillStatus, "verified");
+    assert.equal(recovered?.verifiedEntryAtomic ?? null, null);
+    assert.equal(recovered?.receiptOwnershipKey ?? null, null);
   });
 
   it("closes a verified zero-balance row as balance-gone and surfaces the reason", async () => {
@@ -754,6 +793,239 @@ describe("trade worker cycle", () => {
   });
 });
 
+describe("staged trade UNKNOWN worker pre-pass", () => {
+  const KEY = `0x${"66".repeat(32)}` as Hex;
+  const BLOCK_HASH = `0x${"77".repeat(32)}` as Hex;
+  const EXECUTE = parseAbi(["function execute(bytes encodedIntent) payable returns (bytes4 err)"]);
+  const calls = [{ to: address(100), data: "0x1234" as Hex }];
+  const fp = fingerprintLpFinalCallsV1(calls);
+
+  async function setup(mode: "landed" | "superseded" | "hold" | "absent" | "lost-cas") {
+    const h = await harness({ settings: settings({ maxOpenPositions: 1 }) });
+    await h.intents.create({ decisionId: "unknown", idempotencyKey: HASH2, agentId: "agent-a", ownerAddress: OWNER,
+      side: "buy", token: address(100), route: { hops: [], fees: [] }, amountWei: 100n, entryWei: 107n,
+      positionId: "unknown", closeReason: null });
+    await h.journal.begin({ idempotencyKey: HASH2, agentId: "agent-a", ownerAddress: OWNER,
+      kind: "trade", decisionId: "unknown", finalCallsFingerprint: fp.canonical, finalCallsFingerprintHash: fp.hash });
+    const identity = canonicalPreparedIntentIdentityV1({ scheme: PORTO_INTENT_SCHEME,
+      decoder: PORTO_V055_DECODER, chainId: "56", eoa: WALLET.toLowerCase() as Address,
+      orchestrator: PORTO_V055_ORCHESTRATOR, orchestratorVersion: PORTO_V055_VERSION,
+      nonce: "9", expiry: "0", executionDataHash: fp.value.executionDataHash, keyHash: KEY });
+    await h.journal.bindPreparedIntent(HASH2, { canonicalIdentity: identity.canonical, identityHash: identity.hash,
+      expectedBindingVersion: 0 });
+    await h.journal.markUnknown(HASH2, "ambiguous");
+    const encoded = encodeAbiParameters(PORTO_V055_INTENT_PARAMETERS, [{ eoa: WALLET,
+      executionData: mode === "superseded" ? "0x1234" : encodeLpFinalCallsV1(calls), nonce: 9n,
+      payer: WALLET, paymentToken: address(100), paymentMaxAmount: 1n, combinedGas: 1n,
+      encodedPreCalls: [], encodedFundTransfers: [], settler: OWNER, expiry: 0n,
+      isMultichain: false, funder: address(0), funderSignature: "0x", settlerContext: "0x",
+      paymentAmount: 0n, paymentRecipient: OWNER,
+      signature: concatHex([`0x${"11".repeat(65)}` as Hex, KEY, "0x00"]),
+      paymentSignature: "0x", supportedAccountImplementation: OWNER }]);
+    const obs = { chainId: 56 as const,
+      transaction: { hash: HASH2, to: PORTO_V055_ORCHESTRATOR,
+        input: encodeFunctionData({ abi: EXECUTE, functionName: "execute", args: [encoded] }),
+        blockNumber: 1_001n, blockHash: BLOCK_HASH, transactionIndex: 0n },
+      receipt: { status: 1n, transactionHash: HASH2, blockNumber: 1_001n, blockHash: BLOCK_HASH,
+        transactionIndex: 0n, logs: [{ address: PORTO_V055_ORCHESTRATOR,
+          topics: [INTENT_EXECUTED_TOPIC, padHex(WALLET, { size: 32 }), toHex(9n, { size: 32 })],
+          data: encodeAbiParameters([{ type: "bool" }, { type: "bytes4" }], [true, "0x00000000"]), logIndex: 0n }] },
+      receiptBlock: { number: 1_001n, hash: BLOCK_HASH }, finalizedBlock: { number: 1_100n, hash: BLOCK_HASH } };
+    const unknownReads: TradeUnknownReads = {
+      async finalizedBlock() { return { number: 1_100n, hash: BLOCK_HASH }; },
+      async accountNonce() { return 10n; },
+      async blockAtOrBefore() { return 1_000n; },
+      async intentExecutedTxHashes() { return mode === "hold" ? [] : [HASH2]; },
+      async readFinalized() { return obs; },
+    };
+    const now = (h.deps.now?.() ?? 0) + 300_000;
+    return { h, deps: { ...h.deps, unknownReads: mode === "absent" ? undefined : unknownReads,
+      now: () => now, readiness: { ...h.deps.readiness, ready: false } } as TradeWorkerDeps };
+  }
+
+  it("R12 landed advances with its hash and projects in the same cycle", async () => {
+    const { h, deps } = await setup("landed");
+    await runTradeWorkerOnce(deps);
+    assert.equal((await h.journal.get(HASH2))?.state, "COMMITTED");
+    assert.equal((await h.journal.get(HASH2))?.externalRef.txHash, HASH2);
+    assert.equal((await h.positions.get(OWNER, "agent-a", "unknown"))?.entryTxHash, HASH2);
+  });
+
+  it("R12 superseded resolves without a trade tx hash and releases the intent", async () => {
+    const { h, deps } = await setup("superseded");
+    await runTradeWorkerOnce(deps);
+    const row = await h.journal.get(HASH2);
+    assert.equal(row?.state, "ROLLED_BACK");
+    assert.equal(row?.externalRef.txHash, undefined);
+    assert.equal((await h.intents.listUnsettled(OWNER, "agent-a")).length, 0);
+  });
+
+  it("R12 hold and absent reads write no resolution run row", async () => {
+    for (const mode of ["hold", "absent"] as const) {
+      const { h, deps } = await setup(mode);
+      await runTradeWorkerOnce(deps);
+      assert.equal((await h.journal.get(HASH2))?.state, "UNKNOWN");
+      assert.equal((await h.positions.listRuns(OWNER, "agent-a", 100)).filter((run) => run.reason === "ambiguous-trade-resolved").length, 0);
+    }
+  });
+
+  it("R13 a lost journal CAS is swallowed without a resolution run row", async () => {
+    const { h, deps } = await setup("lost-cas");
+    const journal = new Proxy(h.journal, { get(target, property) {
+      if (property === "advanceUnknown") return async (...args: Parameters<typeof h.journal.advanceUnknown>) => {
+        await target.advanceUnknown(...args);
+        return target.advanceUnknown(...args);
+      };
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    await runTradeWorkerOnce({ ...deps, journal });
+    assert.equal((await h.journal.get(HASH2))?.state, "COMMITTED");
+    assert.equal((await h.positions.listRuns(OWNER, "agent-a", 100)).filter((run) => run.reason === "ambiguous-trade-resolved").length, 0);
+  });
+
+  it("R2.4 projected v2 sell adopts verified proceeds after balance-gone closed it", async () => {
+    const h = await harness({ settings: settings({ maxOpenPositions: 1 }) });
+    const token = address(100);
+    await openPosition(h, token, "gone-v2");
+    await h.positions.closePosition({ ownerAddress: OWNER, agentId: "agent-a", positionId: "gone-v2",
+      exitWei: 0n, reason: "balance-gone", exitFillStatus: "unverified" });
+    await h.intents.create({ decisionId: "gone-v2", idempotencyKey: HASH2, agentId: "agent-a", ownerAddress: OWNER,
+      side: "sell", token, route: { hops: [], fees: [] }, amountWei: 10n, positionId: "gone-v2",
+      entryWei: 0n, closeReason: null, settlementAsset: "USDT" });
+    await h.intents.markProjected(OWNER, "agent-a", "gone-v2");
+    await h.journal.begin({ idempotencyKey: HASH2, agentId: "agent-a", ownerAddress: OWNER,
+      kind: "trade", decisionId: "gone-v2" });
+    await h.journal.markCommitted(HASH2, { txHash: HASH2 });
+    const ownership = `56|${HASH2}|${token}|1|${HASH}`;
+    await runTradeWorkerOnce({ ...h.deps, readiness: { ...h.deps.readiness, ready: false },
+      recoverFill: async () => ({ side: "sell", exitWei: 12n, fillStatus: "verified", receiptOwnershipKey: ownership }) });
+    const row = await h.positions.get(OWNER, "agent-a", "gone-v2");
+    assert.equal(row?.exitWei, 12n);
+    assert.equal(row?.exitFillStatus, "verified");
+    assert.equal(row?.exitReceiptOwnershipKey, ownership.toLowerCase());
+  });
+
+  it("R4.4 contaminated other-wallet buy and sell retain no receipt-attributed accounting", async () => {
+    let balance = 100n;
+    let balanceReads = 0;
+    const h = await harness({ settings: settings({ maxOpenPositions: 1, takeProfitBps: null,
+      stopLossBps: null, maxHoldSec: null }),
+      tokenBalance: async () => { balanceReads += 1; return balance; },
+      llm: { async complete() { return { model: "fixture", content: JSON.stringify({
+        decisions: [{ index: 0, exit: false, reason: "hold" }] }) }; } } });
+    const publicKey = "0x0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8" as Hex;
+    await h.agents.updateAgentSessionFacts(OWNER, "agent-a", { ...h.created[0]!.sessionFacts!, publicKey });
+    const token = address(100);
+    const pair = address(500);
+    await h.positions.open({ positionId: "contaminated-sell", agentId: "agent-a", ownerAddress: OWNER,
+      token, route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: null,
+      fillStatus: "unverified", openedAt: h.deps.now?.() ?? Date.now(), settlementAsset: "USDT",
+      requestedEntryAtomic: 100n, verifiedEntryAtomic: null });
+    await runTradeWorkerOnce(h.deps);
+    const quantity = await h.positions.get(OWNER, "agent-a", "contaminated-sell");
+    assert.equal(quantity?.fillStatus, "verified");
+    assert.equal(quantity?.tokenAmount, 100n);
+    assert.equal(quantity?.verifiedEntryAtomic, null);
+    assert.equal(quantity?.receiptOwnershipKey ?? null, null);
+    balance = 0n;
+    await runTradeWorkerOnce(h.deps);
+    assert.equal((await h.positions.get(OWNER, "agent-a", "contaminated-sell"))?.closeReason, "balance-gone");
+    const keyHash = accountKeyHashForAddress(publicKeyToAddress(publicKey));
+    const calls = [{ to: pair, value: 0n, data: "0x12345678" as Hex }];
+    const member = (wallet: Address, nonce: bigint) => encodeAbiParameters(PORTO_V055_INTENT_PARAMETERS, [{
+      eoa: wallet, executionData: encodeLpFinalCallsV1(calls), nonce, payer: address(0),
+      paymentToken: address(0), paymentMaxAmount: 0n, combinedGas: 0n,
+      encodedPreCalls: [], encodedFundTransfers: [], settler: address(0), expiry: 0n,
+      isMultichain: false, funder: address(0), funderSignature: "0x", settlerContext: "0x",
+      paymentAmount: 0n, paymentRecipient: address(0),
+      signature: concatHex([`0x${"11".repeat(65)}` as Hex, keyHash, "0x00"]),
+      paymentSignature: "0x", supportedAccountImplementation: address(0),
+    }] as const);
+    const other = address(600);
+    const blockHash = `0x${"77".repeat(32)}` as Hex;
+    const transferTopic = keccak256(stringToBytes("Transfer(address,address,uint256)"));
+    const transfer = (asset: Address, from: Address, to: Address, value: bigint, logIndex: bigint) => ({
+      address: asset, topics: [transferTopic, padHex(from, { size: 32 }), padHex(to, { size: 32 })],
+      data: toHex(value, { size: 32 }), logIndex });
+    const event = (wallet: Address, nonce: bigint, logIndex: bigint) => ({ address: PORTO_V055_ORCHESTRATOR,
+      topics: [INTENT_EXECUTED_TOPIC, padHex(wallet, { size: 32 }), toHex(nonce, { size: 32 })],
+      data: encodeAbiParameters([{ type: "bool" }, { type: "bytes4" }], [true, "0x00000000"]), logIndex });
+    const logs = [event(WALLET, 7n, 1n), event(other, 8n, 2n),
+      transfer(token, WALLET, pair, 100n, 3n), transfer(USDT_56, pair, WALLET, 90n, 4n)];
+    const transaction = { hash: HASH2, to: PORTO_V055_ORCHESTRATOR,
+      input: encodeFunctionData({ abi: parseAbi(["function execute(bytes[] encodedIntents) payable returns (bytes4[] errs)"]),
+        functionName: "execute", args: [[member(WALLET, 7n), member(other, 8n)]] }),
+      blockNumber: 100n, blockHash, transactionIndex: 0n };
+    const observed = (receiptLogs: typeof logs): TradfiReceiptObservation => ({ chainId: 56,
+      transaction, receipt: { status: 1n, transactionHash: HASH2, blockNumber: 100n, blockHash,
+        transactionIndex: 0n, logs: receiptLogs }, receiptBlock: { number: 100n, hash: blockHash },
+      finalizedBlock: { number: 110n, hash: HASH } });
+    const expected = { wallet: WALLET, sessionPublicKey: publicKey, sessionGeneration: 0,
+      callsHash: hashCalls(calls), calls, side: "sell" as const, token, amountInAtomic: 100n,
+      minOutAtomic: 80n, directRoute: { kind: "v2" as const, router: pair, pools: [pair],
+        blockNumber: 100n, blockHash } };
+    const clean = verifyTradfiV2Receipt({ observation: observed(logs), expected });
+    assert.equal(clean.ok, true, clean.ok ? "" : clean.code);
+    const contaminated = observed([...logs, transfer(USDT_56, other, WALLET, 1n, 5n)]);
+    assert.equal(verifyTradfiV2Receipt({ observation: contaminated, expected }).ok, false);
+    await h.intents.create({ decisionId: "contaminated-sell", idempotencyKey: HASH2, agentId: "agent-a",
+      ownerAddress: OWNER, side: "sell", token, route: { hops: [], fees: [] }, amountWei: 100n,
+      entryWei: 0n, positionId: "contaminated-sell", closeReason: null, settlementAsset: "USDT" });
+    await h.journal.begin({ idempotencyKey: HASH2, agentId: "agent-a", ownerAddress: OWNER,
+      kind: "trade", decisionId: "contaminated-sell" });
+    await h.journal.markCommitted(HASH2, { txHash: HASH2 });
+    let recoveries = 0;
+    const deps: TradeWorkerDeps = { ...h.deps, readiness: { ...h.deps.readiness, ready: false },
+      async recoverFill() {
+        recoveries += 1;
+        assert.equal(verifyTradfiV2Receipt({ observation: contaminated, expected }).ok, false);
+        return { side: "sell", exitWei: null, fillStatus: "unverified" };
+      } };
+    await runTradeWorkerOnce(deps);
+    await runTradeWorkerOnce(deps);
+    const exited = await h.positions.get(OWNER, "agent-a", "contaminated-sell");
+    assert.ok(balanceReads > 0);
+    assert.ok(recoveries >= 2);
+    assert.equal(exited?.exitWei, 0n);
+    assert.equal(exited?.exitFillStatus, "unverified");
+    assert.equal(exited?.exitReceiptOwnershipKey ?? null, null);
+
+    const buyLogs = [event(WALLET, 7n, 1n), event(other, 8n, 2n),
+      transfer(USDT_56, WALLET, pair, 100n, 3n), transfer(token, pair, WALLET, 90n, 4n)];
+    const buyExpected = { ...expected, side: "buy" as const };
+    const buyObserved = (receiptLogs: typeof buyLogs): TradfiReceiptObservation => {
+      const base = observed(receiptLogs);
+      return { ...base, transaction: { ...base.transaction, hash: HASH },
+        receipt: { ...base.receipt, transactionHash: HASH } };
+    };
+    assert.equal(verifyTradfiV2Receipt({ observation: buyObserved(buyLogs), expected: buyExpected }).ok, true);
+    const contaminatedBuy = buyObserved([...buyLogs, transfer(USDT_56, other, WALLET, 1n, 5n)]);
+    assert.equal(verifyTradfiV2Receipt({ observation: contaminatedBuy, expected: buyExpected }).ok, false);
+    await h.intents.create({ decisionId: "contaminated-buy", idempotencyKey: HASH, agentId: "agent-a",
+      ownerAddress: OWNER, side: "buy", token, route: { hops: [], fees: [] }, amountWei: 100n,
+      entryWei: 107n, positionId: "contaminated-buy", closeReason: null, settlementAsset: "USDT" });
+    await h.journal.begin({ idempotencyKey: HASH, agentId: "agent-a", ownerAddress: OWNER,
+      kind: "trade", decisionId: "contaminated-buy" });
+    await h.journal.markCommitted(HASH, { txHash: HASH });
+    const buyDeps: TradeWorkerDeps = { ...h.deps, readiness: { ...h.deps.readiness, ready: false },
+      async recoverFill(intent) {
+        if (intent.side === "sell") return { side: "sell", exitWei: null, fillStatus: "unverified" };
+        assert.equal(verifyTradfiV2Receipt({ observation: contaminatedBuy, expected: buyExpected }).ok, false);
+        return { side: "buy", entryWei: 107n, tokenAmount: null, fillStatus: "unverified", receiptAttributable: false };
+      } };
+    await runTradeWorkerOnce(buyDeps);
+    assert.equal((await h.positions.get(OWNER, "agent-a", "contaminated-buy"))?.fillStatus, "unverified");
+    balance = 90n;
+    await runTradeWorkerOnce({ ...buyDeps, readiness: h.deps.readiness });
+    const recoveredBuy = await h.positions.get(OWNER, "agent-a", "contaminated-buy");
+    assert.equal(recoveredBuy?.fillStatus, "verified");
+    assert.equal(recoveredBuy?.tokenAmount, 90n);
+    assert.equal(recoveredBuy?.verifiedEntryAtomic, null);
+    assert.equal(recoveredBuy?.receiptOwnershipKey ?? null, null);
+  });
+});
+
 describe("TRADING-AGENT primary/fallback model (operator 2026-09-03)", () => {
   it("asks the primary, and the distinct fallback only when the primary throws", async () => {
     const asked: string[] = [];
@@ -775,7 +1047,7 @@ describe("TRADING-AGENT primary/fallback model (operator 2026-09-03)", () => {
     assert.deepEqual(asked, ["glm-5.3-flash", "0gm-1.0-35b-a3b"]);
   });
 
-  it("runs the daemon override in both roles (2026-09-16): the primary slot, then the fallback slot — never the owner's choice", async () => {
+  it("the owner's signed model choice wins over the daemon override (2026-09-20): primary, then the owner's fallback", async () => {
     const asked: string[] = [];
     const answer = { content: JSON.stringify({ decisions: [] }), model: "x" };
     const h = await harness({
@@ -787,14 +1059,15 @@ describe("TRADING-AGENT primary/fallback model (operator 2026-09-03)", () => {
       llmFor: (modelId: string): TradeLlm => ({
         async complete() {
           asked.push(modelId);
-          if (modelId === "qwen3.7-flash") throw new Error("router down");
+          if (modelId === "glm-5.3-flash") throw new Error("router down");
           return answer;
         },
       }),
     };
     await runTradeWorkerOnce(deps, {});
-    assert.deepEqual(asked, ["qwen3.7-flash", "0gm-1.0-35b-a3b"]);
+    assert.deepEqual(asked, ["glm-5.3-flash", "qwen3-vl-30b"]);
   });
+
 });
 
 it("records ordered, sanitized model and execution observations without changing the trade", async () => {
@@ -986,6 +1259,173 @@ describe("trade worker gas cache across a shared wallet (review 3/4)", () => {
       reads.some((value) => value < reads[0]!),
       `every read returned the pre-spend figure ${reads[0]}: the cache was not invalidated`,
     );
+  });
+});
+
+describe("TradFi worker RWA snapshot and venue routing", () => {
+  const NOW = Date.now();
+  const TOKEN = address(950);
+  const WBNB = getAddress("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c");
+  const UNI_ROUTER = getAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+  it("reads both RWA lanes once, screens the computed fact, and persists the winning venue", async () => {
+    const venue: VenueRow = { dex: "uniswap", version: "v3", pool: address(951), feeTier: 3000, quote: WBNB,
+      quoteSymbol: "WBNB", priceUsd: 100, liquidityUsd: 100_000, volume24hUsd: 1, asOf: NOW };
+    const fact: RwaFact = { platform: "bstock", underlyingTicker: "NVDA", tokenPriceUsd: 100,
+      referencePriceUsd: 100, premiumBps: 999, openState: true, marketStatus: null, reasonCode: "TRADING",
+      staleness: "fresh", tokenToShareRatio: 1, onchainPriceUsd: 100, venues: [venue] };
+    const bstock: UniverseRow = { address: TOKEN, symbol: "NVDAB", lane: "bstocks", source: "fixture", rwa: fact, venues: [venue] };
+    const meme = { ...bstock, lane: "meme" as const };
+    let laneReads = 0;
+    const reads: TradeDataPlaneReads = {
+      async universe(lane) {
+        if (lane === "meme") return [meme];
+        if (lane === "bstocks") { laneReads += 1; return [bstock]; }
+        if (lane === "ondo") { laneReads += 1; return []; }
+        return [];
+      },
+      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => ({ address, symbol: "NVDAB",
+        priceUsd: 100, marketCapUsd: null, volume24hUsd: 1, holders: 1, priceChange24hPct: 0 })); },
+      async eligibilityBatch(addresses) { return addresses.map((address) => ({ address, eligible: true, reason: "binance_rwa",
+        source: "binance-rwa" as const, venue: null })); },
+      async security() { return { riskLevel: "ok", flags: [] }; },
+    };
+    const routeReader = quoteReader(async (path, amount) => path[0] === WBNB ? amount : amount);
+    routeReader.quoteUniV3Single = async (_in, _out, fee, amount) => fee === 3000 ? amount * 3n : amount;
+    routeReader.quoteUniV3Path = async (_path, amount) => amount * 2n;
+    const executed: string[] = [];
+    const h = await harness({
+      now: NOW,
+      settings: settings({ executionModel: "tradfi", entryWei: "20000000000000000", noReentry: false }),
+      reads,
+      bstocks: new Set([TOKEN.toLowerCase()]),
+      routeReader,
+      executor: { async execute(input) {
+        executed.push(input.request.venue);
+        return { kind: "committed", receipt: { status: "CONFIRMED", transactionHash: HASH },
+          fill: { side: "buy", entryWei: input.request.amountWei, tokenAmount: input.request.quotedOutWei, fillStatus: "verified" }, meta: {} };
+      } },
+    });
+    const agent = await h.agents.getAgentById("agent-a");
+    assert.ok(agent?.sessionFacts);
+    await h.agents.updateAgentSessionFacts(OWNER, "agent-a", {
+      ...agent.sessionFacts,
+      spec: { ...agent.sessionFacts.spec, allowedCalls: [
+        ...agent.sessionFacts.spec.allowedCalls,
+        { to: UNI_ROUTER, selector: "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))" },
+        { to: UNI_ROUTER, selector: "exactInput((bytes,address,uint256,uint256))" },
+        { to: UNI_ROUTER, selector: "unwrapWETH9(uint256,address)" },
+        { to: UNI_ROUTER, selector: "refundETH()" },
+      ] },
+    });
+    const report = await runTradeWorkerOnce({ ...h.deps, uniswapRouter: UNI_ROUTER });
+    assert.equal(report.outcomes[0]?.reason, "entered");
+    assert.deepEqual(executed, ["uniswap_v3"]);
+    assert.equal((await h.positions.listOpen(OWNER, "agent-a"))[0]?.venue, "uniswap_v3");
+    assert.equal(laneReads, 2);
+  });
+
+  it("AUDIT A1: a successful static-only lane read (rows without facts) refuses every member as rwa-unavailable", async () => {
+    const staticRow: UniverseRow = { address: TOKEN, symbol: "NVDAB", lane: "bstocks", source: "static", marketHours: "us-equities" };
+    const reads: TradeDataPlaneReads = {
+      async universe(lane) {
+        if (lane === "bstocks") return [staticRow];
+        if (lane === "ondo") return [];
+        return [{ ...staticRow, lane: "meme" as const }];
+      },
+      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => ({ address, symbol: "NVDAB",
+        priceUsd: 100, marketCapUsd: 5e9, volume24hUsd: 1, holders: 1, priceChange24hPct: 0 })); },
+      async eligibilityBatch(addresses) { return addresses.map((address) => ({ address, eligible: true, reason: "allowlist",
+        source: "allowlist" as const, venue: null })); },
+      async security() { return { riskLevel: "ok", flags: [] }; },
+    };
+    const executed: string[] = [];
+    const h = await harness({
+      now: NOW,
+      settings: settings({ executionModel: "sigma", noReentry: false }),
+      reads,
+      bstocks: new Set([TOKEN.toLowerCase()]),
+      routeReader: quoteReader(async (_path, amount) => amount),
+      executor: { async execute(input) { executed.push(input.request.venue); throw new Error("must not execute"); } },
+    });
+    const report = await runTradeWorkerOnce(h.deps);
+    const events = (report.outcomes[0] as unknown as { readonly events?: readonly { readonly code: string; readonly token?: Address }[] })?.events ?? [];
+    assert.equal(executed.length, 0);
+    assert.equal(events.some((event) => event.code === "rwa-unavailable" && event.token === TOKEN), true,
+      `expected an rwa-unavailable refusal, got ${JSON.stringify(events.map((event) => event.code))}`);
+  });
+
+  it("AUDIT A1: a session without the four Uniswap selectors never quotes or executes on Uniswap", async () => {
+    const venue: VenueRow = { dex: "uniswap", version: "v3", pool: address(952), feeTier: 3000, quote: WBNB,
+      quoteSymbol: "WBNB", priceUsd: 100, liquidityUsd: 100_000, volume24hUsd: 1, asOf: NOW };
+    const fact: RwaFact = { platform: "bstock", underlyingTicker: "NVDA", tokenPriceUsd: 100,
+      referencePriceUsd: 100, premiumBps: 0, openState: true, marketStatus: null, reasonCode: "TRADING",
+      staleness: "fresh", tokenToShareRatio: 1, onchainPriceUsd: 100, venues: [venue] };
+    const bstock: UniverseRow = { address: TOKEN, symbol: "NVDAB", lane: "bstocks", source: "fixture", rwa: fact, venues: [venue] };
+    const reads: TradeDataPlaneReads = {
+      async universe(lane) {
+        if (lane === "bstocks") return [bstock];
+        if (lane === "ondo") return [];
+        return [{ ...bstock, lane: "meme" as const }];
+      },
+      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => ({ address, symbol: "NVDAB",
+        priceUsd: 100, marketCapUsd: null, volume24hUsd: 1, holders: 1, priceChange24hPct: 0 })); },
+      async eligibilityBatch(addresses) { return addresses.map((address) => ({ address, eligible: true, reason: "binance_rwa",
+        source: "binance-rwa" as const, venue: null })); },
+      async security() { return { riskLevel: "ok", flags: [] }; },
+    };
+    let uniswapQuotes = 0;
+    const routeReader = quoteReader(async (_path, amount) => amount);
+    routeReader.quoteUniV3Single = async (_in, _out, _fee, amount) => { uniswapQuotes += 1; return amount * 3n; };
+    routeReader.quoteUniV3Path = async (_path, amount) => { uniswapQuotes += 1; return amount * 3n; };
+    const executed: string[] = [];
+    const h = await harness({
+      now: NOW,
+      settings: settings({ executionModel: "tradfi", entryWei: "20000000000000000", noReentry: false }),
+      reads,
+      bstocks: new Set([TOKEN.toLowerCase()]),
+      routeReader,
+      executor: { async execute(input) {
+        executed.push(input.request.venue);
+        return { kind: "committed", receipt: { status: "CONFIRMED", transactionHash: HASH },
+          fill: { side: "buy", entryWei: input.request.amountWei, tokenAmount: input.request.quotedOutWei, fillStatus: "verified" }, meta: {} };
+      } },
+    });
+    // The session keeps its original allowlist: no Uniswap selector rules.
+    const report = await runTradeWorkerOnce({ ...h.deps, uniswapRouter: UNI_ROUTER });
+    assert.equal(report.outcomes[0]?.reason, "entered");
+    assert.equal(uniswapQuotes, 0);
+    assert.notEqual(executed[0], "uniswap_v3");
+  });
+
+  it("keeps the seven-probe Pancake repair when both RWA lane reads fail", async () => {
+    const base = dataPlane(1);
+    const token = address(960);
+    const reads: TradeDataPlaneReads = {
+      ...base,
+      async universe(lane, signal) {
+        if (lane === "bstocks" || lane === "ondo") throw new Error("RWA feed unavailable");
+        return base.universe(lane, signal);
+      },
+    };
+    const routeReader: RouteQuoteReader = {
+      async quoteV2(path, amount) { if (path[0] === token) throw new Error("stored pool reverted"); return amount; },
+      async quoteV3Single(_in, _out, fee, amount) { return fee === 100 ? amount * 2n : amount; },
+      async quoteV3Path() { throw new Error("no hop route"); },
+      async quoteUniV3Single() { throw new Error("not a repair probe"); },
+      async quoteUniV3Path() { throw new Error("not a repair probe"); },
+    };
+    const h = await harness({ reads, routeReader, now: NOW });
+    await openPosition(h, token, "repair-during-feed-outage");
+    await h.settingsStore.requestDrain(OWNER, "agent-a");
+    const seen: string[] = [];
+    const report = await runTradeWorkerOnce({ ...h.deps, executionIdentity: (agent, request) => {
+      seen.push(`${request.side}:${request.venue}`);
+      return h.deps.executionIdentity(agent, request);
+    } });
+    assert.equal(report.outcomes[0]?.reason, "draining");
+    assert.equal(seen[0], "sell:pancake_v3");
+    assert.equal((await h.positions.get(OWNER, "agent-a", "repair-during-feed-outage"))?.status, "closed");
   });
 });
 

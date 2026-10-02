@@ -455,6 +455,82 @@ export function buildLpMintWbnbBatch(params: LpMintWbnbParams): readonly WalletC
   ];
 }
 
+export type SingleSidedMintParams = {
+  readonly nfpm: Address;
+  /** Pool legs, in POOL ORDER (`token0 < token1`). No WBNB leg is required. */
+  readonly token0: Address;
+  readonly token1: Address;
+  readonly fee: number;
+  /** Each mint deposits exactly ONE leg, with a positive floor on it. */
+  readonly mints: readonly {
+    readonly tickLower: number;
+    readonly tickUpper: number;
+    readonly amount0DesiredWei: bigint;
+    readonly amount1DesiredWei: bigint;
+    readonly amount0MinWei: bigint;
+    readonly amount1MinWei: bigint;
+  }[];
+  /** ALWAYS the agent's wallet address, from the persisted row. */
+  readonly recipient: Address;
+  readonly deadline: bigint;
+};
+
+/**
+ * Auto DCA's resting orders (AUTO-DCA-SPEC §5.5): single-sided mints into any
+ * pool the caller has pinned — the {@link buildLpMintWbnbBatch} shape WITHOUT
+ * its WBNB-leg rule, which every other builder here keeps byte-identical.
+ *
+ * Per mint, in the caller's order (TP first, then levels): `[approve(leg,
+ * nfpm, 0), approve(leg, nfpm, exact desired), mint]`. The zero reset clears
+ * any dust allowance a previous mint left (the module's residual note); the
+ * amount is exact, never max (Rev2 item 15). No value on any call, no
+ * `multicall`, no NFT approval.
+ */
+export function buildSingleSidedMintBatch(params: SingleSidedMintParams): readonly WalletCall[] {
+  const builder = "buildSingleSidedMintBatch";
+  const t0 = params.token0.toLowerCase();
+  const t1 = params.token1.toLowerCase();
+  if (t0 === t1) fail(builder, "token0 and token1 are the same address; a pool has two distinct legs.");
+  if (t0 > t1) fail(builder, "token0/token1 are not in pool order (token0 < token1).");
+  validateFee(builder, params.fee);
+  validateDeadline(builder, params.deadline);
+  requireRealAddress(builder, "recipient", params.recipient);
+  if (params.mints.length === 0) fail(builder, "there is no mint to build.");
+
+  const calls: WalletCall[] = [];
+  for (const [index, mint] of params.mints.entries()) {
+    validateTicks(builder, mint.tickLower, mint.tickUpper);
+    validateDepositLeg(builder, `mint ${index} leg 0`, mint.amount0DesiredWei, mint.amount0MinWei);
+    validateDepositLeg(builder, `mint ${index} leg 1`, mint.amount1DesiredWei, mint.amount1MinWei);
+    if ((mint.amount0DesiredWei > 0n) === (mint.amount1DesiredWei > 0n)) {
+      fail(builder, `mint ${index} must deposit exactly one leg; a resting order is single-sided.`);
+    }
+    const leg = mint.amount0DesiredWei > 0n ? params.token0 : params.token1;
+    const desired = mint.amount0DesiredWei > 0n ? mint.amount0DesiredWei : mint.amount1DesiredWei;
+    calls.push(
+      buildApprove(leg, params.nfpm, 0n),
+      buildApprove(leg, params.nfpm, desired),
+      {
+        to: params.nfpm,
+        data: encodeMint({
+          token0: params.token0,
+          token1: params.token1,
+          fee: params.fee,
+          tickLower: mint.tickLower,
+          tickUpper: mint.tickUpper,
+          amount0DesiredWei: mint.amount0DesiredWei,
+          amount1DesiredWei: mint.amount1DesiredWei,
+          amount0MinWei: mint.amount0MinWei,
+          amount1MinWei: mint.amount1MinWei,
+          recipient: params.recipient,
+          deadline: params.deadline,
+        }),
+      },
+    );
+  }
+  return calls;
+}
+
 export type LpIncreaseParams = {
   readonly nfpm: Address;
   readonly tokenId: bigint;

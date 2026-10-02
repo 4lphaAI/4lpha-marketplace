@@ -18,6 +18,7 @@ import { buildShiftGridSettings } from "@/lib/grid/settings";
 import { canonicalEncode, type OwnerActionEnvelope } from "@/lib/exec/owner-action";
 import { depositAmountBnb, depositAmountWei, requiredDepositWei } from "@/lib/altana/hire-funding";
 import { armGridAgent, GridDeployActions, UI_PRESET_TO_GEOMETRY, type LivePool } from "./GridLiveDeploy";
+import { DEPLOYED_HOLD_MS, DeployRunModal, IDLE_DEPLOY_STEPS, type DeployStep, type DeployStepDef, type DeployStepKey, type DeployStepState } from "./DeployRunModal";
 
 /** Same primitive as GridLiveDeploy's deploy button, so Live mode keeps one visual language. */
 const primaryBtn: React.CSSProperties = { cursor: "pointer", padding: "14px 22px", borderRadius: "var(--radius-sm)", background: "var(--cat-grid)", border: "none", color: "#08110c", font: "var(--weight-medium) var(--text-md)/1 var(--font-sans)" };
@@ -169,13 +170,9 @@ function grantCall(call: { readonly to?: string; readonly signature?: string }):
 }
 
 
-/* ── The one-press deploy: its steps, and the panel that shows them ──────── */
+/* ── The one-press deploy: its steps, and the popup that shows them ──────── */
 
-type DeployStepKey = "hire" | "fund" | "grant" | "converge" | "arm";
-type DeployStepState = "pending" | "active" | "done" | "failed" | "skipped";
-type DeployStep = { readonly state: DeployStepState; readonly detail?: string };
-
-const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: string; readonly hint: string }[] = [
+const DEPLOY_STEPS: readonly DeployStepDef[] = [
   { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key and read session" },
   { key: "fund", title: "Fund the agent wallet", hint: "Only when the wallet cannot cover the registration fee" },
   { key: "grant", title: "Grant the session on chain", hint: "Your passkey authorises the session; the relay submits it" },
@@ -183,40 +180,7 @@ const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: stri
   { key: "arm", title: "Arm the grid", hint: "Placed from your signed plan — no further signature" },
 ];
 
-const STEP_MARK: Record<DeployStepState, string> = {
-  pending: "○", active: "◐", done: "●", failed: "✕", skipped: "–",
-};
-
-function DeployProgress({ steps }: { readonly steps: Record<DeployStepKey, DeployStep> }) {
-  return (
-    <div style={{ display: "grid", gap: 2, padding: 12, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)" }}>
-      {DEPLOY_STEPS.map(({ key, title, hint }, index) => {
-        const step = steps[key];
-        const colour = step.state === "done" ? "var(--profit)"
-          : step.state === "failed" ? "var(--loss)"
-            : step.state === "active" ? "var(--cat-grid)" : "var(--text-subtle)";
-        return (
-          <div key={key} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "8px 6px" }}>
-            <span style={{ color: colour, font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-mono)", width: 44, flex: "0 0 auto" }}>
-              {STEP_MARK[step.state]} {index + 1}
-            </span>
-            <span style={{ display: "grid", gap: 3, minWidth: 0 }}>
-              <span style={{ font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-sans)", color: step.state === "pending" ? "var(--text-subtle)" : "var(--ink-1)" }}>{title}</span>
-              <span style={{ font: "var(--weight-regular) var(--text-xs)/1.4 var(--font-sans)", color: step.state === "failed" ? "var(--loss)" : "var(--text-subtle)", overflowWrap: "anywhere" }}>
-                {step.detail ?? hint}
-              </span>
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-const IDLE_STEPS: Record<DeployStepKey, DeployStep> = {
-  hire: { state: "pending" }, fund: { state: "pending" }, grant: { state: "pending" },
-  converge: { state: "pending" }, arm: { state: "pending" },
-};
+const IDLE_STEPS = IDLE_DEPLOY_STEPS;
 
 /**
  * The Demo / Live SPLIT (fix-review finding 2).
@@ -590,6 +554,16 @@ function HireGridDeployLive(props: {
     }
   };
 
+  const openAgentPage = (id: string): void => {
+    if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+  };
+  /** The popup's "Open the agent page" during the deployed hold: end the run so it cannot navigate a second time. */
+  const openDeployedAgent = (): void => {
+    if (agentId === null) return;
+    activeRun.current?.stop();
+    openAgentPage(agentId);
+  };
+
   const mark = (key: DeployStepKey, state: DeployStepState, detail?: string): void => {
     setSteps((current) => ({ ...current, [key]: detail === undefined ? { state } : { state, detail } }));
   };
@@ -796,7 +770,9 @@ function HireGridDeployLive(props: {
       const claimOutcome = current.armPlan?.claim?.outcome;
       if (claimOutcome?.status === "completed") {
         forgetGridHire(hireStorage, id);
-        if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+        mark("arm", "done", "Already armed.");
+        await run.wait(DEPLOYED_HOLD_MS);
+        openAgentPage(id);
         return;
       }
       if (claimOutcome?.status === "held" || claimOutcome?.status === "interrupted") {
@@ -849,9 +825,10 @@ function HireGridDeployLive(props: {
         ? `Position NFT #${String(armBlock.tokenId)} minted.`
         : "Armed.");
 
-      // ── 6. The agent page, without another click ──────────────────────────
+      // ── 6. "Agent deployed", then the agent page without another click ────
       forgetGridHire(hireStorage, id);
-      if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+      await run.wait(DEPLOYED_HOLD_MS);
+      openAgentPage(id);
     } catch (error) {
       if (!mounted.current || run.stopped) return;
       const text = error instanceof Error ? error.message : "The deploy could not be completed.";
@@ -876,6 +853,13 @@ function HireGridDeployLive(props: {
     if (agentId !== null) forgetGridHire(hireStorage, agentId);
     setAgentId(null); setView(null); setPreview(null); setMessage(null); setSteps(IDLE_STEPS);
   };
+  // ONE popup instance for every branch below: keyed, so it survives the
+  // switch into the arm branch mid-run instead of remounting (and replaying
+  // its entrance) when the hire converges.
+  const deployModal = <DeployRunModal key="deploy-run" label="Grid Agent" color="var(--cat-grid)" agentId={agentId}
+    stepDefs={DEPLOY_STEPS} steps={steps} running={running} suspended={deposit} message={message} note={working}
+    onCancel={view?.status === "provisioning" && view.cancelRequested !== true ? () => void cancelHire() : null}
+    cancelDisabled={working !== null && !running} onOpenAgent={openDeployedAgent} />;
   if (step === "arm" && agentId !== null) {
     const openAgent = (id: string): void => { if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`); };
     // STEP 2 OF 2, and the one that actually places money. The grant only
@@ -893,7 +877,7 @@ function HireGridDeployLive(props: {
           {armPlanFallback ? "Arm the grid with a signature" : "Arm the grid"}
         </button>
       </div>
-      {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
+      {deployModal}
       {message ? <p style={{ color: "var(--loss)" }}>{message}</p> : null}
       <div><button type="button" style={{ ...secondaryBtn, padding: "10px 16px", font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)" }} onClick={() => openAgent(agentId)}>Open the agent page without arming</button></div>
     </div>;
@@ -931,10 +915,9 @@ function HireGridDeployLive(props: {
         run reports each step as it happens and lands on the agent page. */}
     {step === "s1" || step === "fund-and-grant" || (step === "poll" && view?.cancelRequested !== true) ? <div style={{ display: "grid", gap: 12 }}>
       <button type="button" style={busyBtn(running || working !== null || blocked !== null, primaryBtn)} onClick={() => void deployAll()} disabled={running || working !== null || blocked !== null}>
-        {running ? "Deploying…" : step === "s1" ? "Deploy grid agent" : "Continue deploy"}
+        {running ? "Deploying…" : step === "s1" ? "Sign hire and create the session key" : "Continue deploy"}
       </button>
       {blocked !== null ? <p style={{ color: "var(--loss)", margin: 0 }}>{blocked}</p> : null}
-      {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
     </div> : null}
     {step === "poll" && view !== null ? <p>{view.cancelRequested === true
       ? cancellationMessage(view)
@@ -963,5 +946,6 @@ function HireGridDeployLive(props: {
     }} wallet={fundsWallet} connectedAddress={connectedAddress} passkey={owner.passkey} ownerAddress={owner.ownerAddress} initialTab="deposit"
       {...(depositWei === null ? {} : { fixedDepositWei: depositWei, autoSubmitDeposit: true })}
       onDepositSubmitted={() => { mark("fund", "active", "Deposit sent. Waiting for it to land in the agent wallet…"); setDeposit(false); }} /> : null}
+    {deployModal}
   </div>;
 }

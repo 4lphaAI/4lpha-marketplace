@@ -193,3 +193,101 @@ describe("the compact tiles (operator, 2026-09-16)", () => {
     } finally { await done(); }
   });
 });
+
+// ---------------------------------------------------------------------------
+// AUDIT L-7/R2.7: the CMC "Data log" row shows "LLM requested: <reason>" only
+// for a row whose `requestedBy === "llm"`; a scheduled row shows nothing extra.
+// ---------------------------------------------------------------------------
+
+describe("CMC Data log LLM-requested label (TRADFI-LLM-CMC-REQUEST §7/R2.7)", () => {
+  it("shows the reason under an LLM-requested row and nothing extra under a scheduled row", async () => {
+    const host = document.createElement("div"), root = createRoot(host);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ data: {} }) })));
+    try {
+      const t = trade(0, {
+        settings: settings({ settlementAsset: "USDT", executionModel: "tradfi" }),
+        cmcLog: {
+          news: [
+            { ticker: "NVDA", skill: "us_equity_trade_planning_context", status: "available", asOfMs: NOW, expiresAtMs: NOW + 3_600_000,
+              sourceUrl: null, paymentOperationId: null, context: null, requestedBy: "llm", requestReason: "NVDA line reads unknown" },
+            { ticker: "MSFT", skill: "us_equity_trade_planning_context", status: "available", asOfMs: NOW, expiresAtMs: NOW + 3_600_000,
+              sourceUrl: null, paymentOperationId: null, context: null },
+          ],
+          attempts: [],
+        },
+      });
+      await act(async () => root.render(<TradeAgentDetail {...props(view(), t)} />));
+      await act(async () => { [...host.querySelectorAll("button")].find((button) => button.textContent === "CMC x402")!.click(); });
+      const dataToggle = [...host.querySelectorAll("button")].find((button) => button.textContent?.startsWith("Data log"))!;
+      await act(async () => { dataToggle.click(); });
+      expect(host.textContent).toContain("LLM requested: NVDA line reads unknown");
+      const rows = [...host.querySelectorAll(".fl-run-card")];
+      const nvdaRow = rows.find((row) => row.textContent?.includes("NVDA"));
+      const msftRow = rows.find((row) => row.textContent?.includes("MSFT"));
+      expect(nvdaRow?.textContent).toContain("LLM requested:");
+      expect(msftRow?.textContent).not.toContain("LLM requested:");
+    } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+  });
+});
+
+describe("TRADFI-EXPIRY-KEEP-REMOVE on the trade page", () => {
+  async function render(v: AgentDetailView, t: TradeView, extra: Record<string, unknown> = {}): Promise<{ readonly host: HTMLDivElement; readonly done: () => Promise<void> }> {
+    const host = document.createElement("div"), root = createRoot(host);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ data: {} }) })));
+    await act(async () => root.render(<TradeAgentDetail {...props(v, t)} {...extra} />));
+    return { host, done: async () => { await act(async () => root.unmount()); vi.unstubAllGlobals(); } };
+  }
+  const label = (host: HTMLElement) => host.querySelector(".fl-status")?.textContent;
+
+  it("a removed TradFi AI agent that was drained earlier shows revoked (or retired), never draining; every other kind keeps its label", async () => {
+    for (const status of ["revoked", "retired"] as const) {
+      const ai = await render(view({ status }), trade(2, { tradfiAi: true, lifecycle: { draining: true, drainingAt: 1 } }));
+      try { expect(label(ai.host)).toBe(status); } finally { await ai.done(); }
+    }
+    const legacy = await render(view({ status: "revoked" }), trade(2, { lifecycle: { draining: true, drainingAt: 1 } }));
+    try { expect(label(legacy.host)).toBe("draining"); } finally { await legacy.done(); }
+    const notAi = await render(view({ status: "revoked" }), trade(2, { tradfiAi: false, lifecycle: { draining: true, drainingAt: 1 } }));
+    try { expect(label(notAi.host)).toBe("draining"); } finally { await notAi.done(); }
+    const armed = await render(view(), trade(2, { tradfiAi: true, lifecycle: { draining: true, drainingAt: 1 } }));
+    try { expect(label(armed.host)).toBe("draining"); } finally { await armed.done(); }
+  });
+
+  it("counts recorded kept holdings and says they are outside the PnL; shows nothing for zero or an older plane", async () => {
+    const many = await render(view({ status: "revoked" }), trade(2, { tradfiAi: true, keptPositions: 2 }));
+    try { expect(many.host.querySelector("[data-kept-positions]")?.textContent).toBe("2 positions kept in wallet, not counted in PnL. This is the recorded count, not a live balance."); } finally { await many.done(); }
+    const one = await render(view({ status: "revoked" }), trade(1, { tradfiAi: true, keptPositions: 1 }));
+    try { expect(one.host.querySelector("[data-kept-positions]")?.textContent).toContain("1 position kept in wallet"); } finally { await one.done(); }
+    for (const kept of [0, undefined]) {
+      const none = await render(view({ status: "revoked" }), trade(1, { tradfiAi: true, ...(kept === undefined ? {} : { keptPositions: kept }) }));
+      try { expect(none.host.querySelector("[data-kept-positions]")).toBeNull(); } finally { await none.done(); }
+    }
+  });
+
+  it("the expiry banner uses the AI copy only for tradfiAi === true and passes the position count through", async () => {
+    const dead = Math.floor(Date.now() / 1_000) - 60;
+    const held = await render(view({ sessionExpiresAt: dead }), trade(2, { tradfiAi: true }));
+    try { expect(held.host.querySelector('[role="alert"]')?.textContent).toBe("Session expired. Positions are held, not sold. SL/TP and the exit model are off. Renew to resume, or withdraw from Account."); } finally { await held.done(); }
+    const empty = await render(view({ sessionExpiresAt: dead }), trade(0, { tradfiAi: true }));
+    try { expect(empty.host.querySelector('[role="alert"]')?.textContent).toBe("Session expired. The agent can't trade. Renew to resume, or withdraw from Account."); } finally { await empty.done(); }
+    const other = await render(view({ sessionExpiresAt: dead }), trade(2));
+    try { expect(other.host.querySelector('[role="alert"]')?.textContent).toBe("Session expired — the agent can't trade or sell. Withdraw tokens from Account, or hire again."); } finally { await other.done(); }
+  });
+
+  it("separates the renewal refusal reason from the banner (…hire again. finishing a trade intent…, never …hire again.finishing…)", async () => {
+    const dead = Math.floor(Date.now() / 1_000) - 60;
+    const reason = "finishing a trade intent 885cad94-0000-4000-8000-000000000000";
+    const status = <span data-renewal-reason="">{reason}</span>;
+    const legacy = await render(view({ sessionExpiresAt: dead }), trade(2), { renewalStatus: status });
+    try {
+      expect(legacy.host.textContent).toContain(`hire again. ${reason}`);
+      expect(legacy.host.textContent).not.toContain(`hire again.${reason}`);
+    } finally { await legacy.done(); }
+    const ai = await render(view({ sessionExpiresAt: dead }), trade(2, { tradfiAi: true }), { renewalStatus: status });
+    try {
+      expect(ai.host.textContent).toContain(`withdraw from Account. ${reason}`);
+      expect(ai.host.textContent).not.toContain(`Account.${reason}`);
+    } finally { await ai.done(); }
+    const quiet = await render(view({ sessionExpiresAt: dead }), trade(2));
+    try { expect(quiet.host.textContent).not.toContain("Account. finishing"); } finally { await quiet.done(); }
+  });
+});

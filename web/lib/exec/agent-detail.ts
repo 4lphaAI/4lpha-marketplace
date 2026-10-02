@@ -347,6 +347,8 @@ export type AgentDetailView = {
   readonly hireSizingName: string | null;
   /** The hire's open native budget in wei (`hireSizing.openNativeBudgetWei`) — the basis every gross percent is measured against. */
   readonly armedBudgetWei: string | null;
+  /** The per-buy ceiling the hire's session was granted for (`hireSizing.entryWei`, TradFi v2 only); a settings amount above it is refused on every buy. */
+  readonly hiredEntryWei?: string;
   readonly walletAddress: string;
   readonly sessionPublicKey: string | null;
   readonly renewalPending?: boolean;
@@ -573,6 +575,7 @@ function parseOwner(payload: unknown): {
   httpRuntimeProfile: string;
   hireSizingName: string | null;
   armedBudgetWei: string | null;
+  hiredEntryWei: string | null;
 } {
   const body = row(payload);
   const data = row(body?.["data"]);
@@ -589,6 +592,7 @@ function parseOwner(payload: unknown): {
     httpRuntimeProfile: typeof data["httpRuntimeProfile"] === "string" ? data["httpRuntimeProfile"] : "unbound-v1",
     hireSizingName: typeof row(data["hireSizing"])?.["name"] === "string"
       ? row(data["hireSizing"])?.["name"] as string : null,
+    hiredEntryWei: typeof row(data["hireSizing"])?.["entryWei"] === "string" ? String(row(data["hireSizing"])?.["entryWei"]) : null,
     armedBudgetWei: typeof row(data["hireSizing"])?.["openNativeBudgetWei"] === "string"
       ? String(row(data["hireSizing"])?.["openNativeBudgetWei"]) : null,
     session: data["session"] === null ? null : row(data["session"]),
@@ -935,6 +939,7 @@ function notArmedView(owner: ReturnType<typeof parseOwner>, data: Row, nowMs: nu
     httpRuntimeProfile: owner.httpRuntimeProfile,
     hireSizingName: owner.hireSizingName,
     armedBudgetWei: owner.armedBudgetWei,
+    ...(owner.hiredEntryWei === null ? {} : { hiredEntryWei: owner.hiredEntryWei }),
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
@@ -1270,6 +1275,7 @@ function mapLpAgentDetail(
     httpRuntimeProfile: owner.httpRuntimeProfile,
     hireSizingName: owner.hireSizingName,
     armedBudgetWei: owner.armedBudgetWei,
+    ...(owner.hiredEntryWei === null ? {} : { hiredEntryWei: owner.hiredEntryWei }),
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey: typeof session?.["publicKey"] === "string" ? session["publicKey"] : null,
@@ -1624,6 +1630,7 @@ export function mapAgentDetail(
     httpRuntimeProfile: owner.httpRuntimeProfile,
     hireSizingName: owner.hireSizingName,
     armedBudgetWei: owner.armedBudgetWei,
+    ...(owner.hiredEntryWei === null ? {} : { hiredEntryWei: owner.hiredEntryWei }),
     ...(owner.erc8004Identity === undefined ? {} : { erc8004Identity: owner.erc8004Identity }),
     walletAddress: owner.walletAddress,
     sessionPublicKey,

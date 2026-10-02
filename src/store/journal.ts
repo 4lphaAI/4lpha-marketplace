@@ -40,7 +40,7 @@
  * The idempotency key is the primary key: a second `begin` with the same key
  * returns the existing row and never creates a duplicate or re-runs the work.
  */
-import { keccak256, stringToHex, type Hex } from "viem";
+import { keccak256, stringToHex, type Address, type Hex } from "viem";
 import { sanitizeMessage } from "../core/errors.js";
 import type { JournalPrincipal } from "../billing/types.js";
 import type {
@@ -168,6 +168,7 @@ export type JournalKind =
   | "tradeSettings"
   | "tradeExit"
   | "tradeDrain"
+  | "tradeCmcBudget"
   // MARKETPLACE-LENDING-AGENT R2.1 (closing REVIEW B1). THREE owner-action
   // rows and ONE money kind, and the four had to be enumerated together
   // because they land in the same six hand-maintained places the Venus note
@@ -199,7 +200,18 @@ export type JournalKind =
   // arm batch, every rescue batch, and the retire batch. `lendingRescue` does
   // NOT exist as a kind — one namespace, `lending:<agentId>:<day>:<n>`, so a
   // decision id used by a rescue can never be reused by the retire.
-  | "lending";
+  | "lending"
+  // AUTO-DCA R2.3 / F17. ONE money kind for EVERY Auto DCA submission — start,
+  // fill, level placement, close, stop-loss sweep, Remove — each one relay batch
+  // under the trade session key, keyed `dca:<agentId>:<roundNo>:<seq>`. It sits
+  // in the six hand-maintained places every kind above names: this union,
+  // {@link MONEY_KINDS}, the Postgres `getByDecision` SQL literal,
+  // `test/support/fakeSql.ts`'s copy of that filter, `resolveRow`'s callsId
+  // branch, and NOT {@link LOCAL_ONLY_KINDS}. Not `trade`: a `TradeRequest` is
+  // the HTTP `/trade` wire type, and NFPM calldata must never ride a shape a
+  // route can reach (I12). There is no DCA owner-action kind; the owner actions
+  // it uses already exist.
+  | "dcaRange";
 
 /**
  * Kinds that move money under a session key.
@@ -225,6 +237,10 @@ export const MONEY_KINDS: ReadonlySet<JournalKind> = new Set<JournalKind>([
   "venusSupply",
   "venusClaim",
   "venusClaimRepayLeg",
+  // AUTO-DCA R2.3. Every Auto DCA batch submits through `executeViaSession`,
+  // records a `callsId`, carries `quoteSpendWei`, and shares this namespace.
+  // Listed here, not last, so the SQL literal keeps its pinned tail.
+  "dcaRange",
   "billingCollect",
   // MARKETPLACE-LENDING-AGENT R2.1. The lending guard submits through the same
   // `executeViaSession` relay as `trade` and `lp`, records a `callsId`, and
@@ -327,6 +343,7 @@ export const LOCAL_ONLY_KINDS: ReadonlySet<JournalKind> = new Set<JournalKind>([
   "tradeSettings",
   "tradeExit",
   "tradeDrain",
+  "tradeCmcBudget",
   // MARKETPLACE-LENDING-AGENT R2.1, and the FOURTH time this file records the
   // same trap: `ownerMutation` journals a row of the route's kind
   // unconditionally, so an interrupted `POST /lending/arm` whose kind were
@@ -459,6 +476,27 @@ export type JournalExternalRef = {
    * stops a denied decisionId from being re-bound to different parameters.
    */
   readonly paramsHash?: Hex;
+  /** USDT quote reservation for a TradFi v2 buy, kept in the JSON identity. */
+  readonly quoteSpendWei?: string;
+  /** Finalized attributable USDT debit; absent keeps the conservative reservation. */
+  readonly actualQuoteSpendWei?: string;
+  /** Exact wallet batch submitted for a TradFi v2 operation. */
+  readonly submittedCalls?: readonly { readonly to: Address; readonly value: string; readonly data: Hex }[];
+  /** Session generation used to create the submitted call batch. */
+  readonly sessionGeneration?: number;
+  /** Guard identity used by the submitted v2 route, when the route used one. */
+  readonly guardQuote?: { readonly address: Address; readonly calldata: Hex };
+  /** Canonical receipt identity claimed after finalized v2 verification. */
+  readonly receiptEvidence?: {
+    readonly transactionHash: Hex;
+    readonly wallet: Address;
+    readonly chainIntentHash: Hex;
+    readonly nonce: string;
+    readonly callsHash: Hex;
+    readonly blockHash: Hex;
+    readonly blockNumber: string;
+    readonly swapLogIndex: string;
+  };
   /**
    * The server's findings from an owner-signed `resolveUnknown` (PHASE3.3 Rev2
    * item 17). This ref field is the row's only jsonb, and the evidence lands
@@ -594,6 +632,7 @@ export type JournalBeginInput = {
   readonly externalRef?: JournalExternalRef;
   /** Native this operation charges, in wei. Defaults to `0n`. */
   readonly nativeSpendWei?: bigint;
+  readonly quoteSpendWei?: bigint;
   /** Existing finalized LP market height; omitted for every non-LP begin. */
   readonly begunAtBlock?: bigint;
   /** Both fields are required together and accepted only for kind `lp`. */
@@ -639,6 +678,7 @@ export type JournalBeginWithSpendResult = {
   readonly entry: JournalEntry;
   /** Sum over every OTHER counting row for this agent since `sinceMs`. */
   readonly otherSpendWei: bigint;
+  readonly otherQuoteSpendWei?: bigint;
   /**
    * Whether THIS call inserted the row. `false` means the key already existed —
    * including a concurrent request's still-PENDING row. The money routes gate
@@ -684,6 +724,13 @@ export interface ExecutionJournal {
     idempotencyKey: string,
     externalRef?: JournalExternalRef,
   ): Promise<JournalEntry>;
+  /** Staged trade completion: writes only while the locked row still owns this callsId. */
+  completeStagedTrade(
+    idempotencyKey: string,
+    expect: { readonly callsId: Hex },
+    outcome: { readonly state: "COMMITTED"; readonly txHash?: Hex }
+      | { readonly state: "ROLLED_BACK"; readonly lastError: string },
+  ): Promise<{ readonly applied: boolean; readonly entry: JournalEntry }>;
   /**
    * `externalRef` is how a REFUSED owner action archives its evidence
    * (PHASE3.3-AUDIT A7): the action's own row is the only place a refusal can
@@ -819,6 +866,8 @@ export interface ExecutionJournal {
     sinceMs: number,
     excludeIdempotencyKey?: string,
   ): Promise<bigint>;
+  /** Pending/unknown USDT quote reservations not yet represented by chain spend. */
+  sumPendingQuoteSpendSince(agentId: string, sinceMs: number): Promise<bigint>;
   /** Rows still eligible for reconcile: PENDING or IN_PROGRESS only. */
   listNonTerminal(): Promise<JournalEntry[]>;
   close(): Promise<void>;
@@ -839,8 +888,8 @@ function normalizeFinalCallsBinding(input: JournalBeginInput): {
     throw new Error("Journal final-calls fingerprint fields must be supplied together.");
   }
   if (canonical === undefined || hash === undefined) return { canonical: null, hash: null };
-  if (input.kind !== "lp") {
-    throw new Error("Only LP money rows may carry a final-calls fingerprint.");
+  if (input.kind !== "lp" && input.kind !== "trade") {
+    throw new Error("Only LP or trade money rows may carry a final-calls fingerprint.");
   }
   if (Buffer.byteLength(canonical, "utf8") > 192 || !HASH_HEX.test(hash)) {
     throw new Error("Journal final-calls fingerprint is malformed or over 192 bytes.");
@@ -1059,6 +1108,31 @@ function mergeRef(
       current.billingInvoice.sessionGeneration !== update.billingInvoice.sessionGeneration
     )
   ) throw new Error("Billing invoice journal binding is immutable.");
+  if (current.submittedCalls !== undefined && update.submittedCalls !== undefined
+    && JSON.stringify(current.submittedCalls) !== JSON.stringify(update.submittedCalls)) {
+    throw new Error("Submitted v2 calls are immutable.");
+  }
+  if (current.sessionGeneration !== undefined && update.sessionGeneration !== undefined
+    && current.sessionGeneration !== update.sessionGeneration) {
+    throw new Error("Submitted v2 session generation is immutable.");
+  }
+  if (current.guardQuote !== undefined && update.guardQuote !== undefined
+    && (current.guardQuote.address.toLowerCase() !== update.guardQuote.address.toLowerCase()
+      || current.guardQuote.calldata.toLowerCase() !== update.guardQuote.calldata.toLowerCase())) {
+    throw new Error("Submitted v2 guard identity is immutable.");
+  }
+  if (current.receiptEvidence !== undefined && update.receiptEvidence !== undefined
+    && JSON.stringify(current.receiptEvidence) !== JSON.stringify(update.receiptEvidence)) {
+    throw new Error("Receipt evidence ownership is immutable.");
+  }
+  if (current.actualQuoteSpendWei !== undefined && update.actualQuoteSpendWei !== undefined
+    && current.actualQuoteSpendWei !== update.actualQuoteSpendWei) {
+    throw new Error("Actual v2 quote debit is immutable.");
+  }
+  if (current.quoteSpendWei !== undefined && update.quoteSpendWei !== undefined
+    && current.quoteSpendWei !== update.quoteSpendWei) {
+    throw new Error("Reserved v2 quote debit is immutable.");
+  }
   return {
     ...current,
     ...(update.callsId === undefined ? {} : { callsId: update.callsId }),
@@ -1066,6 +1140,12 @@ function mergeRef(
     ...(update.publicKey === undefined ? {} : { publicKey: update.publicKey }),
     ...(update.callsHash === undefined ? {} : { callsHash: update.callsHash }),
     ...(update.paramsHash === undefined ? {} : { paramsHash: update.paramsHash }),
+    ...(update.quoteSpendWei === undefined ? {} : { quoteSpendWei: update.quoteSpendWei }),
+    ...(update.actualQuoteSpendWei === undefined ? {} : { actualQuoteSpendWei: update.actualQuoteSpendWei }),
+    ...(update.submittedCalls === undefined ? {} : { submittedCalls: update.submittedCalls }),
+    ...(update.sessionGeneration === undefined ? {} : { sessionGeneration: update.sessionGeneration }),
+    ...(update.guardQuote === undefined ? {} : { guardQuote: update.guardQuote }),
+    ...(update.receiptEvidence === undefined ? {} : { receiptEvidence: update.receiptEvidence }),
     // R18: this merge is field-by-field and SILENTLY DROPS anything it does not
     // enumerate, which is why the evidence key has to be listed here rather
     // than spread in at the call site.
@@ -1255,7 +1335,9 @@ export class MemoryExecutionJournal implements ExecutionJournal {
       const created = !this.#rows.has(input.idempotencyKey);
       const entry = this.#insert(input);
       const otherSpendWei = this.#sum(input.agentId, sinceMs, input.idempotencyKey);
-      return { entry, otherSpendWei, created };
+      return input.quoteSpendWei === undefined
+        ? { entry, otherSpendWei, created }
+        : { entry, otherSpendWei, otherQuoteSpendWei: this.#sumQuote(input.agentId, sinceMs, input.idempotencyKey), created };
     });
   }
 
@@ -1308,9 +1390,12 @@ export class MemoryExecutionJournal implements ExecutionJournal {
     return this.#withLock(idempotencyKey, async () => {
       const current = this.#rows.get(idempotencyKey);
       if (current === undefined) throw new Error(`Journal row "${idempotencyKey}" does not exist.`);
-      if (current.kind !== "lp" || current.finalCallsFingerprint === null ||
+      if ((current.kind !== "lp" && current.kind !== "trade") || current.finalCallsFingerprint === null ||
           current.finalCallsFingerprintHash === null) {
-        throw new Error("Prepared intent binding requires a fingerprinted LP row.");
+        throw new Error("Prepared intent binding requires a fingerprinted LP or trade row.");
+      }
+      if (current.kind === "trade" && current.state !== "PENDING") {
+        throw new Error("Prepared trade binding requires a PENDING row.");
       }
       assertPreparedBindMatchesFinalCalls(current, input);
       if (current.preparedIntentIdentity !== null) {
@@ -1347,6 +1432,16 @@ export class MemoryExecutionJournal implements ExecutionJournal {
     return total;
   }
 
+  #sumQuote(agentId: string, sinceMs: number, excludeKey?: string): bigint {
+    let total = 0n;
+    for (const row of this.#rows.values()) {
+      if (row.agentId !== agentId || row.createdAt < sinceMs || row.idempotencyKey === excludeKey || !SPEND_COUNTING_STATES.has(row.state)) continue;
+      const raw = row.externalRef.actualQuoteSpendWei ?? row.externalRef.quoteSpendWei;
+      if (raw !== undefined && /^\d{1,78}$/u.test(raw)) total += BigInt(raw);
+    }
+    return total;
+  }
+
   markInProgress(
     idempotencyKey: string,
     externalRef: JournalExternalRef,
@@ -1359,6 +1454,17 @@ export class MemoryExecutionJournal implements ExecutionJournal {
     externalRef?: JournalExternalRef,
   ): Promise<JournalEntry> {
     return this.#transition(idempotencyKey, "COMMITTED", { externalRef });
+  }
+
+  completeStagedTrade(
+    idempotencyKey: string,
+    expect: { readonly callsId: Hex },
+    outcome: { readonly state: "COMMITTED"; readonly txHash?: Hex }
+      | { readonly state: "ROLLED_BACK"; readonly lastError: string },
+  ): Promise<{ readonly applied: boolean; readonly entry: JournalEntry }> {
+    return this.#transition(idempotencyKey, outcome.state,
+      outcome.state === "COMMITTED" ? { externalRef: outcome.txHash === undefined ? {} : { txHash: outcome.txHash } }
+        : { lastError: outcome.lastError }, "standard", expect);
   }
 
   markRolledBack(
@@ -1632,6 +1738,16 @@ export class MemoryExecutionJournal implements ExecutionJournal {
     return this.#sum(agentId, sinceMs, excludeIdempotencyKey);
   }
 
+  async sumPendingQuoteSpendSince(agentId: string, sinceMs: number): Promise<bigint> {
+    let total = 0n;
+    for (const row of this.#rows.values()) {
+      if (row.agentId !== agentId || row.createdAt < sinceMs || (row.state !== "PENDING" && row.state !== "IN_PROGRESS" && row.state !== "UNKNOWN")) continue;
+      const raw = row.externalRef.quoteSpendWei;
+      if (raw !== undefined && /^\d{1,78}$/u.test(raw)) total += BigInt(raw);
+    }
+    return total;
+  }
+
   async listNonTerminal(): Promise<JournalEntry[]> {
     return [...this.#rows.values()]
       .filter((entry) => NON_TERMINAL.has(entry.state))
@@ -1646,16 +1762,34 @@ export class MemoryExecutionJournal implements ExecutionJournal {
   #transition(
     idempotencyKey: string,
     target: JournalState,
+    change: { externalRef?: JournalExternalRef | undefined; lastError?: string | undefined },
+    path?: TransitionPath,
+  ): Promise<JournalEntry>;
+  #transition(
+    idempotencyKey: string,
+    target: JournalState,
+    change: { externalRef?: JournalExternalRef | undefined; lastError?: string | undefined },
+    path: TransitionPath,
+    staged: { readonly callsId: Hex },
+  ): Promise<{ readonly applied: boolean; readonly entry: JournalEntry }>;
+  #transition(
+    idempotencyKey: string,
+    target: JournalState,
     change: {
       externalRef?: JournalExternalRef | undefined;
       lastError?: string | undefined;
     },
     path: TransitionPath = "standard",
-  ): Promise<JournalEntry> {
+    staged?: { readonly callsId: Hex },
+  ): Promise<JournalEntry | { readonly applied: boolean; readonly entry: JournalEntry }> {
     return this.#withLock(idempotencyKey, async () => {
       const current = this.#rows.get(idempotencyKey);
       if (current === undefined) {
         throw new Error(`Journal row "${idempotencyKey}" does not exist.`);
+      }
+      if (staged !== undefined && (current.kind !== "trade" || current.state !== "IN_PROGRESS" ||
+          current.externalRef.callsId !== staged.callsId)) {
+        return { applied: false, entry: current };
       }
       if (path === "resolve-unknown" || path === "advance-on-chain" || path === "retire-pre-bind") {
         assertResolvableUnknown(current);
@@ -1678,7 +1812,7 @@ export class MemoryExecutionJournal implements ExecutionJournal {
         updatedAt: this.#now(),
       };
       this.#rows.set(idempotencyKey, next);
-      return next;
+      return staged === undefined ? next : { applied: true, entry: next };
     });
   }
 
@@ -1812,13 +1946,25 @@ const JOURNAL_BILLING_CALLS_ID_CHECK_DDL = `
 const JOURNAL_PREPARED_BINDING_CHECK_DDL = `
   do $journal_prepared_binding$
   begin
-    if not exists (select 1 from pg_constraint where conname = 'execution_journal_prepared_binding_check') then
+    perform pg_advisory_xact_lock(hashtext('execution_journal_prepared_binding_check'));
+    if not exists (select 1 from pg_constraint where conname = 'execution_journal_prepared_binding_check'
+        and conrelid = 'execution_journal'::regclass) then
       alter table execution_journal add constraint execution_journal_prepared_binding_check check (
         prepared_binding_version >= 0 and
         ((final_calls_fingerprint is null and final_calls_fingerprint_hash is null) or
-         (kind = 'lp' and final_calls_fingerprint is not null and final_calls_fingerprint_hash ~ '^0x[0-9a-f]{64}$')) and
+         (kind in ('lp', 'trade') and final_calls_fingerprint is not null and final_calls_fingerprint_hash ~ '^0x[0-9a-f]{64}$')) and
         ((prepared_intent_identity is null and prepared_intent_identity_hash is null) or
-         (kind = 'lp' and prepared_intent_identity is not null and prepared_intent_identity_hash ~ '^0x[0-9a-f]{64}$'))
+         (kind in ('lp', 'trade') and prepared_intent_identity is not null and prepared_intent_identity_hash ~ '^0x[0-9a-f]{64}$'))
+      );
+    elsif not exists (select 1 from pg_constraint where conname = 'execution_journal_prepared_binding_check'
+        and conrelid = 'execution_journal'::regclass and pg_get_constraintdef(oid) like '%trade%') then
+      alter table execution_journal drop constraint execution_journal_prepared_binding_check;
+      alter table execution_journal add constraint execution_journal_prepared_binding_check check (
+        prepared_binding_version >= 0 and
+        ((final_calls_fingerprint is null and final_calls_fingerprint_hash is null) or
+         (kind in ('lp', 'trade') and final_calls_fingerprint is not null and final_calls_fingerprint_hash ~ '^0x[0-9a-f]{64}$')) and
+        ((prepared_intent_identity is null and prepared_intent_identity_hash is null) or
+         (kind in ('lp', 'trade') and prepared_intent_identity is not null and prepared_intent_identity_hash ~ '^0x[0-9a-f]{64}$'))
       );
     end if;
   end $journal_prepared_binding$
@@ -1928,7 +2074,14 @@ export class PostgresExecutionJournal implements ExecutionJournal {
         sinceMs,
         input.idempotencyKey,
       );
-      return { entry, otherSpendWei, created };
+      if (input.quoteSpendWei === undefined) return { entry, otherSpendWei, created };
+      const quote = await client.query<{ readonly total: string | null }>(
+        `/* journal.sumQuoteSpend */ select coalesce(sum(case when coalesce(external_ref->>'actualQuoteSpendWei', external_ref->>'quoteSpendWei') ~ '^[0-9]{1,78}$' then (coalesce(external_ref->>'actualQuoteSpendWei', external_ref->>'quoteSpendWei'))::numeric else 0 end), 0)::text as total
+         from execution_journal where agent_id = $1 and created_at >= $2 and idempotency_key <> $3
+           and state in ('PENDING','IN_PROGRESS','COMMITTED')`,
+        [input.agentId, new Date(sinceMs), input.idempotencyKey],
+      );
+      return { entry, otherSpendWei, otherQuoteSpendWei: BigInt(quote.rows[0]?.total ?? "0"), created };
     };
     return tx === undefined ? this.#sql.transaction(work) : work(tx);
   }
@@ -2006,9 +2159,12 @@ export class PostgresExecutionJournal implements ExecutionJournal {
       const row = locked.rows[0];
       if (row === undefined) throw new Error(`Journal row "${idempotencyKey}" does not exist.`);
       const current = rowToEntry(row);
-      if (current.kind !== "lp" || current.finalCallsFingerprint === null ||
+      if ((current.kind !== "lp" && current.kind !== "trade") || current.finalCallsFingerprint === null ||
           current.finalCallsFingerprintHash === null) {
-        throw new Error("Prepared intent binding requires a fingerprinted LP row.");
+        throw new Error("Prepared intent binding requires a fingerprinted LP or trade row.");
+      }
+      if (current.kind === "trade" && current.state !== "PENDING") {
+        throw new Error("Prepared trade binding requires a PENDING row.");
       }
       assertPreparedBindMatchesFinalCalls(current, input);
       if (current.preparedIntentIdentity !== null) {
@@ -2026,7 +2182,8 @@ export class PostgresExecutionJournal implements ExecutionJournal {
              prepared_binding_version = prepared_binding_version + 1,
              updated_at = $5
          where idempotency_key = $1
-           and kind = 'lp'
+           and kind in ('lp', 'trade')
+           and (kind = 'lp' or state = 'PENDING')
            and prepared_binding_version = $4
            and prepared_intent_identity is null
            and prepared_intent_identity_hash is null
@@ -2077,6 +2234,17 @@ export class PostgresExecutionJournal implements ExecutionJournal {
     externalRef?: JournalExternalRef,
   ): Promise<JournalEntry> {
     return this.#transition(idempotencyKey, "COMMITTED", { externalRef });
+  }
+
+  completeStagedTrade(
+    idempotencyKey: string,
+    expect: { readonly callsId: Hex },
+    outcome: { readonly state: "COMMITTED"; readonly txHash?: Hex }
+      | { readonly state: "ROLLED_BACK"; readonly lastError: string },
+  ): Promise<{ readonly applied: boolean; readonly entry: JournalEntry }> {
+    return this.#transition(idempotencyKey, outcome.state,
+      outcome.state === "COMMITTED" ? { externalRef: outcome.txHash === undefined ? {} : { txHash: outcome.txHash } }
+        : { lastError: outcome.lastError }, "standard", expect);
   }
 
   markRolledBack(
@@ -2440,7 +2608,7 @@ export class PostgresExecutionJournal implements ExecutionJournal {
       `/* journal.getByDecision */
        select ${JOURNAL_COLUMNS}
        from execution_journal
-       where agent_id = $1 and decision_id = $2 and kind in ('execute', 'trade', 'lp', 'venusRepay', 'venusSupply', 'venusClaim', 'venusClaimRepayLeg', 'billingCollect', 'lending', 'quantTrade')
+       where agent_id = $1 and decision_id = $2 and kind in ('execute', 'trade', 'lp', 'venusRepay', 'venusSupply', 'venusClaim', 'venusClaimRepayLeg', 'dcaRange', 'billingCollect', 'lending', 'quantTrade')
        order by created_at asc
        limit 1`,
       [agentId, decisionId],
@@ -2479,6 +2647,15 @@ export class PostgresExecutionJournal implements ExecutionJournal {
     return this.#sum(this.#sql, agentId, sinceMs, excludeIdempotencyKey);
   }
 
+  async sumPendingQuoteSpendSince(agentId: string, sinceMs: number): Promise<bigint> {
+    const result = await this.#sql.query<{ readonly total: string | null }>(
+      `/* journal.sumPendingQuoteSpend */ select coalesce(sum(case when external_ref->>'quoteSpendWei' ~ '^[0-9]{1,78}$' then (external_ref->>'quoteSpendWei')::numeric else 0 end), 0)::text as total
+       from execution_journal where agent_id = $1 and created_at >= $2 and state in ('PENDING','IN_PROGRESS','UNKNOWN')`,
+      [agentId, new Date(sinceMs)],
+    );
+    return BigInt(result.rows[0]?.total ?? "0");
+  }
+
   async listNonTerminal(): Promise<JournalEntry[]> {
     const result = await this.#sql.query<JournalRow>(
       `/* journal.listNonTerminal */
@@ -2496,12 +2673,26 @@ export class PostgresExecutionJournal implements ExecutionJournal {
   #transition(
     idempotencyKey: string,
     target: JournalState,
+    change: { externalRef?: JournalExternalRef | undefined; lastError?: string | undefined },
+    path?: TransitionPath,
+  ): Promise<JournalEntry>;
+  #transition(
+    idempotencyKey: string,
+    target: JournalState,
+    change: { externalRef?: JournalExternalRef | undefined; lastError?: string | undefined },
+    path: TransitionPath,
+    staged: { readonly callsId: Hex },
+  ): Promise<{ readonly applied: boolean; readonly entry: JournalEntry }>;
+  #transition(
+    idempotencyKey: string,
+    target: JournalState,
     change: {
       externalRef?: JournalExternalRef | undefined;
       lastError?: string | undefined;
     },
     path: TransitionPath = "standard",
-  ): Promise<JournalEntry> {
+    staged?: { readonly callsId: Hex },
+  ): Promise<JournalEntry | { readonly applied: boolean; readonly entry: JournalEntry }> {
     return this.#sql.transaction(async (tx) => {
       const locked = await tx.query<JournalRow>(
         `/* journal.transitionSelect */
@@ -2514,6 +2705,10 @@ export class PostgresExecutionJournal implements ExecutionJournal {
         throw new Error(`Journal row "${idempotencyKey}" does not exist.`);
       }
       const entry = rowToEntry(current);
+      if (staged !== undefined && (entry.kind !== "trade" || entry.state !== "IN_PROGRESS" ||
+          entry.externalRef.callsId !== staged.callsId)) {
+        return { applied: false, entry };
+      }
       if (path === "resolve-unknown" || path === "advance-on-chain" || path === "retire-pre-bind") {
         assertResolvableUnknown(entry);
       }
@@ -2541,7 +2736,7 @@ export class PostgresExecutionJournal implements ExecutionJournal {
       if (row === undefined) {
         throw new Error("Journal transition failed to update the row.");
       }
-      return rowToEntry(row);
+      return staged === undefined ? rowToEntry(row) : { applied: true, entry: rowToEntry(row) };
     });
   }
 }
@@ -2932,6 +3127,15 @@ async function resolveRow(
     // one commit; the runbook makes "all services healthy on the new commit"
     // the precondition of enablement.
     || kind === "quantTrade"
+    // AUTO-DCA R2.3 / F17. The fifth hand-maintained site for `dcaRange`: one
+    // relay batch with a `callsId`, resolved from it exactly as the kinds above.
+    // Without this branch a crashed DCA batch would park as a PERMANENT UNKNOWN.
+    //
+    // DEPLOYMENT ORDER RULE (§11.2): every service that calls `reconcile` —
+    // `execution-api`, `trade-worker`, `lp-worker`, `lending-worker`,
+    // `dev-stack` — must be running the commit that knows `dcaRange` BEFORE
+    // `DCA_ENABLED=true` is set anywhere.
+    || kind === "dcaRange"
   ) {
     // An `lp` row is one saga step submitted through the same relay, so it
     // resolves identically: only its callsId — never a live session, never the

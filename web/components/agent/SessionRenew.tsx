@@ -6,6 +6,11 @@ import type { Address, Hex } from "viem";
 import { Button } from "@/design-system";
 import { GrantAgentSessionError, grantAgentSession, revokeAgentSession } from "@/lib/altana/client";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
+import { encodeReadHeader } from "@/lib/exec/owner-action";
+import { runCmcContinuation } from "@/lib/altana/cmc-continuation";
+import { GridDeployRun } from "@/lib/altana/grid-hire-recovery";
+
+const RENEW_CMC_DEADLINE_MS = 120_000;
 
 type WirePermissions = {
   readonly calls: readonly { readonly to?: string; readonly signature?: string }[];
@@ -53,6 +58,7 @@ export type SessionRenewProps = {
   readonly sessionExpiresAt: number | null | undefined;
   readonly status?: string;
   readonly kind: "trade" | "grid" | "lp";
+  readonly cmcRebind?: boolean;
   readonly readHeaders?: Readonly<Record<string, string>>;
   readonly refresh?: () => Promise<unknown>;
 };
@@ -168,6 +174,7 @@ export function useSessionRenew(props: SessionRenewProps): SessionRenewSlots {
   const [step, setStep] = React.useState<"idle" | "preview" | "signing" | "granting" | "retry" | "retryExpired" | "converging" | "done" | "cancelled">("idle");
   const [busy, setBusy] = React.useState(false);
   const [message, setMessage] = React.useState<string | null>(null);
+  const [cmcNote, setCmcNote] = React.useState<string | null>(null);
 
   const selectPending = React.useCallback((data: NonNullable<SessionPayload["data"]>): void => {
     const value = data?.pendingRenewal;
@@ -246,7 +253,7 @@ export function useSessionRenew(props: SessionRenewProps): SessionRenewSlots {
   }, [completeFromOwnerRead, readSession]);
 
   const start = React.useCallback(async () => {
-    setBusy(true); setMessage(null); setStep("signing");
+    setBusy(true); setMessage(null); setCmcNote(null); setStep("signing");
     try {
       const params = { ttlSec: 604_800 };
       const envelope = await owner.signEnvelope("renewSession", props.agentId, params);
@@ -272,6 +279,23 @@ export function useSessionRenew(props: SessionRenewProps): SessionRenewSlots {
         if (current === null) {
           setMessage("Could not read the renewal state — refresh.");
         } else if (current.pendingRenewal === undefined) {
+          if (props.cmcRebind === true) {
+            let bound = false;
+            const run = new GridDeployRun();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => { controller.abort(); run.stop(); }, RENEW_CMC_DEADLINE_MS);
+            try {
+              bound = await run.guarded(() => runCmcContinuation({
+                agentId: props.agentId, header: { name: "x-renew-action", value: encodeReadHeader(envelope) }, expectedMode: "rebind",
+                ownerAddress: owner.ownerAddress, wallet: props.walletAddress as Address, passkey: owner.passkey!,
+                sessionPublicKey: data.sessionPublicKey, sessionExpiry: data.expiry, incrementWei: "0", run, signal: controller.signal, check: () => run.check(),
+                requestJson: async (input, init) => { const response = await fetch(input, { ...init, signal: controller.signal }); return { response, payload: await jsonResponse(response) }; },
+                preparing: () => undefined, executing: () => undefined,
+              }));
+            } catch { bound = false; }
+            finally { clearTimeout(timeout); }
+            if (!bound) setCmcNote("Renewed. Data access (CMC) still needs a rebind: open the CMC x402 tab and press Rebind data access.");
+          }
           if (await completeFromOwnerRead()) return;
           setMessage("Could not read the renewal state — refresh.");
           return;
@@ -285,7 +309,7 @@ export function useSessionRenew(props: SessionRenewProps): SessionRenewSlots {
         : error instanceof Error ? error.message : "Renewal failed.";
       await reconcileAfterError(fallback, false);
     } finally { setBusy(false); }
-  }, [completeFromOwnerRead, owner, props.agentId, readSession, reconcileAfterError]);
+  }, [completeFromOwnerRead, owner, props.agentId, props.cmcRebind, props.walletAddress, readSession, reconcileAfterError]);
 
   const cancel = React.useCallback(async () => {
     if (pending === null) return;
@@ -349,7 +373,7 @@ export function useSessionRenew(props: SessionRenewProps): SessionRenewSlots {
   const alert = message !== null && step !== "retryExpired" ? mono(message, "var(--danger)", "alert") : null;
   return {
     button,
-    status: status === null && alert === null ? null : <>{status}{status !== null && alert !== null ? <br /> : null}{alert}</>,
+    status: status === null && alert === null && cmcNote === null ? null : <>{status}{status !== null && alert !== null ? <br /> : null}{alert}{cmcNote === null ? null : <><br />{mono(cmcNote)}</>}</>,
   };
 }
 

@@ -2,23 +2,28 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { lpWithdrawOutcome } from "@/lib/lp/withdraw";
-import { formatEther, isHex, size } from "viem";
-import { ActivityRow, Button, Category, ChartFrame, Icon, MetricTile, Num, SegmentedToggle, Skeleton, StatusBadge } from "@/design-system";
+import { encodeFunctionData, formatEther, getAddress, isHex, parseAbi, size, zeroAddress } from "viem";
+import { FundsModal, type FundsWallet } from "@/components/FundsModal";
+import { executeCmcBudgetCalls, keyHashForSession } from "@/lib/altana/cmc-budget";
+import { depositAmountWei } from "@/lib/altana/hire-funding";
+import { ActivityRow, Button, Category, ChartFrame, Icon, MetricTile, Modal, Num, SegmentedToggle, Skeleton, StatusBadge } from "@/design-system";
 import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
 import { CHART_INTERVALS, displaySide, emptyRungPairs, gridSideLabel, liveRungSides, liveRungValueWei, relativeTime, rungFillTick, rungHoldsWbnb, sequenceOutcome, shiftFills, type AgentDetailView, type ChartInterval, type DetailMetric, type DetailMotion, type OhlcvResult, type LiveRungGap } from "@/lib/exec/agent-detail";
 import { REVIEWED_MAJORS_56, formatAtomic, midpointWbnbUsdtPrice, pairQuoting, rangePrices, reviewedPair, type ReviewedPair, priceAtTick } from "@/lib/exec/pairs";
 import { LiquidityChart, type LiquidityGeometry } from "@/components/lp/LiquidityChart";
 import { gridModelLabel } from "@/lib/grid/economics";
+import { pancakePositionUrl } from "@/lib/pancake";
 import { useAgentDetail, type ChartUnit, type UseAgentDetailResult } from "@/lib/exec/use-agent-detail";
 import { useMockAgentDetail } from "@/lib/mock/use-mock-agent-detail";
-import { usePublicClient } from "wagmi";
-import { NFPM_56 } from "@/lib/exec/pairs";
+import { useAccount, usePublicClient } from "wagmi";
+import { NFPM_56, USDT_56 } from "@/lib/exec/pairs";
 import { listWalletPositionIds, readOnChainPosition, readWalletLegBalances, type OnChainPosition, type OnChainPositionRead } from "@/lib/altana/position-reader";
 import type { DustRead } from "@/lib/lp/dust";
 import { readLpAccounting, selectLpAccountingPosition, type LpAccountingRead } from "@/lib/lp/accounting";
 import { useOwnerActions } from "@/lib/exec/use-owner-actions";
-import type { TradeSettings } from "@/lib/trade";
+import { scheduleNativeNeeds, type TradeSettings } from "@/lib/trade";
 import { TradeAgentDetail } from "@/components/trade/TradeAgentDetail";
+import { DCA_REMOVE_PATIENCE_MS, dcaRemoveProgress } from "@/components/trade/TradeRunLog";
 import { LpAgentDetail } from "@/components/agent/LpAgentDetail";
 import { LendingAgentDetail } from "@/components/agent/LendingAgentDetail";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
@@ -52,6 +57,11 @@ type Props = { readonly agentId: string; readonly go: (route: string) => void };
 type Tab = "Overview" | "Run log";
 /** `side` is the DISPLAY side (`displaySide`): "buy" bought the display base, "sell" sold it. */
 type Fill = { readonly motion: DetailMotion; readonly side: "buy" | "sell" };
+
+/** `setSpendLimit(bytes32 keyHash, address token, uint8 period, uint256 limit)` — as `scripts/owner-add-spend-limit.ts` calls it. */
+const SET_SPEND_LIMIT_ABI = parseAbi(["function setSpendLimit(bytes32 keyHash,address token,uint8 period,uint256 limit)"]);
+/** Altana's rolling-day spend period constant (`PERIOD_DAY` in `scripts/owner-add-spend-limit.ts`). */
+const PERIOD_DAY = 2;
 
 const TICK_ASK = "var(--warn)", TICK_BID = "var(--cat-grid)";
 const RUNG_LINE = "#2cd391";
@@ -293,11 +303,6 @@ function chartAxis(candles: OhlcvResult["candles"]): readonly string[] {
 
 function short(value: string): string {
   return value.length <= 12 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`;
-}
-
-/** The position page PancakeSwap shows for a V3 NFT — the same link the LP detail uses. */
-function pancakePositionUrl(tokenId: string): string {
-  return `https://pancakeswap.finance/liquidity/${tokenId}`;
 }
 
 function fills(view: AgentDetailView | null): readonly Fill[] {
@@ -799,16 +804,52 @@ function usePairIcons(token0: string | undefined, token1: string | undefined): R
   return icons;
 }
 
+/**
+ * TRADFI-EXPIRY-KEEP-REMOVE §5.2: the TradFi AI agent's Remove choice while it
+ * holds positions. An expired session cannot sell, so Sell all is disabled and
+ * Keep is preselected; otherwise the owner must pick one before Remove enables.
+ */
+function TradeRemoveChoice({ expired, onCancel, onSell, onKeep }: {
+  readonly expired: boolean;
+  readonly onCancel: () => void;
+  readonly onSell: () => void;
+  readonly onKeep: () => void;
+}) {
+  const [choice, setChoice] = useState<"sell" | "keep" | null>(expired ? "keep" : null);
+  const label = choice === "sell" ? "Sell all and remove" : choice === "keep" ? "Keep positions and remove" : "Remove";
+  return (
+    <Modal title="Remove agent" onClose={onCancel} footer={<>
+      <Button variant="ghost" onClick={onCancel}>Cancel</Button>
+      <Button variant="danger" disabled={choice === null} onClick={() => (choice === "sell" ? onSell() : onKeep())}>{label}</Button>
+    </>}>
+      <label style={{ display: "block", marginBottom: 12 }}>
+        <input type="radio" name="trade-remove-choice" value="sell" disabled={expired} checked={choice === "sell"} onChange={() => setChoice("sell")} />{" "}
+        <strong>Sell all and remove.</strong> The agent sells every open position to USDT, then its session key is revoked.
+        {expired ? <em style={{ display: "block" }}>Session expired. The agent can&apos;t sell. Renew to sell, or keep positions.</em> : null}
+      </label>
+      <label style={{ display: "block" }}>
+        <input type="radio" name="trade-remove-choice" value="keep" checked={choice === "keep"} onChange={() => setChoice("keep")} />{" "}
+        <strong>Keep positions and remove.</strong> Nothing is sold. The agent takes no further decision and its session key is revoked. Your positions stay in the wallet and are not counted in PnL. Withdraw them from Account.
+      </label>
+    </Modal>
+  );
+}
+
 export function HiredAgentScreen({ agentId, go }: Props) {
   // `?mock=1` swaps the VIEW for the recording fixture and nothing else; with
   // the flag absent this is the real result by identity.
   const detail = useMockAgentDetail(useAgentDetail(agentId), agentId);
   const owner = useOwnerActions();
+  const { address: connectedAddress } = useAccount();
   const [runFilter, setRunFilter] = useState("All");
   const [tab, setTab] = useState<Tab>("Overview");
   const [delegatedUnit, setDelegatedUnit] = useState<"USD" | "BNB">("USD");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  /** TRADFI-EXPIRY-KEEP-REMOVE §5.2: the Sell all / Keep choice, open while set. */
+  const [removeChoice, setRemoveChoice] = useState<{ readonly expired: boolean } | null>(null);
+  /** B3 (TRADFI-SCHEDULE-NATIVE-CAP-PLAN): the interval-edit BNB top-up, when one is owed. */
+  const [scheduleDepositWei, setScheduleDepositWei] = useState<bigint | null>(null);
   const [registration, setRegistration] = useState<SessionRegistration>(null);
   const [finalizedRevocation, setFinalizedRevocation] = useState<FinalizedSessionRevocation>(null);
   // What the CHAIN says each position NFT holds, keyed by tokenId. The plane's
@@ -1166,6 +1207,35 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     await readOnChainPositions(view);
   });
 
+  // AUTO-DCA R2.11 / D18: the passkey pull door — one prompt for up to three orders
+  // (the per-order button passes one token id). The browser reads the positions from
+  // chain, never from the plane, filtered to the DCA pool with liquidity > 0, and
+  // submits the reader's own 1 % minimums.
+  const pullDcaOrders = (tokenId?: string) => perform(async () => {
+    const dca = detail.trade?.dca;
+    const wallet = view?.walletAddress;
+    if (dca === undefined || wallet === null || wallet === undefined) return;
+    if (owner.passkey === null) throw new Error("Pulling orders on chain needs the passkey that holds this wallet.");
+    if (!publicClient) throw new Error("The chain could not be read. Try again in a moment.");
+    const pair = [USDT_56, dca.token.toLowerCase()].sort().join();
+    const ids = tokenId === undefined ? await listWalletPositionIds(publicClient, NFPM_56 as `0x${string}`, wallet as `0x${string}`) : [BigInt(tokenId)];
+    const reads = await Promise.all(ids.map((id) => readOnChainPosition(publicClient, NFPM_56 as `0x${string}`, id)));
+    const positions = reads.filter((read): read is OnChainPosition => read.kind === "position" && read.liquidity > 0n && read.fee === dca.fee
+      && [read.token0.toLowerCase(), read.token1.toLowerCase()].sort().join() === pair);
+    if (positions.length === 0) { setMessage("No Auto DCA order holds liquidity on chain."); return; }
+    if (positions.some((position) => !position.amountsAvailable || (position.minimums.amount0 === 0n && position.minimums.amount1 === 0n))) {
+      throw new Error("The pool price could not be read, so this close has no floor to submit. Try again in a moment.");
+    }
+    if (positions.length > 3) throw new Error("More than three orders rest on chain. Close them one at a time.");
+    setMessage(`Pulling ${positions.length} resting order${positions.length === 1 ? "" : "s"} with your passkey…`);
+    const { closeLpPositionsWithPasskey } = await import("@/lib/altana/client");
+    const result = await closeLpPositionsWithPasskey({ record: owner.passkey, nfpm: NFPM_56 as `0x${string}`, deadlineSec: BigInt(Math.floor(Date.now() / 1000) + 600),
+      positions: positions.map((position) => ({ tokenId: position.tokenId, liquidity: position.liquidity, amount0Min: position.minimums.amount0, amount1Min: position.minimums.amount1 })) });
+    if (result.status === "FAILED") throw new Error(`The on-chain pull failed (${result.callsId.slice(0, 10)}…). Nothing left the orders; close them one at a time.`);
+    setMessage(result.status === "PENDING" ? "On-chain pull pending — refresh after confirmation." : "Orders pulled into the wallet. The plane books them from their own receipts.");
+    await detail.refreshTrade();
+  });
+
   const runRemove = () => perform(async () => {
     if (view?.renewalPending === true) {
       throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
@@ -1401,10 +1471,48 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   const saveTradeSettings = async (settings: TradeSettings): Promise<void> => {
     setBusy(true);
     setMessage("");
+    // B3 (TRADFI-SCHEDULE-NATIVE-CAP-PLAN): the interval BEFORE this save, so the
+    // native-need recompute below runs ONLY when the interval itself changed —
+    // every other schedule edit (end rule, premium ceiling, market hours…) stops
+    // at the save above, exactly as it did before this plan.
+    const previousIntervalSec = detail.trade?.schedule?.intervalSec;
     try {
       await mutate("tradeSettings", "/trade/settings", settings);
-      await detail.refreshTrade();
+      const refreshed = await detail.refreshTrade();
       setMessage("Trading settings saved.");
+      const schedule = refreshed?.schedule;
+      if (settings.tradeMode === "schedule" && settings.scheduleIntervalSec !== undefined && schedule !== undefined
+        && previousIntervalSec !== undefined && previousIntervalSec !== settings.scheduleIntervalSec) {
+        const remainingBuys = Math.max(0, schedule.plannedBuys - schedule.fills);
+        const sessionRemainingMs = schedule.sessionExpiresAtSec === null || schedule.sessionExpiresAtSec === undefined
+          ? 0 : schedule.sessionExpiresAtSec * 1_000 - Date.now();
+        const needs = scheduleNativeNeeds({ intervalSec: settings.scheduleIntervalSec, remainingBuys, sessionRemainingMs });
+        const owed: string[] = [];
+        if (schedule.nativeCapWei !== null && schedule.nativeCapWei !== undefined && needs.dayCapWei > BigInt(schedule.nativeCapWei)) {
+          const walletAddress = view?.walletAddress ?? null;
+          const sessionPublicKey = view?.sessionPublicKey ?? null;
+          if (owner.passkey !== null && walletAddress !== null && sessionPublicKey !== null
+            && owner.passkey.walletAddress?.toLowerCase() === walletAddress.toLowerCase()) {
+            try {
+              const keyHash = keyHashForSession(sessionPublicKey as `0x${string}`);
+              const call = { to: getAddress(walletAddress), value: 0n,
+                data: encodeFunctionData({ abi: SET_SPEND_LIMIT_ABI, functionName: "setSpendLimit",
+                  args: [keyHash, zeroAddress, PERIOD_DAY, needs.dayCapWei] as const }) };
+              const result = await executeCmcBudgetCalls({ record: owner.passkey, calls: [call] });
+              if (result.status === "FAILED") owed.push("the on-chain native day cap (the raise failed on chain)");
+            } catch (error) {
+              owed.push(`the on-chain native day cap (${error instanceof Error ? error.message.slice(0, 120) : "signature not completed"})`);
+            }
+          } else {
+            owed.push("the on-chain native day cap (connect this agent's own passkey to raise it)");
+          }
+        }
+        if (schedule.nativeBalanceWei !== null && schedule.nativeBalanceWei !== undefined && needs.balanceWei > BigInt(schedule.nativeBalanceWei)) {
+          setScheduleDepositWei(depositAmountWei(needs.balanceWei - BigInt(schedule.nativeBalanceWei)));
+          owed.push("a BNB deposit for the faster interval");
+        }
+        if (owed.length > 0) setMessage(`Trading settings saved. Still owed: ${owed.join("; ")}.`);
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Action failed.");
       throw error;
@@ -1413,50 +1521,16 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     }
   };
 
-  const runTradeRemove = () => perform(async () => {
-    if (view === null) return;
-    if (view.renewalPending === true) {
-      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
-    }
-    const refreshed = await detail.refresh();
-    if (refreshed?.renewalPending === true) {
-      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
-    }
-    if (owner.passkey === null || view.sessionPublicKey === null) {
+  /**
+   * The on-chain half of Remove, shared by Sell all and Keep (TRADFI-EXPIRY-KEEP-REMOVE
+   * §5.2): the finalized proof that already removes the key, else the passkey
+   * revoke, then the proof again. `done` is what an owner reads when it worked.
+   */
+  const finishTradeRemoval = async (start: AgentDetailView, done: { readonly early: string; readonly proven: string }): Promise<void> => {
+    if (view === null || owner.passkey === null || view.sessionPublicKey === null) {
       throw new Error("Removing this agent needs the passkey that owns its wallet.");
     }
-    let currentView = refreshed ?? view;
-    if (view.status === "revoked") {
-      const current = await detail.refreshTrade();
-      if (current !== null && (current.open.length > 0 || current.pendingIntents.length > 0)) {
-        throw new Error("Local revoke is already recorded, but conversion to BNB is incomplete. Use Hard revoke, then Account recovery for the remaining tokens.");
-      }
-    }
-    if (view.status !== "revoked") {
-      setMessage("Removing: closing the entry gate and requesting every open position exit to BNB…");
-      await mutate("tradeDrain", "/trade/drain", {});
-      if (view.status === "paused") {
-        setMessage("Removing: resuming the worker so it can exit every open position to BNB…");
-        await mutate("unpause", "/unpause", {});
-      }
-      let drained = false;
-      for (let attempt = 0; attempt < 50; attempt += 1) {
-        const current = await detail.refreshTrade();
-        if (current !== null && current.open.length === 0 && current.pendingIntents.length === 0) {
-          drained = true;
-          break;
-        }
-        setMessage("Removing: waiting for confirmed exits and zero token balances…");
-        await new Promise((resolve) => window.setTimeout(resolve, 3_000));
-      }
-      if (!drained) {
-        setMessage("The agent is still draining. No new entries can open; press Removing again after the pending exits settle.");
-        return;
-      }
-      setMessage("Removing: positions are empty. Revoking the agent on the execution plane…");
-      await mutate("revoke", "/revoke", {});
-      currentView = await detail.refresh() ?? view;
-    }
+    let currentView = start;
     // An EXPIRED session is already invalid in the KeyStore (2026-09-17,
     // trading-agent-01-new): the SDK's revoke then submits only the account-level
     // revoke, which reverts KeyDoesNotExist on Altana, and the page looped on
@@ -1467,7 +1541,7 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       const evidence = await readRegistration();
       currentView = await detail.refresh() ?? currentView;
       if (hasFreshRevocationProof(removeSnapshotOf(currentView, registration, evidence), Date.now())) {
-        setMessage("Agent removed. The recorded session is no longer valid on chain (expired or revoked); no revocation was needed.");
+        setMessage(done.early);
         return;
       }
     }
@@ -1493,10 +1567,140 @@ export function HiredAgentScreen({ agentId, go }: Props) {
       throw new Error(`The on-chain session-key revocation did not happen (${failure}). Plane status: ${currentView.status}; KeyStore evidence: ${evidence?.kind ?? "none"}. Press Remove again after the plane records the revoke, or use Finish removal.`);
     }
     if (proven) {
-      setMessage("Agent removed. Every verified position was exited to BNB before revocation.");
+      setMessage(done.proven);
     } else {
       setMessage("The revocation was submitted. Press Finish removal after the chain confirms it.");
     }
+  };
+
+  /**
+   * TRADFI-EXPIRY-KEEP-REMOVE §5.2 — Keep positions and remove, and its resume:
+   * the plane records the revoke (`{ keepPositions: true }`) only when it has
+   * not yet, then the shared on-chain tail ALONE — no drain, no second revoke.
+   * `start` is the caller's REFRESHED agent view.
+   */
+  const keepPositionsAndRemove = async (start: AgentDetailView): Promise<void> => {
+    if (start.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
+    }
+    if (owner.passkey === null || start.sessionPublicKey === null) {
+      throw new Error("Removing this agent needs the passkey that owns its wallet.");
+    }
+    let current = start;
+    if (current.status !== "revoked" && current.status !== "retired") {
+      setMessage("Removing: recording the revoke on the execution plane. Positions are kept, nothing is sold…");
+      await mutate("revoke", "/revoke", { keepPositions: true });
+      current = await detail.refresh() ?? current;
+    }
+    const kept = (await detail.refreshTrade())?.keptPositions ?? 0;
+    const message = `Agent removed. ${kept} position${kept === 1 ? " was" : "s were"} kept in the wallet. Withdraw the stocks and USDT from Account.`;
+    await finishTradeRemoval(current, { early: message, proven: message });
+  };
+
+  /** A TradFi AI agent that holds positions: decide AFTER a refresh — resume at the tail, or offer the choice. */
+  const startTradfiAiRemove = () => perform(async () => {
+    if (view === null) return;
+    const refreshed = await detail.refresh() ?? view;
+    if (refreshed.status === "revoked" || refreshed.status === "retired") {
+      await keepPositionsAndRemove(refreshed);
+      return;
+    }
+    setRemoveChoice({ expired: sessionExpiry(refreshed.sessionExpiresAt, Date.now()).state === "expired" });
+  });
+
+  const runTradeRemove = () => perform(async () => {
+    if (view === null) return;
+    if (view.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
+    }
+    const refreshed = await detail.refresh();
+    if (refreshed?.renewalPending === true) {
+      throw new Error("A renewal is pending; finish or cancel it before removing the agent.");
+    }
+    if (owner.passkey === null || view.sessionPublicKey === null) {
+      throw new Error("Removing this agent needs the passkey that owns its wallet.");
+    }
+    let currentView = refreshed ?? view;
+    // AUTO-DCA R4.7/R4.8: the DCA copy and loop are used throughout this remove.
+    const dcaAgent = detail.trade?.dca !== undefined;
+    const dcaSymbol = detail.trade?.dca?.symbol;
+    // TRADFI-EXPIRY-KEEP-REMOVE: the TradFi AI agent settles in USDT and branches on the REFRESHED lifecycle.
+    const tradfiAi = detail.trade?.tradfiAi === true;
+    const settle = tradfiAi ? "USDT" : "BNB";
+    const status = tradfiAi ? currentView.status : view.status;
+    // The AI agent's revoke may be recorded as `retired` too, and by ANOTHER path while the dialog was open.
+    const recorded = tradfiAi ? status === "revoked" || status === "retired" : status === "revoked";
+    if (recorded) {
+      const current = await detail.refreshTrade();
+      if (tradfiAi && current !== null && current.open.length > 0) {
+        // §5.2: the plane already recorded the revoke, so what remains is a KEPT holding: resume at the on-chain tail ALONE.
+        await keepPositionsAndRemove(currentView);
+        return;
+      }
+      if (current !== null && (current.open.length > 0 || current.pendingIntents.length > 0)) {
+        throw new Error(`Local revoke is already recorded, but conversion to ${settle} is incomplete. Use Hard revoke, then Account recovery for the remaining tokens.`);
+      }
+    }
+    if (!recorded) {
+      // AUTO-DCA R2.23 #17: the plane runs Remove for a paused DCA agent without an unpause.
+      setMessage(dcaAgent
+        ? "Removing: closing the entry gate; the plane pulls every order back to the agent wallet…"
+        : `Removing: closing the entry gate and requesting every open position exit to ${settle}…`);
+      await mutate("tradeDrain", "/trade/drain", {});
+      if (status === "paused" && !dcaAgent) {
+        setMessage(`Removing: resuming the worker so it can exit every open position to ${settle}…`);
+        await mutate("unpause", "/unpause", {});
+      }
+      let drained = false;
+      if (dcaAgent) {
+        // AUTO-DCA R4.8: the DCA loop waits on the plane's own progress, not an attempt count.
+        let best = Number.POSITIVE_INFINITY;
+        let progressAt = Date.now();
+        let message = "Removing: waiting for the plane…";
+        for (;;) {
+          const current = await detail.refreshTrade();
+          if (current !== null && current.dca !== undefined) {
+            const progress = dcaRemoveProgress(current);
+            if (progress.done) { drained = true; break; }
+            if (progress.stage < best) { best = progress.stage; progressAt = Date.now(); }
+            message = progress.message;
+          }
+          if (Date.now() - progressAt >= DCA_REMOVE_PATIENCE_MS) {
+            setMessage(`${message} Remove keeps running on the plane; press Removing again to finish once it is done.`);
+            return;
+          }
+          setMessage(message);
+          await new Promise((resolve) => window.setTimeout(resolve, 3_000));
+        }
+      } else {
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+          const current = await detail.refreshTrade();
+          // A DCA agent holds no positions: it is drained once its round has settled and no batch is in flight.
+          if (current !== null && current.open.length === 0 && current.pendingIntents.length === 0
+            && (current.dca === undefined || (current.dca.round === null && current.dca.inFlight === null))) {
+            drained = true;
+            break;
+          }
+          setMessage("Removing: waiting for confirmed exits and zero token balances…");
+          await new Promise((resolve) => window.setTimeout(resolve, 3_000));
+        }
+        if (!drained) {
+          setMessage("The agent is still draining. No new entries can open; press Removing again after the pending exits settle.");
+          return;
+        }
+      }
+      setMessage(dcaAgent
+        ? "Removing: every order is back in the agent wallet. Revoking the agent on the execution plane…"
+        : "Removing: positions are empty. Revoking the agent on the execution plane…");
+      await mutate("revoke", "/revoke", {});
+      currentView = await detail.refresh() ?? view;
+    }
+    await finishTradeRemoval(currentView, {
+      early: "Agent removed. The recorded session is no longer valid on chain (expired or revoked); no revocation was needed.",
+      proven: dcaAgent
+        ? `Agent removed. Every order was pulled back to the agent wallet and nothing was sold; withdraw your USDT and ${dcaSymbol!} with Withdraw on My agents.`
+        : `Agent removed. Every verified position was exited to ${settle} before revocation.`,
+    });
   });
 
   const runTradeHardRevoke = () => perform(async () => {
@@ -1515,7 +1719,11 @@ export function HiredAgentScreen({ agentId, go }: Props) {
     // already proves removal. Order now: plane revoke first, then evidence,
     // and the passkey ceremony only when the evidence is not there yet.
     if (current.status !== "revoked") {
-      if (trading && (await detail.refreshTrade())?.lifecycle.draining !== true) {
+      // A schedule agent never sells (CLAUDE.md, TRADFI-SCHEDULE-BUY-SPEC §0):
+      // `/trade/drain` refuses it outright (409 schedule_no_sell), so hard
+      // revoke must skip straight to the revoke call, same as an already-draining agent.
+      const refreshedTrade = trading ? await detail.refreshTrade() : null;
+      if (trading && refreshedTrade?.schedule === undefined && refreshedTrade?.portfolio === undefined && refreshedTrade?.lifecycle.draining !== true) {
         setMessage("Removing: closing the entry gate on the execution plane…");
         await mutate("tradeDrain", "/trade/drain", {});
       }
@@ -1561,7 +1769,8 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   const nowMs = useSessionClock();
   const sessionPill = sessionPillOverride(sessionExpiry(view?.sessionExpiresAt, nowMs), view?.status);
   // One renewal control for every kind: the button sits left of Edit, the status is one mono line under the hero (operator, 2026-09-16).
-  const renewal = useSessionRenew({ agentId, walletAddress: view?.walletAddress ?? "", sessionExpiresAt: view?.sessionExpiresAt, kind: trading ? "trade" : lpAgent ? "lp" : "grid", readHeaders: detail.readHeaders, refresh: detail.refresh });
+  const renewal = useSessionRenew({ agentId, walletAddress: view?.walletAddress ?? "", sessionExpiresAt: view?.sessionExpiresAt, kind: trading ? "trade" : lpAgent ? "lp" : "grid", readHeaders: detail.readHeaders, refresh: detail.refresh,
+    cmcRebind: detail.trade?.settings?.executionModel === "tradfi" && detail.trade.settings.settlementAsset === "USDT" && detail.trade.settings.cmcNewsEnabled === true });
   const sessionDead = sessionExpiry(view?.sessionExpiresAt, nowMs).state === "expired" && (view?.status === "armed" || view?.status === "paused");
   const status = sessionPill?.status ?? (view?.status === "armed" ? "live" : "paused");
   const statusLabel = view === null ? "—" : sessionPill?.label ?? (["provisioning", "revoked", "retired"].includes(view.status) ? view.status : undefined);
@@ -1596,29 +1805,66 @@ export function HiredAgentScreen({ agentId, go }: Props) {
   const identityStatus = <Erc8004IdentityStatus identity={view?.erc8004Identity} />;
 
   if (trading) {
-    return <TradeAgentDetail
-      identityStatus={identityStatus}
-      agentId={agentId}
-      view={view}
-      trade={detail.trade}
-      busy={busy}
-      removed={removed && detail.trade !== null && detail.trade.open.length === 0 && detail.trade.pendingIntents.length === 0}
-      message={statusMessage}
-      signedOut={detail.state === "signed-out" || detail.state === "auth-expired"}
-      go={go}
-      signIn={detail.signIn}
-      refresh={detail.refreshTrade}
-      togglePause={() => void togglePause()}
-      remove={() => {
-        // An expired session cannot sell: Remove revokes the key outright and the owner withdraws what is left from Account (the old Hard revoke, folded in 2026-09-16).
-        if (sessionDead) { if (window.confirm("The session has expired, so the agent cannot sell. Remove will revoke the session key now; any tokens left stay in the wallet — withdraw them from Account.")) void runTradeHardRevoke(); return; }
-        if (window.confirm("Remove this agent? It will resume if paused, exit every open position to BNB, then revoke the session key.")) void runTradeRemove();
-      }}
-      sellNow={sellNow}
-      saveSettings={saveTradeSettings}
-      renewalButton={renewal.button}
-      renewalStatus={renewal.status}
-    />;
+    // B3: the wallet FundsModal needs when an interval edit is short of BNB.
+    const scheduleFundsWallet: FundsWallet | null = view?.walletAddress === null || view?.walletAddress === undefined ? null : {
+      address: view.walletAddress, custodyModel: "passkey", depositable: true,
+      source: "declared", availableUsdMicros: null, deployedUsdMicros: "0", deployedReason: "declared",
+    };
+    return <>
+      <TradeAgentDetail
+        identityStatus={identityStatus}
+        agentId={agentId}
+        view={view}
+        trade={detail.trade}
+        busy={busy}
+        removed={removed && detail.trade !== null && (detail.trade.portfolio !== undefined || detail.trade.tradfiAi === true || detail.trade.open.length === 0 && detail.trade.pendingIntents.length === 0)}
+        message={statusMessage}
+        signedOut={detail.state === "signed-out" || detail.state === "auth-expired"}
+        go={go}
+        signIn={detail.signIn}
+        refresh={detail.refreshTrade}
+        togglePause={() => void togglePause()}
+        remove={() => {
+          // A schedule agent buys only, never sells (spec: TRADFI-SCHEDULE-BUY-SPEC §0):
+          // Remove revokes the key outright and leaves its holdings in the wallet.
+          const scheduleSymbol = detail.trade?.schedule?.symbol;
+          if (detail.trade?.portfolio !== undefined) {
+            if (window.confirm("Removing revokes the agent's key. Your stocks stay in this wallet; withdraw them with your passkey.")) void runTradeHardRevoke();
+            return;
+          }
+          if (scheduleSymbol !== undefined) {
+            if (window.confirm(`Removing revokes the agent's key. Your ${scheduleSymbol} stays in this wallet; withdraw it with your passkey.`)) void runTradeHardRevoke();
+            return;
+          }
+          // TRADFI-EXPIRY-KEEP-REMOVE §5.2: a TradFi AI agent holding positions chooses Sell all or Keep, BEFORE the expired path below (which would send `{}` and fail the empty-position rule).
+          if (detail.trade?.tradfiAi === true && detail.trade.open.length > 0) { void startTradfiAiRemove(); return; }
+          // An expired session cannot sell: Remove revokes the key outright and the owner withdraws what is left from Account (the old Hard revoke, folded in 2026-09-16).
+          if (sessionDead) { if (window.confirm("The session has expired, so the agent cannot sell. Remove will revoke the session key now; any tokens left stay in the wallet — withdraw them from Account.")) void runTradeHardRevoke(); return; }
+          if (detail.trade?.dca !== undefined) {
+            const dcaSymbol = detail.trade.dca.symbol;
+            if (window.confirm(`Remove this agent? It pulls every resting order back to the agent wallet and sells nothing, then revokes the session key. Your USDT and ${dcaSymbol} stay in the wallet; withdraw them with Withdraw on My agents. A paused agent is not resumed.`)) void runTradeRemove();
+            return;
+          }
+          if (window.confirm("Remove this agent? It will resume if paused, exit every open position to BNB, then revoke the session key.")) void runTradeRemove();
+        }}
+        sellNow={sellNow}
+        pullDcaOrders={(tokenId) => void pullDcaOrders(tokenId)}
+        planeUnreachable={detail.state === "execution-unavailable"}
+        readHeaders={detail.readHeaders}
+        saveSettings={saveTradeSettings}
+        cmcOwner={{ ownerAddress: owner.ownerAddress, passkey: owner.passkey, signEnvelope: owner.signEnvelope, signReadHeader: owner.signReadHeader }}
+        renewalButton={renewal.button}
+        renewalStatus={renewal.status}
+      />
+      {removeChoice === null ? null : <TradeRemoveChoice expired={removeChoice.expired} onCancel={() => setRemoveChoice(null)}
+        onSell={() => { setRemoveChoice(null); void runTradeRemove(); }}
+        onKeep={() => { setRemoveChoice(null); void perform(async () => { if (view !== null) await keepPositionsAndRemove(await detail.refresh() ?? view); }); }} />}
+      {scheduleDepositWei !== null && scheduleFundsWallet ? <FundsModal open onClose={() => setScheduleDepositWei(null)}
+        wallet={scheduleFundsWallet} connectedAddress={connectedAddress} passkey={owner.passkey} ownerAddress={owner.ownerAddress}
+        initialTab="deposit" fixedDepositWei={scheduleDepositWei} fixedDepositAsset="BNB"
+        onDepositSubmitted={() => { setScheduleDepositWei(null); void detail.refreshTrade(); }}
+        autoSubmitDeposit /> : null}
+    </>;
   }
 
   if (lendingAgent) {

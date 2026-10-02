@@ -24,6 +24,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+import { getAddress, type Hex } from "viem";
 import {
   AGENT_ID,
   CHAIN_ID,
@@ -34,6 +35,7 @@ import {
   NETWORK,
   NOW_SEC,
   OPERATOR_TOKEN,
+  SESSION_KEY,
   TREASURY,
   call,
   createHarness,
@@ -54,14 +56,21 @@ import {
 import { createServer } from "../src/server.js";
 import { MemoryAgentStore } from "../src/store/agents.js";
 import { MemoryExecutionJournal } from "../src/store/journal.js";
+import { MemoryTradeSettingsStore } from "../src/store/tradeSettings.js";
 import { MemoryNonceStore } from "../src/store/nonces.js";
 import { MemoryKillSwitch } from "../src/killswitch/killswitch.js";
+import { validateSessionSpec } from "../src/core/session.js";
 import {
   NATIVE_RESERVE_REMEDY,
   RELAY_FEE_PER_EXIT_WEI,
   checkNativeCapSizing,
   exitReserveWei,
+  tradeSessionSpec,
 } from "../src/ops/policy.js";
+import { PANCAKE_V2_ROUTER_56, WBNB_56 } from "../src/ops/venues.js";
+import { DEFAULT_TRADE_SETTINGS, tradeSettingsDigest, type TradeSettings } from "../src/trade/settings.js";
+import { USDT_56 } from "../src/trade/settlement.js";
+import { executeTradeForAgent } from "../src/trade/execute.js";
 import { GLOBAL_AGENT_SENTINEL } from "../src/auth/ownerAuth.js";
 
 
@@ -959,5 +968,91 @@ describe("PHASE2.5 F3: which check is the floor and which is the guarantee", () 
       throw new Error("fixture expected a shortfall");
     }
     assert.equal(sized.shortfallWei, exitReserveWei(1) + 1n);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* TRADFI-SCHEDULE-NATIVE-CAP-PLAN A1 — the schedule reserve is ONE token      */
+/* -------------------------------------------------------------------------- */
+
+describe("A1: a schedule agent's native reserve floor counts ONE token, not the chain grant", () => {
+  const SCHED_OWNER = getAddress(`0x${"66".repeat(20)}`);
+  const SCHED_WALLET = getAddress(`0x${"77".repeat(20)}`);
+  const SCHED_TOKEN = getAddress(`0x${"88".repeat(20)}`);
+  const SCHED_KEY = `0x04${"99".repeat(64)}` as Hex;
+  const SCHED_H = `0x${"77".repeat(32)}` as Hex;
+  const E = 10n ** 18n;
+  const R = RELAY_FEE_PER_EXIT_WEI;
+
+  /** A schedule-shaped v2 agent, granted a session over ONE token. */
+  async function schedFixture() {
+    const now = Date.now();
+    const agents = new MemoryAgentStore();
+    const spec = tradeSessionSpec({ venues: { chainId: 56, pancakeRouterV2: PANCAKE_V2_ROUTER_56, wbnb: WBNB_56 },
+      tokens: [{ token: SCHED_TOKEN }], nativeCaps: [{ limit: 10n ** 18n, period: "day" }],
+      quoteToken: USDT_56, quoteDailyCapWei: 60n * E, quotePerTradeCapWei: 20n * E, platformFeeBps: 0,
+      nowSeconds: Math.floor(now / 1000), expiresAt: Math.floor(now / 1000) + 86_400 });
+    const agent = await agents.createAgent({ id: "sched-native-reserve", ownerAddress: SCHED_OWNER, walletAddress: SCHED_WALLET,
+      custodyModel: "passkey", status: "armed", caps: { dailyNativeWei: 10n ** 18n },
+      sessionFacts: { spec, permissions: validateSessionSpec(spec), publicKey: SCHED_KEY, expiry: spec.expiresAt,
+        grantedAtSec: Math.floor(now / 1000) - 86_400, hireSizing: { name: "trade-v1", version: 1, openNativeBudgetWei: "0",
+          settlementAsset: "USDT", minEntryWei: (20n * E).toString(), capitalQuoteWei: (60n * E).toString(),
+          ...{ entryWei: (20n * E).toString(), quotePerTradeWei: (20n * E).toString() } } } });
+    await agents.putAgentSessionKey(SCHED_OWNER, agent.id, SESSION_KEY);
+    return { now, agents, agent, provider: new FakeWalletProvider(), journal: new MemoryExecutionJournal(() => now) };
+  }
+
+  const buyRequest = {
+    decisionId: "sched-buy", venue: "pancake" as const, side: "buy" as const, token: SCHED_TOKEN,
+    amountWei: 20n * E, quotedOutWei: 20n * E, minOutWei: 194n * E / 10n,
+    settlementAsset: "USDT" as const, platformFeeAtomic: 0n,
+  };
+
+  /** Chain says 29 sellable tokens; the meter holds enough for the ONE-token reserve and no more. */
+  function meterAtOneTokenReserve() {
+    const remaining = 2n * R + 1n;
+    return { kind: "day" as const, limitWei: 1_000n * R, currentSpentWei: 1_000n * R - remaining, grantedTokenCount: 29 };
+  }
+
+  it("passes a schedule buy where the chain-granted count (29) would refuse it", async () => {
+    const h = await schedFixture();
+    const settingsStore = new MemoryTradeSettingsStore(h.agents, () => h.now);
+    const settings: TradeSettings = { ...DEFAULT_TRADE_SETTINGS, executionModel: "tradfi", settlementAsset: "USDT",
+      entryWei: (20n * E).toString(), minEntryWei: (20n * E).toString(), capitalQuoteWei: (60n * E).toString(),
+      cmcNewsEnabled: false, maxOpenPositions: 1, takeProfitBps: null, stopLossBps: null, maxHoldSec: null,
+      noReentry: false, breakEvenAfterTp: false, tradeMode: "schedule", scheduleToken: SCHED_TOKEN.toLowerCase(),
+      scheduleIntervalSec: 3_600, scheduleFirstAtSec: null, scheduleEndKind: "budget", scheduleEndAtSec: null,
+      scheduleEndRuns: null, scheduleMarketHoursOnly: false, scheduleMaxPremiumBps: 100 };
+    await settingsStore.put({ agentId: h.agent.id, ownerAddress: SCHED_OWNER, params: settings, digest: tradeSettingsDigest(settings) });
+    h.provider.nativeDayMeterResult = meterAtOneTokenReserve();
+    const result = await executeTradeForAgent({ agent: h.agent, request: buyRequest,
+      idempotencyKey: SCHED_H, paramsHash: SCHED_H, scanGate: { evaluate: async () => ({ verdict: "allow", reasons: [] }) },
+      deps: { chainId: 56, keyStore: SCHED_OWNER, agentStore: h.agents, journal: h.journal, settingsStore,
+        killswitch: new MemoryKillSwitch(), providerRegistry: { get: () => h.provider },
+        trade: tradeConfig({ venues: { chainId: 56, pancakeRouterV2: PANCAKE_V2_ROUTER_56, wbnb: WBNB_56 } }),
+        pancake: { router: PANCAKE_V2_ROUTER_56, wbnb: WBNB_56 }, pancakeV3: null, uniswapV3: null,
+        flapPortal: null, nowMs: () => h.now } });
+    assert.equal(h.provider.executeCalls.length, 1,
+      result.kind === "denied" || result.kind === "rolled-back" ? result.code : result.kind);
+  });
+
+  it("still refuses the SAME meter for an ordinary (non-schedule) v2 agent — the chain count is unchanged", async () => {
+    const h = await schedFixture();
+    const settingsStore = new MemoryTradeSettingsStore(h.agents, () => h.now);
+    const settings: TradeSettings = { ...DEFAULT_TRADE_SETTINGS, executionModel: "tradfi", settlementAsset: "USDT",
+      entryWei: (20n * E).toString(), minEntryWei: (20n * E).toString(), capitalQuoteWei: (60n * E).toString(),
+      cmcNewsEnabled: false };
+    await settingsStore.put({ agentId: h.agent.id, ownerAddress: SCHED_OWNER, params: settings, digest: tradeSettingsDigest(settings) });
+    h.provider.nativeDayMeterResult = meterAtOneTokenReserve();
+    const result = await executeTradeForAgent({ agent: h.agent, request: buyRequest,
+      idempotencyKey: SCHED_H, paramsHash: SCHED_H, scanGate: { evaluate: async () => ({ verdict: "allow", reasons: [] }) },
+      deps: { chainId: 56, keyStore: SCHED_OWNER, agentStore: h.agents, journal: h.journal, settingsStore,
+        killswitch: new MemoryKillSwitch(), providerRegistry: { get: () => h.provider },
+        trade: tradeConfig({ venues: { chainId: 56, pancakeRouterV2: PANCAKE_V2_ROUTER_56, wbnb: WBNB_56 } }),
+        pancake: { router: PANCAKE_V2_ROUTER_56, wbnb: WBNB_56 }, pancakeV3: null, uniswapV3: null,
+        flapPortal: null, nowMs: () => h.now } });
+    assert.equal(h.provider.executeCalls.length, 0);
+    assert.ok((result.kind === "denied" || result.kind === "rolled-back") && result.code === "NATIVE_RESERVE",
+      result.kind === "denied" || result.kind === "rolled-back" ? result.code : result.kind);
   });
 });

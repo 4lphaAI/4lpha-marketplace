@@ -39,7 +39,7 @@ it("trade-worker daemon persists only confirmed receipt fills and keeps its boot
   assert.match(source, /must be exactly "true" or "false"/u);
   assert.match(source, /OPENROUTER_API_KEY/u);
   assert.match(source, /resolveLpRpcUrls\(process\.env, readerNetwork\)/u);
-  assert.match(source, /createRouteQuoteReader\(\{ rpcUrls \}\)/u);
+  assert.match(source, /createRouteQuoteReader\(\{\s*rpcUrls,\s*\.\.\.\(trade\.venues\.uniswapQuoterV3/u);
   assert.match(source, /await routeReader\.getChainId\(\) !== 56/u);
   assert.match(source, /Math\.min\(600, Math\.max\(60,/u);
   assert.doesNotMatch(source, /OWNER_PRIVATE_KEY|SESSION_PRIVATE_KEY/u);

@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseEther, toFunctionSelector } from "viem";
+import { getAddress, parseEther, toFunctionSelector } from "viem";
 import {
   DEFAULT_MAX_SESSION_SECONDS,
   isSessionExpired,
@@ -14,6 +14,7 @@ import {
   validateSessionSpec,
 } from "../src/core/session.js";
 import { InvalidSessionSpecError, type SessionSpec } from "../src/core/types.js";
+import { tradeSessionSpec } from "../src/ops/policy.js";
 
 const NOW = 1_800_000_000;
 const TARGET = "0x000000000000000000000000000000000000dEaD";
@@ -315,6 +316,25 @@ describe("flat-signature regression pin (PHASE3 R1)", () => {
         { limit: 100_000_000_000_000_000n, period: "day" },
       ],
     });
+  });
+});
+
+describe("tradeSessionSpec Uniswap authority", () => {
+  it("grants exactly four target-bound SwapRouter02 selectors and no multicall", () => {
+    const router = getAddress("0x1111111111111111111111111111111111111111");
+    const venues = { chainId: 56, wbnb: getAddress("0x2222222222222222222222222222222222222222"), uniswapRouterV3: router };
+    const session = tradeSessionSpec({ venues, tokens: [], nativeCaps: [{ limit: 10n, period: "day" }], expiresAt: NOW + 3_600, nowSeconds: NOW });
+    const rules = session.allowedCalls.filter((rule) => rule.to?.toLowerCase() === router.toLowerCase());
+    assert.deepEqual(rules.map((rule) => rule.selector), [
+      "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))",
+      "exactInput((bytes,address,uint256,uint256))",
+      "unwrapWETH9(uint256,address)",
+      "refundETH()",
+    ]);
+    assert.equal(rules.some((rule) => rule.selector?.startsWith("multicall")), false);
+    assert.deepEqual(rules.map((rule) => toFunctionSelector(rule.selector ?? "")), [
+      "0x04e45aaf", "0xb858183f", "0x49404b7c", "0x12210e8a",
+    ]);
   });
 });
 

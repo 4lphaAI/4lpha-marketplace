@@ -22,12 +22,12 @@
  */
 
 import * as React from "react";
-import { parseEther } from "viem";
+import { encodeFunctionData, parseEther, parseUnits } from "viem";
 import { useBalance, useGasPrice, usePublicClient, useSendTransaction } from "wagmi";
 import { Button, Input, Modal, Select } from "@/design-system";
 import type { StoredPasskey } from "@/lib/exec/passkey";
 import type { AccountPortfolio } from "@/lib/exec/types";
-import { halfOfWei, maxDepositWei } from "@/lib/altana/amounts";
+import { halfOfWei, maxDepositWei, transferFeeWei } from "@/lib/altana/amounts";
 import { formatWeiAsBnb } from "@/lib/grid/geometry";
 import {
   formatAtomic,
@@ -43,7 +43,7 @@ import {
   withdrawReserveNote,
 } from "@/lib/altana/withdraw";
 import type { WithdrawableToken } from "@/lib/exec/account-view";
-import { WBNB_56 } from "@/lib/exec/pairs";
+import { USDT_56, WBNB_56 } from "@/lib/exec/pairs";
 
 export type FundsWallet = AccountPortfolio["wallets"][number];
 
@@ -61,6 +61,16 @@ const NATIVE_SOURCE = "native";
  * that can move it. This option asks the chain directly instead.
  */
 const MANUAL_SOURCE = "manual";
+
+/** Canonical BSC USDT used for TradFi principal and proceeds. */
+export const USDT_DEPOSIT_DECIMALS = 18;
+export const USDT_TRANSFER_GAS_LIMIT = 65_000n;
+
+const ERC20_TRANSFER_ABI = [{
+  type: "function", name: "transfer", stateMutability: "nonpayable",
+  inputs: [{ name: "to", type: "address" }, { name: "amount", type: "uint256" }],
+  outputs: [{ name: "", type: "bool" }],
+}] as const;
 
 const ERC20_METADATA_ABI = [
   { type: "function", name: "symbol", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "string" }] },
@@ -85,6 +95,30 @@ export function parseDepositAmount(raw: string): { readonly wei: bigint } | { re
   if (!/^\d{1,12}(\.\d{1,18})?$/u.test(trimmed)) return { error: "Enter an amount in BNB, digits and one decimal point." };
   const wei = parseEther(trimmed);
   return wei <= 0n ? { error: "Enter an amount greater than zero." } : { wei };
+}
+
+/** Parses a user-entered USDT amount without converting it through JavaScript numbers. */
+export function parseUsdtDepositAmount(raw: string): { readonly atomic: bigint } | { readonly error: string } {
+  const trimmed = raw.trim();
+  if (trimmed === "") return { error: "Enter an amount in USDT." };
+  if (!/^\d{1,24}(\.\d{1,18})?$/u.test(trimmed)) return { error: "Enter an amount in USDT with up to 18 decimals." };
+  const atomic = parseUnits(trimmed, USDT_DEPOSIT_DECIMALS);
+  return atomic <= 0n ? { error: "Enter an amount greater than zero." } : { atomic };
+}
+
+/**
+ * A token transfer leaves the token balance untouched by gas, but its sender
+ * still needs native BNB for the transfer. `null` means one of those reads is
+ * unavailable, so the UI must not offer Half/Max or submit a guessed amount.
+ */
+export function maxUsdtDepositAtomic(input: {
+  readonly balanceAtomic: bigint;
+  readonly nativeBalanceWei: bigint;
+  readonly gasPriceWei: bigint;
+}): bigint | null {
+  const reserve = transferFeeWei({ gasPriceWei: input.gasPriceWei, gasLimit: USDT_TRANSFER_GAS_LIMIT });
+  if (input.balanceAtomic <= 0n || input.nativeBalanceWei < reserve) return 0n;
+  return input.balanceAtomic;
 }
 
 const BODY = { font: "var(--type-body)", color: "var(--text-muted)", marginBottom: 16 } as const;
@@ -165,6 +199,8 @@ export function FundsModal(props: {
    * own confirmation; there is no amount to get wrong.
    */
   readonly fixedDepositWei?: bigint;
+  readonly fixedDepositAtomic?: bigint;
+  readonly fixedDepositAsset?: "BNB" | "USDT";
   readonly autoSubmitDeposit?: boolean;
   /** Fires once with the transaction hash after the wallet has sent the deposit. */
   readonly onDepositSubmitted?: (hash: string) => void;
@@ -270,12 +306,19 @@ function DepositTab(props: {
   readonly connectedAddress: string | undefined;
   readonly tabs: React.ReactNode;
   readonly fixedDepositWei?: bigint;
+  readonly fixedDepositAtomic?: bigint;
+  readonly fixedDepositAsset?: "BNB" | "USDT";
   readonly autoSubmitDeposit?: boolean;
   readonly onDepositSubmitted?: (hash: string) => void;
 }) {
   const { sendTransaction, data: hash, isPending, error, reset } = useSendTransaction();
   const fixed = props.fixedDepositWei;
-  const [amount, setAmount] = React.useState(fixed === undefined ? "" : formatWeiAsBnb(fixed));
+  const fixedAsset = props.fixedDepositAsset ?? (fixed === undefined && props.fixedDepositAtomic === undefined ? undefined : "BNB");
+  const [depositAsset, setDepositAsset] = React.useState<"BNB" | "USDT">(fixedAsset ?? "BNB");
+  const fixedAny = fixed !== undefined || props.fixedDepositAtomic !== undefined;
+  const [amount, setAmount] = React.useState(fixedAsset === "USDT" && props.fixedDepositAtomic !== undefined
+    ? formatAtomic(props.fixedDepositAtomic, USDT_DEPOSIT_DECIMALS)
+    : fixed === undefined ? "" : formatWeiAsBnb(fixed));
   const [invalid, setInvalid] = React.useState<string | null>(null);
   const sameAddress = props.connectedAddress !== undefined && props.connectedAddress.toLowerCase() === props.wallet.address.toLowerCase();
   // The deposit is paid OUT OF the same balance it moves, so "Max" is the
@@ -286,12 +329,50 @@ function DepositTab(props: {
   const gasPrice = useGasPrice();
   const balanceWei = balance.data?.value;
   const gasPriceWei = gasPrice.data;
-  const max = balanceWei === undefined || gasPriceWei === undefined
+  const usdtBalance = useBalance({
+    address: props.connectedAddress as `0x${string}` | undefined,
+    token: USDT_56 as `0x${string}`,
+  });
+  const max = depositAsset === "BNB"
+    ? balanceWei === undefined || gasPriceWei === undefined
+      ? null
+      : maxDepositWei({ balanceWei, gasPriceWei })
+    : usdtBalance.data?.value === undefined || balanceWei === undefined || gasPriceWei === undefined
+      ? null
+      : maxUsdtDepositAtomic({ balanceAtomic: usdtBalance.data.value, nativeBalanceWei: balanceWei, gasPriceWei });
+  const gasReserve = gasPriceWei === undefined
     ? null
-    : maxDepositWei({ balanceWei, gasPriceWei });
+    : transferFeeWei({ gasPriceWei, gasLimit: depositAsset === "BNB" ? undefined : USDT_TRANSFER_GAS_LIMIT });
 
   const close = () => { setAmount(""); setInvalid(null); reset(); props.onClose(); };
   const confirm = () => {
+    if (depositAsset === "USDT") {
+      if (props.connectedAddress === undefined || balanceWei === undefined || gasPriceWei === undefined) {
+        setInvalid("The connected wallet balance and gas price must be readable before a USDT deposit.");
+        return;
+      }
+      const parsed = props.fixedDepositAtomic !== undefined ? { atomic: props.fixedDepositAtomic } : parseUsdtDepositAmount(amount);
+      if ("error" in parsed) { setInvalid(parsed.error); return; }
+      if (usdtBalance.data?.value === undefined || parsed.atomic > usdtBalance.data.value) {
+        setInvalid("The connected wallet does not hold enough USDT.");
+        return;
+      }
+      if (balanceWei < gasReserve!) {
+        setInvalid("Keep enough BNB in the connected wallet to pay the USDT transfer gas.");
+        return;
+      }
+      setInvalid(null);
+      sendTransaction({
+        to: USDT_56 as `0x${string}`,
+        value: 0n,
+        data: encodeFunctionData({
+          abi: ERC20_TRANSFER_ABI,
+          functionName: "transfer",
+          args: [props.wallet.address as `0x${string}`, parsed.atomic],
+        }),
+      });
+      return;
+    }
     if (fixed !== undefined) {
       sendTransaction({ to: props.wallet.address as `0x${string}`, value: fixed });
       return;
@@ -305,11 +386,19 @@ function DepositTab(props: {
   // Never while the connected wallet is the agent wallet, and never twice.
   const autoSubmitted = React.useRef(false);
   React.useEffect(() => {
-    if (!props.autoSubmitDeposit || fixed === undefined || autoSubmitted.current) return;
+    if (!props.autoSubmitDeposit || !fixedAny || autoSubmitted.current) return;
     if (props.connectedAddress === undefined || sameAddress || isPending || hash !== undefined) return;
+    if (depositAsset === "USDT" && props.fixedDepositAtomic !== undefined
+      && (balanceWei === undefined || gasPriceWei === undefined || usdtBalance.data?.value === undefined
+        || balanceWei < transferFeeWei({ gasPriceWei, gasLimit: USDT_TRANSFER_GAS_LIMIT })
+        || usdtBalance.data.value < props.fixedDepositAtomic)) return;
     autoSubmitted.current = true;
-    sendTransaction({ to: props.wallet.address as `0x${string}`, value: fixed });
-  }, [props.autoSubmitDeposit, fixed, props.connectedAddress, sameAddress, isPending, hash, sendTransaction, props.wallet.address]);
+    if (depositAsset === "USDT" && props.fixedDepositAtomic !== undefined) {
+      sendTransaction({ to: USDT_56 as `0x${string}`, value: 0n, data: encodeFunctionData({ abi: ERC20_TRANSFER_ABI, functionName: "transfer", args: [props.wallet.address as `0x${string}`, props.fixedDepositAtomic] }) });
+    } else if (fixed !== undefined) {
+      sendTransaction({ to: props.wallet.address as `0x${string}`, value: fixed });
+    }
+  }, [props.autoSubmitDeposit, fixedAny, fixed, props.fixedDepositAtomic, depositAsset, props.connectedAddress, sameAddress, isPending, hash, sendTransaction, props.wallet.address, balanceWei, gasPriceWei, usdtBalance.data?.value]);
   const reported = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (hash === undefined || reported.current === hash) return;
@@ -320,7 +409,7 @@ function DepositTab(props: {
   return <Modal title="Deposit" onClose={close} footer={
     <>
       <Button variant="ghost" onClick={close}>{hash ? "Done" : "Cancel"}</Button>
-      <Button variant="primary" onClick={confirm} disabled={isPending || sameAddress}>{isPending ? "Confirm in your wallet…" : "Deposit BNB"}</Button>
+      <Button variant="primary" onClick={confirm} disabled={isPending || sameAddress}>{isPending ? "Confirm in your wallet…" : `Deposit ${depositAsset}`}</Button>
     </>
   }>
     {props.tabs}
@@ -328,16 +417,31 @@ function DepositTab(props: {
     <p style={BODY}>
       From connected wallet <span style={MONO}>{props.connectedAddress ? truncateAddress(props.connectedAddress) : "not connected"}</span>
       {" → "}Agent wallet <span style={MONO}>{truncateAddress(props.wallet.address)}</span>.
+      {depositAsset === "USDT" ? " USDT is strategy capital; BNB remains the network gas reserve." : ""}
     </p>
 
-    {fixed === undefined
-      ? <AmountLabelRow max={max} reason="The connected wallet balance could not be read."
-          onPick={(wei) => { setAmount(formatWeiAsBnb(wei)); setInvalid(null); }} />
+    {!fixedAny ? <Select label="Asset" value={depositAsset} onChange={(event: { target: { value: string } }) => {
+      const next = event.target.value === "USDT" ? "USDT" : "BNB";
+      setDepositAsset(next);
+      setAmount("");
+      setInvalid(null);
+      reset();
+    }} options={[{ value: "BNB", label: balanceWei === undefined ? "BNB" : `BNB · ${formatWeiAsBnb(balanceWei)}` }, {
+      value: "USDT", label: usdtBalance.data?.value === undefined ? "USDT" : `USDT · ${formatAtomic(usdtBalance.data.value, USDT_DEPOSIT_DECIMALS)}`,
+    }]} /> : null}
+
+    {!fixedAny
+      ? <AmountLabelRow max={max} reason={max === null
+        ? depositAsset === "USDT" ? "The connected wallet's USDT balance, BNB gas balance, and gas price must be readable." : "The connected wallet balance could not be read."
+        : depositAsset === "USDT" && gasReserve !== null && balanceWei !== undefined && balanceWei < gasReserve ? `Keep ${formatBnb(gasReserve, 8)} BNB for the USDT transfer gas.` : "The connected wallet holds no amount available to deposit."}
+          onPick={(value) => { setAmount(depositAsset === "USDT" ? formatAtomic(value, USDT_DEPOSIT_DECIMALS) : formatWeiAsBnb(value)); setInvalid(null); }} />
       : <p style={BODY}>This is the amount the hire needs: agent capital plus the session registration fee and its gas. It is not editable here.</p>}
 
-    <Input mono suffix="BNB" value={amount} inputMode="decimal" placeholder="0.05" readOnly={fixed !== undefined}
-      onChange={(event: { target: { value: string } }) => { if (fixed !== undefined) return; setAmount(event.target.value); setInvalid(null); }}
+    <Input mono suffix={depositAsset} value={amount} inputMode="decimal" placeholder={depositAsset === "USDT" ? "20" : "0.05"} readOnly={fixedAny}
+      onChange={(event: { target: { value: string } }) => { if (fixedAny) return; setAmount(event.target.value); setInvalid(null); }}
       error={invalid ?? undefined} />
+
+    {depositAsset === "USDT" && !fixedAny ? <p style={NOTE_SM}>USDT balance: {usdtBalance.data?.value === undefined ? "unavailable" : `${formatAtomic(usdtBalance.data.value, USDT_DEPOSIT_DECIMALS)} USDT`} · transfer gas: {gasReserve === null ? "unavailable" : `${formatBnb(gasReserve, 8)} BNB`}</p> : null}
 
     {sameAddress && <p style={NOTE_SM}>The connected wallet is the agent wallet. A self-transfer is not a deposit.</p>}
     {hash && <p style={{ ...NOTE_SM, color: "var(--profit)" }}>

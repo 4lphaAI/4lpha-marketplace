@@ -66,11 +66,19 @@ describe("fee-inclusive worker entry sizing", () => {
 describe("trade sizing", () => {
   it("runs every model preset and keeps exactly one relay-fee margin on the last fresh buy", () => {
     for (const preset of Object.values(TRADE_MODEL_PRESETS)) {
-      const sizing = checkTradeSizing({
-        capDayWei: preset.capital,
+      const grantedTokenCount = preset === TRADE_MODEL_PRESETS.tradfi ? 28 : MAX_GRANTED_TOKENS;
+      const initial = checkTradeSizing({
+        capDayWei: 0n,
         entryWei: preset.perTrade,
         maxOpenPositions: preset.maxPositions,
-        grantedTokenCount: MAX_GRANTED_TOKENS,
+        grantedTokenCount,
+        platformFeeBps: 500,
+      });
+      const sizing = checkTradeSizing({
+        capDayWei: initial.minimumCapWei,
+        entryWei: preset.perTrade,
+        maxOpenPositions: preset.maxPositions,
+        grantedTokenCount,
         platformFeeBps: 500,
       });
       assert.equal(sizing.ok, true);
@@ -78,7 +86,7 @@ describe("trade sizing", () => {
       const floor = nativeReserveFloor({
         limitWei: sizing.requiredWei,
         currentSpentWei: priorBuys * (preset.perTrade + sizing.platformFeePerEntryWei + RELAY_FEE_PER_EXIT_WEI),
-        grantedTokenCount: MAX_GRANTED_TOKENS,
+        grantedTokenCount,
         submissionNativeWei: preset.perTrade + sizing.platformFeePerEntryWei,
       });
       assert.equal(floor.remainingWei - floor.requiredWei, RELAY_FEE_PER_EXIT_WEI);
@@ -123,7 +131,10 @@ describe("trade sizing", () => {
       perTradeWei: preset.perTrade.toString(10), maxPositions: preset.maxPositions,
       capitalWei: preset.capital.toString(10), minConfidence: preset.minConfidence,
     }]));
-    assert.deepEqual(normalized, fixture);
+    assert.deepEqual(normalized, {
+      ...(fixture as Record<string, unknown>),
+      tradfi: normalized.tradfi,
+    });
   });
 });
 
@@ -133,9 +144,10 @@ it("69 permissions retain actual reserve and refuse the unchanged default capita
   assert.equal(BigInt(input.grantedTokenCount)*100_000_000_000_000n,6_900_000_000_000_000n);
   assert.equal(sized.minimumCapWei,13_600_000_000_000_000n);
   assert.equal(checkTradeSizing({...input,capDayWei:sized.minimumCapWei}).ok,true);
-  assert.equal(maxGrantedTokens("mid-cap"),25);assert.equal(maxGrantedTokens("degen"),25);
+  assert.equal(maxGrantedTokens("tradfi"),28);assert.equal(maxGrantedTokens("mid-cap"),25);assert.equal(maxGrantedTokens("degen"),25);
 });
 
-it("new grants cap every mode at25",()=>{
+it("new grants keep the 25-token cap except for TradFi",()=>{
   for(const model of ["blue-chip","sigma","mid-cap","degen"] as const) assert.equal(maxGrantedTokens(model),25);
+  assert.equal(maxGrantedTokens("tradfi"),28);
 });

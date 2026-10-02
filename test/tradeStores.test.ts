@@ -107,7 +107,7 @@ class TradeFakeSql implements SqlClient {
     if (tag === "tradePositions.open") {
       if (this.positions.has(String(p[0]))) return [];
       const row: Row = { id: p[0], agent_id: p[1], owner_address: p[2], token: p[3],
-        route: JSON.parse(String(p[4])), entry_wei: p[5], token_amount: p[6], fill_status: p[7], opened_at: p[8], entry_tx_hash: p[9], status: "open",
+        route: JSON.parse(String(p[4])), venue: p[12] ?? null, entry_wei: p[5], token_amount: p[6], fill_status: p[7], opened_at: p[8], entry_tx_hash: p[9], status: "open",
         exit_requested_at: null, orphaned_at: null, closed_at: null, exit_wei: null, exit_tx_hash: null,
         sold_token_amount: null, exit_fill_status: null, close_reason: null,
         last_sell_refusal: null, last_sell_refusal_at: null, no_price_count: 0 };
@@ -119,6 +119,17 @@ class TradeFakeSql implements SqlClient {
       return [...this.positions.values()]
         .filter((row) => row["owner_address"] === p[0] && row["agent_id"] === p[1])
         .filter((row) => tag === "tradePositions.list" || row["status"] === "open");
+    }
+    if (tag === "tradePositions.exitReceiptOwnership") {
+      return [...this.positions.values()].filter((row) => row["exit_receipt_ownership_key"] === p[0]).map((row) => ({ id: row["id"] }));
+    }
+    if (tag === "tradePositions.adoptVerifiedExit") {
+      const row = this.position(p);
+      if (row === undefined || row["status"] !== "closed" ||
+          !(row["exit_wei"] === null || row["close_reason"] === "balance-gone" && BigInt(String(row["exit_wei"])) === 0n
+            && row["exit_fill_status"] !== "verified") || row["exit_receipt_ownership_key"] != null) return [];
+      row["exit_wei"] = p[3]; row["exit_fill_status"] = "verified"; row["exit_receipt_ownership_key"] = p[4];
+      return [row];
     }
     if (tag?.startsWith("tradePositions.") === true) {
       const row = this.position(p);
@@ -132,14 +143,20 @@ class TradeFakeSql implements SqlClient {
       return [row];
     }
     if (tag === "tradeRuns.insert") {
-      this.runs.set(String(p[0]), { id: p[0], agent_id: p[1], owner_address: p[2], dry_run: p[3], reason: p[4], created_at: p[5] });
+      this.runs.set(String(p[0]), { id: p[0], agent_id: p[1], owner_address: p[2], dry_run: p[3], reason: p[4], created_at: p[5], entries: p[8], exits: p[9] });
       return [];
     }
     if (tag === "tradeRuns.prune") {
       const rows = [...this.runs.values()].filter((row) => row["agent_id"] === p[0])
         .sort((a, b) => Number(b["created_at"]) - Number(a["created_at"]) || String(b["id"]).localeCompare(String(a["id"])));
-      for (const row of rows.slice(200)) this.runs.delete(String(row["id"]));
+      for (const row of rows.slice(200)) if (Number(row["entries"]) === 0 && Number(row["exits"]) === 0) this.runs.delete(String(row["id"]));
       return [];
+    }
+    if (tag === "tradeRuns.listExecuted") {
+      return [...this.runs.values()]
+        .filter((row) => row["owner_address"] === p[0] && row["agent_id"] === p[1] && (Number(row["entries"]) > 0 || Number(row["exits"]) > 0))
+        .sort((a, b) => Number(b["created_at"]) - Number(a["created_at"]) || String(b["id"]).localeCompare(String(a["id"])))
+        .slice(0, Number(p[2]));
     }
     if (tag === "tradeRuns.list") {
       return [...this.runs.values()]
@@ -300,8 +317,9 @@ describe("trade position and run stores", () => {
   it("round-trips every position lifecycle field with owner isolation", async () => {
     for (const store of await positionStores()) {
       const opened = await store.open({ positionId: "p1", agentId: "a1", ownerAddress: OWNER_A, token: TOKEN,
-        route: { hops: [], fees: [] }, entryWei: 5n, tokenAmount: 9n, fillStatus: "verified", openedAt: 500 });
+        route: { hops: [], fees: [3000] }, venue: "uniswap_v3", entryWei: 5n, tokenAmount: 9n, fillStatus: "verified", openedAt: 500 });
       assert.equal(opened.status, "open");
+      assert.equal(opened.venue, "uniswap_v3");
       assert.equal(opened.exitRequestedAt, null);
       assert.equal(await store.get(OWNER_B, "a1", "p1"), null);
       assert.equal((await store.incrementNoPrice(OWNER_A, "a1", "p1"))?.noPriceCount, 1);
@@ -312,6 +330,53 @@ describe("trade position and run stores", () => {
       assert.equal(closed?.exitWei, 7n);
       assert.equal(closed?.closedAt, 1_000);
     }
+  });
+
+  it("R2.4 adopts only a zero unverified balance-gone exit and keeps ownership unique", async () => {
+    for (const store of await positionStores()) {
+      for (const id of ["gone", "already", "second", "no-proof", "zero-other", "zero-verified"]) {
+        await store.open({ positionId: id, agentId: "a", ownerAddress: OWNER_A, token: TOKEN,
+          route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 10n, fillStatus: "verified", openedAt: NOW });
+        await store.closePosition({ ownerAddress: OWNER_A, agentId: "a", positionId: id,
+          exitWei: id === "already" ? 5n : 0n, reason: id === "zero-other" ? "llm" : "balance-gone",
+          exitFillStatus: id === "already" || id === "zero-verified" ? "verified" : "unverified" });
+      }
+      const key = `56|0x${"11".repeat(32)}|${TOKEN}|1|0x${"22".repeat(32)}`;
+      assert.equal((await store.adoptVerifiedExit({ ownerAddress: OWNER_A, agentId: "a", positionId: "gone",
+        exitWei: 12n, receiptOwnershipKey: key }))?.exitWei, 12n);
+      await store.adoptVerifiedExit({ ownerAddress: OWNER_A, agentId: "a", positionId: "already",
+        exitWei: 12n, receiptOwnershipKey: `56|0x${"33".repeat(32)}|${TOKEN}|2|0x${"44".repeat(32)}` });
+      assert.equal((await store.get(OWNER_A, "a", "already"))?.exitWei, 5n);
+      assert.notEqual((await store.adoptVerifiedExit({ ownerAddress: OWNER_A, agentId: "a", positionId: "second",
+        exitWei: 12n, receiptOwnershipKey: key }))?.exitWei, 12n);
+      for (const id of ["zero-other", "zero-verified"]) {
+        await store.adoptVerifiedExit({ ownerAddress: OWNER_A, agentId: "a", positionId: id,
+          exitWei: 12n, receiptOwnershipKey: `56|0x${"55".repeat(32)}|${TOKEN}|3|0x${"66".repeat(32)}` });
+        assert.equal((await store.get(OWNER_A, "a", id))?.exitWei, 0n);
+      }
+      assert.equal((await store.get(OWNER_A, "a", "no-proof"))?.exitWei, 0n);
+    }
+  });
+
+  it("R2.4 real local PostgreSQL enforces the zero balance-gone adoption predicate", { timeout: 120_000 }, async (t) => {
+    const cluster = await localPostgres();
+    if (cluster === null) { t.skip("PostgreSQL 17 binaries unavailable; no external database fallback"); return; }
+    const sql = await createPgSqlClient(cluster.url);
+    const store = await PostgresTradePositionStore.create(sql, () => NOW);
+    t.after(async () => { await store.close(); await cluster.close(); });
+    for (const [id, reason] of [["eligible", "balance-gone"], ["other", "llm"]] as const) {
+      await store.open({ positionId: id, agentId: "a", ownerAddress: OWNER_A, token: TOKEN,
+        route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 10n, fillStatus: "verified", openedAt: NOW });
+      await store.closePosition({ ownerAddress: OWNER_A, agentId: "a", positionId: id,
+        exitWei: 0n, reason, exitFillStatus: "unverified" });
+    }
+    const key = `56|0x${"11".repeat(32)}|${TOKEN}|1|0x${"22".repeat(32)}`;
+    await store.adoptVerifiedExit({ ownerAddress: OWNER_A, agentId: "a", positionId: "eligible",
+      exitWei: 12n, receiptOwnershipKey: key });
+    assert.equal((await store.get(OWNER_A, "a", "eligible"))?.exitWei, 12n);
+    await store.adoptVerifiedExit({ ownerAddress: OWNER_A, agentId: "a", positionId: "other",
+      exitWei: 12n, receiptOwnershipKey: `56|0x${"33".repeat(32)}|${TOKEN}|2|0x${"44".repeat(32)}` });
+    assert.equal((await store.get(OWNER_A, "a", "other"))?.exitWei, 0n);
   });
 
   it("marks a revoked agent's open position orphaned", async () => {
@@ -357,5 +422,26 @@ describe("trade position and run stores", () => {
     assert.equal(sql.transactions, 202);
     const prune = sql.texts.find((text) => text.includes("/* tradeRuns.prune */")) ?? "";
     assert.match(prune, /order by created_at desc, id desc limit 200/u);
+    assert.match(prune, /entries = 0 and exits = 0/u);
+  });
+
+  it("a run that executed survives the 200-row prune and is listed by listExecutedRuns", async () => {
+    const sql = new TradeFakeSql();
+    let tick = 1_000;
+    const clock = (): number => (tick += 1);
+    const stores: readonly TradePositionStore[] = [
+      new MemoryTradePositionStore(clock),
+      await PostgresTradePositionStore.create(sql, clock),
+    ];
+    for (const store of stores) {
+      const executed = await store.insertRun({ agentId: "a1", ownerAddress: OWNER_A, dryRun: false, reason: "bought", entries: 1 });
+      for (let index = 0; index < 250; index += 1) {
+        await store.insertRun({ agentId: "a1", ownerAddress: OWNER_A, dryRun: false, reason: `refused-${index}` });
+      }
+      assert.equal((await store.listRuns(OWNER_A, "a1", 200)).some((run) => run.id === executed.id), false);
+      const kept = await store.listExecutedRuns(OWNER_A, "a1");
+      assert.deepEqual(kept.map((run) => run.id), [executed.id]);
+      assert.equal((await store.listExecutedRuns(OWNER_B, "a1")).length, 0);
+    }
   });
 });

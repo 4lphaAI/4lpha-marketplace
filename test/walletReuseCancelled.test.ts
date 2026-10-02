@@ -226,7 +226,7 @@ describe("R5 execution boundary with retained key", () => {
           idempotencyKey: CANCEL_ACTION, paramsHash: CANCEL_ACTION,
           scanGate: { evaluate: async () => { throw new Error("canceled draft reached scanner"); } },
           deps: { chainId: 97, keyStore: WALLET, agentStore: store, journal, killswitch: h.killswitch,
-            providerRegistry: { get: () => h.provider }, trade: tradeConfig(), pancake: null, pancakeV3: null,
+            providerRegistry: { get: () => h.provider }, trade: tradeConfig(), pancake: null, pancakeV3: null, uniswapV3: null,
             flapPortal: null, nowMs: () => NOW * 1_000 } });
         assert.deepEqual(result, { kind: "denied", status: 409, code: "not_executable" });
       }

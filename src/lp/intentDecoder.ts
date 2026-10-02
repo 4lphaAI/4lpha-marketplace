@@ -120,6 +120,7 @@ export function decodePortoV055Transaction(
   chainId: number,
   orchestrator: Address,
   input: Hex,
+  limits: { readonly memberBytes: number; readonly executionDataBytes: number } = { memberBytes: 4_096, executionDataBytes: 4_096 },
 ): readonly DecodedPortoIntentV055[] {
   if (chainId !== 56 || orchestrator.toLowerCase() !== PORTO_V055_ORCHESTRATOR) {
     throw new Error("Unsupported Porto decoder registry key.");
@@ -145,23 +146,24 @@ export function decodePortoV055Transaction(
   if (reencoded.toLowerCase() !== input.toLowerCase()) {
     throw new Error("Orchestrator calldata is non-canonical or has trailing data.");
   }
-  return members.map((member, index) => decodeMember(member, index, members.length));
+  return members.map((member, index) => decodeMember(member, index, members.length, limits));
 }
 
 function decodeMember(
   encoded: Hex,
   memberIndex: number,
   memberCount: number,
+  limits: { readonly memberBytes: number; readonly executionDataBytes: number },
 ): DecodedPortoIntentV055 {
-  if ((encoded.length - 2) / 2 > 4_096) throw new Error("Intent member exceeds 4096 bytes.");
+  if ((encoded.length - 2) / 2 > limits.memberBytes) throw new Error(`Intent member exceeds ${limits.memberBytes} bytes.`);
   let intent: ReturnType<typeof decodeAbiParameters<typeof PORTO_V055_INTENT_PARAMETERS>>[0];
   try {
     [intent] = decodeAbiParameters(PORTO_V055_INTENT_PARAMETERS, encoded);
   } catch {
     throw new Error(`Intent member ${memberIndex} is malformed for Orchestrator 0.5.5.`);
   }
-  if ((intent.executionData.length - 2) / 2 > 4_096) {
-    throw new Error(`Intent member ${memberIndex} executionData exceeds 4096 bytes.`);
+  if ((intent.executionData.length - 2) / 2 > limits.executionDataBytes) {
+    throw new Error(`Intent member ${memberIndex} executionData exceeds ${limits.executionDataBytes} bytes.`);
   }
   const signatureBytes = (intent.signature.length - 2) / 2;
   if (signatureBytes < 33) throw new Error(`Intent member ${memberIndex} wrapper is too short.`);
@@ -221,6 +223,7 @@ export function pairPreparedIntentCandidate(
   identity: PreparedIntentIdentityV1,
   transaction: LandingTransaction,
   receipt: LandingReceipt,
+  limits: { readonly memberBytes: number; readonly executionDataBytes: number } = { memberBytes: 4_096, executionDataBytes: 4_096 },
 ): CandidatePairingResult {
   if (transaction.to.toLowerCase() !== identity.orchestrator ||
       receipt.transactionHash.toLowerCase() !== transaction.hash.toLowerCase() ||
@@ -231,7 +234,7 @@ export function pairPreparedIntentCandidate(
   }
   let members: readonly DecodedPortoIntentV055[];
   try {
-    members = decodePortoV055Transaction(56, transaction.to, transaction.input);
+    members = decodePortoV055Transaction(56, transaction.to, transaction.input, limits);
   } catch {
     return { outcome: "ambiguous", reason: "candidate decoder rejected calldata" };
   }

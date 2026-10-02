@@ -3,6 +3,30 @@
 import * as React from "react";
 
 /**
+ * Batched token-logo lookup shared by every picker/detail page that shows a
+ * `TokenIcon`. Kept beside it for the same reason `TokenIcon` itself lives
+ * here: a second copy per screen is how the deploy picker and the agent
+ * detail page drift apart.
+ */
+export function useTokenIcons(addresses: readonly string[]): Readonly<Record<string, string | null>> {
+  const [icons, setIcons] = React.useState<Record<string, string | null>>({});
+  const key = React.useMemo(() => [...new Set(addresses.map((address) => address.toLowerCase()))].sort().join(","), [addresses]);
+  React.useEffect(() => {
+    const unique = key === "" ? [] : key.split(",");
+    if (unique.length === 0) return;
+    const controller = new AbortController();
+    void Promise.all(Array.from({ length: Math.ceil(unique.length / 8) }, (_, index) => {
+      const chunk = unique.slice(index * 8, index * 8 + 8);
+      return fetch(`/api/token-icons?v=2&addresses=${encodeURIComponent(chunk.join(","))}`, { signal: controller.signal })
+        .then((response) => response.ok ? response.json() : null)
+        .then((payload: { readonly data?: Record<string, string | null> } | null) => payload?.data ?? {});
+    })).then((chunks) => setIcons(Object.assign({}, ...chunks))).catch(() => undefined);
+    return () => controller.abort();
+  }, [key]);
+  return icons;
+}
+
+/**
  * One token badge, and the overlapping pair the pool rows use. Lives here
  * rather than inside a screen because the deploy picker and the agent detail
  * page must draw the same badge — a second copy is how two screens drift.

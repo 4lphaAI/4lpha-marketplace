@@ -10,8 +10,10 @@
 import {
   createClient,
   getAddress,
+  hashTypedData,
   http,
   isAddress,
+  isHex,
   keccak256,
   type Address,
   type Chain,
@@ -46,6 +48,9 @@ export const PORTO_V055_DECODER = "porto-orchestrator-intent-v055" as const;
 export const PORTO_V055_ORCHESTRATOR =
   "0xaf140d0416a994aebb3fa6212b16ce6700f09751" as Address;
 export const PORTO_V055_VERSION = "0.5.5" as const;
+export const PORTO_V055_INTENT_TYPE = "Intent(bool multichain,address eoa,Call[] calls,uint256 nonce,address payer,address paymentToken,uint256 paymentMaxAmount,uint256 combinedGas,bytes[] encodedPreCalls,bytes[] encodedFundTransfers,address settler,uint256 expiry)Call(address to,uint256 value,bytes data)";
+export const PORTO_V055_CALL_TYPE = "Call(address to,uint256 value,bytes data)";
+export const PORTO_V055_DOMAIN_TYPE = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 
 /**
  * The ONE token the relay bills gas in on chain 56, passed explicitly on every
@@ -157,6 +162,7 @@ export type PortoStagedLpSubmit = {
   readonly restoredSessionExpiry: number;
   readonly calls: readonly WalletCall[];
   readonly expectedExecutionDataHash: Hex;
+  readonly requireSignedPayloadBinding?: true;
   readonly bind: PreparedIntentBinder;
   readonly signal?: AbortSignal;
 };
@@ -419,6 +425,10 @@ export class PortoStagedLpAdapter {
       if (deficits.short) {
         throw new Error(`Porto quote reports deficits before bind: ${deficits.summary}`);
       }
+      if (input.requireSignedPayloadBinding === true) {
+        if (prepared.context.preCall) throw new Error("Porto preCall is unsupported for staged trade.");
+        assertPreparedSignedPayloadV1({ digest: prepared.digest, quoteIntent: intent, calls: input.calls });
+      }
 
       const identity: PreparedIntentIdentityV1 = {
       scheme: PORTO_INTENT_SCHEME,
@@ -476,6 +486,67 @@ export class PortoStagedLpAdapter {
       if (!bindInvoked) throw new ProvenPreBindStagedLpError(error);
       throw error;
     }
+  }
+}
+
+/** Reconstruct the supported Orchestrator 0.5.5 commitment from local calls. */
+export function assertPreparedSignedPayloadV1(input: {
+  readonly digest: Hex;
+  readonly quoteIntent: unknown;
+  readonly calls: readonly WalletCall[];
+}): void {
+  const raw = input.quoteIntent;
+  if (!isRecord(raw) ||
+      typeof raw["eoa"] !== "string" || !isAddress(raw["eoa"]) ||
+      typeof raw["payer"] !== "string" || !isAddress(raw["payer"]) ||
+      typeof raw["paymentToken"] !== "string" || !isAddress(raw["paymentToken"]) ||
+      typeof raw["settler"] !== "string" || !isAddress(raw["settler"]) ||
+      typeof raw["funder"] !== "string" || !isAddress(raw["funder"]) ||
+      typeof raw["nonce"] !== "bigint" || typeof raw["paymentMaxAmount"] !== "bigint" ||
+      typeof raw["combinedGas"] !== "bigint" || typeof raw["expiry"] !== "bigint" ||
+      typeof raw["isMultichain"] !== "boolean" ||
+      !Array.isArray(raw["encodedPreCalls"]) || !raw["encodedPreCalls"].every((value: unknown) => typeof value === "string" && isHex(value)) ||
+      !Array.isArray(raw["encodedFundTransfers"]) || !raw["encodedFundTransfers"].every((value: unknown) => typeof value === "string" && isHex(value)) ||
+      typeof raw["funderSignature"] !== "string" || !isHex(raw["funderSignature"])) {
+    throw new Error("Porto prepared trade has an unsupported Intent shape.");
+  }
+  const intent = raw as {
+    readonly eoa: Address; readonly payer: Address; readonly paymentToken: Address;
+    readonly settler: Address; readonly funder: Address; readonly nonce: bigint;
+    readonly paymentMaxAmount: bigint; readonly combinedGas: bigint; readonly expiry: bigint;
+    readonly isMultichain: boolean; readonly encodedPreCalls: readonly Hex[];
+    readonly encodedFundTransfers: readonly Hex[]; readonly funderSignature: Hex;
+  };
+  if (intent.isMultichain || (intent.nonce >> 240n) === 0xc1d0n ||
+      intent.encodedPreCalls.length !== 0 || intent.encodedFundTransfers.length !== 0 ||
+      intent.funder.toLowerCase() !== PORTO_NATIVE_FEE_TOKEN || intent.funderSignature !== "0x") {
+    throw new Error("Porto prepared trade has unsupported execution extensions.");
+  }
+  const digest = hashTypedData({
+    domain: { name: "Orchestrator", version: PORTO_V055_VERSION, chainId: 56,
+      verifyingContract: PORTO_V055_ORCHESTRATOR },
+    types: {
+      Intent: [
+        { name: "multichain", type: "bool" }, { name: "eoa", type: "address" },
+        { name: "calls", type: "Call[]" }, { name: "nonce", type: "uint256" },
+        { name: "payer", type: "address" }, { name: "paymentToken", type: "address" },
+        { name: "paymentMaxAmount", type: "uint256" }, { name: "combinedGas", type: "uint256" },
+        { name: "encodedPreCalls", type: "bytes[]" }, { name: "encodedFundTransfers", type: "bytes[]" },
+        { name: "settler", type: "address" }, { name: "expiry", type: "uint256" },
+      ],
+      Call: [{ name: "to", type: "address" }, { name: "value", type: "uint256" }, { name: "data", type: "bytes" }],
+    },
+    primaryType: "Intent",
+    message: {
+      multichain: false, eoa: getAddress(intent.eoa),
+      calls: input.calls.map((call) => ({ to: getAddress(call.to), value: call.value ?? 0n, data: call.data ?? "0x" })),
+      nonce: intent.nonce, payer: getAddress(intent.payer), paymentToken: getAddress(intent.paymentToken),
+      paymentMaxAmount: intent.paymentMaxAmount, combinedGas: intent.combinedGas,
+      encodedPreCalls: [], encodedFundTransfers: [], settler: getAddress(intent.settler), expiry: intent.expiry,
+    },
+  });
+  if (digest.toLowerCase() !== input.digest.toLowerCase()) {
+    throw new Error("Porto prepared trade digest differs from the bound Intent.");
   }
 }
 

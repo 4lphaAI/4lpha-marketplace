@@ -30,6 +30,7 @@
  *     --owner-address 0x... --token 0x... --amount 0.002 --confirm i-understand-real-funds
  *
  *   --venue pancake_v3 --fees 100                 (one pool)
+ *   --venue uniswap_v3 --fees 500                 (one pool)
  *   --venue pancake_v3 --hops 0x55d3... --fees 500,100   (BNB -> USDT -> token)
  *   --venue fourmeme                              (bonding curve, no route)
  *   --venue flap                                  (bonding curve, no route)
@@ -122,7 +123,7 @@ const FOURMEME_HELPER: Address = getAddress("0xF251F83e40a78868FcfA3FA4599Dad649
 /* Arguments                                                                  */
 /* -------------------------------------------------------------------------- */
 
-type Venue = "pancake" | "pancake_v3" | "fourmeme" | "flap";
+type Venue = "pancake" | "pancake_v3" | "uniswap_v3" | "fourmeme" | "flap";
 
 type Args = {
   readonly agentId: string;
@@ -190,10 +191,11 @@ function parseArgs(argv: readonly string[]): Args {
   if (
     venue !== "pancake" &&
     venue !== "pancake_v3" &&
+    venue !== "uniswap_v3" &&
     venue !== "fourmeme" &&
     venue !== "flap"
   ) {
-    throw new Error(`--venue must be pancake, pancake_v3, fourmeme or flap.`);
+    throw new Error(`--venue must be pancake, pancake_v3, uniswap_v3, fourmeme or flap.`);
   }
 
   const list = (name: string): string[] => {
@@ -474,6 +476,7 @@ async function quote(input: {
   readonly side: "buy" | "sell";
   readonly amountInWei: bigint;
   readonly router: Address | undefined;
+  readonly quoter?: Address;
   readonly wbnb: Address | undefined;
 }): Promise<bigint> {
   const { args, side, amountInWei } = input;
@@ -536,10 +539,12 @@ async function quote(input: {
 
   // V3: the quoter mutates state internally and then reverts, so it is called
   // through `simulateContract` rather than `readContract`.
+  const quoter = input.quoter;
+  if (quoter === undefined) throw new Error("No V3 quoter configured for this chain.");
   const fees = side === "buy" ? args.fees : [...args.fees].reverse();
   if (fees.length === 1) {
     const { result } = await publicClient.simulateContract({
-      address: QUOTER_V3,
+      address: quoter,
       abi: QUOTER_V3_ABI,
       functionName: "quoteExactInputSingle",
       args: [
@@ -555,7 +560,7 @@ async function quote(input: {
     return result[0];
   }
   const { result } = await publicClient.simulateContract({
-    address: QUOTER_V3,
+    address: quoter,
     abi: QUOTER_V3_ABI,
     functionName: "quoteExactInput",
     args: [encodeV3Path(tokens, fees), amountInWei],
@@ -830,6 +835,9 @@ async function main(): Promise<void> {
   }
 
   const venues = resolveVenues({ chainId: NETWORK.chainId });
+  const quoter = args.venue === "uniswap_v3"
+    ? venues.uniswapQuoterV3
+    : args.venue === "pancake_v3" ? QUOTER_V3 : undefined;
   const amountInWei = parseEther(args.amount);
 
   const agentBody = await serviceAgentGet(args, runtimeSigner);
@@ -913,6 +921,7 @@ async function main(): Promise<void> {
       side: "sell",
       amountInWei: amount,
       router: venues.pancakeRouterV2,
+      ...(quoter === undefined ? {} : { quoter }),
       wbnb: venues.wbnb,
     });
     if (quotedSell <= 0n) throw new Error("The venue quoted zero out for the sell.");
@@ -961,6 +970,7 @@ async function main(): Promise<void> {
     side: "buy",
     amountInWei,
     router: venues.pancakeRouterV2,
+    ...(quoter === undefined ? {} : { quoter }),
     wbnb: venues.wbnb,
   });
   if (quotedBuy <= 0n) throw new Error("The venue quoted zero out; there is no route to trade.");
@@ -986,6 +996,7 @@ async function main(): Promise<void> {
       side: "buy",
       amountInWei: probeIn,
       router: venues.pancakeRouterV2,
+      ...(quoter === undefined ? {} : { quoter }),
       wbnb: venues.wbnb,
     });
     const noImpact = probeOut * 100n;

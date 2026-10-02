@@ -54,7 +54,7 @@ describe("receipt-derived trade fills", () => {
     const trade = tradeConfig({ venues: { chainId: 56, pancakeRouterV2: WBNB, wbnb: WBNB } });
     const value = request("buy");
     const identity = tradeExecutionIdentity({ agentId: "agent-a", chainId: 56, request: value,
-      trade, pancake: { router: WBNB, wbnb: WBNB }, pancakeV3: null, flapPortal: null });
+      trade, pancake: { router: WBNB, wbnb: WBNB }, pancakeV3: null, uniswapV3: null, flapPortal: null });
     assert.equal(identity.paramsHash, tradeParamsHash({ chainId: 56, venue: value.venue, side: value.side,
       token: value.token, amountWei: value.amountWei, minOutWei: value.minOutWei,
       quotedOutWei: value.quotedOutWei, router: WBNB, wbnb: WBNB, route: value.route }));

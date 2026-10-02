@@ -6,8 +6,10 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import { decodeFunctionData, parseAbi } from "viem";
 import type { AgentDetailView, OhlcvResult } from "@/lib/exec/agent-detail";
 import { rangePrices, reviewedPair } from "@/lib/exec/pairs";
+import type { TradeSettings, TradeView } from "@/lib/trade";
 
 const hook = vi.hoisted(() => ({
   detail: null as unknown,
@@ -22,6 +24,7 @@ const hook = vi.hoisted(() => ({
   publicClient: undefined as unknown,
   readOnChainPosition: vi.fn(),
   listWalletPositionIds: vi.fn(),
+  executeCmcBudgetCalls: vi.fn(),
 }));
 vi.mock("@/lib/exec/use-agent-detail", () => ({ useAgentDetail: () => hook.detail }));
 vi.mock("@/lib/exec/use-owner-actions", () => ({ useOwnerActions: () => hook.owner }));
@@ -39,10 +42,22 @@ vi.mock("@/lib/altana/position-reader", () => ({
 // The screen reads each position NFT straight from chain, because the plane's
 // row and the chain disagreed once (2026-09-03, NFT 7316794). No client in a
 // static render: the reads are skipped and every assertion below is unchanged.
-vi.mock("wagmi", () => ({ usePublicClient: () => hook.publicClient }));
+vi.mock("wagmi", () => ({ usePublicClient: () => hook.publicClient, useAccount: () => ({ address: undefined }) }));
 vi.mock("@/components/MarketChart", () => ({
   MarketChart: ({ priceLines = [] }: { readonly priceLines?: readonly { readonly price: number; readonly color: string; readonly title: string }[] }) => (
     <div data-testid="market-chart" data-price-lines={JSON.stringify(priceLines)} />
+  ),
+}));
+// B3 (TRADFI-SCHEDULE-NATIVE-CAP-PLAN): the owner self-call executor is a real
+// Altana SDK client under the hood; the save-flow tests below observe what the
+// screen BUILDS and PASSES to it, not the relay.
+vi.mock("@/lib/altana/cmc-budget", () => ({
+  executeCmcBudgetCalls: hook.executeCmcBudgetCalls,
+  keyHashForSession: () => `0x${"ab".repeat(32)}`,
+}));
+vi.mock("@/components/FundsModal", () => ({
+  FundsModal: (props: { readonly fixedDepositWei?: bigint; readonly fixedDepositAsset?: string }) => (
+    <div data-testid="funds-modal" data-fixed-deposit-wei={props.fixedDepositWei?.toString() ?? ""} data-fixed-deposit-asset={props.fixedDepositAsset ?? ""} />
   ),
 }));
 
@@ -686,7 +701,13 @@ describe("Hired agent detail provenance", () => {
   it("pins the restricted editor, exact closed columns, and terminal recovery copy", () => {
     const source = readFileSync(join(process.cwd(), "components/trade/TradeAgentDetail.tsx"), "utf8");
     // 2026-09-16: the expired-recovery banner (Hard revoke + Account recovery) and the three tile subtitles are gone by the operator's ruling; Remove takes the hard path itself when the session is dead.
-    for (const forbidden of ["Agent name", "BNB per entry", "Total capital", "Min market cap", "Max market cap", "Gas priority", "Show advanced settings", "Hard revoke", "Account recovery", "24h spend authority", "slots free", "relay costs excluded"]) {
+    // 2026-09-25 (DCA-DETAIL fix pass, MEDIUM 1): the removed "Total capital" EditPanel
+    // field rendered its label the way every surviving EditPanel field still does —
+    // `<span>Total capital</span>` inside a `<label>` — not as a component prop. The
+    // Auto DCA detail page's read-only "Total capital" TILE is `<Metric label="Total
+    // capital" …>`, a different JSX shape that does not match this pinned form; it is
+    // the one permitted occurrence of the string "Total capital" in this file.
+    for (const forbidden of ["Agent name", "BNB per entry", "<span>Total capital</span>", "Min market cap", "Max market cap", "Gas priority", "Show advanced settings", "Hard revoke", "Account recovery", "24h spend authority", "slots free", "relay costs excluded"]) {
       expect(source).not.toContain(forbidden);
     }
     for (const required of ["No re-entry", "Take profit", "Stop loss", "Max holding time", "Slippage tolerance", "Primary model", "Fallback model", "Exit reason", "Held", "Entry / exit", "Transactions", "Realised", "renewalButton", "renewalStatus"]) {
@@ -874,5 +895,139 @@ describe("session clock on the grid page (2026-09-15)", () => {
     expect(host.querySelector(".fl-status")?.textContent).toBe("Live");
     expect(host.querySelector('[data-session-expiry="ok"]')?.textContent).toMatch(/^Session · (4d 23h|5d)$/u);
     expect(host.querySelector("[data-session-notice]")).toBeNull();
+  });
+});
+
+describe("B3: a schedule interval edit raises the native cap and tops up BNB when short (TRADFI-SCHEDULE-NATIVE-CAP-PLAN)", () => {
+  const SET_SPEND_LIMIT_ABI = parseAbi(["function setSpendLimit(bytes32 keyHash,address token,uint8 period,uint256 limit)"]);
+  const scheduleAgentView: AgentDetailView = { ...view, httpRuntimeProfile: "unbound-v1", hireSizingName: "trade-v1" };
+  const SCHEDULE_SETTINGS: TradeSettings = {
+    name: "Schedule Buy 01", executionModel: "tradfi", entryWei: "10000000000000000000",
+    maxOpenPositions: 1, minMarketCapUsd: null, maxMarketCapUsd: null, noReentry: false,
+    takeProfitBps: null, stopLossBps: null, maxHoldSec: null, breakEvenAfterTp: false,
+    slippageBps: 300, gasPriority: "standard", instructions: null, skillMarkdown: null,
+    primaryModel: "qwen3.7-flash", fallbackModel: "0gm-1.0-35b-a3b", crashProtection: true,
+    settlementAsset: "USDT", minEntryWei: "10000000000000000000", capitalQuoteWei: "100000000000000000000",
+    cmcNewsEnabled: false, tradeMode: "schedule", scheduleToken: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    scheduleIntervalSec: 86400, scheduleFirstAtSec: null, scheduleEndKind: "runs", scheduleEndAtSec: null,
+    scheduleEndRuns: 10, scheduleMarketHoursOnly: false, scheduleMaxPremiumBps: 150,
+  };
+
+  function fixtureSchedule(nativeCapWei: string, nativeBalanceWei: string): NonNullable<TradeView["schedule"]> {
+    return {
+      token: SCHEDULE_SETTINGS.scheduleToken!, symbol: "AAPLX", decimals: 18, amountWei: SCHEDULE_SETTINGS.entryWei,
+      intervalSec: 86_400, anchorMs: 1_000, nextDueAtMs: 4_000, currentSlot: 0, currentSlotTaken: true,
+      fills: 1, postponed: 0, plannedBuys: 10, buysThisSession: 7,
+      spentWei: "10000000000000000000", remainingWei: "90000000000000000000", finished: null,
+      endKind: "runs", endAtSec: null, endRuns: 10, marketHoursOnly: false, maxPremiumBps: 150, firstAtSec: null,
+      premiumBps: 0, premiumLimitBps: 150,
+      nativeCapWei, nativeSpentWei: "0", nativeBalanceWei, nativeBuysRefused: false,
+      sessionExpiresAtSec: Math.floor(Date.now() / 1_000) + 7 * 86_400,
+      holding: { walletBalance: "0", boughtAtomic: "0", verifiedSpentWei: "0", verifiedFills: 0, quoteWei: null, quoteReason: "balance-zero" },
+    };
+  }
+
+  function fixtureTradeView(nativeCapWei: string, nativeBalanceWei: string): TradeView {
+    return {
+      settings: SCHEDULE_SETTINGS, schedule: fixtureSchedule(nativeCapWei, nativeBalanceWei),
+      open: [], closed: [], runs: [], pinned: [], marketHours: { usEquitiesOpen: true, holidaysModeled: false },
+      summary: { grossDeltaWei: null, grossComplete: false, grossReason: null, wins: null, winRateBps: null, closedTrades: 0, openPositions: 0, maxOpenPositions: 1, observedAt: 2_000 },
+      lifecycle: { draining: false, drainingAt: null }, pendingIntents: [],
+    };
+  }
+
+  /** Signs in, opens Edit, switches Frequency from Daily to Hourly, and Saves. */
+  async function editIntervalToHourly(nativeCapWei: string, nativeBalanceWei: string, executeResult: "confirmed" | "failed" | "throws") {
+    const refreshedTrade = fixtureTradeView(nativeCapWei, nativeBalanceWei);
+    const refreshTrade = vi.fn(async () => refreshedTrade);
+    hook.detail = { state: "ready", view: scheduleAgentView, market: null, trade: fixtureTradeView(nativeCapWei, nativeBalanceWei),
+      asOfMs: 2_000, message: "", readHeaders: {}, signIn: vi.fn(), refresh: vi.fn(), refreshTrade };
+    hook.owner.passkey = { walletAddress: view.walletAddress };
+    hook.owner.signEnvelope.mockReset();
+    hook.owner.signEnvelope.mockResolvedValue({ signed: {}, signature: "0xsig" });
+    hook.executeCmcBudgetCalls.mockReset();
+    if (executeResult === "failed") hook.executeCmcBudgetCalls.mockResolvedValue({ status: "FAILED", callsId: "0xcalls" });
+    else if (executeResult === "throws") hook.executeCmcBudgetCalls.mockRejectedValue(new Error("user cancelled the request"));
+    else hook.executeCmcBudgetCalls.mockResolvedValue({ status: "CONFIRMED", callsId: "0xcalls" });
+    let settingsSaved = false;
+    vi.stubGlobal("fetch", vi.fn(async (request: RequestInfo | URL) => {
+      const url = String(request);
+      if (url.endsWith("/trade/settings")) {
+        settingsSaved = true;
+        return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.endsWith("/session")) {
+        return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }));
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    try {
+      await act(async () => { root.render(<HiredAgentScreen agentId="owner-exact-agent-92" go={() => undefined} />); await Promise.resolve(); });
+      const editButton = [...host.querySelectorAll("button")].find((button) => button.textContent === "Edit");
+      await act(async () => { editButton?.click(); await Promise.resolve(); });
+      const frequencySelect = [...host.querySelectorAll("label")]
+        .find((label) => label.textContent?.startsWith("Frequency"))?.querySelector("select");
+      await act(async () => {
+        (frequencySelect as HTMLSelectElement).value = "3600";
+        frequencySelect?.dispatchEvent(new Event("change", { bubbles: true }));
+        await Promise.resolve();
+      });
+      const saveButton = [...host.querySelectorAll("button")].find((button) => button.textContent === "Save");
+      await act(async () => { saveButton?.click(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      return { settingsSaved, messageText: host.textContent ?? "", calls: [...hook.executeCmcBudgetCalls.mock.calls] };
+    } finally {
+      await act(async () => { root.unmount(); });
+      host.remove();
+      hook.owner.passkey = null;
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it("builds exactly one setSpendLimit self-call with the absolute new cap and the session key hash when the cap is short", async () => {
+    // Hourly, 9 buys left (plannedBuys 10 - fills 1), 7 session days ⇒ needs.dayCapWei = 11R.
+    // 3R is short of it, so the save must raise the cap.
+    const R = 100_000_000_000_000n;
+    const result = await editIntervalToHourly((3n * R).toString(10), (20n * R).toString(10), "confirmed");
+    expect(result.settingsSaved).toBe(true);
+    expect(result.calls.length).toBe(1);
+    const input = result.calls[0]![0] as { readonly record: unknown; readonly calls: readonly { readonly to: string; readonly value: bigint; readonly data: `0x${string}` }[] };
+    expect(input.calls.length).toBe(1);
+    const call = input.calls[0]!;
+    expect(call.value).toBe(0n);
+    expect(call.to.toLowerCase()).toBe(view.walletAddress.toLowerCase());
+    const decoded = decodeFunctionData({ abi: SET_SPEND_LIMIT_ABI, data: call.data });
+    expect(decoded.args[0]).toBe(`0x${"ab".repeat(32)}`);
+    expect(decoded.args[1]).toBe("0x0000000000000000000000000000000000000000");
+    expect(decoded.args[2]).toBe(2);
+    expect(decoded.args[3]).toBe(11n * R);
+  });
+
+  it("makes no call and opens no deposit modal when the cap and balance are already enough", async () => {
+    const R = 100_000_000_000_000n;
+    const result = await editIntervalToHourly((20n * R).toString(10), (20n * R).toString(10), "confirmed");
+    expect(result.settingsSaved).toBe(true);
+    expect(result.calls.length).toBe(0);
+  });
+
+  it("opens the deposit modal with the exact shortfall when the balance is short", async () => {
+    const R = 100_000_000_000_000n;
+    // Cap already covers 11R; balance holds only 4R, short of the same 11R need.
+    const result = await editIntervalToHourly((20n * R).toString(10), (4n * R).toString(10), "confirmed");
+    expect(result.settingsSaved).toBe(true);
+    expect(result.calls.length).toBe(0);
+    expect(result.messageText).toContain("BNB deposit");
+  });
+
+  it("a cancelled cap signature leaves the saved settings in place and names what is still owed", async () => {
+    const R = 100_000_000_000_000n;
+    const result = await editIntervalToHourly((3n * R).toString(10), (20n * R).toString(10), "throws");
+    expect(result.settingsSaved).toBe(true);
+    expect(result.calls.length).toBe(1);
+    expect(result.messageText).toContain("Trading settings saved");
+    expect(result.messageText).toContain("Still owed");
+    expect(result.messageText).toContain("native day cap");
   });
 });

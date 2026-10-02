@@ -35,6 +35,8 @@ export interface MarketChartPriceLine {
 export interface MarketChartMarker {
   readonly timestamp: number;
   readonly side: "buy" | "sell";
+  /** Marker label; defaults to "B" / "S". */
+  readonly text?: string;
 }
 
 interface MarketChartProps {
@@ -46,6 +48,7 @@ interface MarketChartProps {
   priceLines?: readonly MarketChartPriceLine[];
   embedded?: boolean;
   height?: number;
+  defaultInterval?: Timeframe;
 }
 
 // Lightweight Charts paints on a canvas and parses colours itself, so it understands
@@ -78,13 +81,13 @@ function measureWidth(container: HTMLDivElement): number {
   return width > 0 ? width : 600;
 }
 
-export function MarketChart({ kind, address, title, candles: suppliedCandles, markers = [], priceLines = [], embedded = false, height = 470 }: MarketChartProps) {
+export function MarketChart({ kind, address, title, candles: suppliedCandles, markers = [], priceLines = [], embedded = false, height = 470, defaultInterval = "1m" }: MarketChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const markerSeriesRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
-  const [interval, setInterval] = useState<Timeframe>("1m");
+  const [interval, setInterval] = useState<Timeframe>(defaultInterval);
   const [loadedCandles, setLoadedCandles] = useState<Candle[]>([]);
   const [meta, setMeta] = useState<MarketDataMeta | null>(null);
   const [loading, setLoading] = useState(true);
@@ -250,14 +253,16 @@ export function MarketChart({ kind, address, title, candles: suppliedCandles, ma
   }, [priceLines, candles]);
 
   useEffect(() => {
-    markerSeriesRef.current?.setMarkers(markers.map((marker) => ({
+    // A marker older than the loaded window would be pinned to the left edge; it is not shown.
+    const firstCandleMs = candles[0]?.timestamp ?? Number.NEGATIVE_INFINITY;
+    markerSeriesRef.current?.setMarkers(markers.filter((marker) => marker.timestamp >= firstCandleMs).map((marker) => ({
       time: Math.floor(marker.timestamp / 1_000) as UTCTimestamp,
       position: marker.side === "buy" ? "belowBar" : "aboveBar",
       shape: marker.side === "buy" ? "arrowUp" : "arrowDown",
       color: marker.side === "buy" ? "oklch(0.72 0.09 205)" : "#f0913a",
-      text: marker.side === "buy" ? "B" : "S",
+      text: marker.text ?? (marker.side === "buy" ? "B" : "S"),
     })));
-  }, [markers]);
+  }, [markers, candles]);
 
   const latest = candles.at(-1);
   const first = candles.at(0);

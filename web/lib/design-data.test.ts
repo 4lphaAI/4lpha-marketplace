@@ -15,4 +15,27 @@ describe("agent deploy routes", () => {
       "/deploy/lending",
     ]);
   });
+
+  it("publishes the four current trading agents and retires the legacy cards", () => {
+    const tradingNames = AGENTS
+      .filter((agent) => agent.categoryId === "trading")
+      .map((agent) => agent.name);
+
+    expect(tradingNames).toEqual([
+      "AI Stocks Trader",
+      "Tradfi Recurring Buy",
+      "Auto DCA Agent",
+      "Smart Portfolio Agent",
+    ]);
+    expect(tradingNames).not.toContain("Sigma Trader");
+    expect(tradingNames).not.toContain("Vector Trader");
+    expect(tradingNames).not.toContain("Degen Trader");
+    expect(tradingNames).not.toContain("Atlas Trader");
+  });
+
+  it("keeps the Health Guard card copy protocol-neutral", () => {
+    expect(AGENTS.find((agent) => agent.id === "health-guard")?.tagline).toBe(
+      "Repays your debt from a reserve before liquidation.",
+    );
+  });
 });

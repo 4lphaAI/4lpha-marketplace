@@ -84,6 +84,9 @@ export const MAX_MAX_VENUE_FEE_BPS = 1_000;
 
 /** The resolved, validated trade configuration the HTTP layer runs on. */
 export type TradeRuntimeConfig = {
+  /** `TRADE_STAGED_SUBMIT`; absent means off (the executor reads only the literal `true`). */
+  readonly stagedSubmit?: boolean;
+  readonly preflightSimulate?: boolean;
   readonly venues: VenueConfig;
   readonly feePolicy: FeePolicy;
   /** Present only when a fee is configured. Folded into every paramsHash. */
@@ -101,6 +104,8 @@ export type TradeRuntimeConfig = {
    * caller's `amountWei`, in basis points. See {@link DEFAULT_MAX_VENUE_FEE_BPS}.
    */
   readonly maxVenueFeeBps: number;
+  /** Verified guard address; absent keeps the aggregator branch unavailable. */
+  readonly aggregatorGuard?: Address;
 };
 
 /** The environment, as a plain readonly record. Injected so this stays pure. */
@@ -666,6 +671,47 @@ export function resolveGridEnabled(env: TradeEnv): boolean {
   return enabled;
 }
 
+/**
+ * `DCA_ENABLED`, Auto DCA's master switch (AUTO-DCA-SPEC §0.2) — parsed exactly
+ * like {@link resolveGridEnabled}: OFF by default, ON only for `"true"`, and a
+ * typo FAILS THE BOOT. Its pair rule names the trade agent's own predicate,
+ * `TRADE_AGENT_ENABLED` (`src/index-server.ts`, `scripts/trade-worker.ts`):
+ * Auto DCA is a trade-worker branch over trade-plane stores, so enabling it
+ * without the trade agent would be a healthy-looking server that runs no DCA
+ * agent at all.
+ */
+export function resolveDcaEnabled(env: TradeEnv): boolean {
+  const raw = read(env, "DCA_ENABLED");
+  const enabled =
+    raw === ""
+      ? false
+      : raw === "true"
+        ? true
+        : raw === "false"
+          ? false
+          : null;
+  if (enabled === null) {
+    throw new Error(`DCA_ENABLED must be exactly "true" or "false"; got "${raw}".`);
+  }
+  if (enabled && read(env, "TRADE_AGENT_ENABLED") !== "true") {
+    throw new Error(
+      'DCA_ENABLED is "true" while TRADE_AGENT_ENABLED is not: Auto DCA runs inside the trade agent, so its hire branch, its worker branch and its stores are all built inside the trade composition.',
+    );
+  }
+  return enabled;
+}
+
+export function resolvePortfolioEnabled(env: TradeEnv): boolean {
+  const raw = read(env, "PORTFOLIO_ENABLED");
+  if (raw !== "" && raw !== "true" && raw !== "false") {
+    throw new Error(`PORTFOLIO_ENABLED must be exactly "true" or "false"; got "${raw}".`);
+  }
+  if (raw === "true" && read(env, "TRADE_AGENT_ENABLED") !== "true") {
+    throw new Error('PORTFOLIO_ENABLED is "true" while TRADE_AGENT_ENABLED is not.');
+  }
+  return raw === "true";
+}
+
 /* -------------------------------------------------------------------------- */
 /* Passkey owner auth (PHASE1.5)                                              */
 /* -------------------------------------------------------------------------- */
@@ -825,12 +871,24 @@ export function resolveTradeConfig(
   options: ResolveTradeConfigOptions,
 ): TradeRuntimeConfig {
   const keyStore = options.keyStore;
+  const stagedSubmitRaw = read(env, "TRADE_STAGED_SUBMIT");
+  if (stagedSubmitRaw !== "" && stagedSubmitRaw !== "false" && stagedSubmitRaw !== "true") {
+    throw new Error(`TRADE_STAGED_SUBMIT must be exactly "true" or "false"; got "${stagedSubmitRaw}".`);
+  }
+  const stagedSubmit = stagedSubmitRaw === "true";
+  const preflightRaw = read(env, "TRADFI_PREFLIGHT_SIMULATE");
+  if (preflightRaw !== "" && preflightRaw !== "false" && preflightRaw !== "true") {
+    throw new Error('TRADFI_PREFLIGHT_SIMULATE must be exactly "true" or "false".');
+  }
+  const preflightSimulate = preflightRaw === "true";
 
   const venues = resolveVenues({
     chainId: options.chainId,
     overrides: {
       pancakeRouterV2: read(env, "VENUE_PANCAKE_ROUTER"),
       pancakeRouterV3: read(env, "VENUE_PANCAKE_ROUTER_V3"),
+      uniswapRouterV3: read(env, "VENUE_UNISWAP_ROUTER_V3"),
+      uniswapQuoterV3: read(env, "VENUE_UNISWAP_QUOTER_V3"),
       wbnb: read(env, "VENUE_WBNB"),
       fourMemeHelper: read(env, "VENUE_FOURMEME_HELPER"),
       flapPortal: read(env, "VENUE_FLAP_PORTAL"),
@@ -871,6 +929,7 @@ export function resolveTradeConfig(
   );
 
   const feeTreasury = readAddressEnv(env, "FEE_TREASURY_ADDRESS", keyStore);
+  const aggregatorGuard = readAddressEnv(env, "TRADFI_BINANCE_GUARD_ADDRESS", keyStore);
   const rawFeeBps = read(env, "FEE_BPS");
 
   if ((feeTreasury === undefined) !== (rawFeeBps === "")) {
@@ -884,6 +943,8 @@ export function resolveTradeConfig(
 
   if (feeTreasury === undefined) {
     return {
+      stagedSubmit,
+      preflightSimulate,
       venues,
       feePolicy: createNoFeePolicy(),
       scanTtlSec,
@@ -892,6 +953,7 @@ export function resolveTradeConfig(
       maxSlippageBps,
       deadlineSec,
       maxVenueFeeBps,
+      ...(aggregatorGuard === undefined ? {} : { aggregatorGuard }),
     };
   }
 
@@ -929,6 +991,8 @@ export function resolveTradeConfig(
   }
 
   return {
+    stagedSubmit,
+    preflightSimulate,
     venues,
     feePolicy,
     feeTreasury,
@@ -939,6 +1003,7 @@ export function resolveTradeConfig(
     maxSlippageBps,
     deadlineSec,
     maxVenueFeeBps,
+    ...(aggregatorGuard === undefined ? {} : { aggregatorGuard }),
   };
 }
 

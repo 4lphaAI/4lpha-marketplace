@@ -106,6 +106,7 @@ export type PancakeV3SellParams = {
 export function isEncodableV3Route(route: TradeRoute): boolean {
   return (
     route.hops.length <= MAX_ROUTE_HOPS && route.fees.length === route.hops.length + 1
+    && route.fees.every((fee) => V3_FEE_TIERS.some((tier) => tier === fee))
   );
 }
 
@@ -226,6 +227,7 @@ function encodeMulticall(inner: readonly Hex[]): Hex {
 export function buildPancakeV3Buy(
   params: PancakeV3BuyParams,
 ): readonly WalletCall[] {
+  if (!isEncodableV3Route(params.route)) throw new Error("Pancake V3 route is not encodable.");
   const swap = encodeSwapLeg({
     tokens: buyTokens(params),
     fees: params.route.fees,
@@ -271,6 +273,7 @@ export function buildPancakeV3Buy(
 export function buildPancakeV3Sell(
   params: PancakeV3SellParams,
 ): readonly WalletCall[] {
+  if (!isEncodableV3Route(params.route)) throw new Error("Pancake V3 route is not encodable.");
   // The sell path is the exact reverse of the buy path — tokens AND fee tiers
   // (PHASE2.2 R2). Reversing only the addresses would route through a real but
   // wrong-tier pool, where `minOutWei` is the only thing left standing.

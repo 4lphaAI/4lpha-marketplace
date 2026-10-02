@@ -230,7 +230,7 @@ describe("LP durable grant recovery", () => {
       { view: { ...provisioning(false), missing: ["account-key"] }, expectedButton: "Check hire status" },
       { view: { ...provisioning(false), missing: ["permissions-differ"] }, expectedButton: "Start a new hire" },
       { view: { ...provisioning(false), cancelRequested: true }, expectedButton: "Start a new hire", pointerCleared: true },
-      { view: { status: "retired" }, expectedButton: "Deploy LP Agent", pointerCleared: true },
+      { view: { status: "retired" }, expectedButton: "Sign hire and create the session key", pointerCleared: true },
     ];
     for (const testCase of cases) {
       await act(async () => { root!.unmount(); });
@@ -271,7 +271,7 @@ describe("LP durable grant recovery", () => {
     current = provisioning(true);
     provisionResponse = new Response(JSON.stringify({ error: { code: "conflict" } }), { status: 409 });
     await mount();
-    await act(async () => { button("Deploy LP Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
     const sessionPosts = fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/") && String(url).endsWith("/session") && init?.method === "POST");
     expect(sessionPosts).toHaveLength(1);
     expect(localStorage.getItem(LP_HIRE_STORAGE_KEY)).not.toBeNull();
@@ -614,7 +614,7 @@ async function runLpLedger(scenario: {
   mocks.signEnvelope.mockImplementation(async (action: string, agentId: string, params: unknown) => ({
     signed: { action, agentId, owner: mocks.owner.ownerAddress }, signature: "0x1234", params,
   }));
-  await act(async () => { button("Deploy LP Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+  await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
   for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); });
   if (scenario.fundingWait) {
     await act(async () => { await vi.advanceTimersByTimeAsync(6_001); });
@@ -714,7 +714,7 @@ describe("HIRE-SIGNATURES-BC LP prompt ledger", () => {
       throw new Error(`Unexpected URL ${url}`);
     });
     await mount();
-    await act(async () => { button("Deploy LP Agent").click(); await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(0); });
     for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
     for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });

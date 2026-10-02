@@ -3,7 +3,9 @@ import { hasProvisioningCancellation, type AgentRecord, type AgentStore, type Pe
 import type { TradeSettingsStore } from "../store/tradeSettings.js";
 import type { TradeIntentStore } from "../store/tradeIntents.js";
 import { isTerminalLpSequence, type LpSequenceStore } from "../store/lpSequences.js";
-import type { ExecutionJournal } from "../store/journal.js";
+import type { ExecutionJournal, JournalEntry } from "../store/journal.js";
+import { isTradfiAiSettings, parseTradeSettings } from "../trade/settings.js";
+import { isDisposedInertSubmission } from "../trade/inertSubmission.js";
 import { ACCOUNT_ABI, KEYSTORE_ABI } from "./abis.js";
 import {
   assessGrantEvidence,
@@ -61,10 +63,20 @@ export function buildPendingOnChainRevoke(pending: PendingGrant | PendingRenewal
 }
 
 export type RenewalQuiescenceDeps = {
-  readonly tradeIntents?: Pick<TradeIntentStore, "listUnsettled">;
+  readonly tradeIntents?: Pick<TradeIntentStore, "listUnsettled"> & Partial<Pick<TradeIntentStore, "get">>;
+  /** Read-only: the TradFi AI discriminator for the disposed-inert-sell exemption. */
+  readonly tradeSettings?: Pick<TradeSettingsStore, "get">;
   readonly lpSequences?: Pick<LpSequenceStore, "listSequences">;
   readonly journal?: Pick<ExecutionJournal, "listNonTerminal" | "listUnknownForAgent">;
 };
+
+async function isDisposedInertRow(agent: AgentRecord, journal: JournalEntry, deps: RenewalQuiescenceDeps): Promise<boolean> {
+  if (deps.tradeSettings === undefined || deps.tradeIntents?.get === undefined || journal.decisionId === null) return false;
+  const settings = await deps.tradeSettings.get(agent.ownerAddress, agent.id);
+  const parsed = settings === null ? null : parseTradeSettings(settings.params);
+  if (parsed?.ok !== true || !isTradfiAiSettings(parsed.value.effective)) return false;
+  return isDisposedInertSubmission({ intent: await deps.tradeIntents.get(agent.ownerAddress, agent.id, journal.decisionId), journal });
+}
 
 /** The persisted-record inventory used at both renewal admission and swap. */
 export async function assessRenewalQuiescence(
@@ -89,8 +101,12 @@ export async function assessRenewalQuiescence(
   if (deps.journal !== undefined) {
     const pending = (await deps.journal.listNonTerminal()).find((row) => row.agentId === agent.id);
     if (pending !== undefined) return { quiescent: false, reason: `journal ${pending.state}: ${pending.idempotencyKey}` };
-    const unknown = (await deps.journal.listUnknownForAgent(agent.id))[0];
-    if (unknown !== undefined) return { quiescent: false, reason: `journal UNKNOWN: ${unknown.idempotencyKey}` };
+    // TRADFI-EXPIRY-KEEP-REMOVE §2.3: a hashless UNKNOWN sell already disposed as
+    // inert (durable, key-bound evidence on its rolled-back intent) no longer
+    // blocks — TradFi AI only, and only when every binding below holds.
+    for (const unknown of await deps.journal.listUnknownForAgent(agent.id)) {
+      if (!await isDisposedInertRow(agent, unknown, deps)) return { quiescent: false, reason: `journal UNKNOWN: ${unknown.idempotencyKey}` };
+    }
   }
   const claim = agent.sessionFacts?.armPlan?.claim;
   if (claim !== null && claim !== undefined && claim.outcome === null) {
@@ -234,6 +250,13 @@ export async function convergeProvisioning(input: {
       name: pending.sizing.sizingPreset,
       version: pending.sizing.sizingPresetVersion,
       openNativeBudgetWei: pending.sizing.openNativeBudgetWei,
+      ...(pending.sizing.entryWei === undefined ? {} : { entryWei: pending.sizing.entryWei }),
+      ...(pending.sizing.quotePerTradeWei === undefined ? {} : { quotePerTradeWei: pending.sizing.quotePerTradeWei }),
+      ...(pending.sizing.settlementAsset === undefined ? {} : { settlementAsset: pending.sizing.settlementAsset }),
+      ...(pending.sizing.minEntryWei === undefined ? {} : { minEntryWei: pending.sizing.minEntryWei }),
+      ...(pending.sizing.capitalQuoteWei === undefined ? {} : { capitalQuoteWei: pending.sizing.capitalQuoteWei }),
+      ...(pending.sizing.cmcNewsEnabled === undefined ? {} : { cmcNewsEnabled: pending.sizing.cmcNewsEnabled }),
+      ...(pending.sizing.cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: pending.sizing.cmcTotalBudgetWei }),
     },
     provisionActionId: pending.provisionActionId,
     ...(pending.hireRunId === undefined ? {} : { hireRunId: pending.hireRunId }),

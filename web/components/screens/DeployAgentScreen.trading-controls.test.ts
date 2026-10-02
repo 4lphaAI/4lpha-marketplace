@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 const deploySource = readFileSync(new URL("./DeployAgentScreen.tsx", import.meta.url), "utf8");
 const tradeDetailSource = readFileSync(new URL("../trade/TradeAgentDetail.tsx", import.meta.url), "utf8");
+const hireTradeSource = readFileSync(new URL("../deploy/HireTradeDeploy.tsx", import.meta.url), "utf8");
 const configStart = deploySource.indexOf("const CONFIG = {");
 const tradingPresets = deploySource.slice(deploySource.indexOf("  trading: ["), deploySource.indexOf("  lp: ["));
 const tradingConfigStart = deploySource.indexOf("  trading: [", configStart);
@@ -13,7 +14,8 @@ describe("Trading control presentation", () => {
     expect(tradingPresets).not.toContain('executionModel: "mid-cap"');
     expect(tradingPresets).toContain('label: "Degen"');
     expect(tradingPresets).toContain('label: "Sigma"');
-    expect(tradingPresets).toContain('label: "Blue Chip", executionModel: "blue-chip"');
+    expect(tradingPresets).toContain('label: "TradFi", executionModel: "tradfi"');
+    expect(tradingPresets).not.toContain('executionModel: "blue-chip"');
     expect(tradingConfig).toContain("Move the stop to break-even");
     expect(deploySource).toContain("breakEvenAfterTp: false");
   });
@@ -40,5 +42,19 @@ describe("Trading control presentation", () => {
     expect(tradingConfig).toContain('label: "Fallback model", type: "select", v: MODELS[1], options: FALLBACKS, excludeValueOf: "primary", showDisabledOption: true');
     expect(tradingConfig).not.toContain("options: [MODELS[0]], disabled: true");
     expect(tradingConfig).not.toContain("options: [MODELS[1]], disabled: true");
+  });
+
+  it("uses the persisted TradFi v2 discriminator for USDT sizing and paid data", () => {
+    expect(deploySource).toContain('settlementAsset: "USDT"');
+    expect(deploySource).toContain("minEntryWei");
+    expect(deploySource).toContain("capitalQuoteWei");
+    expect(deploySource).toContain("cmcNewsEnabled");
+    expect(deploySource).toContain("cmcTotalBudgetWei");
+    expect(deploySource).toContain('capitalBnb={tradfiV2 ? ""');
+    // The capital hint was dropped on operator ruling 2026-09-20 (TradFi deploy port).
+    expect(deploySource).not.toContain("BNB relay fees are funded separately");
+    expect(deploySource).not.toContain("platformFeeBps: 500");
+    expect(hireTradeSource).not.toContain("platformFeeBps: 500");
+    expect(hireTradeSource).toContain("preview.sizing.platformFeeBps");
   });
 });

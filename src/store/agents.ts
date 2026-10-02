@@ -114,6 +114,13 @@ export type SessionFacts = {
     readonly name: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1";
     readonly version: 1;
     readonly openNativeBudgetWei: string;
+    readonly entryWei?: string;
+    readonly quotePerTradeWei?: string;
+    readonly settlementAsset?: "USDT";
+    readonly minEntryWei?: string;
+    readonly capitalQuoteWei?: string;
+    readonly cmcNewsEnabled?: boolean;
+    readonly cmcTotalBudgetWei?: string;
   };
   /** Durable link used only to repair S1's row-before-journal crash window. */
   readonly provisionActionId?: Hex;
@@ -144,6 +151,11 @@ export type FundingRequirement = {
   readonly relayGasHeadroomWei: string;
   readonly requiredWei: string;
   readonly balanceWei: string | null;
+  /** Optional v2 quote-token funding facts; legacy funding remains unchanged. */
+  readonly quoteAsset?: "USDT";
+  readonly quoteRequiredWei?: string;
+  readonly quoteBalanceWei?: string | null;
+  readonly quoteShortfallWei?: string;
 };
 
 export type PendingGrant = {
@@ -160,9 +172,16 @@ export type PendingGrant = {
   readonly expiresAt: number;
   readonly sizing: {
     readonly openNativeBudgetWei: string;
+    readonly entryWei?: string;
+    readonly quotePerTradeWei?: string;
     readonly capDayWei: string;
     readonly sizingPreset: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1";
     readonly sizingPresetVersion: 1;
+    readonly settlementAsset?: "USDT";
+    readonly minEntryWei?: string;
+    readonly capitalQuoteWei?: string;
+    readonly cmcNewsEnabled?: boolean;
+    readonly cmcTotalBudgetWei?: string;
   };
   readonly funding: FundingRequirement;
   readonly createdAtSec: number;

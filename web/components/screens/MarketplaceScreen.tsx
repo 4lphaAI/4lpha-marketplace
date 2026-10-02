@@ -12,6 +12,21 @@ import { AgentCard, Button, CATEGORY_LIST, EmptyState, FilterChip, Select } from
 import { AGENTS, agentDeployKind, SORTS } from "@/lib/design-data";
 import { DeployAgentSection } from "@/components/screens/DeployAgentScreen";
 
+const MARKETPLACE_CARD_CSS = `
+.fl-marketplace-page .fl-card__price-value--zero{display:inline-block;padding:0;border:0;background:transparent;letter-spacing:normal;position:static}
+.fl-marketplace-page .fl-card__price-value--zero::before{content:none;animation:none}
+.fl-marketplace-page .fl-card__price-unit{padding-left:0}
+.fl-marketplace-page .fl-zerofee{position:relative;display:inline-flex;align-items:center;border-radius:999px;padding:3px 10px;isolation:isolate}
+.fl-marketplace-page .fl-zerofee__ring{position:absolute;inset:0;border-radius:inherit;overflow:hidden}
+.fl-marketplace-page .fl-zerofee__ring::before{content:"";position:absolute;inset:-60%;background:conic-gradient(from 0deg,transparent 0deg 250deg,var(--brand-hover) 285deg,var(--brand) 305deg,transparent 330deg 360deg);animation:fl-zerofee-spin 2.6s linear infinite}
+.fl-marketplace-page .fl-zerofee__ring::after{content:"";position:absolute;inset:1.5px;border-radius:inherit;background:var(--surface-card)}
+.fl-marketplace-page .fl-card:hover .fl-zerofee__ring::after{background:var(--surface-card-hover)}
+.fl-marketplace-page .fl-card--registry .fl-zerofee__ring::after{background:var(--surface-sunken)}
+.fl-marketplace-page .fl-zerofee__text{position:relative;z-index:1;font:var(--weight-semibold) var(--text-xs)/1 var(--font-mono);color:var(--brand);letter-spacing:.02em}
+@keyframes fl-zerofee-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.fl-marketplace-page .fl-zerofee__ring::before{animation:none}}
+`;
+
 function MarketplaceScreen({ go, onHire, search = "" }) {
   const [filter, setFilter] = React.useState("all");
   const [sort, setSort] = React.useState(SORTS[0]);
@@ -26,6 +41,7 @@ function MarketplaceScreen({ go, onHire, search = "" }) {
 
   return (
     <div className="fl-shell fl-marketplace-page">
+      <style>{MARKETPLACE_CARD_CSS}</style>
       <DeployAgentSection go={go} />
       <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 24, flexWrap: "wrap" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>

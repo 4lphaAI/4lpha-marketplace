@@ -2940,7 +2940,7 @@ export class FakeSqlClient implements SqlClient {
           row["agent_id"] === params[0] &&
           row["decision_id"] === params[1] &&
           // `kind in ('execute','trade','lp','venusRepay','venusSupply',
-          // 'venusClaim','venusClaimRepayLeg','billingCollect','lending',
+          // 'venusClaim','venusClaimRepayLeg','dcaRange','billingCollect','lending',
           // 'quantTrade')`: one
           // decisionId namespace across every money route. Mirrors journal.ts's
           // SQL literal by hand — the journal.lp, journal.venus and
@@ -2954,7 +2954,8 @@ export class FakeSqlClient implements SqlClient {
             row["kind"] === "venusClaimRepayLeg" ||
             row["kind"] === "billingCollect" ||
             row["kind"] === "lending" ||
-            row["kind"] === "quantTrade"),
+            row["kind"] === "quantTrade" ||
+            row["kind"] === "dcaRange"),
       )
       .sort((a, b) => asTime(a["created_at"]) - asTime(b["created_at"]));
     const row = matches[0];
@@ -3602,7 +3603,8 @@ export class FakeSqlClient implements SqlClient {
 
   #journalBindPreparedUpdate(params: readonly unknown[]): Row[] {
     const row = this.#journal.get(params[0] as string);
-    if (row === undefined || row["kind"] !== "lp" ||
+    if (row === undefined || (row["kind"] !== "lp" && row["kind"] !== "trade") ||
+        (row["kind"] === "trade" && row["state"] !== "PENDING") ||
         row["prepared_intent_identity"] !== null ||
         row["prepared_intent_identity_hash"] !== null ||
         BigInt(String(row["prepared_binding_version"])) !== BigInt(String(params[3]))) {

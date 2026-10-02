@@ -707,6 +707,7 @@ export interface WalletProvider {
    * identity before this method is permitted to sign or send.
    */
   submitPreparedLp?(params: PortoStagedLpSubmit): Promise<ExecutionReceipt>;
+  submitPreparedTrade?(params: PortoStagedLpSubmit): Promise<ExecutionReceipt>;
 
   /**
    * The session's DAILY NATIVE meter as the ACCOUNT currently reports it

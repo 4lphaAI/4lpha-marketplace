@@ -37,7 +37,9 @@ it("feature enrichment max3 reads, other models zero, outage fallback and abort"
   await enrichFeatures(dp,"degen",[pool.tokenAddress],now);assert.equal(calls,3);
   assert.equal((await enrichFeatures({...dp,async featurePools(){throw Error("outage")}},"sigma",[pool.tokenAddress],now)).size,0);
   const abort=new AbortController();abort.abort();await assert.rejects(enrichFeatures(dp,"sigma",[pool.tokenAddress],now,abort.signal));
-  assert.deepEqual(selectFeaturePools({pools:Array(11).fill(pool)},[pool.tokenAddress]),[]);
+  // 2026-09-22: the index bound is the 69-token pin ceiling (the data plane serves 36 pools); over it stays malformed.
+  assert.deepEqual(selectFeaturePools({pools:Array(70).fill(pool)},[pool.tokenAddress]),[]);
+  assert.equal(selectFeaturePools({pools:Array(36).fill(pool)},[pool.tokenAddress]).length,1);
 });
 const candidate=(n:number,lane:PinnedCandidate["lane"]="allowlist"):PinnedCandidate=>({address:addr(n),symbol:"NVDAx",lane,marketCapUsd:2e9,priceUsd:1,volume24hUsd:n,holders:1,priceChange24hPct:1});
 it("diversifies exact equity identities, never symbols, and reaches token69 through50+19",async()=>{
@@ -46,7 +48,7 @@ it("diversifies exact equity identities, never symbols, and reaches token69 thro
   assert.equal(rows[0]!.address,addr(2));assert.equal(rows[1]!.address,equity.address);assert.equal(rows[2]!.address,addr(3));
   const batches:number[]=[];let scans=0;const candidates=Array.from({length:69},(_,i)=>candidate(i+100));
   const result=await selectEntryCandidates({model:"sigma",settings:{minMarketCapUsd:null,maxMarketCapUsd:null,noReentry:false},candidates,
-    pinnedAddresses:new Set(candidates.map(c=>c.address)),previouslyEnteredAddresses:new Set(),openPositionAddresses:new Set(),forbiddenAddresses:new Set(),usEquityAddresses:new Set(),nowMs:now,verdictCache:createTradeVerdictCache(),
+    pinnedAddresses:new Set(candidates.map(c=>c.address)),previouslyEnteredAddresses:new Set(),openPositionAddresses:new Set(),forbiddenAddresses:new Set(),rwaAddresses:new Set(),rwaFacts:new Map(),nowMs:now,verdictCache:createTradeVerdictCache(),
     dataPlane:{...reads,async tokensBatch(addresses){batches.push(addresses.length);return addresses.map(address=>({...candidate(Number.parseInt(address.slice(-4),16)),address}))},
       async eligibilityBatch(addresses){batches.push(addresses.length);return addresses.map(address=>({address,eligible:true,reason:"ok",source:"allowlist" as const,venue:null}))},async security(){scans++;return {riskLevel:"ok",flags:[]}}}});
   assert.deepEqual(batches,[50,50,19,19]);assert.equal(result.kind,"selected");if(result.kind==="selected") assert.equal(result.candidates[0]!.address,addr(168));assert.equal(scans,12);

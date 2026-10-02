@@ -737,6 +737,7 @@ const DEMO_CLOSURE_ALLOWED = [
   "store/codec.ts",
   "store/demoAgents.ts",
   "store/sql.ts",
+  "trade/classification.ts",
   "trade/dataPlaneReads.ts",
   // `trade/doctrine.ts` and `trade/llm.ts` entered when the demo brain was
   // wired (fix-review finding 10). The LLM module builds prompts, validates an
@@ -744,7 +745,13 @@ const DEMO_CLOSURE_ALLOWED = [
   // wallet, no session and no submit.
   "trade/doctrine.ts",
   "trade/exits.ts",
+  "trade/features.ts",
+  "trade/guard.ts",
   "trade/llm.ts",
+  "trade/rwa.ts",
+  "trade/score.ts",
+  "trade/session.ts",
+  "trade/settlement.ts",
   "trade/sizing.ts",
   "trade/universe.ts",
 ] as const;
@@ -759,6 +766,11 @@ const DEMO_CLOSURE_FORBIDDEN = [
   "lp/worker.ts",
   "trade/execute.ts",
   "trade/worker.ts",
+  // AUTO-DCA §15.1: the DCA core, its range executor and its stores.
+  "trade/dca.ts",
+  "trade/dcaExecute.ts",
+  "store/dcaRounds.ts",
+  "ops/uniswapV3.ts",
   "store/journal.ts",
   "store/agents.ts",
   "store/lpSequences.ts",
@@ -912,6 +924,6 @@ describe("demo mode's import boundary", () => {
     );
     // The PACKAGE reach is pinned too, so a new dependency is a deliberate act
     // rather than something that arrives with an unrelated edit.
-    assert.deepEqual([...bare].sort(), ["hono", "viem"]);
+    assert.deepEqual([...bare].sort(), ["hono", "node:crypto", "viem"]);
   });
 });

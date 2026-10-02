@@ -772,7 +772,8 @@ const PROTOCOL_LOGOS = {
   "bStocks": "/design/protocols/bstocks.png",
   "fourmeme": "/design/protocols/fourmeme.png",
   "flapsh": "/design/protocols/flapsh.png",
-  "bstocks": "/design/protocols/bstocks.png"
+  "bstocks": "/design/protocols/bstocks.png",
+  "ondo": "/design/protocols/ondo.png"
 };
 Object.assign(__ds_scope, { PROTOCOL_LOGOS });
 })(); } catch (e) { __ds_ns.__errors.push({ path: "components/protocolLogos.js", error: String((e && e.message) || e) }); }
@@ -831,11 +832,13 @@ function AgentCard({
     style: {
       color: cat.color,
       borderColor: cat.color,
-      background: cat.tint
+      background: cat.tint,
+      width: 37,
+      height: 37
     }
   }, /*#__PURE__*/React.createElement(__ds_scope.Icon, {
     name: cat.icon,
-    size: 17
+    size: 22
   })), /*#__PURE__*/React.createElement("div", {
     style: {
       minWidth: 0
@@ -882,8 +885,14 @@ function AgentCard({
   }, /*#__PURE__*/React.createElement("div", {
     className: "fl-card__price"
   }, /*#__PURE__*/React.createElement("span", {
-    className: "fl-card__price-value"
-  }, "0 Fees"), /*#__PURE__*/React.createElement("span", {
+    className: "fl-card__price-value fl-card__price-value--zero"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "fl-zerofee"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "fl-zerofee__ring"
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "fl-zerofee__text"
+  }, "0 Fees"))), /*#__PURE__*/React.createElement("span", {
     className: "fl-card__price-unit"
   }, "this month")), /*#__PURE__*/React.createElement(__ds_scope.Button, {
     variant: "primary",

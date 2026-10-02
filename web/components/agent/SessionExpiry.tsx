@@ -129,6 +129,17 @@ const COPY: Record<SessionExpiryKind, {
 };
 
 /**
+ * TRADFI-EXPIRY-KEEP-REMOVE R4: the TradFi AI agent sells nothing at expiry, so
+ * its lines say positions are held. Keyed on the plane's `tradfiAi` flag, never
+ * on USDT (schedule, DCA and portfolio share it). The paused line is unchanged.
+ */
+const TRADFI_AI_COPY = {
+  expiredHeld: "Session expired. Positions are held, not sold. SL/TP and the exit model are off. Renew to resume, or withdraw from Account.",
+  expiredNone: "Session expired. The agent can't trade. Renew to resume, or withdraw from Account.",
+  soon: (r: string) => `Session ends in ${r}. No new entries in the last 2 h; positions are held, not sold. Renew after it ends.`,
+} as const;
+
+/**
  * The one-line consequence under the title, on every agent kind, ONCE.
  *
  * Renders nothing while the session has more than a day left, nothing without
@@ -138,25 +149,28 @@ const COPY: Record<SessionExpiryKind, {
  * the remedy. Revoked / retired / provisioning agents are past or before the
  * session and get nothing here. Same visual as `GasNotice`: a mono line, no box.
  */
-export function SessionExpiryNotice({ kind, expiresAt, nowMs, status, open }: {
+export function SessionExpiryNotice({ kind, expiresAt, nowMs, status, open, tradfiAi }: {
   readonly kind: SessionExpiryKind;
   readonly expiresAt: number | null | undefined;
   readonly nowMs: number;
   readonly status: string | undefined;
   /** Open positions / live orders / an active guard (1) — what the session's death strands. */
   readonly open: number;
+  /** The trade DTO's `tradfiAi === true`; only the trade kind reads it. */
+  readonly tradfiAi?: boolean;
 }) {
   const view = sessionExpiry(expiresAt, nowMs);
   if (view.state === "none" || view.state === "ok") return null;
   if (status !== "armed" && status !== "paused") return null;
   const copy = COPY[kind];
+  const ai = kind === "trade" && tradfiAi === true;
   const remaining = view.label.replace(/^Expires in /u, "");
   const line = (state: "expired" | "paused-soon" | "soon", text: string, tone: string) =>
     <span role="alert" data-session-notice={state} style={{ font: "var(--type-mono-xs)", color: tone }}>{text}</span>;
-  if (view.state === "expired") return line("expired", copy.expired, "var(--danger)");
+  if (view.state === "expired") return line("expired", ai ? (open > 0 ? TRADFI_AI_COPY.expiredHeld : TRADFI_AI_COPY.expiredNone) : copy.expired, "var(--danger)");
   if (open <= 0) return null;
   if (status === "paused") return line("paused-soon", copy.paused(remaining), "var(--warn)");
-  return line("soon", copy.soon(remaining), "var(--warn)");
+  return line("soon", ai ? TRADFI_AI_COPY.soon(remaining) : copy.soon(remaining), "var(--warn)");
 }
 
 const TONES: Record<Exclude<SessionExpiryState, "none">, string> = {

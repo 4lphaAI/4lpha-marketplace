@@ -30,6 +30,7 @@ const PRIVATE_KEY = `0x${"41".repeat(32)}` as Hex;
 const PUBLIC_KEY = `0x04${"51".repeat(64)}` as Hex;
 const KEY_ID = keccak256(PUBLIC_KEY);
 const BLOCK_HASH = `0x${"61".repeat(32)}` as Hex;
+const BLOCK_TIME_SEC = 1_700_000_000n;
 const MASTER_KEY = parseMasterKey(`0x${"71".repeat(32)}`);
 const REVOCATION_CONTEXT = { chainId: 56, keyStoreAddress: KEYSTORE } as const;
 
@@ -104,11 +105,11 @@ describe("finalized KeyStore revocation evidence", () => {
       async isValidKey() { throw new Error("latest must not be used"); },
       async finalizedBlock() {
         reads.push("finalized");
-        return { number: options.noFinalizedNumber === true ? null : 101n, hash: BLOCK_HASH };
+        return { number: options.noFinalizedNumber === true ? null : 101n, hash: BLOCK_HASH, timestampSec: BLOCK_TIME_SEC };
       },
       async blockAt(blockNumber) {
         reads.push(`block:${blockNumber}`);
-        return { number: blockNumber, hash: options.changedHash === true ? `0x${"62".repeat(32)}` as Hex : BLOCK_HASH };
+        return { number: blockNumber, timestampSec: BLOCK_TIME_SEC, hash: options.changedHash === true ? `0x${"62".repeat(32)}` as Hex : BLOCK_HASH };
       },
       async listKeysAt(_wallet, blockNumber) {
         reads.push(`list:${blockNumber}`);
@@ -136,7 +137,7 @@ describe("finalized KeyStore revocation evidence", () => {
     assert.equal(result.kind, "invalid");
     if (result.kind !== "invalid") throw new Error("expected invalid evidence");
     assert.deepEqual(result.evidence, evidence());
-    assert.deepEqual(result.observation, { blockNumber: "101", blockHash: BLOCK_HASH });
+    assert.deepEqual(result.observation, { blockNumber: "101", blockHash: BLOCK_HASH, blockTimeSec: 1_700_000_000 });
     assert.deepEqual(fake.reads, ["finalized", "list:101", "public:101", "valid:101", "block:101"]);
   });
 
@@ -163,7 +164,7 @@ describe("finalized KeyStore revocation evidence", () => {
       } else {
         assert.equal("evidence" in result, false);
         if (result.kind === "registered") {
-          assert.deepEqual(result.observation, { blockNumber: "101", blockHash: BLOCK_HASH });
+          assert.deepEqual(result.observation, { blockNumber: "101", blockHash: BLOCK_HASH, blockTimeSec: 1_700_000_000 });
         }
       }
     }

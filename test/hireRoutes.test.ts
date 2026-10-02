@@ -176,11 +176,11 @@ async function fixture(options: {
     async finalizedBlock() {
       finalizedReads.push("finalized");
       if (finalizedSession.mode === "unreadable") throw new Error("finalized unavailable");
-      return { number: 101n, hash: finalizedHash };
+      return { number: 101n, hash: finalizedHash, timestampSec: 1_700_000_000n };
     },
     async blockAt(blockNumber) {
       finalizedReads.push(`block:${blockNumber}`);
-      return { number: blockNumber, hash: finalizedSession.mode === "hash-change"
+      return { number: blockNumber, timestampSec: 1_700_000_000n, hash: finalizedSession.mode === "hash-change"
         ? `0x${"92".repeat(32)}` as Hex : finalizedHash };
     },
     async listKeysAt(_wallet, blockNumber) {

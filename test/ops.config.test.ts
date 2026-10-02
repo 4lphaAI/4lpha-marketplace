@@ -41,10 +41,12 @@ import {
   FOUR_MEME_TOKEN_MANAGER_56,
   PANCAKE_V2_ROUTER_56,
   PANCAKE_V3_ROUTER_56,
+  UNISWAP_V3_ROUTER02_56,
   WBNB_56,
   pancakeV3Venue,
   pancakeVenue,
   resolveVenues,
+  uniswapV3Venue,
 } from "../src/ops/venues.js";
 import type { SessionSpec, SpendCap } from "../src/core/types.js";
 
@@ -66,6 +68,8 @@ describe("resolveVenues", () => {
     assert.equal(venues.wbnb, WBNB_56);
     assert.equal(venues.fourMemeTokenManager, FOUR_MEME_TOKEN_MANAGER_56);
     assert.equal(venues.fourMemeHelper, FOUR_MEME_HELPER_56);
+    assert.ok(venues.uniswapRouterV3);
+    assert.ok(venues.uniswapQuoterV3);
   });
 
   it("ships chain 97 EMPTY rather than guessing", () => {
@@ -96,6 +100,15 @@ describe("resolveVenues", () => {
       "a router with no WBNB is not a usable V3 venue",
     );
     assert.equal(pancakeV3Venue({ chainId: 56, wbnb: WBNB_56 }), null);
+  });
+
+  it("resolves Uniswap V3 only when its router and WBNB are both present", () => {
+    const both = resolveVenues({ chainId: 56 });
+    const router = both.uniswapRouterV3;
+    assert.ok(router);
+    assert.deepEqual(uniswapV3Venue(both), { router, wbnb: WBNB_56 });
+    assert.equal(uniswapV3Venue({ chainId: 56, uniswapRouterV3: router }), null);
+    assert.equal(uniswapV3Venue({ chainId: 56, wbnb: WBNB_56 }), null);
   });
 
   it("applies overrides and normalizes casing", () => {
@@ -216,11 +229,12 @@ describe("tradeSessionSpec", () => {
     // PHASE2.4: and the flap Portal joins it, for the same reason and with the
     // same timing caveat — a session granted before the line existed cannot
     // call the Portal, because a persisted spec is never rewritten.
-    assert.deepEqual(targets.toSorted(), [
+    assert.deepEqual([...new Set(targets)].toSorted(), [
       FLAP_PORTAL_56,
       FOUR_MEME_TOKEN_MANAGER_56,
       PANCAKE_V2_ROUTER_56,
       PANCAKE_V3_ROUTER_56,
+      UNISWAP_V3_ROUTER02_56,
     ].toSorted());
   });
 
@@ -302,7 +316,7 @@ describe("tradeSessionSpec", () => {
       expiresAt: NOW + 3_600,
       nowSeconds: NOW,
     });
-    assert.equal(spec.allowedCalls.filter((rule) => rule.selector !== undefined).length, 1);
+    assert.equal(spec.allowedCalls.filter((rule) => rule.selector !== undefined && rule.to !== venues.uniswapRouterV3).length, 1);
     assert.equal(spec.spendCaps.filter((cap) => cap.token !== undefined).length, 1);
     // FIRST wins, so the dedup is a stable function of the input order.
     assert.equal(spec.spendCaps.find((cap) => cap.token !== undefined)?.limit, DEFAULT_TOKEN_CAP_LIMIT);

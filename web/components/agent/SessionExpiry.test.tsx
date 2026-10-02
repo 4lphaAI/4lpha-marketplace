@@ -101,3 +101,45 @@ describe("the shared pill override and notice, one wording for four agent kinds"
       .toContain("the guard can&#x27;t repay. Withdraw the reserve from Account, or hire again.");
   });
 });
+
+describe("TRADFI-EXPIRY-KEEP-REMOVE R4: the TradFi AI copy, keyed on the DTO flag and nothing else", () => {
+  const soon = sec(NOW + 6 * 3_600_000);
+  const dead = sec(NOW) - 60;
+  const notice = (over: { readonly expiresAt: number; readonly status: string; readonly open: number; readonly tradfiAi?: boolean; readonly kind?: "trade" | "lp" | "grid" | "lending" }) =>
+    renderToStaticMarkup(<SessionExpiryNotice kind={over.kind ?? "trade"} expiresAt={over.expiresAt} nowMs={NOW} status={over.status} open={over.open}
+      {...(over.tradfiAi === undefined ? {} : { tradfiAi: over.tradfiAi })} />);
+
+  it("expired with positions held says they are held, not sold, and the exit model is off", () => {
+    expect(notice({ expiresAt: dead, status: "armed", open: 2, tradfiAi: true }))
+      .toContain("Session expired. Positions are held, not sold. SL/TP and the exit model are off. Renew to resume, or withdraw from Account.");
+  });
+
+  it("expired with no positions says the agent can't trade", () => {
+    expect(notice({ expiresAt: dead, status: "paused", open: 0, tradfiAi: true }))
+      .toContain("Session expired. The agent can&#x27;t trade. Renew to resume, or withdraw from Account.");
+  });
+
+  it("soon says the 2 h entry cutoff, that positions are held, and to renew after it ends", () => {
+    expect(notice({ expiresAt: soon, status: "armed", open: 1, tradfiAi: true }))
+      .toContain("Session ends in 6h. No new entries in the last 2 h; positions are held, not sold. Renew after it ends.");
+  });
+
+  it("the paused line is unchanged for the AI agent", () => {
+    expect(notice({ expiresAt: soon, status: "paused", open: 1, tradfiAi: true }))
+      .toContain("Paused · session ends in 6h — resume so the agent can sell, or withdraw tokens yourself.");
+  });
+
+  it("a trade page without the literal true flag (schedule, DCA, portfolio, legacy, an older plane) keeps the shared copy", () => {
+    for (const tradfiAi of [undefined, false] as const) {
+      expect(notice({ expiresAt: dead, status: "armed", open: 2, ...(tradfiAi === undefined ? {} : { tradfiAi }) }))
+        .toContain("Session expired — the agent can&#x27;t trade or sell. Withdraw tokens from Account, or hire again.");
+      expect(notice({ expiresAt: soon, status: "armed", open: 2, ...(tradfiAi === undefined ? {} : { tradfiAi }) }))
+        .toContain("Session ends in 6h — sell open positions before then, or remove the agent.");
+    }
+  });
+
+  it("the flag never changes another kind's words", () => {
+    expect(notice({ kind: "lp", expiresAt: dead, status: "armed", open: 1, tradfiAi: true })).toContain("the agent can&#x27;t rotate or close.");
+    expect(notice({ kind: "grid", expiresAt: soon, status: "armed", open: 1, tradfiAi: true })).toContain("close the ladder before then");
+  });
+});

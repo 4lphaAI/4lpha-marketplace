@@ -215,3 +215,34 @@ export type LpOwnerView = {
   readonly grid?: unknown;
   readonly [key: string]: unknown;
 };
+
+/** `GET /agents/:id/trade/simulations`: the pre-flight simulation log, newest first (max 200). Atomic amounts are decimal strings. */
+export type TradeSimulationRow = {
+  readonly createdAt: number;
+  readonly journalKind: "trade" | "dcaRange";
+  /** "increase" = buy, "reduce" = sell. */
+  readonly exposure: "increase" | "reduce";
+  readonly route: "guard" | "direct" | "none";
+  readonly outcome: "success" | "reverted" | "guard-deadline" | "failed-other" | "not-simulated";
+  readonly reason: string | null;
+  readonly blocked: boolean;
+  readonly bareRevert: boolean;
+  readonly failReason: string | null;
+  readonly latencyMs: number | null;
+  readonly upstreamMs: number | null;
+  readonly outputToken: string;
+  /** The intent's token when the journal links one, else the output token. */
+  readonly token: string;
+  readonly predictionKind: "swap-output" | "net-wallet-delta";
+  readonly minOutAtomic: string | null;
+  readonly predictedOutAtomic: string | null;
+  readonly actualOutAtomic: string | null;
+  readonly actualTxHash: string | null;
+  readonly journalState: string | null;
+  readonly journalTxHash: string | null;
+};
+
+export type TradeSimulationLog = {
+  readonly rows: readonly TradeSimulationRow[];
+  readonly unavailable: null | "no-table" | "store-unavailable";
+};

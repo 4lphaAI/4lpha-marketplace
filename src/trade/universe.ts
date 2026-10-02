@@ -3,6 +3,7 @@ import { EQUITY_WRAPPERS } from "./classification.js";
 import type { Address } from "viem";
 import { evaluateSecurityPayload, type ScanReason, type ScanVerdict } from "../rules/scanGate.js";
 import { maxGrantedTokens } from "./sizing.js";
+import { admittedVenueRows, rwaEntryVerdict, type RwaFact } from "./rwa.js";
 import type { TradeExecutionModel, TradeSettings } from "./settings.js";
 import type {
   EligibilityBatchRow,
@@ -12,17 +13,14 @@ import type {
   TradeDataPlaneReads,
   UniverseLane,
   UniverseRow,
+  VenueRow,
 } from "./dataPlaneReads.js";
 
 export const PIN_MAX_READS = 16;
 export const PIN_MAX_BALANCE_READS = 69;
 export const PIN_CONCURRENCY = 4;
 export const MIN_PIN = 5;
-export const US_EQUITY_HOURS_UTC = {
-  weekdays: [1, 2, 3, 4, 5] as const,
-  openMinute: 13 * 60 + 30,
-  closeMinute: 20 * 60,
-} as const;
+export const US_EQUITY_REGULAR_SESSION_ET = { openMinute: 570, closeMinute: 960 } as const;
 export const TRADE_READ_BUDGET = 24;
 export const TRADE_SHORTLIST_MAX = 12;
 export const TRADE_SCAN_TTL_SEC = 300;
@@ -40,9 +38,9 @@ const NON_ENTRY_TOKEN_SYMBOLS: ReadonlySet<string> = new Set([
 ]);
 
 /** Candidate-only exclusions; USDT remains usable as an internal route hop. */
-export function isEntryExcludedToken(address: string, symbol?: string): boolean {
+export function isEntryExcludedToken(address: string, symbol?: string, lane?: UniverseLane): boolean {
   if (NON_ENTRY_TOKEN_ADDRESSES.has(address.toLowerCase())
-    || EQUITY_WRAPPERS.has(address.toLowerCase())) return true;
+    || (EQUITY_WRAPPERS.has(address.toLowerCase()) && lane !== "ondo" && lane !== "bstocks")) return true;
   if (typeof symbol !== "string") return false;
   return NON_ENTRY_TOKEN_SYMBOLS.has(symbol.trim().toUpperCase());
 }
@@ -58,6 +56,14 @@ export class PinTooSmallError extends Error {
   constructor(readonly count: number) {
     super(`The trading universe has only ${count} usable tokens; at least ${MIN_PIN} are required.`);
     this.name = "PinTooSmallError";
+  }
+}
+
+/** A bounded v2 capability census could not finish before the hire read window. */
+export class TradfiCapabilityIncompleteError extends Error {
+  constructor() {
+    super("The TradFi v2 capability preview is incomplete; retry the preview.");
+    this.name = "TradfiCapabilityIncompleteError";
   }
 }
 
@@ -78,15 +84,21 @@ export type PinnedCandidate = {
   readonly priceChange24hPct: number | null;
   readonly holders: number | null;
   readonly marketHours?: "us-equities";
+  readonly underlyingTicker?: string;
+  readonly platform?: string;
+  readonly venues?: readonly VenueRow[];
 };
 
 export type PinUniverseDeps = {
   readonly dataPlane: Pick<TradeDataPlaneReads, "universe" | "tokensBatch">;
   readonly signal?: AbortSignal;
+  /** Optional v2-only guard probe; its presence also admits guard-only rows. */
+  readonly tradfiV2CapabilityProbe?: (candidate: PinnedCandidate, signal?: AbortSignal) => Promise<boolean>;
 };
 
-function lanesFor(model: TradeExecutionModel): readonly UniverseLane[] {
+export function lanesFor(model: TradeExecutionModel): readonly UniverseLane[] {
   switch (model) {
+    case "tradfi": return ["bstocks", "ondo"];
     case "blue-chip": return ["allowlist", "bstocks"];
     case "mid-cap": return ["allowlist", "coins"];
     case "degen": return ["meme"];
@@ -127,6 +139,17 @@ function volumeCompare(left: PinnedCandidate, right: PinnedCandidate): number {
   return rightVolume - leftVolume || left.address.localeCompare(right.address);
 }
 
+function deepestLiquidity(candidate: PinnedCandidate): number {
+  return admittedVenueRows(candidate.venues)[0]?.liquidityUsd ?? 0;
+}
+
+function tradfiCompare(left: PinnedCandidate, right: PinnedCandidate): number {
+  const leftLiquidity = deepestLiquidity(left);
+  const rightLiquidity = deepestLiquidity(right);
+  return rightLiquidity > leftLiquidity ? 1 : rightLiquidity < leftLiquidity ? -1
+    : left.address.localeCompare(right.address);
+}
+
 /** Preserve stable volume ranking inside each provenance bucket. */
 export function rankDiversified<T extends PinnedCandidate>(model: TradeExecutionModel, candidates: readonly T[]): T[] {
   if (model !== "blue-chip" && model !== "sigma") return [...candidates].sort(volumeCompare);
@@ -146,9 +169,10 @@ export function rankDiversified<T extends PinnedCandidate>(model: TradeExecution
   return result;
 }
 
-function inModelBand(model: TradeExecutionModel, row: UniverseRow, token: TokenBatchRow): boolean {
+export function inModelBand(model: TradeExecutionModel, row: UniverseRow, token: TokenBatchRow): boolean {
   const cap = token.marketCapUsd;
   switch (model) {
+    case "tradfi": return row.lane === "bstocks" || row.lane === "ondo";
     case "blue-chip": return row.lane === "bstocks" || (cap !== null && cap > 1_000_000_000);
     case "mid-cap": return cap !== null && cap >= 10_000_000 && cap <= 1_000_000_000;
     case "degen": return cap !== null && cap < 1_000_000;
@@ -156,12 +180,25 @@ function inModelBand(model: TradeExecutionModel, row: UniverseRow, token: TokenB
   }
 }
 
+export type PinUniverseOptions = {
+  /** G2: overrides `lanesFor(model)` — Schedule mode reads bStocks only. */
+  readonly lanes?: readonly UniverseLane[];
+  /**
+   * G3: set only in schedule mode. When true, the v2 capability probe runs
+   * over every ranked candidate instead of the top 28, and the pinned result
+   * is not cut back to 28 — a pool-less bStock sorted past position 28 can
+   * still reach the schedule pin.
+   */
+  readonly probeAll?: boolean;
+};
+
 /** Owner-independent stage cached by the hire flow; C23 keeps balances outside it. */
 export async function pinUniverse(
   model: TradeExecutionModel,
   deps: PinUniverseDeps,
+  options?: PinUniverseOptions,
 ): Promise<readonly PinnedCandidate[]> {
-  const lanes = lanesFor(model);
+  const lanes = options?.lanes ?? lanesFor(model);
   let laneRows: readonly (readonly UniverseRow[] | null)[];
   try {
     laneRows = await mapConcurrent(lanes, PIN_CONCURRENCY, (lane) =>
@@ -173,24 +210,29 @@ export async function pinUniverse(
   const allowlist = allowlistIndex < 0 ? undefined : laneRows[allowlistIndex];
   if (model === "mid-cap" && allowlist === null) throw new ModelUnavailableError(model);
 
-  // Later lanes win, so the static bStocks row supplies market-hours identity (C25).
+  // TradFi has bStocks address precedence; legacy models retain the existing
+  // later-lane behavior so their static bStocks row supplies market-hours identity.
   const universeByAddress = new Map<string, UniverseRow>();
   for (const rows of laneRows) {
     if (rows === null) continue;
-    for (const row of rows) universeByAddress.set(row.address.toLowerCase(), row);
+    for (const row of rows) {
+      const key = row.address.toLowerCase();
+      if (model === "tradfi" && universeByAddress.has(key)) continue;
+      universeByAddress.set(key, row);
+    }
   }
 
   const laneReadCount = lanes.length;
   const tokenReadLimit = Math.min(PIN_MAX_READS - 4, PIN_MAX_READS - laneReadCount);
   // AUDIT M2: under the fixed read ceiling, deterministic custody relevance wins:
-  // bStocks and allowlist first, then meme, then coins; one seed keeps every nonempty lane represented.
-  const lanePriority: Readonly<Record<UniverseLane, number>> = { bstocks: 0, allowlist: 1, meme: 2, coins: 3 };
+  // bStocks and allowlist first, then meme, coins and Ondo; one seed keeps every nonempty lane represented.
+  const lanePriority: Readonly<Record<UniverseLane, number>> = { bstocks: 0, allowlist: 1, meme: 2, coins: 3, ondo: 4 };
   const ranked = [...universeByAddress.values()]
     .sort((left, right) => lanePriority[left.lane] - lanePriority[right.lane]
       || left.address.localeCompare(right.address));
   const capacity = tokenReadLimit * 50;
   const selected = ranked.slice(0, capacity);
-  for (const lane of ["bstocks", "allowlist", "meme", "coins"] as const) {
+  for (const lane of ["bstocks", "allowlist", "meme", "coins", "ondo"] as const) {
     if (selected.some((row) => row.lane === lane)) continue;
     const seed = ranked.find((row) => row.lane === lane);
     if (seed === undefined) continue;
@@ -220,7 +262,12 @@ export async function pinUniverse(
   for (const [key, row] of universeByAddress) {
     const token = tokens.get(key);
     if (token === undefined || !inModelBand(model, row, token)) continue;
-    if (isEntryExcludedToken(row.address, token.symbol)) continue;
+    const venues = row.venues ?? row.rwa?.venues;
+    if (model === "tradfi" && (row.rwa === undefined || row.rwa.openState !== true
+      || row.rwa.reasonCode !== "TRADING"
+      || (admittedVenueRows(venues).length === 0 && deps.tradfiV2CapabilityProbe === undefined))) continue;
+    if (isEntryExcludedToken(row.address, token.symbol, row.lane)) continue;
+    const ticker = row.rwa?.underlyingTicker?.trim().toUpperCase();
     candidates.push({
       address: row.address,
       symbol: token.symbol ?? row.symbol,
@@ -231,11 +278,57 @@ export async function pinUniverse(
       priceChange24hPct: token.priceChange24hPct,
       holders: token.holders,
       ...(row.marketHours === undefined ? {} : { marketHours: row.marketHours }),
+      ...(ticker === undefined || ticker === "" ? {} : { underlyingTicker: ticker }),
+      ...(row.rwa?.platform === undefined ? {} : { platform: row.rwa.platform }),
+      ...(venues === undefined ? {} : { venues }),
     });
   }
-  const pinned = rankDiversified(model, candidates).slice(0, maxGrantedTokens(model));
+  let rankedCandidates = candidates;
+  if (model === "tradfi") {
+    const groups = new Map<string, PinnedCandidate[]>();
+    for (const candidate of candidates) {
+      const key = candidate.underlyingTicker ?? candidate.address.toLowerCase();
+      const group = groups.get(key) ?? [];
+      group.push(candidate);
+      groups.set(key, group);
+    }
+    rankedCandidates = [...groups.values()].map((group) => group.sort((left, right) =>
+      (left.lane === "bstocks" ? 0 : 1) - (right.lane === "bstocks" ? 0 : 1)
+      || tradfiCompare(left, right))[0]!).filter((candidate): candidate is PinnedCandidate => candidate !== undefined)
+      .sort(tradfiCompare);
+  }
+  if (model === "tradfi" && deps.tradfiV2CapabilityProbe !== undefined) {
+    const probeCandidates = options?.probeAll === true ? rankedCandidates : rankedCandidates.slice(0, 28);
+    let probeResults: readonly boolean[];
+    try {
+      probeResults = await mapConcurrent(probeCandidates, 4, (candidate) =>
+        deps.tradfiV2CapabilityProbe!(candidate, deps.signal));
+    } catch {
+      throw new TradfiCapabilityIncompleteError();
+    }
+    rankedCandidates = probeCandidates.filter((_candidate, index) => probeResults[index] === true);
+  }
+  const pinned = (model === "tradfi" ? rankedCandidates : rankDiversified(model, rankedCandidates))
+    .slice(0, options?.probeAll === true ? rankedCandidates.length
+      : model === "tradfi" && deps.tradfiV2CapabilityProbe !== undefined ? 28 : maxGrantedTokens(model));
   if (pinned.length < MIN_PIN) throw new PinTooSmallError(pinned.length);
   return pinned;
+}
+
+/**
+ * R2.3 (H2): one list feeds both the grant and its sizing. G3's schedule pin
+ * is no longer cut to 28, so a caller that separately cuts `pinned` for
+ * sizing and grants the uncut list (or vice versa) can grant more tokens than
+ * it sized for, or drop the chosen token past position 28. The chosen token
+ * always goes first.
+ */
+export function scheduleGrantList(
+  pinned: readonly PinnedCandidate[],
+  chosen: PinnedCandidate,
+): readonly PinnedCandidate[] {
+  const key = chosen.address.toLowerCase();
+  return [chosen, ...pinned.filter((candidate) => candidate.address.toLowerCase() !== key)]
+    .slice(0, maxGrantedTokens("tradfi"));
 }
 
 export type BalanceReader = (token: Address, signal?: AbortSignal) => Promise<bigint>;
@@ -264,12 +357,21 @@ export function marketHoursByAddress(bstocksRows: readonly UniverseRow[]): Reado
 }
 
 export function isUsEquityOpen(nowMs: number): boolean {
-  const date = new Date(nowMs);
-  const day = date.getUTCDay();
-  const minute = date.getUTCHours() * 60 + date.getUTCMinutes();
-  return day >= 1 && day <= 5
-    && minute >= US_EQUITY_HOURS_UTC.openMinute
-    && minute < US_EQUITY_HOURS_UTC.closeMinute;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(nowMs));
+  const weekday = parts.find((part) => part.type === "weekday")?.value;
+  const hour = Number(parts.find((part) => part.type === "hour")?.value ?? "NaN");
+  const minute = Number(parts.find((part) => part.type === "minute")?.value ?? "NaN");
+  const localMinute = hour * 60 + minute;
+  return weekday !== "Sat" && weekday !== "Sun" && weekday !== undefined
+    && localMinute >= US_EQUITY_REGULAR_SESSION_ET.openMinute
+    && localMinute < US_EQUITY_REGULAR_SESSION_ET.closeMinute;
+}
+
+export function rwaMarketClosed(fact: RwaFact | undefined, nowMs: number): boolean {
+  if (typeof fact?.marketStatus === "string") return fact.marketStatus !== "regular";
+  return !isUsEquityOpen(nowMs);
 }
 
 export type CandidateRefusal = {
@@ -280,6 +382,8 @@ export type CandidateRefusal = {
 export type EntryCandidate = PinnedCandidate & {
   /** True when this token's underlying is a US-listed instrument and its market is shut. */
   readonly underlyingMarketClosed: boolean;
+  readonly rwaNote: string | null;
+  readonly marketStatus?: string | null;
   readonly eligibilitySource: EligibilitySource;
   readonly eligibilityVenue: EligibilityVenue | null;
   readonly routeKind: "pancake-discovery" | "pancake-v2" | "fourmeme" | "flap";
@@ -297,13 +401,14 @@ const PROCESS_VERDICT_CACHE = createTradeVerdictCache();
 
 export type SelectEntryCandidatesInput = {
   readonly model: TradeExecutionModel;
-  readonly settings: Pick<TradeSettings, "minMarketCapUsd" | "maxMarketCapUsd" | "noReentry">;
+  readonly settings: Pick<TradeSettings, "minMarketCapUsd" | "maxMarketCapUsd" | "noReentry" | "settlementAsset">;
   readonly candidates: readonly PinnedCandidate[];
   readonly pinnedAddresses: ReadonlySet<string>;
   readonly previouslyEnteredAddresses: ReadonlySet<string>;
   readonly openPositionAddresses: ReadonlySet<string>;
   readonly forbiddenAddresses: ReadonlySet<string>;
-  readonly usEquityAddresses: ReadonlySet<string>;
+  readonly rwaAddresses: ReadonlySet<string>;
+  readonly rwaFacts: ReadonlyMap<string, RwaFact>;
   readonly dataPlane: Pick<TradeDataPlaneReads, "tokensBatch" | "eligibilityBatch" | "security">;
   readonly signal?: AbortSignal;
   readonly nowMs: number;
@@ -389,6 +494,7 @@ function routeFor(row: EligibilityBatchRow): EntryCandidate["routeKind"] | null 
   switch (row.source) {
     case "allowlist":
     case "binance-alpha": return "pancake-discovery";
+    case "binance-rwa": return "pancake-discovery";
     case "fourmeme":
       if (row.venue === "fourmeme-bonding") return "fourmeme";
       return row.venue === "pancake-v2" ? "pancake-v2" : null;
@@ -421,12 +527,31 @@ export async function selectEntryCandidates(
     return true;
   };
   const { kept: prefiltered, summary: prefilter } = partitionPinnedCandidates(input);
-  if (prefiltered.length === 0) return { kind: "selected", candidates: [], refusals, reads, prefilter };
+  const rwaAddresses = input.rwaAddresses;
+  const rwaFacts = input.rwaFacts;
+  const classified: PinnedCandidate[] = [];
+  const rwaNotes = new Map<string, string | null>();
+  for (const candidate of prefiltered) {
+    const key = candidate.address.toLowerCase();
+    if (!rwaAddresses.has(key)) {
+      classified.push(candidate);
+      continue;
+    }
+    const verdict = rwaEntryVerdict(rwaFacts.get(key), input.nowMs,
+      input.model === "tradfi" && input.settings.settlementAsset === "USDT" ? { allowVenueMissing: true } : {});
+    if (verdict.kind === "refuse") {
+      refusals.push({ address: candidate.address, reason: verdict.reason });
+      continue;
+    }
+    rwaNotes.set(key, verdict.note);
+    classified.push(candidate);
+  }
+  if (classified.length === 0) return { kind: "selected", candidates: [], refusals, reads, prefilter };
 
   const tokens: TokenBatchRow[] = [];
   const eligibility: EligibilityBatchRow[] = [];
   try {
-    for (const batch of chunks(prefiltered.map(({ address }) => address), 50)) {
+    for (const batch of chunks(classified.map(({ address }) => address), 50)) {
       if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads, prefilter };
       tokens.push(...await input.dataPlane.tokensBatch(batch, input.signal));
       if (!consume()) return { kind: "aborted", reason: "read-budget", refusals, reads, prefilter };
@@ -439,14 +564,16 @@ export async function selectEntryCandidates(
   const tokenByAddress = new Map(tokens.map((row) => [row.address.toLowerCase(), row]));
   const eligibilityByAddress = new Map(eligibility.map((row) => [row.address.toLowerCase(), row]));
   const ranked: EntryCandidate[] = [];
-  for (const candidate of prefiltered) {
+  for (const candidate of classified) {
     const key = candidate.address.toLowerCase();
+    const fact = rwaFacts.get(key);
+    const marketStatus = fact?.marketStatus;
     const token = tokenByAddress.get(key);
     const gate = eligibilityByAddress.get(key);
     if (token === undefined || gate === undefined) {
       return { kind: "aborted", reason: "data-plane-unavailable", refusals, reads, prefilter };
     }
-    if (isEntryExcludedToken(candidate.address, token.symbol)) {
+    if (isEntryExcludedToken(candidate.address, token.symbol, candidate.lane)) {
       refusals.push({ address: candidate.address, reason: "non-entry-asset" });
       continue;
     }
@@ -467,8 +594,9 @@ export async function selectEntryCandidates(
       ...candidate,
       // A fact for the model, never a refusal: the pool is open even when the
       // underlying exchange is not, and the impact gate prices the difference.
-      underlyingMarketClosed: input.usEquityAddresses.has(candidate.address.toLowerCase())
-        && !isUsEquityOpen(input.nowMs),
+      underlyingMarketClosed: rwaAddresses.has(key) ? rwaMarketClosed(fact, input.nowMs) : false,
+      rwaNote: rwaNotes.get(key) ?? null,
+      ...(marketStatus === undefined ? {} : { marketStatus }),
       symbol: token.symbol ?? candidate.symbol,
       marketCapUsd: token.marketCapUsd,
       priceUsd: token.priceUsd,
@@ -481,7 +609,7 @@ export async function selectEntryCandidates(
       scanReasons: [],
     });
   }
-  const shortlist = rankDiversified(input.model, ranked).slice(0, TRADE_SHORTLIST_MAX);
+  const shortlist = (input.model === "tradfi" ? ranked : rankDiversified(input.model, ranked)).slice(0, TRADE_SHORTLIST_MAX);
   const cache = input.verdictCache ?? PROCESS_VERDICT_CACHE;
   const selected: EntryCandidate[] = [];
   for (const candidate of shortlist) {

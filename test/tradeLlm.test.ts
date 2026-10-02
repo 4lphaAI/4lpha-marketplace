@@ -84,16 +84,16 @@ describe("TRADING-AGENT R7 entry validator", () => {
     assert.deepEqual(result.decisions, []);
   });
 
-  it("truncates reasons to 200 characters", () => {
+  it("truncates reasons to MAX_LLM_REASON_CHARS (1 200 since 2026-09-20)", () => {
     const result = validateEntryResponse(entry([
-      { index: 0, enter: true, confidence: 80, reason: "r".repeat(250) },
+      { index: 0, enter: true, confidence: 80, reason: "r".repeat(MAX_LLM_REASON_CHARS + 50) },
     ]), 1);
     assert.equal(result.decisions[0]?.reason.length, MAX_LLM_REASON_CHARS);
   });
 
   it("maps every JSON/schema parse failure to llm-invalid", () => {
     const result = validateEntryResponse("not json", 1);
-    assert.deepEqual(result, { ok: false, reason: "llm-invalid", decisions: [], duplicateIndexes: [] });
+    assert.deepEqual(result, { ok: false, reason: "llm-invalid", decisions: [], duplicateIndexes: [], dataRequests: [] });
   });
 
   it("applies the model-specific confidence threshold", () => {
@@ -118,7 +118,7 @@ describe("TRADING-AGENT R7 exit validator", () => {
 
   it("maps malformed output to llm-invalid so the caller holds", () => {
     assert.deepEqual(validateExitResponse("{}", 1), {
-      ok: false, reason: "llm-invalid", decisions: [], duplicateIndexes: [],
+      ok: false, reason: "llm-invalid", decisions: [], duplicateIndexes: [], dataRequests: [],
     });
   });
 });
@@ -165,6 +165,17 @@ describe("TRADING-AGENT prompts and transport", () => {
     });
     assert.match(prompt[1]?.content ?? "", /pnlBps/u);
     assert.match(prompt[1]?.content ?? "", /\t100\t60\t-/u);
+  });
+
+  it("orders TradFi notes as market closure, premium/discount, then issuer session", () => {
+    const prompt = buildEntryPrompt({
+      model: "tradfi",
+      candidates: [{ ...candidate, underlyingMarketClosed: true, rwaNote: "discount:2.3%", marketStatus: "overnight" }],
+      owner: { instructions: null, skillMarkdown: null },
+    });
+    const row = prompt[1]?.content.split("\n").find((line) => line.startsWith("0\t")) ?? "";
+    assert.match(row, /underlying-market-closed\|discount:2\.3%\|issuer-session:overnight$/u);
+    assert.match(prompt[0]?.content ?? "", /premium:\+x% means the token trades x% above its underlying stock/u);
   });
 
   it("gives the model explicit time-limit authority only for the live time-only class", () => {
@@ -250,5 +261,140 @@ describe("0G router integration (measured 2026-09-03)", () => {
     }
     assert.deepEqual((bodies[0] as Record<string, unknown>)["chat_template_kwargs"], { enable_thinking: false });
     assert.equal((bodies[1] as Record<string, unknown>)["chat_template_kwargs"], undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRADFI-LLM-CMC-REQUEST R2.8.1/R2.8.2/R3.7: the optional `dataRequests` field.
+// ---------------------------------------------------------------------------
+
+function entryWithRequests(decisions: unknown, dataRequests: unknown): string {
+  return JSON.stringify({ decisions, dataRequests });
+}
+
+describe("TRADFI-LLM-CMC-REQUEST: dataRequests validator gating", () => {
+  it("{decisions} is unchanged when allowDataRequests is not passed", () => {
+    const result = validateEntryResponse(entry([{ index: 0, enter: true, confidence: 80, reason: "go" }]), 1);
+    assert.equal(result.ok, true);
+    if (result.ok) assert.deepEqual(result.dataRequests, []);
+  });
+
+  it("{decisions,dataRequests} is valid ONLY with allowDataRequests: true", () => {
+    const raw = entryWithRequests(
+      [{ index: 0, enter: true, confidence: 80, reason: "go" }],
+      [{ index: 0, skill: "planning", reason: "unknown planning line" }],
+    );
+    const disallowed = validateEntryResponse(raw, 1);
+    assert.equal(disallowed.ok, false, "dataRequests without the option invalidates the WHOLE response");
+    const allowed = validateEntryResponse(raw, 1, { allowDataRequests: true });
+    assert.equal(allowed.ok, true);
+    if (allowed.ok) {
+      assert.deepEqual(allowed.decisions, [{ index: 0, enter: true, confidence: 80, reason: "go" }]);
+      assert.deepEqual(allowed.dataRequests, [{ index: 0, skill: "planning", reason: "unknown planning line" }]);
+    }
+  });
+
+  it("a bad dataRequests entry is dropped without ever touching decisions", () => {
+    const decisions = [{ index: 0, enter: true, confidence: 80, reason: "go" }];
+    const cases: readonly unknown[] = [
+      "not-an-array",
+      [{ index: -1, skill: "planning", reason: "bad index" }],
+      [{ index: 0, skill: "not-a-skill", reason: "bad skill" }],
+      [{ index: 0, skill: "planning", reason: "extra", extra: true }],
+    ];
+    for (const dataRequests of cases) {
+      const result = validateEntryResponse(entryWithRequests(decisions, dataRequests), 1, { allowDataRequests: true });
+      assert.equal(result.ok, true, `decisions must survive a malformed dataRequests: ${JSON.stringify(dataRequests)}`);
+      if (result.ok) {
+        assert.deepEqual(result.decisions, decisions);
+        assert.deepEqual(result.dataRequests, []);
+      }
+    }
+  });
+
+  it("keeps only the first 3 dataRequests entries, positionally", () => {
+    const requests = [0, 1, 2, 3, 4].map((index) => ({ index: 0, skill: "planning", reason: `r${index}` }));
+    const result = validateEntryResponse(entryWithRequests([{ index: 0, enter: true, confidence: 80, reason: "go" }], requests), 1, { allowDataRequests: true });
+    assert.equal(result.ok, true);
+    if (result.ok) assert.deepEqual(result.dataRequests.map((r) => r.reason), ["r0", "r1", "r2"]);
+  });
+
+  it("a >3-entry array whose first 3 are all malformed still yields zero requests (never reaches entry 4)", () => {
+    const requests = [
+      { index: -1, skill: "planning", reason: "bad" },
+      { index: -1, skill: "planning", reason: "bad" },
+      { index: -1, skill: "planning", reason: "bad" },
+      { index: 0, skill: "planning", reason: "would be valid at position 4" },
+    ];
+    const result = validateEntryResponse(entryWithRequests([{ index: 0, enter: true, confidence: 80, reason: "go" }], requests), 1, { allowDataRequests: true });
+    assert.equal(result.ok, true);
+    if (result.ok) assert.deepEqual(result.dataRequests, []);
+  });
+
+  it("slices a request reason to 80 chars", () => {
+    const requests = [{ index: 0, skill: "planning", reason: "r".repeat(200) }];
+    const result = validateEntryResponse(entryWithRequests([{ index: 0, enter: true, confidence: 80, reason: "go" }], requests), 1, { allowDataRequests: true });
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.dataRequests[0]?.reason.length, 80);
+  });
+
+  it("exit validator: same gating, same drop-only-the-bad-entry rule", () => {
+    const raw = JSON.stringify({ decisions: [{ index: 0, exit: true, reason: "sell" }], dataRequests: [{ index: 0, skill: "events", reason: "next earnings?" }] });
+    assert.equal(validateExitResponse(raw, 1).ok, false, "no option ⇒ dataRequests is off-schema");
+    const allowed = validateExitResponse(raw, 1, { allowDataRequests: true });
+    assert.equal(allowed.ok, true);
+    if (allowed.ok) assert.deepEqual(allowed.dataRequests, [{ index: 0, skill: "events", reason: "next earnings?" }]);
+  });
+
+  it("28 decision rows at 202-char reasons plus 3 dataRequests entries at 80 chars still parse (R3.7)", () => {
+    // AUDIT L-5: `enter:true` rows WITH `amountAtomic` — an `enter:false` row
+    // (no amountAtomic key) makes the body ~7 587 bytes, already under the OLD
+    // 8 192 cap, so this test proved nothing about the +512 headroom. A
+    // realistic v2 `enter:true` row crosses the old cap (measured 8 595 bytes),
+    // so this only passes because of the R3.7 +512 allowance.
+    const AMOUNT = "5000000000000000000";
+    const decisions = Array.from({ length: 28 }, (_, index) => ({ index, enter: true, amountAtomic: AMOUNT, confidence: 50, reason: "r".repeat(202) }));
+    const dataRequests = [0, 1, 2].map((index) => ({ index, skill: "planning" as const, reason: "r".repeat(80) }));
+    const body = entryWithRequests(decisions, dataRequests);
+    assert.ok(Buffer.byteLength(body, "utf8") > 8_192, `expected the body to exceed the OLD 8192-byte cap, was ${Buffer.byteLength(body, "utf8")}`);
+    const result = validateEntryResponse(body, 28, { allowDataRequests: true, v2: true,
+      bounds: new Map(decisions.map((_row, index) => [index, { minAtomic: 1n, maxAtomic: BigInt(AMOUNT) }])) });
+    assert.equal(result.ok, true, "28 rows + 3 requests must fit inside MAX_LLM_RESPONSE_BYTES + 512");
+    if (result.ok) assert.equal(result.dataRequests.length, 3);
+  });
+
+  it("the system line is present only when input.dataRequests === true, and non-TradFi/CMC-off prompts stay byte-identical", () => {
+    const withRequests = buildEntryPrompt({ model: "tradfi", v2: true, dataRequests: true,
+      candidates: [{ address: "0x1111111111111111111111111111111111111111", symbol: "T", marketCapUsd: 1, priceUsd: 1, volume24hUsd: 1, priceChange24hPct: 1, holders: 1, source: "allowlist", scanFlags: [] }],
+      owner: { instructions: null, skillMarkdown: null } });
+    const withoutRequests = buildEntryPrompt({ model: "tradfi", v2: true,
+      candidates: [{ address: "0x1111111111111111111111111111111111111111", symbol: "T", marketCapUsd: 1, priceUsd: 1, volume24hUsd: 1, priceChange24hPct: 1, holders: 1, source: "allowlist", scanFlags: [] }],
+      owner: { instructions: null, skillMarkdown: null } });
+    assert.match(withRequests[0]?.content ?? "", /dataRequests/u);
+    assert.doesNotMatch(withoutRequests[0]?.content ?? "", /dataRequests/u);
+    // G0 follow-up 2026-09-25: the event calendar is enabled, so the line names both skills.
+    assert.match(withRequests[0]?.content ?? "", /skill is "planning"/u);
+    assert.match(withRequests[0]?.content ?? "", /"events" \(upcoming event calendar\)/u);
+    // AUDIT M-1: the example must show `dataRequests` as a SECOND KEY of the SAME
+    // object as `decisions` (never a separate JSON object), and state the 80-char cap.
+    assert.match(withRequests[0]?.content ?? "", /SECOND KEY of the SAME JSON object next to decisions \(never a separate object\)/u);
+    assert.match(withRequests[0]?.content ?? "", /each reason at most 80 characters/u);
+    assert.match(withRequests[0]?.content ?? "", /\{"decisions":\[\.\.\.\],"dataRequests":\[\{"index":0,"skill":"planning","reason":"<=80 chars"\}\]\}/u);
+  });
+
+  it("option 2 (2026-09-30): only the ENTRY line nudges the model to request events for a row with no company-events part", () => {
+    const nudge = /When you set enter=true for a row whose CMC line has no "company events:" part, also request skill "events"/u;
+    const entry = buildEntryPrompt({ model: "tradfi", v2: true, dataRequests: true,
+      candidates: [{ address: "0x1111111111111111111111111111111111111111", symbol: "T", marketCapUsd: 1, priceUsd: 1, volume24hUsd: 1, priceChange24hPct: 1, holders: 1, source: "allowlist", scanFlags: [] }],
+      owner: { instructions: null, skillMarkdown: null } });
+    const exit = buildExitPrompt({ tradfi: true, timeLimitAuthority: true, dataRequests: true, owner: { instructions: null, skillMarkdown: null },
+      positions: [{ tokenAddress: "0x1", symbol: "T", pnlBps: 0n, ageSec: 1, takeProfitBps: null, stopLossBps: null }] });
+    const entryOff = buildEntryPrompt({ model: "tradfi", v2: true,
+      candidates: [{ address: "0x1111111111111111111111111111111111111111", symbol: "T", marketCapUsd: 1, priceUsd: 1, volume24hUsd: 1, priceChange24hPct: 1, holders: 1, source: "allowlist", scanFlags: [] }],
+      owner: { instructions: null, skillMarkdown: null } });
+    assert.match(entry[0]?.content ?? "", nudge);
+    assert.doesNotMatch(exit[0]?.content ?? "", nudge);
+    assert.match(exit[0]?.content ?? "", /dataRequests/u);
+    assert.doesNotMatch(entryOff[0]?.content ?? "", nudge);
   });
 });

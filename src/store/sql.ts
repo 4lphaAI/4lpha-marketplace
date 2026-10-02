@@ -53,6 +53,7 @@ type PgPoolClient = {
 };
 
 type PgPool = {
+  on(event: "error", listener: () => void): unknown;
   query(text: string | PgQueryConfig, params?: readonly unknown[]): Promise<PgQueryResult>;
   connect(): Promise<PgPoolClient>;
   end(): Promise<void>;
@@ -60,8 +61,15 @@ type PgPool = {
 
 type PgModule = {
   readonly default: {
-    readonly Pool: new (config: { connectionString: string }) => PgPool;
+    readonly Pool: new (config: { connectionString: string } & PgPoolOptions) => PgPool;
   };
+};
+
+export type PgPoolOptions = {
+  readonly max?: number;
+  readonly connectionTimeoutMillis?: number;
+  readonly idleTimeoutMillis?: number;
+  readonly allowExitOnIdle?: boolean;
 };
 
 /**
@@ -72,10 +80,16 @@ type PgModule = {
  */
 export async function createPgSqlClient(
   connectionString: string,
+  poolOptions?: PgPoolOptions,
+  onPoolError?: () => void,
 ): Promise<SqlClient> {
   const specifier = "pg";
   const mod = (await import(specifier)) as unknown as PgModule;
-  const pool = new mod.default.Pool({ connectionString });
+  const pool = poolOptions === undefined
+    ? new mod.default.Pool({ connectionString })
+    : new mod.default.Pool({ connectionString, ...poolOptions });
+  // Review4 Q1: idle errors arrive outside query promises. Evidence alone opts in.
+  if (onPoolError !== undefined) pool.on("error", onPoolError);
 
   const fromPool: SqlClient = {
     transactionScope: "top-level",

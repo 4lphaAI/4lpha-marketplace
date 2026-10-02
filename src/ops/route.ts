@@ -44,7 +44,10 @@ export const MAX_ROUTE_POOLS = MAX_ROUTE_HOPS + 1;
  * guess at 2500.
  */
 export const V3_FEE_TIERS = [100, 500, 2500, 10_000] as const;
-export type V3FeeTier = (typeof V3_FEE_TIERS)[number];
+export const UNISWAP_V3_FEE_TIERS = [100, 500, 3000, 10_000] as const;
+export type V3FeeTier = (typeof V3_FEE_TIERS)[number] | (typeof UNISWAP_V3_FEE_TIERS)[number];
+
+export type TradeVenueId = "pancake_v2" | "pancake_v3" | "uniswap_v3";
 
 /**
  * A validated route, in the ONE orientation this codebase uses: always

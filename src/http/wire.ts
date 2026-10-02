@@ -23,6 +23,7 @@ import { canonicalEncode } from "../auth/canonical.js";
 import {
   MAX_ROUTE_HOPS,
   MAX_ROUTE_POOLS,
+  UNISWAP_V3_FEE_TIERS,
   V3_FEE_TIERS,
   normalizeRoute,
   type TradeRoute,
@@ -138,6 +139,58 @@ export type TradeHireParams = {
   readonly settingsParams: TradeSettings;
 };
 
+export type TradeCmcBudgetParams = {
+  readonly mode: "topup" | "rebind";
+  readonly expectedGeneration: number;
+  readonly additionalBudgetWei: string;
+  readonly sessionPublicKey: Hex;
+  readonly sessionExpiry: number;
+  readonly operationId: string;
+};
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+export function parseTradeCmcBudgetParams(value: unknown): ParseResult<TradeCmcBudgetParams> {
+  if (!isRecord(value)) return fail("CMC budget params must be an object.");
+  const keys = Object.keys(value).sort();
+  const expected = ["additionalBudgetWei", "expectedGeneration", "mode", "operationId", "sessionExpiry", "sessionPublicKey"].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) return fail("CMC budget params have unknown or missing fields.");
+  if (value["mode"] !== "topup" && value["mode"] !== "rebind") return fail('CMC budget mode must be "topup" or "rebind".');
+  const generation = value["expectedGeneration"];
+  if (!Number.isSafeInteger(generation) || (generation as number) < 0) return fail("expectedGeneration must be a non-negative integer.");
+  const expiry = value["sessionExpiry"];
+  if (!Number.isSafeInteger(expiry) || (expiry as number) <= 0) return fail("sessionExpiry must be a positive unix timestamp.");
+  const amount = value["additionalBudgetWei"];
+  if (typeof amount !== "string" || !/^(0|[1-9]\d{0,77})$/u.test(amount)) return fail("additionalBudgetWei must be a canonical decimal string.");
+  if (value["mode"] === "topup" && BigInt(amount) <= 0n) return fail("topup additionalBudgetWei must be positive.");
+  if (value["mode"] === "rebind" && amount !== "0") return fail("rebind additionalBudgetWei must be exactly 0.");
+  const publicKey = value["sessionPublicKey"];
+  if (typeof publicKey !== "string" || !/^0x(?:02|03)[0-9a-fA-F]{64}$|^0x04[0-9a-fA-F]{128}$/u.test(publicKey)) return fail("sessionPublicKey must be canonical SEC1 bytes.");
+  const operationId = value["operationId"];
+  if (typeof operationId !== "string" || !UUID.test(operationId)) return fail("operationId must be a UUID.");
+  return { ok: true, value: { mode: value["mode"], expectedGeneration: generation as number, additionalBudgetWei: amount,
+    sessionPublicKey: publicKey as Hex, sessionExpiry: expiry as number, operationId } };
+}
+
+export function parseTradeCmcAttemptParams(value: unknown): ParseResult<{ readonly operationId: string; readonly attemptId: string; readonly callsId?: Hex }> {
+  if (!isRecord(value)) return fail("CMC attempt params must contain operationId and attemptId UUIDs.");
+  const keys = Object.keys(value);
+  const hasCallsId = Object.prototype.hasOwnProperty.call(value, "callsId");
+  if ((keys.length !== 2 && !(hasCallsId && keys.length === 3)) || typeof value["operationId"] !== "string" || typeof value["attemptId"] !== "string"
+    || !UUID.test(value["operationId"] as string) || !UUID.test(value["attemptId"] as string)) return fail("CMC attempt params must contain operationId and attemptId UUIDs.");
+  if (hasCallsId && (typeof value["callsId"] !== "string" || !/^0x[0-9a-fA-F]{64}$/u.test(value["callsId"] as string))) {
+    return fail("CMC attempt callsId must be a bytes32 hex string.");
+  }
+  return { ok: true, value: { operationId: value["operationId"] as string, attemptId: value["attemptId"] as string,
+    ...(hasCallsId ? { callsId: value["callsId"] as Hex } : {}) } };
+}
+
+export function parseTradeCmcConfirmParams(value: unknown): ParseResult<{ readonly operationId: string; readonly callsId: Hex }> {
+  if (!isRecord(value) || Object.keys(value).length !== 2 || typeof value["operationId"] !== "string" || typeof value["callsId"] !== "string"
+    || !UUID.test(value["operationId"] as string) || !/^0x[0-9a-fA-F]{64}$/u.test(value["callsId"] as string)) return fail("CMC confirm params are invalid.");
+  return { ok: true, value: { operationId: value["operationId"] as string, callsId: value["callsId"] as Hex } };
+}
+
 /**
  * MARKETPLACE-LENDING-AGENT R3.3(1) — the lending hire envelope.
  *
@@ -187,6 +240,17 @@ export function parseRenewSessionParams(value: unknown): ParseResult<RenewSessio
     return fail('"ttlSec" must be an integer from 3600 through 604800.');
   }
   return { ok: true, value: { ttlSec: ttlSec as number } };
+}
+
+/** `revoke` params: exactly `{}` or exactly `{ keepPositions: true }` (TRADFI-EXPIRY-KEEP-REMOVE §5.1). */
+export function parseRevokeParams(value: unknown): ParseResult<{ readonly keepPositions: boolean }> {
+  if (!isRecord(value)) return fail("Revoke params must be a JSON object.");
+  const keys = Object.keys(value);
+  if (keys.length === 0) return { ok: true, value: { keepPositions: false } };
+  if (keys.length !== 1 || keys[0] !== "keepPositions" || value["keepPositions"] !== true) {
+    return fail('Revoke params must be exactly {} or {"keepPositions": true}.');
+  }
+  return { ok: true, value: { keepPositions: true } };
 }
 
 export function parseCancelRenewalParams(value: unknown): ParseResult<{ readonly grantDigest: Hex }> {
@@ -343,9 +407,9 @@ export function parseTradeHireParams(value: unknown): ParseResult<TradeHireParam
     return fail('"ttlSec" must be an integer from 3600 through 604800.');
   }
   const executionModel = value["executionModel"];
-  if (executionModel !== "blue-chip" && executionModel !== "mid-cap"
+  if (executionModel !== "tradfi" && executionModel !== "mid-cap"
     && executionModel !== "degen" && executionModel !== "sigma") {
-    return fail('"executionModel" must be "blue-chip", "mid-cap", "degen", or "sigma".');
+    return fail('"executionModel" must be "tradfi", "mid-cap", "degen", or "sigma".');
   }
   const hireRunId = value["hireRunId"];
   if (typeof hireRunId !== "string" || !LOWER_UUID.test(hireRunId)) {
@@ -356,6 +420,9 @@ export function parseTradeHireParams(value: unknown): ParseResult<TradeHireParam
   if (!settings.ok) return fail(`"settings" is invalid: ${settings.message}`);
   if (settings.value.effective.executionModel !== executionModel) {
     return fail('"settings.executionModel" must equal "executionModel".');
+  }
+  if (executionModel === "tradfi" && settings.value.effective.settlementAsset !== "USDT") {
+    return fail('TradFi hires require the explicit USDT settlement discriminator.');
   }
   return { ok: true, value: {
     walletAddress: walletAddress.value, capDayWei: capDayWei.value,
@@ -465,7 +532,7 @@ export function hashCalls(calls: readonly WalletCall[]): Hex {
 /* -------------------------------------------------------------------------- */
 
 /** Venues the trade route can route to. A CLOSED set. */
-export const TRADE_VENUES = ["pancake", "pancake_v3", "fourmeme", "flap"] as const;
+export const TRADE_VENUES = ["pancake", "pancake_v3", "uniswap_v3", "fourmeme", "flap"] as const;
 export type TradeVenue = (typeof TRADE_VENUES)[number];
 
 /**
@@ -475,7 +542,7 @@ export type TradeVenue = (typeof TRADE_VENUES)[number];
  * hops and no fee tiers, so a `route` on one is a 400 rather than a field that
  * is silently ignored while still changing `paramsHash`.
  */
-const ROUTABLE_VENUES: readonly TradeVenue[] = ["pancake", "pancake_v3"];
+const ROUTABLE_VENUES: readonly TradeVenue[] = ["pancake", "pancake_v3", "uniswap_v3"];
 
 /** Trade sides. A CLOSED set. */
 export const TRADE_SIDES = ["buy", "sell"] as const;
@@ -499,6 +566,16 @@ export type TradeRequest = {
    * different trades.
    */
   readonly route?: TradeRoute;
+  /** Present only for persisted USDT-denominated TradFi v2 intents. */
+  readonly settlementAsset?: "USDT";
+  readonly platformFeeAtomic?: bigint;
+  readonly guardQuote?: {
+    readonly guard: Address;
+    readonly router: Address;
+    readonly spender: Address;
+    readonly calldata: Hex;
+    readonly deadline: bigint;
+  };
 };
 
 /**
@@ -544,11 +621,11 @@ function readPositiveBigint(value: unknown, field: string): ParseResult<bigint> 
  */
 function readFeeTier(value: unknown, field: string): ParseResult<V3FeeTier> {
   if (typeof value !== "number" || !Number.isInteger(value)) {
-    return fail(`"${field}" must be one of: ${V3_FEE_TIERS.join(", ")}.`);
+    return fail(`"${field}" must be one of: ${[...new Set([...V3_FEE_TIERS, ...UNISWAP_V3_FEE_TIERS])].join(", ")}.`);
   }
-  const match = V3_FEE_TIERS.find((tier) => tier === value);
+  const match = [...new Set([...V3_FEE_TIERS, ...UNISWAP_V3_FEE_TIERS])].find((tier) => tier === value);
   if (match === undefined) {
-    return fail(`"${field}" must be one of: ${V3_FEE_TIERS.join(", ")}.`);
+    return fail(`"${field}" must be one of: ${[...new Set([...V3_FEE_TIERS, ...UNISWAP_V3_FEE_TIERS])].join(", ")}.`);
   }
   return { ok: true, value: match };
 }
@@ -632,6 +709,19 @@ function parseRoute(
     if (fees.length !== hops.length + 1) {
       return fail(`"route.fees" must carry exactly one entry per pool.`);
     }
+    if (fees.some((fee) => !V3_FEE_TIERS.includes(fee as (typeof V3_FEE_TIERS)[number]))) {
+      return fail(`"route.fees" must be one of: ${V3_FEE_TIERS.join(", ")}.`);
+    }
+  } else if (venue === "uniswap_v3") {
+    if (fees.length === 0) {
+      return fail(`"route.fees" is required for the uniswap_v3 venue.`);
+    }
+    if (fees.length !== hops.length + 1) {
+      return fail(`"route.fees" must carry exactly one entry per pool.`);
+    }
+    if (fees.some((fee) => !UNISWAP_V3_FEE_TIERS.includes(fee as (typeof UNISWAP_V3_FEE_TIERS)[number]))) {
+      return fail(`"route.fees" must be one of: ${UNISWAP_V3_FEE_TIERS.join(", ")}.`);
+    }
   } else if (fees.length > 0) {
     return fail(`"route.fees" is meaningless on the pancake venue.`);
   }
@@ -713,6 +803,8 @@ export type TradeParamsHashInput = {
    * is now aimed at a different contract.
    */
   readonly routerV3?: Address;
+  /** Resolved Uniswap V3 SwapRouter02, folded even for Pancake requests. */
+  readonly routerUniV3?: Address;
   /**
    * The resolved flap Portal, folded in for exactly the reason `routerV3` is
    * (PHASE2.2 R7 / PHASE2.4 R8): a `VENUE_FLAP_PORTAL` repointed between a
@@ -731,6 +823,9 @@ export type TradeParamsHashInput = {
    * tiers are both bound.
    */
   readonly route?: TradeRoute;
+  readonly settlementAsset?: "USDT";
+  readonly platformFeeAtomic?: bigint;
+  readonly guardQuote?: TradeRequest["guardQuote"];
 };
 
 /**

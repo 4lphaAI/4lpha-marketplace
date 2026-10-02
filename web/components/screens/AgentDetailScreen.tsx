@@ -15,6 +15,9 @@ import { TradeExplainer } from "@/components/explainers/TradeExplainer";
 import { RangeExplainer } from "@/components/explainers/RangeExplainer";
 import { CompoundExplainer } from "@/components/explainers/CompoundExplainer";
 import { LendingExplainer } from "@/components/explainers/LendingExplainer";
+import { ScheduleExplainer } from "@/components/explainers/ScheduleExplainer";
+import { DcaExplainer } from "@/components/explainers/DcaExplainer";
+import { SmartExplainer } from "@/components/explainers/SmartExplainer";
 import { agentDeployKind } from "@/lib/design-data";
 
 /** A protocol/venue name renders as its logo when the design ships one. */
@@ -84,6 +87,9 @@ function AgentDetailScreen({ agent, go, onHire }) {
           {agent.categoryId === "grid"
             ? <GridLadderExplainer pair={agent.pair || "BNB / USDT"} protocol={agent.protocol} budget={agent.dailyCap || "500 USDT"} />
             : agent.explainer === "compound" ? <CompoundExplainer pair={agent.pair || "BNB / USDT"} protocol={agent.protocol} />
+            : agent.explainer === "smart" ? <SmartExplainer protocol={agent.protocol} />
+            : agent.explainer === "dca" ? <DcaExplainer protocol={agent.protocol} />
+            : agent.explainer === "schedule" ? <ScheduleExplainer protocol={agent.protocol} />
             : agent.explainer === "trade" ? <TradeExplainer pair={agent.pair || "BNB / USDT"} protocol={agent.protocol} />
             : agent.explainer === "lending" ? <LendingExplainer protocol={agent.protocol} />
             : agent.categoryId === "lp" ? <RangeExplainer pair={agent.pair || "BNB / USDT"} protocol={agent.protocol} />
@@ -166,7 +172,7 @@ function AgentDetailScreen({ agent, go, onHire }) {
             </div>
             <div style={{ marginTop: 14 }}>
               <PermissionItem kind="info">Zero fees this month, include LLM model usage.</PermissionItem>
-              <PermissionItem kind="info">Gas &amp; CMC x402 data is paid by the agent operator.</PermissionItem>
+              <PermissionItem kind="info">Gas is funded separately; optional data requests use the agent wallet's finite USDT budget.</PermissionItem>
             </div>
           </Panel>
 

@@ -57,7 +57,7 @@ describe("venus journal kinds: every enumeration, not just the type", () => {
     // comment says "extend all three together". This reads the source rather
     // than trusting that it was.
     const source = readFileSync(new URL("../src/store/journal.ts", import.meta.url), "utf8");
-    const clause = /kind in \(([^)]*)\)/u.exec(source);
+    const clause = /kind in \(([^)]*)\)/u.exec(source.split("/* journal.getByDecision */")[1] ?? "");
     assert.ok(clause !== null, "the getByDecision kind filter was not found at all");
     for (const kind of VENUS_MONEY_KINDS) {
       assert.ok(

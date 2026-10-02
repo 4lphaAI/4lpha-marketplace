@@ -125,7 +125,7 @@ import {
   type SpendPeriod,
 } from "../core/types.js";
 import { validateSessionSpec } from "../core/session.js";
-import type { Address } from "viem";
+import { getAddress, type Address } from "viem";
 import { RELAY_FEE_PER_EXIT_WEI } from "./relayFee.js";
 export { RELAY_FEE_PER_EXIT_WEI } from "./relayFee.js";
 import type { VenueConfig } from "./venues.js";
@@ -150,6 +150,19 @@ export const MAX_TRADE_SESSION_SECONDS = 7 * 24 * 60 * 60;
 
 /** The `approve` grant this template needs, in canonical signature form. */
 export const APPROVE_SELECTOR = "approve(address,uint256)";
+export const TRANSFER_SELECTOR = "transfer(address,uint256)";
+export const TRADFI_GUARD_SWAP_SELECTOR =
+  "swap(address,address,uint256,uint256,uint256,bytes)";
+export const TRADFI_USDT_56: Address = getAddress(
+  "0x55d398326f99059fF775485246999027B3197955",
+);
+
+const UNISWAP_V3_EXACT_INPUT_SINGLE_SELECTOR =
+  "exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))";
+const UNISWAP_V3_EXACT_INPUT_SELECTOR =
+  "exactInput((bytes,address,uint256,uint256))";
+const UNISWAP_V3_REFUND_ETH_SELECTOR = "refundETH()";
+const UNISWAP_V3_UNWRAP_WETH9_SELECTOR = "unwrapWETH9(uint256,address)";
 
 /**
  * PHASE3.19 item 1 — WBNB's payable zero-arg wrap, in canonical signature form.
@@ -248,7 +261,27 @@ export type TradeSessionSpecInput = {
   readonly expiresAt: number;
   /** Clock, unix SECONDS. Injected so the clamp is testable. */
   readonly nowSeconds?: number;
+  /** Optional USDT-denominated TradFi v2 policy facts. */
+  readonly quoteToken?: Address;
+  readonly quoteDailyCapWei?: bigint;
+  readonly quotePerTradeCapWei?: bigint;
+  readonly platformFeeBps?: number;
+  readonly aggregatorGuard?: Address;
+  /**
+   * Auto DCA (AUTO-DCA-SPEC §9.1): the NFPM, granted per-selector ONLY —
+   * `mint`, `decreaseLiquidity`, `collect` from {@link NFPM_GRANTED_SELECTORS},
+   * never target-only, never `multicall` or an NFT-authority selector. Absent
+   * ⇒ the spec is byte-identical for every existing caller.
+   */
+  readonly nfpm?: Address;
 };
+
+/** The three NFPM rules an Auto DCA grant adds (§9.1), in canonical form. */
+const DCA_NFPM_SELECTORS = [
+  "mint((address,address,uint24,int24,int24,uint256,uint256,uint256,uint256,address,uint256))",
+  "decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))",
+  "collect((uint256,address,uint128,uint128))",
+] as const satisfies readonly (typeof NFPM_GRANTED_SELECTORS)[number][];
 
 /**
  * Build the canonical trade `SessionSpec`.
@@ -267,6 +300,15 @@ export function tradeSessionSpec(input: TradeSessionSpecInput): SessionSpec {
   const nowSeconds = input.nowSeconds ?? Math.floor(Date.now() / 1000);
   const ceiling = nowSeconds + MAX_TRADE_SESSION_SECONDS;
   const expiresAt = Math.min(input.expiresAt, ceiling);
+
+  if (input.platformFeeBps !== undefined
+    && (!Number.isInteger(input.platformFeeBps) || input.platformFeeBps < 0 || input.platformFeeBps > 500)) {
+    throw new InvalidSessionSpecError("platformFeeBps must be an integer in 0..500.");
+  }
+  const hasQuoteFact = input.quoteToken !== undefined || input.quoteDailyCapWei !== undefined || input.quotePerTradeCapWei !== undefined;
+  if (hasQuoteFact && input.quoteToken === undefined) {
+    throw new InvalidSessionSpecError("TradFi v2 quote policy requires quoteToken, quoteDailyCapWei, and quotePerTradeCapWei together.");
+  }
 
   if (input.nativeCaps.length === 0) {
     throw new InvalidSessionSpecError(
@@ -295,6 +337,66 @@ export function tradeSessionSpec(input: TradeSessionSpecInput): SessionSpec {
     seen.add(key);
     tokens.push(grant);
   }
+  if (input.quoteToken !== undefined) {
+    if (input.quoteToken.toLowerCase() !== TRADFI_USDT_56.toLowerCase()) {
+      throw new InvalidSessionSpecError("TradFi v2 quoteToken must be canonical BSC USDT.");
+    }
+    if (input.quoteDailyCapWei === undefined || input.quoteDailyCapWei <= 0n) {
+      throw new InvalidSessionSpecError("TradFi v2 quoteToken requires a positive quoteDailyCapWei.");
+    }
+    if (input.quotePerTradeCapWei === undefined || input.quotePerTradeCapWei <= 0n) {
+      throw new InvalidSessionSpecError("TradFi v2 quoteToken requires a positive quotePerTradeCapWei.");
+    }
+    if (input.quotePerTradeCapWei !== undefined
+      && (input.quotePerTradeCapWei <= 0n || input.quotePerTradeCapWei > input.quoteDailyCapWei)) {
+      throw new InvalidSessionSpecError("TradFi v2 quotePerTradeCapWei must be positive and no greater than quoteDailyCapWei.");
+    }
+    const key = input.quoteToken.toLowerCase();
+    const existing = tokens.find((grant) => grant.token.toLowerCase() === key);
+    if (existing !== undefined && (existing.limit !== input.quoteDailyCapWei
+      || (existing.period !== undefined && existing.period !== "day"))) {
+      throw new InvalidSessionSpecError("TradFi v2 quoteToken has a conflicting spend cap.");
+    }
+    if (!seen.has(key)) {
+      seen.add(key);
+      tokens.push({ token: input.quoteToken, limit: input.quoteDailyCapWei, period: "day" });
+    }
+  }
+
+  // Auto DCA §9.1: the `lpSessionSpec` all-pairs role-collision rule, over this
+  // template's granted addresses once an NFPM joins them. An NFPM equal to a
+  // target-only venue or the treasury would be `{ to: NFPM }` — the grant that
+  // carries `setApprovalForAll` — and one equal to a token merges an ERC-20
+  // approve rule into the position manager. Only run with `nfpm`, so every
+  // existing caller keeps its exact behaviour.
+  const nfpm = input.nfpm;
+  if (nfpm !== undefined) {
+    const roles: readonly (readonly [string, Address | undefined])[] = [
+      ["nfpm", nfpm],
+      ["pancakeRouterV2", input.venues.pancakeRouterV2],
+      ["pancakeRouterV3", input.venues.pancakeRouterV3],
+      ["uniswapRouterV3", input.venues.uniswapRouterV3],
+      ["fourMemeTokenManager", input.venues.fourMemeTokenManager],
+      ["flapPortal", input.venues.flapPortal],
+      ["aggregatorGuard", input.aggregatorGuard],
+      ["treasury", input.treasury],
+      ...tokens.map((grant, index) => [`token ${index}`, grant.token] as const),
+    ];
+    for (let a = 0; a < roles.length; a += 1) {
+      for (let b = a + 1; b < roles.length; b += 1) {
+        const left = roles[a];
+        const right = roles[b];
+        if (
+          left !== undefined && right !== undefined && left[1] !== undefined && right[1] !== undefined &&
+          left[1].toLowerCase() === right[1].toLowerCase()
+        ) {
+          throw new InvalidSessionSpecError(
+            `tradeSessionSpec: ${left[0]} and ${right[0]} are the same address (${left[1]}). Each address plays a distinct role in the grant; a collision merges two authorities the template keeps apart.`,
+          );
+        }
+      }
+    }
+  }
 
   const allowedCalls: CallRule[] = [
     ...(input.venues.pancakeRouterV2 === undefined
@@ -310,6 +412,17 @@ export function tradeSessionSpec(input: TradeSessionSpecInput): SessionSpec {
     ...(input.venues.pancakeRouterV3 === undefined
       ? []
       : [{ to: input.venues.pancakeRouterV3 }]),
+    // SwapRouter02 is NOT target-only: its inherited helpers and multicall
+    // surface would recreate the SmartRouter grant. These four target-bound
+    // selectors are the complete Uniswap trade surface (R3.1/R5.2).
+    ...(input.venues.uniswapRouterV3 === undefined
+      ? []
+      : [
+          { to: input.venues.uniswapRouterV3, selector: UNISWAP_V3_EXACT_INPUT_SINGLE_SELECTOR },
+          { to: input.venues.uniswapRouterV3, selector: UNISWAP_V3_EXACT_INPUT_SELECTOR },
+          { to: input.venues.uniswapRouterV3, selector: UNISWAP_V3_UNWRAP_WETH9_SELECTOR },
+          { to: input.venues.uniswapRouterV3, selector: UNISWAP_V3_REFUND_ETH_SELECTOR },
+        ]),
     ...(input.venues.fourMemeTokenManager === undefined
       ? []
       : [{ to: input.venues.fourMemeTokenManager }]),
@@ -322,11 +435,17 @@ export function tradeSessionSpec(input: TradeSessionSpecInput): SessionSpec {
     ...(input.venues.flapPortal === undefined
       ? []
       : [{ to: input.venues.flapPortal }]),
+    ...(input.aggregatorGuard === undefined
+      ? []
+      : [{ to: input.aggregatorGuard, selector: TRADFI_GUARD_SWAP_SELECTOR }]),
     // TARGET-BOUND approve, one per token. Not the bare-selector form: this is
     // the whole point of the phase. The SPENDER is an argument and `CallRule`
     // cannot constrain it (PHASE2 OQ1), so the spender stays bounded by the
     // trade route hardcoding it — unchanged, and still load-bearing.
     ...tokens.map((grant) => ({ to: grant.token, selector: APPROVE_SELECTOR })),
+    ...(input.quoteToken === undefined || (input.platformFeeBps ?? 0) <= 0
+      ? []
+      : [{ to: input.quoteToken, selector: TRANSFER_SELECTOR }]),
     // Granted so the fee transfer clears the on-chain policy. Without it a
     // configured fee turns every trade into an on-chain NOT_ALLOWED.
     //
@@ -336,7 +455,8 @@ export function tradeSessionSpec(input: TradeSessionSpecInput): SessionSpec {
     // add a treasury token cap, and do not narrow this to a selector-bound
     // `transfer` — that WOULD trip the guard and then demand a cap for an
     // address that is not a token.
-    ...(input.treasury === undefined ? [] : [{ to: input.treasury }]),
+    ...(input.treasury === undefined || input.quoteToken !== undefined ? [] : [{ to: input.treasury }]),
+    ...(nfpm === undefined ? [] : DCA_NFPM_SELECTORS.map((selector) => ({ to: nfpm, selector }))),
   ];
 
   const spendCaps: SpendCap[] = [
@@ -682,6 +802,14 @@ export type NativeReserveInput = {
    * own fix.
    */
   readonly submissionNativeWei: bigint;
+  /**
+   * The exit reserve to keep, when the caller sizes it itself. Auto DCA keeps
+   * two sweeps' worth, `2 × R_DCA` (AUTO-DCA-SPEC R2.9), rather than
+   * repurposing `grantedTokenCount`. Absent ⇒ {@link exitReserveWei} of the
+   * granted count, `max(1, n)` included, so every existing caller is unchanged
+   * (REVIEW2 condition 6).
+   */
+  readonly exitReserveWei?: bigint;
 };
 
 /**
@@ -761,7 +889,7 @@ export type NativeReserveFloor = {
  */
 export function nativeReserveFloor(input: NativeReserveInput): NativeReserveFloor {
   const remainingWei = input.limitWei - input.currentSpentWei;
-  const reserveWei = exitReserveWei(input.grantedTokenCount);
+  const reserveWei = input.exitReserveWei ?? exitReserveWei(input.grantedTokenCount);
   const ownFeeWei = RELAY_FEE_PER_EXIT_WEI;
   const submissionNativeWei = input.submissionNativeWei;
   const requiredWei = submissionNativeWei + ownFeeWei + reserveWei;

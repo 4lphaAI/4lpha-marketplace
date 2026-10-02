@@ -211,6 +211,67 @@ export const PANCAKE_V3_ROUTER_ABI = [
 ] as const;
 
 /**
+ * Uniswap V3 SwapRouter02's four target-bound functions used by the trade
+ * session. There is intentionally no target-only or multicall ABI entry: the
+ * wallet submits the buy refund leg and the sell unwrap leg as separate calls
+ * in one atomic account batch (R3.1/R3.9).
+ */
+export const UNISWAP_V3_ROUTER02_ABI = [
+  {
+    name: "exactInputSingle",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [{
+      name: "params",
+      type: "tuple",
+      components: [
+        { name: "tokenIn", type: "address" },
+        { name: "tokenOut", type: "address" },
+        { name: "fee", type: "uint24" },
+        { name: "recipient", type: "address" },
+        { name: "amountIn", type: "uint256" },
+        { name: "amountOutMinimum", type: "uint256" },
+        { name: "sqrtPriceLimitX96", type: "uint160" },
+      ],
+    }],
+    outputs: [{ name: "amountOut", type: "uint256" }],
+  },
+  {
+    name: "exactInput",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [{
+      name: "params",
+      type: "tuple",
+      components: [
+        { name: "path", type: "bytes" },
+        { name: "recipient", type: "address" },
+        { name: "amountIn", type: "uint256" },
+        { name: "amountOutMinimum", type: "uint256" },
+      ],
+    }],
+    outputs: [{ name: "amountOut", type: "uint256" }],
+  },
+  {
+    name: "refundETH",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [],
+    outputs: [],
+  },
+  {
+    name: "unwrapWETH9",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [
+      { name: "amountMinimum", type: "uint256" },
+      { name: "recipient", type: "address" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+/**
  * PancakeSwap NonfungiblePositionManager (NFPM) — the eight entry points the
  * LP sagas call, and DELIBERATELY nothing else.
  *

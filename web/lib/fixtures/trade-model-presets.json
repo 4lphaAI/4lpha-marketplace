@@ -1,4 +1,10 @@
 {
+  "tradfi": {
+    "perTradeWei": "20000000000000000",
+    "maxPositions": 3,
+    "capitalWei": "10000000000000000",
+    "minConfidence": 80
+  },
   "blue-chip": {
     "perTradeWei": "2000000000000000",
     "maxPositions": 3,

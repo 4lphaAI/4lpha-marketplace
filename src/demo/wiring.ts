@@ -50,7 +50,7 @@ const DEFAULT_DEMO_RPC_URLS = ["https://bsc-dataseed.bnbchain.org"] as const;
 const TOKENS_BATCH_MAX = 50;
 
 /** The four live execution models. A demo runs the same set and no others. */
-const TRADE_EXECUTION_MODELS = ["blue-chip", "mid-cap", "degen", "sigma"] as const;
+const TRADE_EXECUTION_MODELS = ["tradfi", "mid-cap", "degen", "sigma"] as const;
 
 function isTradeExecutionModel(value: string): value is TradeExecutionModel {
   return (TRADE_EXECUTION_MODELS as readonly string[]).includes(value);

@@ -10,13 +10,13 @@ const OWNER = getAddress("0x1111111111111111111111111111111111111111");
 const WALLET = getAddress("0x2222222222222222222222222222222222222222");
 const TOKEN = getAddress("0x3333333333333333333333333333333333333333");
 
-async function fixture(balance: () => bigint, token: Address = TOKEN, maxAgeMs = 0) {
+async function fixture(balance: () => bigint, token: Address = TOKEN, maxAgeMs = 0, venue: "pancake_v2" | "uniswap_v3" = "pancake_v2") {
   const agents = new MemoryAgentStore();
   const agent = await agents.createAgent({ id: "a1", ownerAddress: OWNER, walletAddress: WALLET,
     custodyModel: "passkey", status: "armed" });
   const positions = new MemoryTradePositionStore(() => 1_000);
   const first = await positions.open({ positionId: "p1", agentId: "a1", ownerAddress: OWNER,
-    token, route: { hops: [], fees: [] }, entryWei: 50n, tokenAmount: 100n,
+    token, route: venue === "uniswap_v3" ? { hops: [], fees: [3000] } : { hops: [], fees: [] }, venue, entryWei: 50n, tokenAmount: 100n,
     fillStatus: "verified", openedAt: 500 });
   const observer = createTradeDetailObserver({
     provider: {
@@ -28,6 +28,8 @@ async function fixture(balance: () => bigint, token: Address = TOKEN, maxAgeMs =
       async quoteV2(_path, amount) { return amount; },
       async quoteV3Single(_tokenIn, _tokenOut, _fee, amount) { return amount; },
       async quoteV3Path(_path, amount) { return amount; },
+      async quoteUniV3Single(_tokenIn, _tokenOut, _fee, amount) { return amount; },
+      async quoteUniV3Path(_path, amount) { return amount; },
     },
     now: () => 2_000,
     maxAgeMs,
@@ -47,6 +49,13 @@ describe("trade detail observer attribution", () => {
     const [unattributed] = await extra.observer.observe(extra.agent, [extra.first]);
     assert.equal(unattributed?.quoteStatus, "unattributed");
     assert.equal(unattributed?.currentQuoteWei, null);
+  });
+
+  it("uses a persisted Uniswap venue for owner valuation", async () => {
+    const f = await fixture(() => 100n, TOKEN, 0, "uniswap_v3");
+    const [quoted] = await f.observer.observe(f.agent, [f.first]);
+    assert.equal(quoted?.quoteStatus, "quoted");
+    assert.equal(quoted?.currentQuoteWei, "100");
   });
 
   it("refuses to split a wallet balance across two open rows for the same token", async () => {

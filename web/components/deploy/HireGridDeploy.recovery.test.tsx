@@ -95,7 +95,7 @@ async function click(label: string) { await act(async () => { button(label).clic
 describe("grid hire interruption in the rendered UI", () => {
   it("closing funding stops the run even when its in-flight read later says funded", async () => {
     await deploy();
-    await click("Deploy grid agent");
+    await click("Sign hire and create the session key");
     expect(button("Close deposit")).toBeDefined();
     const pending = deferred<Response>();
     nextFunding = pending.promise;
@@ -112,16 +112,16 @@ describe("grid hire interruption in the rendered UI", () => {
 
   it("cancellation releases the form while the old funding read is still unresolved", async () => {
     await deploy();
-    await click("Deploy grid agent");
+    await click("Sign hire and create the session key");
     const pending = deferred<Response>();
     nextFunding = pending.promise;
     await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
     await click("Cancel hire safely");
     expect(button("Start a new hire").disabled).toBe(false);
     await click("Start a new hire");
-    expect(button("Deploy grid agent").disabled).toBe(false);
+    expect(button("Sign hire and create the session key").disabled).toBe(false);
     await act(async () => { pending.resolve(json(preview("100"))); });
-    expect(button("Deploy grid agent").disabled).toBe(false);
+    expect(button("Sign hire and create the session key").disabled).toBe(false);
     expect(mocks.grant).not.toHaveBeenCalled();
     expect(mocks.arm).not.toHaveBeenCalled();
   });
@@ -130,7 +130,7 @@ describe("grid hire interruption in the rendered UI", () => {
     const pending = deferred<Response>();
     nextProvision = pending.promise;
     await deploy();
-    await click("Deploy grid agent");
+    await click("Sign hire and create the session key");
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(true);
     await act(async () => { root!.unmount(); root = null; });
     localStorage.setItem(key, "newer-agent");
@@ -166,7 +166,7 @@ describe("grid hire interruption in the rendered UI", () => {
     const signature = deferred<unknown>();
     mocks.signEnvelope.mockReturnValue(signature.promise);
     await deploy();
-    await click("Deploy grid agent");
+    await click("Sign hire and create the session key");
     await act(async () => { root!.unmount(); root = null; });
     await act(async () => { signature.resolve({ signed: {}, signature: "0xsig", params: {} }); });
     expect(fetchMock.mock.calls.filter(([url, init]) => String(url).startsWith("/api/agents/") && init?.method === "POST")).toHaveLength(0);
@@ -187,7 +187,7 @@ describe("grid hire interruption in the rendered UI", () => {
     expect(host.textContent).toContain("Cancellation recorded");
     expect(host.textContent).not.toContain("Continue deploy");
     await click("Start a new hire");
-    expect(button("Deploy grid agent").disabled).toBe(false);
+    expect(button("Sign hire and create the session key").disabled).toBe(false);
     expect(mocks.grant).not.toHaveBeenCalled();
     expect(mocks.arm).not.toHaveBeenCalled();
   });
@@ -259,7 +259,7 @@ describe("grid hire interruption in the rendered UI", () => {
 it("preserves wallet occupancy refusal and links the blocking Trading agent without polling a nonexistent Grid", async () => {
   nextProvision = Promise.resolve(new Response(JSON.stringify({ error: { code: "wallet_in_use", message: 'Remove Trading Agent "trading-agent-01" before deploying Grid Agent.' } }), { status: 409, headers: { "content-type": "application/json" } }));
   await deploy();
-  await click("Deploy grid agent");
+  await click("Sign hire and create the session key");
   expect(host.textContent).toContain('Remove Trading Agent "trading-agent-01" before deploying Grid Agent.');
   expect(host.querySelector('a[href="/account/trading-agent-01"]')?.textContent).toBe("Open agent");
   expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/session") && init?.method !== "POST")).toHaveLength(0);
@@ -271,7 +271,7 @@ it("preserves wallet occupancy refusal and links the blocking Trading agent with
 it("does not reinterpret unrelated 409 errors as an existing agent", async () => {
   nextProvision = Promise.resolve(new Response(JSON.stringify({ error: { code: "conflict", message: "Hire temporarily unavailable." } }), { status: 409, headers: { "content-type": "application/json" } }));
   await deploy();
-  await click("Deploy grid agent");
+  await click("Sign hire and create the session key");
   expect(host.textContent).toContain("Hire temporarily unavailable.");
   expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/session") && init?.method !== "POST")).toHaveLength(0);
   expect(mocks.grant).not.toHaveBeenCalled();
@@ -306,7 +306,7 @@ it("increments the suffix when another owner holds the global agent id", async (
     throw new Error(`Unexpected URL ${url}`);
   });
   await deploy();
-  await click("Deploy grid agent");
+  await click("Sign hire and create the session key");
   await act(async () => { await vi.advanceTimersByTimeAsync(5_001); });
   for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
   expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "provisionAgent").map(([, agentId]) => agentId))
@@ -491,7 +491,7 @@ async function runGridLedger(scenario: {
   });
   await deploy();
   await act(async () => {
-    button("Deploy grid agent").click();
+    button("Sign hire and create the session key").click();
     await vi.advanceTimersByTimeAsync(0);
   });
   for (let i = 0; i < 5; i += 1) {
@@ -592,7 +592,7 @@ describe("HIRE-SIGNATURES-BC grid prompt ledger", () => {
       throw new Error(`Unexpected URL ${url}`);
     });
     await deploy();
-    await act(async () => { button("Deploy grid agent").click(); await vi.advanceTimersByTimeAsync(5_001); });
+    await act(async () => { button("Sign hire and create the session key").click(); await vi.advanceTimersByTimeAsync(5_001); });
     for (let i = 0; i < 5; i += 1) await act(async () => { await Promise.resolve(); await vi.advanceTimersByTimeAsync(0); });
     expect(posts).toBe(1);
     expect(mocks.signEnvelope.mock.calls.filter(([action]) => action === "provisionAgent")).toHaveLength(1);

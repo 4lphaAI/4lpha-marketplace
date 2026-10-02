@@ -19,6 +19,7 @@ import { rememberReadExpiry } from "@/lib/exec/read-session-window";
 import { nextFreeAgentId } from "./HireGridDeploy";
 import { walletBlockerAgentId } from "@/lib/altana/hire-wallet-blocker";
 import type { LivePool } from "./GridLiveDeploy";
+import { DEPLOYED_HOLD_MS, DeployRunModal, IDLE_DEPLOY_STEPS, type DeployStep, type DeployStepDef, type DeployStepKey, type DeployStepState } from "./DeployRunModal";
 
 const primaryBtn: React.CSSProperties = {
   cursor: "pointer",
@@ -130,11 +131,7 @@ type GrantCallPermission =
   | { readonly to: Address }
   | { readonly signature: string };
 
-type DeployStepKey = "hire" | "fund" | "grant" | "converge" | "arm";
-type DeployStepState = "pending" | "active" | "done" | "failed" | "skipped";
-type DeployStep = { readonly state: DeployStepState; readonly detail?: string };
-
-const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: string; readonly hint: string }[] = [
+const DEPLOY_STEPS: readonly DeployStepDef[] = [
   { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key (a read session may be authorized first)" },
   { key: "fund", title: "Fund the agent wallet", hint: "Only when the wallet cannot cover the registration fee" },
   { key: "grant", title: "Grant the session on chain", hint: "Your passkey authorises the session; the relay submits it" },
@@ -142,47 +139,7 @@ const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: stri
   { key: "arm", title: "Open the position", hint: "Signs lpArm and opens the first position" },
 ];
 
-const STEP_MARK: Record<DeployStepState, string> = {
-  pending: "○",
-  active: "◐",
-  done: "●",
-  failed: "✕",
-  skipped: "–",
-};
-
-const IDLE_STEPS: Record<DeployStepKey, DeployStep> = {
-  hire: { state: "pending" },
-  fund: { state: "pending" },
-  grant: { state: "pending" },
-  converge: { state: "pending" },
-  arm: { state: "pending" },
-};
-
-function DeployProgress({ steps }: { readonly steps: Record<DeployStepKey, DeployStep> }) {
-  return (
-    <div style={{ display: "grid", gap: 2, padding: 12, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)" }}>
-      {DEPLOY_STEPS.map(({ key, title, hint }, index) => {
-        const step = steps[key];
-        const colour = step.state === "done" ? "var(--profit)"
-          : step.state === "failed" ? "var(--loss)"
-            : step.state === "active" ? "var(--cat-lp)" : "var(--text-subtle)";
-        return (
-          <div key={key} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "8px 6px" }}>
-            <span style={{ color: colour, font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-mono)", width: 44, flex: "0 0 auto" }}>
-              {STEP_MARK[step.state]} {index + 1}
-            </span>
-            <span style={{ display: "grid", gap: 3, minWidth: 0 }}>
-              <span style={{ font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-sans)", color: step.state === "pending" ? "var(--text-subtle)" : "var(--ink-1)" }}>{title}</span>
-              <span style={{ font: "var(--weight-regular) var(--text-xs)/1.4 var(--font-sans)", color: step.state === "failed" ? "var(--loss)" : "var(--text-subtle)", overflowWrap: "anywhere" }}>
-                {step.detail ?? hint}
-              </span>
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+const IDLE_STEPS = IDLE_DEPLOY_STEPS;
 
 function agentIdFromName(name: string): string {
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9._:-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 96);
@@ -669,6 +626,16 @@ export function HireLpDeploy(props: {
     return () => { current = false; };
   }, [owner.walletAddress, preview, props.pool, view?.status]);
 
+  const openAgentPage = (id: string): void => {
+    if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+  };
+  /** The popup's "Open the agent page" during the deployed hold: end the run so it cannot navigate a second time. */
+  const openDeployedAgent = (): void => {
+    if (agentId === null) return;
+    activeRun.current?.stop();
+    openAgentPage(agentId);
+  };
+
   const mark = (key: DeployStepKey, state: DeployStepState, detail?: string): void => {
     setSteps((current) => ({ ...current, [key]: detail === undefined ? { state } : { state, detail } }));
   };
@@ -1060,7 +1027,9 @@ export function HireLpDeploy(props: {
       const claimOutcome = current.armPlan?.claim?.outcome;
       if (claimOutcome?.status === "completed") {
         forgetLpHire(hireStorage, id);
-        if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+        mark("arm", "done", "Already opened.");
+        await run.wait(DEPLOYED_HOLD_MS);
+        openAgentPage(id);
         return;
       }
       if (claimOutcome?.status === "held" || claimOutcome?.status === "interrupted") {
@@ -1108,7 +1077,8 @@ export function HireLpDeploy(props: {
         : "Position opened.");
 
       forgetLpHire(hireStorage, id);
-      if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+      await run.wait(DEPLOYED_HOLD_MS);
+      openAgentPage(id);
     } catch (error) {
       if (!mounted.current || run.stopped) return;
       const text = error instanceof Error ? error.message : "The deploy could not be completed.";
@@ -1175,6 +1145,13 @@ export function HireLpDeploy(props: {
     setSteps(IDLE_STEPS);
   };
 
+  // ONE popup instance for every branch below: keyed, so it survives the
+  // switch into the arm branch mid-run instead of remounting.
+  const deployModal = <DeployRunModal key="deploy-run" label="LP Agent" color="var(--cat-lp)" agentId={agentId}
+    stepDefs={DEPLOY_STEPS} steps={steps} running={running} suspended={deposit} message={message} note={working}
+    onCancel={view?.status === "provisioning" && view.cancelRequested !== true ? () => void cancelHire() : null}
+    cancelDisabled={working !== null && !running} onOpenAgent={openDeployedAgent} />;
+
   if (step === "arm" && agentId !== null) {
     const openAgent = (id: string): void => { if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`); };
     const retryArm = (): void => {
@@ -1199,7 +1176,7 @@ export function HireLpDeploy(props: {
             {armOutcome?.status === "rolled-back" ? "Retry opening position" : "Open the position"}
           </button>}
       </div>
-      {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
+      {deployModal}
       {message && message !== armOutcome?.reason ? <p style={{ color: "var(--loss)" }}>{message}</p> : null}
       {armOutcome?.status === "held" || armOutcome?.status === "interrupted" ? null : <div><button type="button" style={{ ...secondaryBtn, padding: "10px 16px", font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)" }} onClick={() => openAgent(agentId)}>Open the agent page without opening a position</button></div>}
     </div>;
@@ -1230,10 +1207,9 @@ export function HireLpDeploy(props: {
     </div> : null}
     {step === "s1" || step === "fund-and-grant" || step === "converge" || (step === "poll" && view?.cancelRequested !== true) ? <div style={{ display: "grid", gap: 12 }}>
       <button type="button" style={busyBtn(running || working !== null || blocked !== null, primaryBtn)} onClick={() => void deployAll()} disabled={running || working !== null || blocked !== null}>
-        {running ? "Deploying…" : step === "s1" ? "Deploy LP Agent" : "Continue deploy"}
+        {running ? "Deploying…" : step === "s1" ? "Sign hire and create the session key" : "Continue deploy"}
       </button>
       {blocked !== null ? <p role="alert" style={{ color: "var(--loss)", margin: 0 }}>{blocked}</p> : null}
-      {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
     </div> : null}
     {(step === "poll" || step === "converge") && view !== null ? <p>{view.cancelRequested === true ? cancellationMessage(view) : pollStatusText(view)}</p> : null}
     {view?.status === "provisioning" && view.cancelRequested !== true ? <button type="button" style={busyBtn(working !== null && !running, secondaryBtn)} onClick={() => void cancelHire()} disabled={working !== null && !running}>Cancel hire safely</button> : null}
@@ -1259,5 +1235,6 @@ export function HireLpDeploy(props: {
     }} wallet={fundsWallet} connectedAddress={connectedAddress} passkey={owner.passkey} ownerAddress={owner.ownerAddress} initialTab="deposit"
       {...(depositWei === null ? {} : { fixedDepositWei: depositWei, autoSubmitDeposit: true })}
       onDepositSubmitted={() => { mark("fund", "active", "Deposit sent. Waiting for it to land in the agent wallet…"); setDeposit(false); }} /> : null}
+    {deployModal}
   </div>;
 }

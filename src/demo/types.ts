@@ -25,11 +25,11 @@
  * stated as what it actually has to be:
  *
  *   **Nothing reachable from `src/demo/**` at runtime can ACT.** The whole
- *   transitive closure is 18 modules of arithmetic, validation, parsing and
+ *   transitive closure is 20 modules of arithmetic, validation, parsing and
  *   read-only clients. It contains no module that signs, submits, holds or
  *   decrypts a key, or writes live agent / journal / sequence state:
  *   `wallet/**`, `auth/**`, `killswitch/**`, `lp/sagas.ts`, `lp/open.ts`,
- *   `trade/execute.ts`, `store/journal.ts`, `store/agents.ts`,
+ *   `trade/execute.ts`, `trade/guard.ts`, `store/journal.ts`, `store/agents.ts`,
  *   `store/lpSequences.ts` and `server.ts` are all absent from it.
  *
  * `test/demo.plane.test.ts` computes that closure — following runtime,

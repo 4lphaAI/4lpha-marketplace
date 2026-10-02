@@ -39,6 +39,10 @@ export type VenueConfig = {
    * also a market judgement this service does not make.
    */
   readonly pancakeRouterV3?: Address;
+  /** Uniswap V3 SwapRouter02. Required for either uniswap_v3 side. */
+  readonly uniswapRouterV3?: Address;
+  /** Uniswap V3 QuoterV2. Optional: without it, Uniswap probes are skipped. */
+  readonly uniswapQuoterV3?: Address;
   /** Wrapped BNB, the intermediate hop on every pancake path. */
   readonly wbnb?: Address;
   /**
@@ -96,6 +100,20 @@ export const PANCAKE_V3_ROUTER_56: Address = getAddress(
   "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
 );
 
+/**
+ * Uniswap V3 SwapRouter02 on BNB Chain 56. RWA U1-gate deployment pin; the
+ * trade session grants only exactInputSingle, exactInput, unwrapWETH9 and
+ * refundETH as target-bound selectors.
+ */
+export const UNISWAP_V3_ROUTER02_56: Address = getAddress(
+  "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",
+);
+
+/** Uniswap V3 QuoterV2 on BNB Chain 56. RWA U1-gate deployment pin. */
+export const UNISWAP_V3_QUOTER_V2_56: Address = getAddress(
+  "0x78D78E420Da98ad378D7799bE8f4AF69033EB077",
+);
+
 /** WBNB on BNB Chain 56. Verified by reading `router.WETH()` back on-chain. */
 export const WBNB_56: Address = getAddress(
   "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
@@ -142,6 +160,8 @@ const DEFAULTS: ReadonlyMap<number, VenueConfig> = new Map<number, VenueConfig>(
       chainId: 56,
       pancakeRouterV2: PANCAKE_V2_ROUTER_56,
       pancakeRouterV3: PANCAKE_V3_ROUTER_56,
+      uniswapRouterV3: UNISWAP_V3_ROUTER02_56,
+      uniswapQuoterV3: UNISWAP_V3_QUOTER_V2_56,
       wbnb: WBNB_56,
       fourMemeTokenManager: FOUR_MEME_TOKEN_MANAGER_56,
       fourMemeHelper: FOUR_MEME_HELPER_56,
@@ -154,6 +174,8 @@ const DEFAULTS: ReadonlyMap<number, VenueConfig> = new Map<number, VenueConfig>(
 export type VenueOverrides = {
   readonly pancakeRouterV2?: string;
   readonly pancakeRouterV3?: string;
+  readonly uniswapRouterV3?: string;
+  readonly uniswapQuoterV3?: string;
   readonly wbnb?: string;
   readonly fourMemeHelper?: string;
   readonly flapPortal?: string;
@@ -222,6 +244,24 @@ export function resolveVenues(input: ResolveVenuesInput): VenueConfig {
       : validateOverride(
           overrides.pancakeRouterV3,
           "VENUE_PANCAKE_ROUTER_V3",
+        input.keyStore,
+      );
+
+  const uniswapRouterV3 =
+    overrides.uniswapRouterV3 === undefined || overrides.uniswapRouterV3.trim() === ""
+      ? base.uniswapRouterV3
+      : validateOverride(
+          overrides.uniswapRouterV3,
+          "VENUE_UNISWAP_ROUTER_V3",
+          input.keyStore,
+        );
+
+  const uniswapQuoterV3 =
+    overrides.uniswapQuoterV3 === undefined || overrides.uniswapQuoterV3.trim() === ""
+      ? base.uniswapQuoterV3
+      : validateOverride(
+          overrides.uniswapQuoterV3,
+          "VENUE_UNISWAP_QUOTER_V3",
           input.keyStore,
         );
 
@@ -253,6 +293,8 @@ export function resolveVenues(input: ResolveVenuesInput): VenueConfig {
     chainId: input.chainId,
     ...(pancakeRouterV2 === undefined ? {} : { pancakeRouterV2 }),
     ...(pancakeRouterV3 === undefined ? {} : { pancakeRouterV3 }),
+    ...(uniswapRouterV3 === undefined ? {} : { uniswapRouterV3 }),
+    ...(uniswapQuoterV3 === undefined ? {} : { uniswapQuoterV3 }),
     ...(wbnb === undefined ? {} : { wbnb }),
     ...(fourMemeTokenManager === undefined ? {} : { fourMemeTokenManager }),
     ...(fourMemeHelper === undefined ? {} : { fourMemeHelper }),
@@ -283,6 +325,12 @@ export function pancakeVenue(venues: VenueConfig): PancakeVenue | null {
 export function pancakeV3Venue(venues: VenueConfig): PancakeVenue | null {
   if (venues.pancakeRouterV3 === undefined || venues.wbnb === undefined) return null;
   return { router: venues.pancakeRouterV3, wbnb: venues.wbnb };
+}
+
+/** The Uniswap V3 router/WBNB pair, or null when either side is absent. */
+export function uniswapV3Venue(venues: VenueConfig): PancakeVenue | null {
+  if (venues.uniswapRouterV3 === undefined || venues.wbnb === undefined) return null;
+  return { router: venues.uniswapRouterV3, wbnb: venues.wbnb };
 }
 
 /**

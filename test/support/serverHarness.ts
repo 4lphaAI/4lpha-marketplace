@@ -603,6 +603,7 @@ export function tradeConfig(
   overrides: Partial<TradeRuntimeConfig> = {},
 ): TradeRuntimeConfig {
   return {
+    stagedSubmit: false,
     venues: TEST_VENUES,
     feePolicy: createNoFeePolicy(),
     scanTtlSec: 300,

@@ -291,8 +291,8 @@ test("wallet reuse: proof, key deletion, replacement hire, and key writer share 
       async listKeys() { return []; },
       async publicKeyFor() { return ROUTE_PUBLIC_KEY; },
       async isValidKey() { return false; },
-      async finalizedBlock() { return { number: 101n, hash: ROUTE_FINALIZED_HASH }; },
-      async blockAt(blockNumber) { return { number: blockNumber, hash: ROUTE_FINALIZED_HASH }; },
+      async finalizedBlock() { return { number: 101n, hash: ROUTE_FINALIZED_HASH, timestampSec: 1_700_000_000n }; },
+      async blockAt(blockNumber) { return { number: blockNumber, hash: ROUTE_FINALIZED_HASH, timestampSec: 1_700_000_000n }; },
       async listKeysAt(wallet) { return wallet.toLowerCase() === ROUTE_WALLETS[2].toLowerCase()
         ? [keccak256(ROUTE_VALID_PUBLIC_KEY)] : []; },
       async publicKeyForAt() { return ROUTE_VALID_PUBLIC_KEY; },

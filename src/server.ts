@@ -155,6 +155,7 @@ import {
   type AgentStore,
   type PendingGrant,
   type PendingRenewal,
+  type FundingRequirement,
   type ArmPlanOutcome,
   type SessionFacts,
 } from "./store/agents.js";
@@ -168,8 +169,9 @@ import type { NonceStore } from "./store/nonces.js";
 import type { RuntimeReplayStore } from "./store/runtimeReplays.js";
 import type { TradeSettingsStore } from "./store/tradeSettings.js";
 import type { TradePositionStore } from "./store/tradePositions.js";
-import type { TradeIntentStore } from "./store/tradeIntents.js";
+import type { TradeIntentRecord, TradeIntentStore } from "./store/tradeIntents.js";
 import type { TradeDetailObserver } from "./trade/detail.js";
+import type { PortfolioVerifiedFill } from "./trade/portfolioReceipt.js";
 import {
   MAX_CALLS_PER_EXECUTE,
   accountKeyHashForAddress,
@@ -196,8 +198,13 @@ import {
   parseHireParams,
   parseOwnerActionEnvelope,
   parseRenewSessionParams,
+  parseRevokeParams,
   parseCancelRenewalParams,
   parseTradeRequest,
+  parseTradeCmcBudgetParams,
+  type TradeCmcBudgetParams,
+  parseTradeCmcAttemptParams,
+  parseTradeCmcConfirmParams,
   type TradeRequest,
   type HireParams,
   type LendingHireParams,
@@ -221,7 +228,10 @@ import {
   flapVenue,
   pancakeV3Venue,
   pancakeVenue,
+  uniswapV3Venue,
+  WBNB_56,
 } from "./ops/venues.js";
+import { NFPM_56 } from "./ops/nfpm.js";
 import { createNoFeePolicy } from "./ops/fees.js";
 import { forbiddenTokenAddresses } from "./ops/forbiddenTokens.js";
 import {
@@ -251,7 +261,9 @@ import {
   lendingHireSizingPreview,
   lendingSessionSpec,
   type VenusRoutingCensus,
+  TRADFI_GUARD_SWAP_SELECTOR,
 } from "./ops/policy.js";
+import { flashRequest, type TradfiCapabilityProbeResult } from "./trade/guard.js";
 import {
   buildLendingArmBatch,
   buildLendingRetireBatch,
@@ -274,20 +286,57 @@ import {
 } from "./lending/readers.js";
 import type { LendingGuardRecord, LendingGuardStore } from "./store/lendingGuards.js";
 import type { LendingHold } from "./lending/types.js";
-import { immutableTradeSettingChange, parseTradeSettings, tradeSettingsDigest } from "./trade/settings.js";
-import { checkTradeSizing, nativeDayCapWei } from "./trade/sizing.js";
+import { immutableTradeSettingChange, isTradeDcaSettings, isTradePortfolioSettings, isTradfiAiSettings, isTradfiV2Settings, isTradeScheduleSettings, parseTradeSettings, tradeSettingsDigest } from "./trade/settings.js";
+import type { SqlClient } from "./store/sql.js";
+import { PORTFOLIO_LEGACY_MIN_LEG_WEI, PORTFOLIO_MIN_LEG_WEI, PORTFOLIO_PLATFORM_FEE_BPS, portfolioStockAllowed } from "./trade/portfolio.js";
+import {
+  DCA_PLATFORM_FEE_BPS,
+  dcaAhead,
+  dcaBilledNativeWei,
+  dcaEquityWei,
+  dcaGrossRateE18,
+  dcaLevelPrice,
+  dcaMarkedPnlWei,
+  dcaMidPrice,
+  dcaPerFillGas,
+  dcaPoolForToken,
+  dcaPoolLegs,
+  dcaPriceAtTick,
+  dcaR0Gas,
+  dcaRoundAnchor,
+  dcaStopLineWei,
+  dcaTpTarget,
+  type DcaPrice,
+} from "./trade/dca.js";
+import { dcaChainPositions, type DcaChainReads, type DcaPoolIdentity } from "./trade/dcaResolve.js";
+import type { DcaActionRow, DcaOrderRow, DcaRoundRow, DcaRoundStore } from "./store/dcaRounds.js";
+import { freshNativeCostFacts, nativeCostToUsdtAtomic } from "./trade/cost.js";
+import { cmcBudgetView, type CmcBudgetStore } from "./trade/cmc.js";
+import { hireCmcUuid, type CmcOwnerService } from "./trade/cmcOwnerService.js";
+import type { CmcNewsService } from "./trade/cmcNews.js";
+import { cmcProtectedExposureWei, type CmcRuntimeOwner } from "./trade/cmcRuntime.js";
+import { isCurrentCmcSkill } from "./trade/cmcUsEquity.js";
+import { checkTradeSizing, checkTradfiDcaSizing, checkTradfiPortfolioSizing, checkTradfiScheduleSizing, checkTradfiV2Sizing, maxGrantedTokens, nativeDayCapWei, tradfiV2BuyFeeWei, tradfiV2EntryReservation } from "./trade/sizing.js";
+import { USDT_56, TRADFI_V2_QUOTE_CAP_TURNS } from "./trade/settlement.js";
 import {
   ModelUnavailableError,
   PinTooSmallError,
   PinUnreadableError,
+  TradfiCapabilityIncompleteError,
   isUsEquityOpen,
   pinUniverse,
   rerankHeld,
+  scheduleGrantList,
   type PinnedCandidate,
 } from "./trade/universe.js";
 import type { TradeDataPlaneReads } from "./trade/dataPlaneReads.js";
 import type { TradeReadiness } from "./trade/readiness.js";
 import { pinnedTokens, positionView, runView, tradeSummary } from "./trade/view.js";
+import type { TradeSimulationLogReader } from "./store/tradeSimulations.js";
+import { schedulableTokens } from "./trade/schedulable.js";
+import { currentSlot, scheduleAnchorMs, scheduleLedger } from "./trade/schedule.js";
+import { admittedVenueRows, rwaPremiumBps } from "./trade/rwa.js";
+import type { TradfiQuote } from "./trade/route.js";
 import { validateSessionSpec } from "./core/session.js";
 import type { GrantEvidenceReader } from "./wallet/grantEvidence.js";
 import { assessGrantEvidence, grantDigest } from "./wallet/grantEvidence.js";
@@ -353,7 +402,7 @@ import {
   valueLpPosition,
   type LpExitProbe,
 } from "./lp/valuation.js";
-import { MAX_TICK, MIN_TICK, getSqrtRatioAtTick } from "./lp/tickMath.js";
+import { MAX_TICK, MIN_TICK, getAmountsForLiquidity, getSqrtRatioAtTick } from "./lp/tickMath.js";
 import {
   verifyLpResolveUnknown,
   type LpLogAbsenceProbe,
@@ -563,6 +612,8 @@ export type ServerConfig = {
    * fails the process rather than the request on a malformed value.
    */
   readonly passkey?: PasskeyConfig;
+  /** Keep the schedulable bStock list warm for one (amount, slippage) key; refreshed inside the cache TTL. */
+  readonly schedulableWarm?: { readonly amountWei: bigint; readonly slippageBps: number };
   /** Public-key verifier configuration for autonomous HTTP runtime routes. */
   readonly runtimeAuth?: RuntimeAuthConfig;
   /**
@@ -796,6 +847,7 @@ export type LpServerDeps = {
     readonly resolverLeaseMs: number;
     readonly finalizer?: LandingResolutionFinalizer;
   };
+
 };
 
 /**
@@ -898,6 +950,43 @@ export type TradeAgentServerDeps = {
   readonly dataPlane: TradeDataPlaneReads;
   readonly readiness: TradeReadiness;
   readonly feeBps: number;
+  readonly cmc?: CmcBudgetStore;
+  readonly cmcOwner?: CmcOwnerService;
+  readonly cmcOwnerResumePending?: CmcRuntimeOwner["resumePending"];
+  readonly cmcProtectedExposure?: CmcRuntimeOwner["protectedExposure"];
+  readonly cmcNews?: CmcNewsService;
+  readonly guardVerified?: (guard: Address) => Promise<boolean>;
+  readonly scheduleQuotes?: {
+    readonly buy: (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly slippageBps: number; readonly venues?: readonly import("./trade/dataPlaneReads.js").VenueRow[]; readonly signal?: AbortSignal }) => Promise<TradfiQuote>;
+    readonly sell: (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly slippageBps: number; readonly venues?: readonly import("./trade/dataPlaneReads.js").VenueRow[]; readonly signal?: AbortSignal }) => Promise<Pick<TradfiQuote, "quotedOutAtomic">>;
+  };
+  /** Read-only, pre-grant TradFi v2 direct/guard capability census (R2.4: tri-state). */
+  readonly tradfiV2CapabilityProbe?: (input: {
+    readonly candidate: PinnedCandidate;
+    readonly minEntryAtomic: bigint;
+    readonly slippageBps: number;
+    readonly signal?: AbortSignal;
+  }) => Promise<TradfiCapabilityProbeResult>;
+  /**
+   * AUTO-DCA §13. Composed whenever the trade agent is, like the worker's DCA
+   * deps: `enabled` (`DCA_ENABLED`) gates only the hire and its preview
+   * (400 `dca_disabled`, D17); revoke and the view serve an existing DCA agent
+   * either way. Absent ⇒ the hire refuses and the DCA-only reads fail closed.
+   */
+  readonly dca?: {
+    readonly enabled: boolean;
+    readonly store: Pick<DcaRoundStore, "getOpenRound" | "listRounds" | "listOrders" | "listActions">;
+    readonly chain: Pick<DcaChainReads, "reading" | "position" | "walletTokenIds" | "tokenBalance" | "gasPriceWei">
+      & { poolIdentity(pool: Address): Promise<DcaPoolIdentity> };
+  };
+  readonly portfolio?: {
+    readonly enabled: boolean;
+    readonly resolveFill?: (input: { readonly agent: AgentRecord; readonly intent: TradeIntentRecord;
+      readonly journalEntry: JournalEntry; readonly txHash: Hex }) => Promise<PortfolioVerifiedFill | null>;
+  };
+  /** Read-only pre-flight simulation log (the trade-worker owns and writes the tables). Absent ⇒ `store-unavailable`. */
+  readonly simulations?: TradeSimulationLogReader;
+  readonly portfolioValue?: (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly signal?: AbortSignal }) => Promise<bigint | null>;
 };
 
 /** Collaborators the HTTP layer reads from. Injected so the app stays testable. */
@@ -1044,6 +1133,26 @@ export type ErrorCode =
   | "universe_too_small"
   | "capital_too_small"
   | "trade_not_ready"
+  | "cmc_setup_unavailable"
+  | "cmc_capability_unavailable"
+  | "capability_preview_incomplete"
+  | "guard_unverified"
+  | "schedule_token_not_granted"
+  | "schedule_token_not_renewable"
+  | "schedule_token_unquotable"
+  | "schedule_first_buy_out_of_session"
+  | "schedule_end_in_past"
+  | "schedule_no_sell"
+  | "dca_disabled"
+  | "dca_token_unsupported"
+  | "dca_pool_mismatch"
+  | "dca_no_manual_sell"
+  | "portfolio_disabled"
+  | "portfolio_token_unsupported"
+  | "portfolio_token_unquotable"
+  | "portfolio_no_sell"
+  | "keep_not_supported"
+  | "already_revoked"
   | "renewal_pending"
   | "renewal_cancelled_unresolved"
   | "renewal_cancelled"
@@ -1421,27 +1530,127 @@ export function createServer(deps: ServerDeps): Hono {
 
   const trade = config.trade ?? defaultTradeConfig(config.chainId);
   const pinCache = new Map<string, { readonly at: number; readonly candidates: readonly PinnedCandidate[] }>();
-  const cachedPin = async (
+  const schedulableCache = new Map<string, { readonly at: number; readonly tokens: Awaited<ReturnType<typeof schedulableTokens>> }>();
+  const schedulableInFlight = new Map<string, Promise<Awaited<ReturnType<typeof schedulableTokens>>>>();
+  // R2.4 (H3): the most recent tri-state classification per (token,
+  // minEntryAtomic) seen by a schedule-mode probe — best-effort, so a hire on
+  // a token missing from the pin can tell an `unknown` (retryable) answer
+  // apart from a definitively `incapable` one, without re-probing.
+  const lastScheduleCapability = new Map<string, TradfiCapabilityProbeResult>();
+  // R3.1 (D3 seam): AI Trade and Schedule share one execution model ("tradfi")
+  // and would otherwise share one pin cache key. AI mode never calls Flash for
+  // pinning — a pool-less candidate is never admitted (R2.2/D3(i)) — while
+  // Schedule mode keeps today's Flash-backed capability probe.
+  const aiTradfiProbe = (candidate: PinnedCandidate): Promise<boolean> => Promise.resolve(admittedVenueRows(candidate.venues).length > 0);
+  const cachedPinCandidates = async (
     model: import("./trade/settings.js").TradeExecutionModel,
-    walletAddress: Address,
+    mode: "ai" | "schedule",
     signal?: AbortSignal,
+    v2?: { readonly minEntryAtomic: bigint; readonly slippageBps: number },
   ): Promise<readonly PinnedCandidate[]> => {
     const tradeAgent = deps.tradeAgent;
     if (tradeAgent === undefined || !tradeAgent.readiness.ready) throw new TradeNotReadyError();
     if (model === "mid-cap" && !tradeAgent.readiness.allowlistAvailable) throw new ModelUnavailableError(model);
-    const cached = pinCache.get(model);
-    const candidates = cached !== undefined && nowMs() - cached.at < 60_000
+    const v2Probe = model !== "tradfi" || v2 === undefined ? undefined
+      : mode === "ai" ? aiTradfiProbe
+      : tradeAgent.tradfiV2CapabilityProbe !== undefined
+        ? async (candidate: PinnedCandidate, requestSignal?: AbortSignal): Promise<boolean> => {
+            const result = await tradeAgent.tradfiV2CapabilityProbe!({
+              candidate, minEntryAtomic: v2.minEntryAtomic, slippageBps: v2.slippageBps, ...(requestSignal === undefined ? {} : { signal: requestSignal }),
+            });
+            lastScheduleCapability.set(`${candidate.address.toLowerCase()}:${v2.minEntryAtomic.toString(10)}`, result);
+            return result === "capable";
+          }
+        : undefined;
+    // G2/G3: Schedule mode reads bStocks only and probes every ranked
+    // candidate, uncut. L2: `mode` stays in the key even with no v2 probe,
+    // since lanes already differ by mode for a tradfi pin.
+    const scheduleOptions = model === "tradfi" && mode === "schedule" ? { lanes: ["bstocks"] as const, probeAll: true } : undefined;
+    const cacheKey = model !== "tradfi" ? model
+      : v2Probe === undefined ? `${model}:${mode}`
+      : `${model}:${mode}:${v2!.minEntryAtomic.toString(10)}:${v2!.slippageBps}`;
+    const cached = pinCache.get(cacheKey);
+    const cacheTtl = v2Probe === undefined ? 60_000 : 30_000;
+    const candidates = cached !== undefined && nowMs() - cached.at < cacheTtl
       ? cached.candidates
-      : await pinUniverse(model, { dataPlane: tradeAgent.dataPlane, ...(signal === undefined ? {} : { signal }) });
+      : await pinUniverse(model, { dataPlane: tradeAgent.dataPlane, ...(signal === undefined ? {} : { signal }), ...(v2Probe === undefined ? {} : { tradfiV2CapabilityProbe: v2Probe }) }, scheduleOptions);
     if (cached === undefined || cached.candidates !== candidates) {
-      pinCache.set(model, { at: nowMs(), candidates });
+      pinCache.set(cacheKey, { at: nowMs(), candidates });
     }
+    return candidates;
+  };
+  const cachedPin = async (
+    model: import("./trade/settings.js").TradeExecutionModel,
+    mode: "ai" | "schedule",
+    walletAddress: Address,
+    signal?: AbortSignal,
+    v2?: { readonly minEntryAtomic: bigint; readonly slippageBps: number },
+  ): Promise<readonly PinnedCandidate[]> => {
+    const candidates = await cachedPinCandidates(model, mode, signal, v2);
     const provider = deps.providerRegistry.get(config.chainId);
     return rerankHeld(candidates, (token, requestSignal) => provider.getTokenBalance({
       wallet: { address: walletAddress, ownerAddress: walletAddress, custodyModel: "passkey", chainId: config.chainId },
       token,
       ...(requestSignal === undefined ? {} : { signal: requestSignal }),
     }), signal);
+  };
+  const cachedSchedulable = async (amountWei: bigint, slippageBps: number, signal?: AbortSignal): Promise<Awaited<ReturnType<typeof schedulableTokens>>> => {
+    const tradeAgent = deps.tradeAgent;
+    if (tradeAgent === undefined || !tradeAgent.readiness.ready || tradeAgent.scheduleQuotes === undefined) throw new TradeNotReadyError();
+    const key = `${amountWei.toString(10)}:${slippageBps}`;
+    const cached = schedulableCache.get(key);
+    if (cached !== undefined && nowMs() - cached.at < 30_000) return cached.tokens;
+    const running = schedulableInFlight.get(key);
+    if (running !== undefined) return running;
+    const work = (async () => {
+      const candidates = await cachedPinCandidates("tradfi", "schedule", signal, { minEntryAtomic: amountWei, slippageBps });
+      const guard = trade.aggregatorGuard;
+      const guardVerified = guard !== undefined && tradeAgent.guardVerified !== undefined ? await tradeAgent.guardVerified(guard) : false;
+      const tokens = await schedulableTokens({ candidates, amountWei, slippageBps,
+        buy: (candidate) => tradeAgent.scheduleQuotes!.buy({ token: candidate.address, amountInAtomic: amountWei, slippageBps,
+          ...(candidate.venues === undefined ? {} : { venues: candidate.venues }), ...(signal === undefined ? {} : { signal }) }),
+        ...(guardVerified && tradeAgent.dataPlane.binanceQuoteAndSwap !== undefined ? { flash: (candidate: PinnedCandidate) => tradeAgent.dataPlane.binanceQuoteAndSwap!(flashRequest({ tokenIn: USDT_56, tokenOut: candidate.address,
+          amountAtomic: amountWei.toString(10), slippageBps, ...(signal === undefined ? {} : { signal }) })) } : {}), guardVerified,
+        ...(guard === undefined ? {} : { guard }), ...(signal === undefined ? {} : { signal }) });
+      schedulableCache.set(key, { at: nowMs(), tokens });
+      return tokens;
+    })();
+    schedulableInFlight.set(key, work);
+    try { return await work; } finally { schedulableInFlight.delete(key); }
+  };
+  // Operator ruling 2026-09-20: the deploy screen's default key is kept warm so
+  // the first dropdown open never waits on the 22-token quote sweep. Refreshed
+  // inside the 30 s TTL; the served list is never older than the cache allows.
+  // Errors (trade not ready, RPC) are swallowed here and surface on the route.
+  if (config.schedulableWarm !== undefined) {
+    const warm = config.schedulableWarm;
+    const refresh = (): void => { void cachedSchedulable(warm.amountWei, warm.slippageBps).catch(() => undefined); };
+    refresh();
+    setInterval(refresh, 25_000).unref();
+  }
+
+  const enrichTradfiV2Funding = async (input: {
+    readonly funding: FundingRequirement;
+    readonly wallet: Address;
+    readonly capitalQuoteWei: bigint;
+    readonly cmcTotalBudgetWei?: bigint;
+    readonly signal?: AbortSignal;
+  }): Promise<FundingRequirement> => {
+    const balance = await deps.providerRegistry.get(config.chainId).getTokenBalance({
+      wallet: { address: input.wallet, ownerAddress: input.wallet, custodyModel: "passkey", chainId: config.chainId },
+      token: USDT_56, ...(input.signal === undefined ? {} : { signal: input.signal }),
+    });
+    const required = input.capitalQuoteWei + (input.cmcTotalBudgetWei ?? 0n);
+    const shortfall = required > balance ? required - balance : 0n;
+    return { ...input.funding, quoteAsset: "USDT", quoteRequiredWei: required.toString(10), quoteBalanceWei: balance.toString(10), quoteShortfallWei: shortfall.toString(10) };
+  };
+  const currentCmcExposure = async (agentId: string, ownerAddress: Address): Promise<bigint> => {
+    if (deps.tradeAgent?.cmcProtectedExposure !== undefined) return deps.tradeAgent.cmcProtectedExposure({ agentId, ownerAddress });
+    const row = await deps.tradeAgent?.cmc?.get(agentId, ownerAddress);
+    if (row === null || row === undefined) return 0n;
+    const pendingOperation = row.pendingOwnerOperationId === null || row.pendingOwnerOperationId === undefined || deps.tradeAgent?.cmc === undefined
+      ? null : await deps.tradeAgent.cmc.getOwnerOperation(agentId, ownerAddress, row.pendingOwnerOperationId);
+    return cmcProtectedExposureWei(row, pendingOperation);
   };
 
   // PHASE2.5-AUDIT A5 — the assertion `WalletProvider.nativeDayMeter`'s own
@@ -2028,6 +2237,36 @@ export function createServer(deps: ServerDeps): Hono {
 
     hireContinuationForArms = hireContinuation;
 
+    app.get("/agents/hire/schedulable", async (c) => {
+      const tradeAgent = deps.tradeAgent;
+      if (tradeAgent === undefined || !tradeAgent.readiness.ready || tradeAgent.scheduleQuotes === undefined) return fail(c, 503, "trade_not_ready");
+      const rawAmount = c.req.query("amountWei") ?? "";
+      const rawSlippage = c.req.query("slippageBps") ?? "";
+      if (!/^\d{1,78}$/u.test(rawAmount) || BigInt(rawAmount) <= 0n || !/^\d{2,3}$/u.test(rawSlippage)
+        || !Number.isInteger(Number(rawSlippage)) || Number(rawSlippage) < 50 || Number(rawSlippage) > 500) {
+        return fail(c, 400, "invalid_request", "Schedulable quote parameters are invalid.");
+      }
+      const amountWei = BigInt(rawAmount);
+      const slippageBps = Number(rawSlippage);
+      try {
+        const tokens = await cachedSchedulable(amountWei, slippageBps, c.req.raw.signal);
+        const provider = deps.providerRegistry.get(config.chainId);
+        const withDecimals = await Promise.all(tokens.map(async (token) => {
+          if (provider.getTokenMetadata === undefined) return token;
+          try {
+            const metadata = await provider.getTokenMetadata({ token: token.address, ...(c.req.raw.signal === undefined ? {} : { signal: c.req.raw.signal }) });
+            return { ...token, ...(Number.isInteger(metadata.decimals) ? { decimals: metadata.decimals } : {}) };
+          } catch { return token; }
+        }));
+        return c.json({ data: { amountWei: rawAmount, slippageBps, asOf: nowMs(), tokens: withDecimals } });
+      } catch (error) {
+        if (error instanceof TradfiCapabilityIncompleteError) return fail(c, 503, "capability_preview_incomplete");
+        if (error instanceof PinTooSmallError) return fail(c, 400, "universe_too_small");
+        if (error instanceof PinUnreadableError) return fail(c, 503, "evidence_unreadable");
+        throw error;
+      }
+    });
+
     app.get("/agents/hire/preview", async (c) => {
       let wallet: Address;
       let openNativeBudgetWei: bigint | undefined;
@@ -2036,6 +2275,23 @@ export function createServer(deps: ServerDeps): Hono {
       let executionModel: import("./trade/settings.js").TradeExecutionModel | undefined;
       let entryWei: bigint | undefined;
       let maxOpenPositions: number | undefined;
+      let settlementAsset: "USDT" | undefined;
+      let minEntryWei: bigint | undefined;
+      let capitalQuoteWei: bigint | undefined;
+      let cmcNewsEnabled: boolean | undefined;
+      let cmcTotalBudgetWei: bigint | undefined;
+      let tradeMode: "schedule" | "dca" | "portfolio" | undefined;
+      let portfolioTokens: readonly string[] | undefined;
+      let portfolioIntervalSec: 14400 | 28800 | 43200 | 86400 | undefined;
+      let dcaToken: string | undefined;
+      let dcaTakeProfitBps: number | undefined;
+      let dcaOrderWei: bigint | undefined;
+      let dcaMaxOrders: number | undefined;
+      let scheduleIntervalSec: 3600 | 14400 | 28800 | 43200 | 86400 | undefined;
+      let scheduleEndKind: "budget" | "date" | "runs" | undefined;
+      let scheduleEndRuns: number | null = null;
+      let scheduleEndAtSec: number | null = null;
+      let scheduleFirstAtSec: number | null = null;
       try {
         wallet = getAddress(c.req.query("walletAddress") ?? "");
         const rawPreset = c.req.query("sizingPreset");
@@ -2052,7 +2308,7 @@ export function createServer(deps: ServerDeps): Hono {
           if (!/^\d{1,78}$/u.test(rawCap) || BigInt(rawCap) <= 0n) throw new Error("cap");
           capDayWei = BigInt(rawCap);
           const rawModel = c.req.query("executionModel");
-          if (rawModel !== "blue-chip" && rawModel !== "mid-cap" && rawModel !== "degen" && rawModel !== "sigma") throw new Error("model");
+          if (rawModel !== "tradfi" && rawModel !== "mid-cap" && rawModel !== "degen" && rawModel !== "sigma") throw new Error("model");
           executionModel = rawModel;
           const rawEntry = c.req.query("entryWei") ?? "";
           if (!/^\d{1,78}$/u.test(rawEntry) || BigInt(rawEntry) <= 0n) throw new Error("entry");
@@ -2060,6 +2316,76 @@ export function createServer(deps: ServerDeps): Hono {
           const rawMax = c.req.query("maxOpenPositions") ?? "";
           if (!/^\d{1,2}$/u.test(rawMax) || !Number.isInteger(Number(rawMax))) throw new Error("positions");
           maxOpenPositions = Number(rawMax);
+          if (executionModel === "tradfi" && c.req.query("settlementAsset") !== undefined) {
+            if (c.req.query("settlementAsset") !== "USDT") throw new Error("settlement");
+            settlementAsset = "USDT";
+            const rawMin = c.req.query("minEntryWei") ?? "";
+            const rawCapital = c.req.query("capitalQuoteWei") ?? "";
+            if (!/^\d{1,78}$/u.test(rawMin) || BigInt(rawMin) <= 0n || !/^\d{1,78}$/u.test(rawCapital) || BigInt(rawCapital) <= 0n) throw new Error("v2 sizing");
+            minEntryWei = BigInt(rawMin); capitalQuoteWei = BigInt(rawCapital);
+            const rawNews = c.req.query("cmcNewsEnabled");
+            if (rawNews !== "true" && rawNews !== "false") throw new Error("news");
+            cmcNewsEnabled = rawNews === "true";
+            const rawBudget = c.req.query("cmcTotalBudgetWei");
+            if (cmcNewsEnabled) {
+              if (rawBudget === undefined || !/^\d{1,78}$/u.test(rawBudget) || BigInt(rawBudget) <= 0n) throw new Error("cmc budget");
+              cmcTotalBudgetWei = BigInt(rawBudget);
+            } else if (rawBudget !== undefined) throw new Error("cmc budget off");
+          }
+          const rawMode = c.req.query("tradeMode");
+          if (rawMode === "portfolio") {
+            const rawTokens = c.req.query("portfolioTokens") ?? "";
+            const tokens = rawTokens.split(",");
+            const rawInterval = c.req.query("portfolioIntervalSec") ?? "";
+            if (settlementAsset !== "USDT" || (minEntryWei !== PORTFOLIO_MIN_LEG_WEI && minEntryWei !== PORTFOLIO_LEGACY_MIN_LEG_WEI) || entryWei !== capitalQuoteWei
+              || maxOpenPositions !== 1 || tokens.length < 2 || tokens.length > 5
+              || tokens.some((token) => !/^0x[0-9a-f]{40}$/u.test(token)) || new Set(tokens).size !== tokens.length
+              || !/^(14400|28800|43200|86400)$/u.test(rawInterval)) throw new Error("portfolio");
+            tradeMode = "portfolio";
+            portfolioTokens = tokens;
+            portfolioIntervalSec = Number(rawInterval) as typeof portfolioIntervalSec;
+          } else if (rawMode === "dca") {
+            // AUTO-DCA §13.1: the five DCA parameters are required together, on
+            // the v2 tuple with minEntryWei = entryWei. The step is validated by
+            // the signed-settings parser at hire; the preview does not size by it.
+            const rawToken = c.req.query("dcaToken") ?? "";
+            const rawStep = c.req.query("dcaStepBps") ?? "";
+            const rawTp = c.req.query("dcaTakeProfitBps") ?? "";
+            const rawOrder = c.req.query("dcaOrderWei") ?? "";
+            const rawOrders = c.req.query("dcaMaxOrders") ?? "";
+            if (settlementAsset !== "USDT" || minEntryWei !== entryWei || !/^0x[0-9a-f]{40}$/u.test(rawToken) || !/^\d{3,4}$/u.test(rawStep)
+              || !/^\d{3,5}$/u.test(rawTp) || Number(rawTp) > 10_000 || !/^\d{1,78}$/u.test(rawOrder) || BigInt(rawOrder) <= 0n
+              || !/^[1-8]$/u.test(rawOrders)) throw new Error("dca");
+            tradeMode = "dca";
+            dcaToken = rawToken; dcaTakeProfitBps = Number(rawTp); dcaOrderWei = BigInt(rawOrder); dcaMaxOrders = Number(rawOrders);
+          } else if (rawMode !== undefined) {
+            if (rawMode !== "schedule" || settlementAsset !== "USDT") throw new Error("schedule mode");
+            tradeMode = "schedule";
+            const rawInterval = c.req.query("scheduleIntervalSec") ?? "";
+            if (!/^(3600|14400|28800|43200|86400)$/u.test(rawInterval)) throw new Error("schedule interval");
+            scheduleIntervalSec = Number(rawInterval) as typeof scheduleIntervalSec;
+            const rawEndKind = c.req.query("scheduleEndKind");
+            if (rawEndKind !== "budget" && rawEndKind !== "date" && rawEndKind !== "runs") throw new Error("schedule end");
+            scheduleEndKind = rawEndKind;
+            const rawRuns = c.req.query("scheduleEndRuns");
+            const rawAt = c.req.query("scheduleEndAtSec");
+            if (scheduleEndKind === "runs") {
+              if (rawRuns === undefined || !/^\d{1,4}$/u.test(rawRuns) || Number(rawRuns) < 1 || Number(rawRuns) > 1000) throw new Error("schedule runs");
+              scheduleEndRuns = Number(rawRuns);
+              if (rawAt !== undefined) throw new Error("schedule date");
+            } else if (scheduleEndKind === "date") {
+              if (rawAt === undefined || !/^\d{1,13}$/u.test(rawAt) || BigInt(rawAt) > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("schedule date");
+              scheduleEndAtSec = Number(rawAt);
+              if (rawRuns !== undefined) throw new Error("schedule runs");
+            } else if (rawRuns !== undefined || rawAt !== undefined) throw new Error("schedule end fields");
+            const rawFirst = c.req.query("scheduleFirstAtSec");
+            if (rawFirst !== undefined) {
+              if (!/^\d{1,13}$/u.test(rawFirst) || BigInt(rawFirst) > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("schedule first");
+              scheduleFirstAtSec = Number(rawFirst);
+            }
+          } else if (["scheduleIntervalSec", "scheduleEndKind", "scheduleEndRuns", "scheduleEndAtSec", "scheduleFirstAtSec"].some((key) => c.req.query(key) !== undefined)) {
+            throw new Error("partial schedule preview");
+          }
         } else {
           const rawBudget = c.req.query("openNativeBudgetWei") ?? "";
           if (!/^\d{1,78}$/u.test(rawBudget) || BigInt(rawBudget) <= 0n) throw new Error("budget");
@@ -2068,14 +2394,35 @@ export function createServer(deps: ServerDeps): Hono {
       } catch {
         return fail(c, 400, "invalid_request", "Hire preview parameters are invalid.");
       }
+      const dca = deps.tradeAgent?.dca;
+      const dcaPool = dcaToken === undefined ? null : dcaPoolForToken(dcaToken);
+      if (tradeMode === "dca") {
+        if (dca === undefined || !dca.enabled) return fail(c, 400, "dca_disabled");
+        if (dcaPool === null) return fail(c, 400, "dca_token_unsupported");
+      }
+      if (tradeMode === "portfolio") {
+        if (deps.tradeAgent?.portfolio?.enabled !== true) return fail(c, 400, "portfolio_disabled");
+        if (portfolioTokens?.some((token) => !portfolioStockAllowed(token))) return fail(c, 400, "portfolio_token_unsupported");
+      }
       try {
         const observedAtSec = nowSec();
-        const [funding, pin] = await Promise.all([
+        const [funding, rawPin] = await Promise.all([
           hire.evidence.readFunding(wallet, hire.grantGasHeadroomWei, observedAtSec, c.req.raw.signal),
-          presetQuery === "trade-v1" && executionModel !== undefined
-            ? cachedPin(executionModel, wallet, c.req.raw.signal)
+          // AUTO-DCA §13.1: no pin for Auto DCA — the grant is the one stock.
+          presetQuery === "trade-v1" && executionModel !== undefined && tradeMode !== "dca" && tradeMode !== "portfolio"
+            ? cachedPin(executionModel, tradeMode === "schedule" ? "schedule" : "ai", wallet, c.req.raw.signal,
+                settlementAsset === "USDT" && minEntryWei !== undefined ? { minEntryAtomic: minEntryWei, slippageBps: 300 } : undefined)
             : Promise.resolve(undefined),
         ]);
+        // R2.3 (H2): with no chosen token, the preview cuts to the grant cap
+        // itself — G3's schedule pin is no longer cut, and an uncut pin would
+        // size and preview a grant no hire could actually make.
+        const pin = rawPin === undefined ? undefined : rawPin.slice(0, maxGrantedTokens("tradfi"));
+        // AUTO-DCA §10.1: the USDT deposit target is the principal plus the first base order's platform fee (none: R2.1, 2026-09-25).
+        const dcaDepositQuoteWei = tradeMode === "dca" ? capitalQuoteWei! + tradfiV2BuyFeeWei(entryWei!, DCA_PLATFORM_FEE_BPS) : undefined;
+        const fundingView = settlementAsset === "USDT"
+          ? await enrichTradfiV2Funding({ funding, wallet, capitalQuoteWei: dcaDepositQuoteWei ?? capitalQuoteWei!, ...(cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei }), signal: c.req.raw.signal })
+          : funding;
         // MARKETPLACE-LENDING-AGENT R2.15: the lending deposit is
         // `budget + registration + headroom + 3 x relayFee` — the
         // `requiredTradeDepositWei` SHAPE, with no `reserves.totalWei`, because
@@ -2083,7 +2430,79 @@ export function createServer(deps: ServerDeps): Hono {
         // is what the browser needs here; the sizing floors come from
         // `/lending/guardable` in receipt mode, which is the only place they
         // can be quoted.
-        const sizing = presetQuery === "trade-v1"
+        const sizing = presetQuery === "trade-v1" && tradeMode === "portfolio"
+          ? (() => {
+              const sized = checkTradfiPortfolioSizing({ capDayWei: capDayWei!, capitalQuoteWei: capitalQuoteWei!, tokenCount: portfolioTokens!.length, intervalSec: portfolioIntervalSec! });
+              return { name: "trade-v1" as const, version: 1 as const, openNativeBudgetWei: "0", executionModel: "tradfi" as const,
+                settlementAsset: "USDT" as const, entryWei: entryWei!.toString(10), minEntryWei: minEntryWei!.toString(10),
+                capitalQuoteWei: capitalQuoteWei!.toString(10), cmcNewsEnabled: false, maxOpenPositions: 1,
+                grantedTokenCount: portfolioTokens!.length, platformFeeBps: 0, platformFeePerEntryWei: "0", platformFeeTotalWei: "0",
+                tradeRelayFeePerSubmitWei: RELAY_FEE_PER_EXIT_WEI.toString(10), capitalRequiredWei: sized.requiredQuoteWei.toString(10),
+                capitalShortfallWei: sized.shortfallQuoteWei.toString(10), nativeReserveWei: sized.nativeReserveWei.toString(10),
+                nativeShortfallWei: sized.nativeShortfallWei.toString(10), tradeMode: "portfolio" as const,
+                tokenCount: portfolioTokens!.length, intervalSec: portfolioIntervalSec!, depositQuoteWei: capitalQuoteWei!.toString(10), ok: sized.ok };
+            })()
+          : presetQuery === "trade-v1" && tradeMode === "dca" && dca !== undefined && dcaPool !== null
+          ? await (async () => {
+              const sized = checkTradfiDcaSizing({ capDayWei: capDayWei!, entryWei: entryWei!, dcaOrderWei: dcaOrderWei!, dcaMaxOrders: dcaMaxOrders!, capitalQuoteWei: capitalQuoteWei! });
+              const feeWei = tradfiV2BuyFeeWei(entryWei!, DCA_PLATFORM_FEE_BPS);
+              const usdtDayCapWei = capitalQuoteWei! * TRADFI_V2_QUOTE_CAP_TURNS;
+              // R2.16: the economics lines are non-blocking (R2.15: a hold at round start, never a
+              // refusal), so an unreadable gas price or a stale BNB price answers `null`, not an error.
+              let economics: Record<string, string | number | null> | null = null;
+              try {
+                // R2.15: `eth_gasPrice` bounded at 1 000 gwei, as the worker's hold does.
+                const rawGasPriceWei = await dca.chain.gasPriceWei();
+                const gasPriceWei = rawGasPriceWei > 1_000_000_000_000n ? 1_000_000_000_000n : rawGasPriceWei;
+                const facts = freshNativeCostFacts(await deps.tradeAgent!.dataPlane.tokensBatch([WBNB_56, USDT_56], c.req.raw.signal), nowMs());
+                const rate = dcaGrossRateE18(dcaPool, dcaTakeProfitBps!);
+                const r0CostUsdtWei = facts === null ? null : nativeCostToUsdtAtomic(dcaBilledNativeWei(dcaR0Gas(dcaPool, dcaAhead(dcaMaxOrders!)), gasPriceWei), facts);
+                const fillCostUsdtWei = facts === null ? null : nativeCostToUsdtAtomic(dcaBilledNativeWei(dcaPerFillGas(dcaPool), gasPriceWei), facts);
+                if (r0CostUsdtWei !== null && fillCostUsdtWei !== null) {
+                  const r0GrossUsdtWei = ((entryWei! + feeWei) * rate) / 10n ** 18n;
+                  const gasPriceGwei = Number(gasPriceWei) / 1e9;
+                  economics = { r0CostUsdtWei: r0CostUsdtWei.toString(10), r0GrossUsdtWei: r0GrossUsdtWei.toString(10),
+                    holdEngagesAtGwei: r0CostUsdtWei > 0n ? (gasPriceGwei * Number(r0GrossUsdtWei)) / Number(r0CostUsdtWei) : null,
+                    perFillNetUsdtWei: ((dcaOrderWei! * rate) / 10n ** 18n - fillCostUsdtWei).toString(10), gasPriceGwei };
+                }
+              } catch { /* economics stays null; the preview never fails over it */ }
+              return { name: "trade-v1" as const, version: 1 as const, openNativeBudgetWei: "0", executionModel: executionModel!, entryWei: entryWei!.toString(10),
+                settlementAsset: "USDT" as const, minEntryWei: minEntryWei!.toString(10), capitalQuoteWei: capitalQuoteWei!.toString(10), cmcNewsEnabled: cmcNewsEnabled!,
+                maxOpenPositions: 1, grantedTokenCount: 1, platformFeeBps: DCA_PLATFORM_FEE_BPS, platformFeePerEntryWei: feeWei.toString(10), platformFeeTotalWei: feeWei.toString(10),
+                tradeRelayFeePerSubmitWei: RELAY_FEE_PER_EXIT_WEI.toString(10), capitalRequiredWei: sized.requiredQuoteWei.toString(10), capitalShortfallWei: sized.shortfallQuoteWei.toString(10),
+                nativeReserveWei: sized.nativeReserveWei.toString(10), nativeShortfallWei: sized.nativeShortfallWei.toString(10),
+                tradeMode: "dca" as const, depositQuoteWei: dcaDepositQuoteWei!.toString(10), usdtDayCapWei: usdtDayCapWei.toString(10),
+                // R3.5 "which cap binds": a no-fill round spends B + fee + a·D of the USDT cap (its resting levels), a full one B + fee + N·D.
+                roundsPerDayAtCap: { noFill: Number(usdtDayCapWei / (entryWei! + feeWei + BigInt(dcaAhead(dcaMaxOrders!)) * dcaOrderWei!)), full: Number(usdtDayCapWei / (entryWei! + feeWei + BigInt(dcaMaxOrders!) * dcaOrderWei!)) },
+                economics, ok: sized.ok,
+              };
+            })()
+          : presetQuery === "trade-v1" && settlementAsset === "USDT" && tradeMode === "schedule"
+          ? (() => {
+              const sized = checkTradfiScheduleSizing({ capDayWei: capDayWei!, entryWei: entryWei!, capitalQuoteWei: capitalQuoteWei!, platformFeeBps: hire.feeBps,
+                grantedTokenCount: pin?.length ?? 0, intervalSec: scheduleIntervalSec!, ttlSec: 604_800, endKind: scheduleEndKind!, endRuns: scheduleEndRuns,
+                endAtSec: scheduleEndAtSec, anchorAtSec: scheduleFirstAtSec ?? observedAtSec });
+              return { name: "trade-v1" as const, version: 1 as const, openNativeBudgetWei: "0", executionModel: executionModel!, entryWei: entryWei!.toString(10),
+                settlementAsset: "USDT" as const, minEntryWei: minEntryWei!.toString(10), capitalQuoteWei: capitalQuoteWei!.toString(10), cmcNewsEnabled: cmcNewsEnabled!,
+                ...(cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: cmcTotalBudgetWei.toString(10) }), maxOpenPositions: 1, grantedTokenCount: pin?.length ?? 0,
+                platformFeeBps: hire.feeBps, platformFeePerEntryWei: tradfiV2BuyFeeWei(entryWei!, hire.feeBps).toString(10), platformFeeTotalWei: tradfiV2BuyFeeWei(entryWei!, hire.feeBps).toString(10),
+                tradeRelayFeePerSubmitWei: RELAY_FEE_PER_EXIT_WEI.toString(10), capitalRequiredWei: sized.requiredQuoteWei.toString(10), capitalShortfallWei: sized.shortfallQuoteWei.toString(10),
+                nativeReserveWei: sized.nativeReserveWei.toString(10), nativeShortfallWei: sized.nativeShortfallWei.toString(10), plannedBuys: sized.plannedBuys, buysThisSession: sized.buysThisSession,
+                tradeMode: "schedule" as const, ok: sized.ok,
+              };
+            })()
+          : presetQuery === "trade-v1" && settlementAsset === "USDT"
+          ? (() => {
+              const sized = checkTradfiV2Sizing({ capDayWei: capDayWei!, minEntryWei: minEntryWei!, maxEntryWei: entryWei!, capitalQuoteWei: capitalQuoteWei!,
+                maxOpenPositions: maxOpenPositions!, grantedTokenCount: pin?.length ?? 0, platformFeeBps: hire.feeBps });
+              return { name: "trade-v1" as const, version: 1 as const, openNativeBudgetWei: "0", executionModel: executionModel!, entryWei: entryWei!.toString(10),
+                minEntryWei: minEntryWei!.toString(10), capitalQuoteWei: capitalQuoteWei!.toString(10), cmcNewsEnabled: cmcNewsEnabled!,
+                ...(cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: cmcTotalBudgetWei.toString(10) }), maxOpenPositions: maxOpenPositions!, grantedTokenCount: pin?.length ?? 0,
+                platformFeeBps: hire.feeBps, platformFeePerEntryWei: tradfiV2BuyFeeWei(entryWei!, hire.feeBps).toString(10), platformFeeTotalWei: (tradfiV2BuyFeeWei(entryWei!, hire.feeBps) * BigInt(maxOpenPositions!)).toString(10),
+                tradeRelayFeePerSubmitWei: RELAY_FEE_PER_EXIT_WEI.toString(10), capitalRequiredWei: sized.requiredQuoteWei.toString(10), capitalShortfallWei: sized.shortfallQuoteWei.toString(10), ok: sized.ok,
+              };
+            })()
+          : presetQuery === "trade-v1"
           ? hireSizingPreview({
               capDayWei: capDayWei!, executionModel: executionModel!, entryWei: entryWei!,
               maxOpenPositions: maxOpenPositions!, grantedTokenCount: pin?.length ?? 0,
@@ -2116,10 +2535,13 @@ export function createServer(deps: ServerDeps): Hono {
           if (!("minimumCapDayWei" in sizing)) throw new Error("Grid hire preview shape mismatch.");
           responseCapDayWei = sizing.minimumCapDayWei;
         }
-        return c.json({ data: { sizing, funding, capDayWei: responseCapDayWei,
-          ...(pin === undefined ? {} : { pin: pin.map(({ symbol, address }) => ({ symbol, address })), indicative: true }) } });
+        return c.json({ data: { sizing, funding: fundingView, capDayWei: responseCapDayWei,
+          ...(portfolioTokens !== undefined ? { pin: portfolioTokens.map((token) => ({ symbol: dcaPoolForToken(token)!.symbol, address: token })), indicative: true }
+            : dcaPool !== null ? { pin: [{ symbol: dcaPool.symbol, address: dcaPool.stock }], indicative: true }
+            : pin === undefined ? {} : { pin: pin.map(({ symbol, address }) => ({ symbol, address })), indicative: true }) } });
       } catch (error) {
         if (error instanceof TradeNotReadyError) return fail(c, 503, "trade_not_ready");
+        if (error instanceof TradfiCapabilityIncompleteError) return fail(c, 503, "capability_preview_incomplete", "TradFi capability preview is incomplete; retry.");
         if (error instanceof ModelUnavailableError) return fail(c, 400, "model_unavailable");
         if (error instanceof PinTooSmallError) return fail(c, 400, "universe_too_small");
         return fail(c, 503, "evidence_unreadable");
@@ -2127,6 +2549,7 @@ export function createServer(deps: ServerDeps): Hono {
     });
 
     app.post("/agents/:id/session", async (c) => {
+      const tradeAgent = deps.tradeAgent;
       const id = c.req.param("id");
       const body = await readJsonBody(c, maxBodyBytes);
       if (body.kind === "error") return body.response;
@@ -2251,6 +2674,21 @@ export function createServer(deps: ServerDeps): Hono {
           if (tradeParams.executionModel === "mid-cap" && !deps.tradeAgent.readiness.allowlistAvailable) {
             return fail(c, 400, "model_unavailable");
           }
+          // AUTO-DCA §13.2: the tuple was validated by the settings parser above;
+          // the flag and the pinned stock refuse here, before any read or write.
+          const dcaHire = isTradeDcaSettings(tradeParams.settings);
+          const portfolioHire = isTradePortfolioSettings(tradeParams.settings);
+          const dcaPool = dcaHire ? dcaPoolForToken(tradeParams.settings.dcaToken!) : null;
+          const dcaDeps = deps.tradeAgent.dca;
+          if (dcaHire) {
+            if (dcaDeps === undefined || !dcaDeps.enabled) return fail(c, 400, "dca_disabled");
+            if (dcaPool === null) return fail(c, 400, "dca_token_unsupported");
+          }
+          if (portfolioHire) {
+            if (deps.tradeAgent.portfolio?.enabled !== true) return fail(c, 400, "portfolio_disabled");
+            if (tradeParams.settings.portfolioTokens!.some((token) => !portfolioStockAllowed(token))) return fail(c, 400, "portfolio_token_unsupported");
+            if (deps.tradeAgent.scheduleQuotes === undefined) return fail(c, 503, "trade_not_ready");
+          }
 
           let ownerVerdict;
           let funding;
@@ -2260,21 +2698,112 @@ export function createServer(deps: ServerDeps): Hono {
               verifyDeclaredWallet({ owner, wallet: tradeParams.walletAddress,
                 reader: deps.keyStoreReader, signal: c.req.raw.signal }),
               hire.evidence.readFunding(tradeParams.walletAddress, hire.grantGasHeadroomWei, observedAtSec, c.req.raw.signal),
-              cachedPin(tradeParams.executionModel, tradeParams.walletAddress, c.req.raw.signal),
+              // No pin for Auto DCA (§13.1): the grant is the one stock.
+              dcaHire || portfolioHire ? Promise.resolve<readonly PinnedCandidate[]>([])
+                : cachedPin(tradeParams.executionModel, isTradeScheduleSettings(tradeParams.settings) ? "schedule" : "ai", tradeParams.walletAddress, c.req.raw.signal,
+                  isTradfiV2Settings(tradeParams.settings) ? { minEntryAtomic: BigInt(tradeParams.settings.minEntryWei!), slippageBps: tradeParams.settings.slippageBps } : undefined),
             ]);
           } catch (error) {
             if (error instanceof TradeNotReadyError || error instanceof ModelUnavailableError
-              || error instanceof PinTooSmallError || error instanceof PinUnreadableError) throw error;
+              || error instanceof PinTooSmallError || error instanceof PinUnreadableError || error instanceof TradfiCapabilityIncompleteError) throw error;
             return fail(c, 503, "evidence_unreadable");
           }
           if (ownerVerdict === "unreadable") return fail(c, 503, "evidence_unreadable");
           if (ownerVerdict === "no-matching-key") return fail(c, 403, "wallet_owner_mismatch");
-          const sized = checkTradeSizing({ capDayWei: tradeParams.capDayWei,
-            entryWei: BigInt(tradeParams.settings.entryWei),
-            maxOpenPositions: tradeParams.settings.maxOpenPositions,
-            grantedTokenCount: pinned.length, platformFeeBps: hire.feeBps });
+          const v2 = isTradfiV2Settings(tradeParams.settings);
+          const schedule = isTradeScheduleSettings(tradeParams.settings);
+          if (portfolioHire) {
+            const rows = await deps.tradeAgent.dataPlane.universe("bstocks", c.req.raw.signal);
+            pinned = tradeParams.settings.portfolioTokens!.map((token) => {
+              const pool = dcaPoolForToken(token)!;
+              return { address: pool.stock, symbol: pool.symbol, lane: "bstocks" as const, marketCapUsd: null,
+                priceUsd: null, volume24hUsd: null, priceChange24hPct: null, holders: null };
+            });
+            for (let index = 0; index < pinned.length; index++) {
+              const token = pinned[index]!;
+              const amountInAtomic = BigInt(tradeParams.settings.capitalQuoteWei!) * BigInt(tradeParams.settings.portfolioWeightsBps![index]!) / 10_000n;
+              const row = rows?.find((candidate) => candidate.address.toLowerCase() === token.address.toLowerCase());
+              try {
+                await deps.tradeAgent.scheduleQuotes!.buy({ token: token.address, amountInAtomic, slippageBps: tradeParams.settings.slippageBps,
+                  ...(row?.venues === undefined ? {} : { venues: row.venues }), signal: c.req.raw.signal });
+              } catch { return fail(c, 400, "portfolio_token_unquotable", `${token.symbol} has no direct buy quote.`); }
+            }
+          }
+          // R2.7/R3.5 (D5): next to the pin reads, before any write — a
+          // refused hire leaves no claim/lease/agent row behind.
+          if (v2 && trade.aggregatorGuard !== undefined) {
+            const guardOk = deps.tradeAgent?.guardVerified !== undefined && await deps.tradeAgent.guardVerified(trade.aggregatorGuard);
+            if (!guardOk) return fail(c, 503, "guard_unverified");
+          }
+          if (schedule) {
+            if (tradeAgent === undefined) return fail(c, 503, "trade_not_ready");
+            const activeTradeAgent = tradeAgent;
+            const chosenCandidate = pinned.find((candidate) =>
+              candidate.address.toLowerCase() === tradeParams.settings.scheduleToken!.toLowerCase());
+            if (chosenCandidate === undefined) {
+              // R2.4 (H3): a transient (`unknown`) probe failure on the chosen
+              // token is retryable, not a permanent "not capable" verdict.
+              const key = `${tradeParams.settings.scheduleToken!.toLowerCase()}:${BigInt(tradeParams.settings.minEntryWei!).toString(10)}`;
+              if (lastScheduleCapability.get(key) === "unknown") return fail(c, 503, "capability_preview_incomplete");
+              return fail(c, 400, "schedule_token_not_granted");
+            }
+            // R2.3 (H2): one list feeds both the grant and its sizing below.
+            pinned = scheduleGrantList(pinned, chosenCandidate);
+            if (activeTradeAgent.scheduleQuotes === undefined) return fail(c, 503, "trade_not_ready");
+            const tokens = await cachedSchedulable(BigInt(tradeParams.settings.entryWei), tradeParams.settings.slippageBps, c.req.raw.signal);
+            if (!tokens.some((token) => token.address.toLowerCase() === tradeParams.settings.scheduleToken!.toLowerCase())) return fail(c, 400, "schedule_token_unquotable");
+            const nowSeconds = nowSec();
+            const first = tradeParams.settings.scheduleFirstAtSec!;
+            if (first !== null && (first < nowSeconds - 300 || first > nowSeconds + tradeParams.ttlSec - 7200)) return fail(c, 400, "schedule_first_buy_out_of_session");
+            const endAt = tradeParams.settings.scheduleEndAtSec!;
+            if (endAt !== null && endAt <= nowSeconds) return fail(c, 400, "schedule_end_in_past");
+          }
+          if (dcaPool !== null && dcaDeps !== undefined) {
+            // §9.3: the pinned pool's identity, re-read at the finalized block.
+            let identity: DcaPoolIdentity;
+            try {
+              identity = await dcaDeps.chain.poolIdentity(dcaPool.pool);
+            } catch {
+              return fail(c, 503, "evidence_unreadable");
+            }
+            const legs = dcaPoolLegs(dcaPool);
+            if (identity.token0.toLowerCase() !== legs.token0.toLowerCase() || identity.token1.toLowerCase() !== legs.token1.toLowerCase()
+              || identity.fee !== dcaPool.fee || identity.tickSpacing !== dcaPool.tickSpacing) return fail(c, 400, "dca_pool_mismatch");
+          }
+          // AUTO-DCA §10.1: a DCA deposit also covers the first base order's platform fee (none: R2.1, 2026-09-25).
+          if (v2) funding = await enrichTradfiV2Funding({ funding, wallet: tradeParams.walletAddress,
+            capitalQuoteWei: BigInt(tradeParams.settings.capitalQuoteWei!) + (dcaHire ? tradfiV2BuyFeeWei(BigInt(tradeParams.settings.entryWei), DCA_PLATFORM_FEE_BPS) : 0n),
+            ...(tradeParams.settings.cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: BigInt(tradeParams.settings.cmcTotalBudgetWei) }), signal: c.req.raw.signal });
+          // R2.9: the route's `capDayWei ≥ dcaNativeReserveWei(N)` is the authority; the web mirror is a convenience.
+          const dcaSized = dcaHire
+            ? checkTradfiDcaSizing({ capDayWei: tradeParams.capDayWei, entryWei: BigInt(tradeParams.settings.entryWei), dcaOrderWei: BigInt(tradeParams.settings.dcaOrderWei!),
+              dcaMaxOrders: tradeParams.settings.dcaMaxOrders!, capitalQuoteWei: BigInt(tradeParams.settings.capitalQuoteWei!) })
+            : null;
+          const portfolioSized = portfolioHire ? checkTradfiPortfolioSizing({ capDayWei: tradeParams.capDayWei,
+            capitalQuoteWei: BigInt(tradeParams.settings.capitalQuoteWei!), tokenCount: pinned.length,
+            intervalSec: tradeParams.settings.portfolioIntervalSec! }) : null;
+          if (portfolioSized !== null && !portfolioSized.ok) return fail(c, 400, "capital_too_small", portfolioSized.nativeShortfallWei > 0n
+            ? `Smart Portfolio needs a BNB day cap of at least ${formatEther(portfolioSized.nativeReserveWei)} BNB.`
+            : `Smart Portfolio capital must be at least ${formatEther(portfolioSized.requiredQuoteWei)} USDT.`);
+          if (dcaSized !== null && !dcaSized.ok) return fail(c, 400, "capital_too_small", dcaSized.nativeShortfallWei > 0n
+            ? `Auto DCA needs a BNB day cap of at least ${formatEther(dcaSized.nativeReserveWei)} BNB.`
+            : `Auto DCA capital must be at least ${formatEther(dcaSized.requiredQuoteWei)} USDT.`);
+          const sized = portfolioSized !== null ? portfolioSized : dcaSized !== null ? dcaSized
+            : schedule
+            ? checkTradfiScheduleSizing({ capDayWei: tradeParams.capDayWei, entryWei: BigInt(tradeParams.settings.entryWei), capitalQuoteWei: BigInt(tradeParams.settings.capitalQuoteWei!),
+                platformFeeBps: hire.feeBps, grantedTokenCount: pinned.length, intervalSec: tradeParams.settings.scheduleIntervalSec!, ttlSec: tradeParams.ttlSec,
+                endKind: tradeParams.settings.scheduleEndKind!, endRuns: tradeParams.settings.scheduleEndRuns!, endAtSec: tradeParams.settings.scheduleEndAtSec!,
+                anchorAtSec: tradeParams.settings.scheduleFirstAtSec ?? observedAtSec })
+            : v2
+            ? checkTradfiV2Sizing({ capDayWei: tradeParams.capDayWei, minEntryWei: BigInt(tradeParams.settings.minEntryWei!),
+              maxEntryWei: BigInt(tradeParams.settings.entryWei), capitalQuoteWei: BigInt(tradeParams.settings.capitalQuoteWei!),
+              maxOpenPositions: tradeParams.settings.maxOpenPositions, grantedTokenCount: pinned.length, platformFeeBps: hire.feeBps })
+            : checkTradeSizing({ capDayWei: tradeParams.capDayWei, entryWei: BigInt(tradeParams.settings.entryWei),
+              maxOpenPositions: tradeParams.settings.maxOpenPositions, grantedTokenCount: pinned.length, platformFeeBps: hire.feeBps });
           if (!sized.ok) return fail(c, 400, "capital_too_small",
-            `Total capital must be at least ${formatEther(sized.minimumCapWei)} BNB.`);
+            schedule ? `Schedule funding is too small on the ${"shortfallQuoteWei" in sized && sized.shortfallQuoteWei > 0n ? "USDT" : "BNB"} side.`
+              : v2 ? `Total capital must be at least ${BigInt(tradeParams.settings.capitalQuoteWei!).toString(10)} USDT atomic units.`
+              : `Total capital must be at least ${formatEther((sized as ReturnType<typeof checkTradeSizing>).minimumCapWei)} BNB.`);
 
           const occupancy = await convergeRevokedWalletOccupants({
             ownerAddress: owner,
@@ -2320,10 +2849,21 @@ export function createServer(deps: ServerDeps): Hono {
             return fail(c, 503, "evidence_unreadable");
           }
           const expiresAt = Math.floor(authorityExpiresAtMs / 1_000);
+          // Verified above, next to the pin reads (R2.7/R3.5) — re-checking here
+          // would let a guard blip pass verification but grant without the rule.
+          const aggregatorGuard = v2 ? trade.aggregatorGuard : undefined;
+          // Auto DCA charges no platform fee: no treasury transfer rule, and a per-trade debit of the base order alone.
+          const v2FeeBps = dcaHire ? DCA_PLATFORM_FEE_BPS : hire.feeBps;
+          const grantFeeBps = portfolioHire ? PORTFOLIO_PLATFORM_FEE_BPS : v2FeeBps;
+          // AUTO-DCA §9.1: exactly USDT + the chosen stock, plus the three NFPM rules.
           const sessionSpec = tradeSessionSpec({ venues: trade.venues,
             ...(trade.feeTreasury === undefined ? {} : { treasury: trade.feeTreasury }),
-            tokens: pinned.map(({ address }) => ({ token: address })),
-            nativeCaps: [{ limit: tradeParams.capDayWei, period: "day" }], expiresAt, nowSeconds: observedAtSec });
+            ...(aggregatorGuard === undefined ? {} : { aggregatorGuard }),
+            tokens: dcaPool !== null ? [{ token: dcaPool.stock }] : pinned.map(({ address }) => ({ token: address })),
+            nativeCaps: [{ limit: tradeParams.capDayWei, period: "day" }], expiresAt, nowSeconds: observedAtSec,
+            ...(v2 ? { quoteToken: USDT_56, quoteDailyCapWei: BigInt(tradeParams.settings.capitalQuoteWei!) * TRADFI_V2_QUOTE_CAP_TURNS,
+              quotePerTradeCapWei: tradfiV2EntryReservation(BigInt(tradeParams.settings.entryWei), grantFeeBps), platformFeeBps: grantFeeBps } : {}),
+            ...(dcaPool !== null ? { nfpm: NFPM_56 } : {}) });
           const nativeCaps = sessionSpec.spendCaps.filter((cap) => cap.token === undefined && cap.period === "day");
           if (nativeCaps.length !== 1) return fail(c, 503, "evidence_unreadable");
           let permissions;
@@ -2339,7 +2879,10 @@ export function createServer(deps: ServerDeps): Hono {
             keyStoreKeyId: keccak256(sessionPublicKey), sessionSpec, permissions,
             grantDigest: grantDigest({ permissions, expiresAt, walletAddress: tradeParams.walletAddress, sessionAddress }),
             expiresAt, sizing: { openNativeBudgetWei: "0", capDayWei: tradeParams.capDayWei.toString(10),
-              sizingPreset: "trade-v1", sizingPresetVersion: 1 }, funding,
+              sizingPreset: "trade-v1", sizingPresetVersion: 1,
+              ...(v2 ? { entryWei: tradeParams.settings.entryWei, quotePerTradeWei: tradfiV2EntryReservation(BigInt(tradeParams.settings.entryWei), grantFeeBps).toString(10), settlementAsset: "USDT" as const, minEntryWei: tradeParams.settings.minEntryWei,
+                capitalQuoteWei: tradeParams.settings.capitalQuoteWei, cmcNewsEnabled: tradeParams.settings.cmcNewsEnabled,
+                ...(tradeParams.settings.cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: tradeParams.settings.cmcTotalBudgetWei }) } : {}) }, funding,
             createdAtSec: Math.floor(acceptedAtMs / 1_000), keyStoreVerdictAtS1: ownerVerdict,
             provisionActionId, hireRunId: tradeParams.hireRunId, autoGrant: true,
             initialTradeSettings: { params: tradeParams.settingsParams, digest: tradeSettingsDigest(tradeParams.settingsParams) },
@@ -2350,7 +2893,7 @@ export function createServer(deps: ServerDeps): Hono {
             row = await deps.agentStore.createProvisioningAgent({ record: {
               id, ownerAddress: owner, walletAddress: tradeParams.walletAddress, custodyModel: "passkey",
               caps: { dailyNativeWei: tradeParams.capDayWei,
-                perTradeNativeWei: BigInt(tradeParams.settings.entryWei) }, httpRuntimeProfile: "unbound-v1",
+                ...(isTradfiV2Settings(tradeParams.settings) ? {} : { perTradeNativeWei: BigInt(tradeParams.settings.entryWei) }) }, httpRuntimeProfile: "unbound-v1",
             }, pendingGrant: pending, sessionKey, signal: occupancy.signal });
           } catch (error) {
             if (occupancy.signal.aborted || nowMs() >= occupancy.deadlineAt) throw new HireEvidenceError();
@@ -2403,6 +2946,7 @@ export function createServer(deps: ServerDeps): Hono {
           });
         } catch (error) {
           if (error instanceof TradeNotReadyError) return fail(c, 503, "trade_not_ready");
+          if (error instanceof TradfiCapabilityIncompleteError) return fail(c, 503, "capability_preview_incomplete", "TradFi capability preview is incomplete; retry.");
           if (error instanceof PinUnreadableError) return fail(c, 503, "evidence_unreadable");
           if (error instanceof PinTooSmallError) return fail(c, 400, "universe_too_small");
           if (error instanceof ModelUnavailableError) return fail(c, 400, "model_unavailable");
@@ -2465,23 +3009,42 @@ export function createServer(deps: ServerDeps): Hono {
               if (tradeParams.executionModel === "mid-cap" && !deps.tradeAgent.readiness.allowlistAvailable) {
                 throw new ModelUnavailableError(tradeParams.executionModel);
               }
-              const [ownerVerdict, funding, pinned] = await Promise.all([
+              let [ownerVerdict, funding, pinned] = await Promise.all([
                 verifyDeclaredWallet({ owner: verified.ownerAddress, wallet: tradeParams.walletAddress,
                   reader: deps.keyStoreReader, signal: c.req.raw.signal }),
                 hire.evidence.readFunding(tradeParams.walletAddress, hire.grantGasHeadroomWei, observedAtSec, c.req.raw.signal),
-                cachedPin(tradeParams.executionModel, tradeParams.walletAddress, c.req.raw.signal),
+                cachedPin(tradeParams.executionModel, isTradeScheduleSettings(tradeParams.settings) ? "schedule" : "ai", tradeParams.walletAddress, c.req.raw.signal,
+                  isTradfiV2Settings(tradeParams.settings) ? { minEntryAtomic: BigInt(tradeParams.settings.minEntryWei!), slippageBps: tradeParams.settings.slippageBps } : undefined),
               ]).catch((error: unknown) => {
                 if (error instanceof TradeNotReadyError || error instanceof ModelUnavailableError
-                  || error instanceof PinTooSmallError || error instanceof PinUnreadableError) throw error;
+                  || error instanceof PinTooSmallError || error instanceof PinUnreadableError || error instanceof TradfiCapabilityIncompleteError) throw error;
                 throw new HireEvidenceError();
               });
               if (ownerVerdict === "unreadable") throw new HireEvidenceError();
               if (ownerVerdict === "no-matching-key") throw new HireWalletOwnerError();
-              const sized = checkTradeSizing({ capDayWei: tradeParams.capDayWei,
-                entryWei: BigInt(tradeParams.settings.entryWei),
-                maxOpenPositions: tradeParams.settings.maxOpenPositions,
-                grantedTokenCount: pinned.length, platformFeeBps: hire.feeBps });
-              if (!sized.ok) throw new TradeCapitalTooSmallError(sized.minimumCapWei);
+              const v2 = isTradfiV2Settings(tradeParams.settings);
+              // R2.3 (H2) — the same derivation as the live hire path, kept
+              // consistent even though this branch is unreachable for trade-v1 (N5).
+              if (isTradeScheduleSettings(tradeParams.settings)) {
+                const chosenCandidate = pinned.find((candidate) =>
+                  candidate.address.toLowerCase() === tradeParams.settings.scheduleToken!.toLowerCase());
+                if (chosenCandidate !== undefined) pinned = scheduleGrantList(pinned, chosenCandidate);
+              }
+              // R2.7/R3.5 (D5) — kept consistent with the live hire path even
+              // though this branch is unreachable for trade-v1 (N5).
+              if (v2 && trade.aggregatorGuard !== undefined) {
+                const guardOk = deps.tradeAgent?.guardVerified !== undefined && await deps.tradeAgent.guardVerified(trade.aggregatorGuard);
+                if (!guardOk) throw new GuardUnverifiedError();
+              }
+              if (v2) funding = await enrichTradfiV2Funding({ funding, wallet: tradeParams.walletAddress,
+                capitalQuoteWei: BigInt(tradeParams.settings.capitalQuoteWei!), ...(tradeParams.settings.cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: BigInt(tradeParams.settings.cmcTotalBudgetWei) }), signal: c.req.raw.signal });
+              const sized = v2
+                ? checkTradfiV2Sizing({ capDayWei: tradeParams.capDayWei, minEntryWei: BigInt(tradeParams.settings.minEntryWei!),
+                  maxEntryWei: BigInt(tradeParams.settings.entryWei), capitalQuoteWei: BigInt(tradeParams.settings.capitalQuoteWei!),
+                  maxOpenPositions: tradeParams.settings.maxOpenPositions, grantedTokenCount: pinned.length, platformFeeBps: hire.feeBps })
+                : checkTradeSizing({ capDayWei: tradeParams.capDayWei, entryWei: BigInt(tradeParams.settings.entryWei),
+                  maxOpenPositions: tradeParams.settings.maxOpenPositions, grantedTokenCount: pinned.length, platformFeeBps: hire.feeBps });
+              if (!sized.ok) throw new TradeCapitalTooSmallError("shortfallQuoteWei" in sized ? sized.shortfallQuoteWei : sized.minimumCapWei);
 
               const sessionKey = generatePrivateKey();
               const sessionAccount = privateKeyToAccount(sessionKey);
@@ -2489,11 +3052,15 @@ export function createServer(deps: ServerDeps): Hono {
               const sessionAddress = sessionAccount.address;
               if (getAddress(publicKeyToAddress(sessionPublicKey)) !== getAddress(sessionAddress)) throw new HireEvidenceError();
               const expiresAt = observedAtSec + tradeParams.ttlSec;
+              const aggregatorGuard = v2 ? trade.aggregatorGuard : undefined;
               const sessionSpec = tradeSessionSpec({ venues: trade.venues,
                 ...(trade.feeTreasury === undefined ? {} : { treasury: trade.feeTreasury }),
+                ...(aggregatorGuard === undefined ? {} : { aggregatorGuard }),
                 tokens: pinned.map(({ address }) => ({ token: address })),
                 nativeCaps: [{ limit: tradeParams.capDayWei, period: "day" }],
-                expiresAt, nowSeconds: observedAtSec });
+                expiresAt, nowSeconds: observedAtSec,
+                ...(v2 ? { quoteToken: USDT_56, quoteDailyCapWei: BigInt(tradeParams.settings.capitalQuoteWei!) * TRADFI_V2_QUOTE_CAP_TURNS,
+                  quotePerTradeCapWei: tradfiV2EntryReservation(BigInt(tradeParams.settings.entryWei), hire.feeBps), platformFeeBps: hire.feeBps } : {}) });
               const nativeCaps = sessionSpec.spendCaps.filter((cap) => cap.token === undefined && cap.period === "day");
               if (nativeCaps.length !== 1) throw new HireEvidenceError();
               const permissions = validateSessionSpec(sessionSpec, { nowSeconds: observedAtSec,
@@ -2504,7 +3071,10 @@ export function createServer(deps: ServerDeps): Hono {
                 keyStoreKeyId: keccak256(sessionPublicKey), sessionSpec, permissions,
                 grantDigest: grantDigest({ permissions, expiresAt, walletAddress: tradeParams.walletAddress, sessionAddress }),
                 expiresAt, sizing: { openNativeBudgetWei: "0", capDayWei: tradeParams.capDayWei.toString(10),
-                  sizingPreset: "trade-v1", sizingPresetVersion: 1 }, funding, createdAtSec: observedAtSec,
+                  sizingPreset: "trade-v1", sizingPresetVersion: 1,
+                  ...(v2 ? { entryWei: tradeParams.settings.entryWei, quotePerTradeWei: tradfiV2EntryReservation(BigInt(tradeParams.settings.entryWei), hire.feeBps).toString(10), settlementAsset: "USDT" as const, minEntryWei: tradeParams.settings.minEntryWei,
+                    capitalQuoteWei: tradeParams.settings.capitalQuoteWei, cmcNewsEnabled: tradeParams.settings.cmcNewsEnabled,
+                    ...(tradeParams.settings.cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: tradeParams.settings.cmcTotalBudgetWei }) } : {}) }, funding, createdAtSec: observedAtSec,
                 keyStoreVerdictAtS1: ownerVerdict, provisionActionId,
                 hireRunId: tradeParams.hireRunId, autoGrant: true,
                 initialTradeSettings: {
@@ -2811,7 +3381,9 @@ export function createServer(deps: ServerDeps): Hono {
         }
         if (error instanceof HireWalletOwnerError) return fail(c, 403, "wallet_owner_mismatch");
         if (error instanceof HireEvidenceError) return fail(c, 503, "evidence_unreadable");
+        if (error instanceof GuardUnverifiedError) return fail(c, 503, "guard_unverified");
         if (error instanceof TradeNotReadyError) return fail(c, 503, "trade_not_ready");
+        if (error instanceof TradfiCapabilityIncompleteError) return fail(c, 503, "capability_preview_incomplete", "TradFi capability preview is incomplete; retry.");
         if (error instanceof PinUnreadableError) return fail(c, 503, "evidence_unreadable");
         if (error instanceof PinTooSmallError) return fail(c, 400, "universe_too_small");
         if (error instanceof ModelUnavailableError) return fail(c, 400, "model_unavailable");
@@ -2864,7 +3436,7 @@ export function createServer(deps: ServerDeps): Hono {
               || prepared.params.sizingPreset === "lending-v1"
               ? prepared.params.capDayWei : prepared.params.openNativeBudgetWei,
               ...(prepared.params.sizingPreset === "trade-v1"
-                ? { perTradeNativeWei: BigInt(prepared.params.settings.entryWei) }
+              ? (isTradfiV2Settings(prepared.params.settings) ? {} : { perTradeNativeWei: BigInt(prepared.params.settings.entryWei) })
                 : {}) },
             httpRuntimeProfile,
           },
@@ -2924,7 +3496,7 @@ export function createServer(deps: ServerDeps): Hono {
     });
 
     const renewalQuiescence = async (agent: AgentRecord) => assessRenewalQuiescence(agent, {
-      ...(deps.tradeAgent === undefined ? {} : { tradeIntents: deps.tradeAgent.intents }),
+      ...(deps.tradeAgent === undefined ? {} : { tradeIntents: deps.tradeAgent.intents, tradeSettings: deps.tradeAgent.settingsStore }),
       ...(deps.lp === undefined ? {} : { lpSequences: deps.lp.store }),
       journal: deps.journal,
     });
@@ -3001,70 +3573,147 @@ export function createServer(deps: ServerDeps): Hono {
       readonly universe?: Record<string, unknown>;
     }> => {
       const facts = agent.sessionFacts;
+      const tradeAgent = deps.tradeAgent;
       if (facts === null) throw new ConflictError("The agent has no granted session.");
       const sizingName = facts.hireSizing?.name ?? (agent.httpRuntimeProfile === "trade-v1" ? "trade-v1" : agent.httpRuntimeProfile === "lp-v1" ? "lp-v1" : null);
       if (sizingName === "lending-v1" || sizingName === null) throw new ConflictError("This agent kind is not renewable in v1.", "renewal_unsupported_kind");
       const expiresAt = nowSec() + ttlSec;
+      const tradeV2 = facts.hireSizing?.settlementAsset === "USDT";
+      let portfolioRenewal = false;
       let spec: import("./core/types.js").SessionSpec;
       let universe: Record<string, unknown> | undefined;
       if (facts.hireSizing?.name === "trade-v1") {
-        const tradeAgent = deps.tradeAgent;
         if (tradeAgent === undefined || !tradeAgent.readiness.ready) throw new ConflictError("Trading universe is unavailable.", "renewal_universe_unavailable");
         const settingsRow = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
         if (settingsRow === null) throw new ConflictError("Trading settings are unavailable.", "renewal_universe_unavailable");
         const parsedSettings = parseTradeSettings(settingsRow.params);
         if (!parsedSettings.ok) throw new ConflictError("Trading settings are invalid.", "renewal_universe_unavailable");
-        let pinned: readonly PinnedCandidate[];
-        try { pinned = await cachedPin(parsedSettings.value.effective.executionModel, agent.walletAddress, signal); }
-        catch { throw new ConflictError("Trading universe is unavailable.", "renewal_universe_unavailable"); }
-        const [positions, unsettled] = await Promise.all([
-          tradeAgent.positions.list(agent.ownerAddress, agent.id),
-          tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id),
-        ]);
-        const held: Address[] = [];
-        const heldSeen = new Set<string>();
-        for (const token of [...positions.filter((row) => row.status === "open").map((row) => row.token), ...unsettled.map((row) => row.token)]) {
-          let normalized: Address;
-          try { normalized = getAddress(token); } catch { throw new ConflictError("A held trade token is malformed.", "renewal_universe_unavailable"); }
-          if (!heldSeen.has(normalized.toLowerCase())) { heldSeen.add(normalized.toLowerCase()); held.push(normalized); }
+        // AUTO-DCA §9.4: the DCA grant renews VERBATIM (the grid/LP precedent), with the guard
+        // rule appended when missing and verified; no pin, and neither half of the `< 5` check.
+        const effective = parsedSettings.value.effective;
+        portfolioRenewal = isTradePortfolioSettings(effective);
+        if (isTradeDcaSettings(effective) || isTradePortfolioSettings(effective)) {
+          const hasGuardRule = trade.aggregatorGuard !== undefined && facts.spec.allowedCalls.some((rule) =>
+            rule.to?.toLowerCase() === trade.aggregatorGuard!.toLowerCase() && rule.selector === TRADFI_GUARD_SWAP_SELECTOR);
+          const guardVerifiedNow = trade.aggregatorGuard !== undefined && !hasGuardRule
+            && tradeAgent.guardVerified !== undefined && await tradeAgent.guardVerified(trade.aggregatorGuard);
+          if (trade.aggregatorGuard !== undefined && !hasGuardRule && !guardVerifiedNow) throw new GuardUnverifiedError();
+          spec = { ...facts.spec, allowedCalls: [...facts.spec.allowedCalls,
+            ...(guardVerifiedNow ? [{ to: trade.aggregatorGuard!, selector: TRADFI_GUARD_SWAP_SELECTOR }] : [])], expiresAt };
+          const capDayWei = nativeDayCapWei(facts);
+          if (capDayWei === null) throw new ConflictError("The native day cap is unavailable.", "renewal_universe_unavailable");
+          const sized = isTradePortfolioSettings(effective)
+            ? checkTradfiPortfolioSizing({ capDayWei, capitalQuoteWei: BigInt(effective.capitalQuoteWei!),
+              tokenCount: effective.portfolioTokens!.length, intervalSec: effective.portfolioIntervalSec! })
+            : checkTradfiDcaSizing({ capDayWei, entryWei: BigInt(effective.entryWei), dcaOrderWei: BigInt(effective.dcaOrderWei!),
+              dcaMaxOrders: effective.dcaMaxOrders!, capitalQuoteWei: BigInt(effective.capitalQuoteWei!) });
+          if (!sized.ok) throw new TradeCapitalTooSmallError(sized.shortfallQuoteWei > 0n ? sized.shortfallQuoteWei : sized.nativeShortfallWei);
+        } else {
+          let pinned: readonly PinnedCandidate[];
+          try { pinned = await cachedPin(parsedSettings.value.effective.executionModel, isTradeScheduleSettings(parsedSettings.value.effective) ? "schedule" : "ai", agent.walletAddress, signal,
+            tradeV2 ? { minEntryAtomic: BigInt(parsedSettings.value.effective.minEntryWei!), slippageBps: parsedSettings.value.effective.slippageBps } : undefined); }
+          catch { throw new ConflictError("Trading universe is unavailable.", "renewal_universe_unavailable"); }
+          const [positions, unsettled] = await Promise.all([
+            tradeAgent.positions.list(agent.ownerAddress, agent.id),
+            tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id),
+          ]);
+          const held: Address[] = [];
+          const heldSeen = new Set<string>();
+          for (const token of [...positions.filter((row) => row.status === "open").map((row) => row.token), ...unsettled.map((row) => row.token)]) {
+            let normalized: Address;
+            try { normalized = getAddress(token); } catch { throw new ConflictError("A held trade token is malformed.", "renewal_universe_unavailable"); }
+            if (!heldSeen.has(normalized.toLowerCase())) { heldSeen.add(normalized.toLowerCase()); held.push(normalized); }
+          }
+          const stockLimit = tradeV2 ? 28 : 25;
+          if (held.length > stockLimit) throw new ConflictError(`The held trade universe exceeds ${stockLimit} tokens.`, "renewal_universe_unavailable");
+          const schedule = isTradeScheduleSettings(parsedSettings.value.effective);
+          const scheduleToken = schedule ? getAddress(parsedSettings.value.effective.scheduleToken!) : undefined;
+          if (scheduleToken !== undefined) {
+            // R2.5 (H4): the chosen token is kept whenever it is CURRENTLY
+            // granted, whatever the probe says now — it was capable at hire (or
+            // a prior renewal). Only refuse when it is neither granted nor
+            // capable today.
+            const alreadyGranted = facts.spec.allowedCalls.some((rule) =>
+              rule.selector === APPROVE_SELECTOR && rule.to?.toLowerCase() === scheduleToken.toLowerCase());
+            const stillCapable = pinned.some((candidate) => candidate.address.toLowerCase() === scheduleToken.toLowerCase());
+            if (!alreadyGranted && !stillCapable) {
+              throw new ConflictError("The scheduled token can no longer be renewed.", "schedule_token_not_renewable");
+            }
+          }
+          const selected = [...held];
+          const selectedSet = new Set(selected.map((token) => token.toLowerCase()));
+          // R2.5 (H4): renewal order for a schedule agent is held, then the
+          // chosen token, then the pin — a schedule agent's own scheduled token
+          // must never fall out of the grant just because the probe or the pin
+          // sort moved it past the cutoff.
+          if (scheduleToken !== undefined && !selectedSet.has(scheduleToken.toLowerCase()) && selected.length < stockLimit) {
+            selected.push(scheduleToken);
+            selectedSet.add(scheduleToken.toLowerCase());
+          }
+          for (const candidate of pinned) {
+            if (selected.length >= stockLimit) break;
+            if (!selectedSet.has(candidate.address.toLowerCase())) { selected.push(candidate.address); selectedSet.add(candidate.address.toLowerCase()); }
+          }
+          if (pinned.length < 5 || selected.length < 5) throw new ConflictError("The trading universe is below the minimum pin.", "renewal_universe_unavailable");
+          const currentTokens = new Set(pinnedTokens(facts, tradeV2).map((token) => token.toLowerCase()));
+          const added = selected.filter((token) => !currentTokens.has(token.toLowerCase()));
+          const nativeCaps = facts.spec.spendCaps.filter((cap) => cap.token === undefined);
+          if (nativeCaps.length === 0) throw new ConflictError("The native session cap is unavailable.", "renewal_universe_unavailable");
+          // C5/R2.7/R3.5: verify (and 503) only when the spec does not already
+          // carry the guard rule — an already-granted agent renews without
+          // paying for a fresh chain read, and F5's bug (the rule was generated
+          // but never survived the APPROVE-only filter below) is fixed by
+          // appending it explicitly instead of relying on that filter.
+          const hasGuardRule = trade.aggregatorGuard !== undefined && facts.spec.allowedCalls.some((rule) =>
+            rule.to?.toLowerCase() === trade.aggregatorGuard!.toLowerCase() && rule.selector === TRADFI_GUARD_SWAP_SELECTOR);
+          const guardVerifiedNow = tradeV2 && trade.aggregatorGuard !== undefined && !hasGuardRule
+            ? tradeAgent.guardVerified !== undefined && await tradeAgent.guardVerified(trade.aggregatorGuard)
+            : false;
+          if (tradeV2 && trade.aggregatorGuard !== undefined && !hasGuardRule && !guardVerifiedNow) throw new GuardUnverifiedError();
+          const generated = tradeSessionSpec({
+            venues: trade.venues,
+            ...(trade.feeTreasury === undefined ? {} : { treasury: trade.feeTreasury }),
+            ...(guardVerifiedNow ? { aggregatorGuard: trade.aggregatorGuard } : {}),
+            tokens: added.map((token): TokenGrant => ({ token })), nativeCaps, expiresAt, nowSeconds: nowSec(),
+          });
+          const finalSet = new Set(selected.map((token) => token.toLowerCase()));
+          if (tradeV2) finalSet.add(USDT_56.toLowerCase());
+          const keptCalls = facts.spec.allowedCalls.filter((rule) =>
+            !(rule.selector === APPROVE_SELECTOR && rule.to !== undefined) || finalSet.has(rule.to.toLowerCase()));
+          const addedCalls = generated.allowedCalls.filter((rule) =>
+            rule.selector === APPROVE_SELECTOR && rule.to !== undefined && added.some((token) => token.toLowerCase() === rule.to!.toLowerCase()));
+          const addedGuardCall = tradeV2 && guardVerifiedNow
+            ? generated.allowedCalls.filter((rule) => rule.to?.toLowerCase() === trade.aggregatorGuard!.toLowerCase() && rule.selector === TRADFI_GUARD_SWAP_SELECTOR)
+            : [];
+          const keptCaps = facts.spec.spendCaps.filter((cap) => cap.token === undefined || finalSet.has(cap.token.toLowerCase()));
+           const addedCaps = generated.spendCaps.filter((cap) => cap.token !== undefined && added.some((token) => token.toLowerCase() === cap.token!.toLowerCase()));
+           spec = { ...facts.spec, allowedCalls: [...keptCalls, ...addedCalls, ...addedGuardCall], spendCaps: [...keptCaps, ...addedCaps], expiresAt };
+           const grantedTokens = new Set(spec.allowedCalls
+             .filter((rule) => rule.selector === APPROVE_SELECTOR && rule.to !== undefined)
+             .map((rule) => rule.to!.toLowerCase()));
+           const cappedTokens = new Set(spec.spendCaps.filter((cap) => cap.token !== undefined).map((cap) => cap.token!.toLowerCase()));
+           if (held.some((token) => !grantedTokens.has(token.toLowerCase()) || !cappedTokens.has(token.toLowerCase()))) {
+             throw new ConflictError("A held trade token cannot be sold by the renewal spec.", "renewal_universe_unavailable");
+           }
+           const capDayWei = nativeCaps.find((cap) => cap.period === "day")?.limit;
+          if (capDayWei === undefined) throw new ConflictError("The native day cap is unavailable.", "renewal_universe_unavailable");
+          // R2.2 (HIGH-1): a schedule agent's native reserve is the schedule reserve (checkTradfiScheduleSizing),
+          // never the v2 (N+3)*R floor — the spec's original "P = 1 is weaker" sentence was wrong (see R2.2).
+          const sized = schedule
+            ? checkTradfiScheduleSizing({ capDayWei, entryWei: BigInt(parsedSettings.value.effective.entryWei),
+              capitalQuoteWei: BigInt(parsedSettings.value.effective.capitalQuoteWei!), platformFeeBps: tradeAgent.feeBps,
+              grantedTokenCount: selected.length, intervalSec: parsedSettings.value.effective.scheduleIntervalSec!,
+              ttlSec, endKind: parsedSettings.value.effective.scheduleEndKind!, endRuns: parsedSettings.value.effective.scheduleEndRuns!,
+              endAtSec: parsedSettings.value.effective.scheduleEndAtSec!, anchorAtSec: parsedSettings.value.effective.scheduleFirstAtSec ?? nowSec() })
+            : tradeV2
+            ? checkTradfiV2Sizing({ capDayWei, minEntryWei: BigInt(parsedSettings.value.effective.minEntryWei!), maxEntryWei: BigInt(parsedSettings.value.effective.entryWei),
+              capitalQuoteWei: BigInt(parsedSettings.value.effective.capitalQuoteWei!), maxOpenPositions: parsedSettings.value.effective.maxOpenPositions,
+              grantedTokenCount: selected.length, platformFeeBps: tradeAgent.feeBps })
+            : checkTradeSizing({ capDayWei, entryWei: BigInt(parsedSettings.value.effective.entryWei), maxOpenPositions: parsedSettings.value.effective.maxOpenPositions,
+              grantedTokenCount: selected.length, platformFeeBps: tradeAgent.feeBps });
+          if (!sized.ok) throw new TradeCapitalTooSmallError("shortfallQuoteWei" in sized ? sized.shortfallQuoteWei : sized.minimumCapWei);
+          universe = { tokens: selected, held: held.length, pinned: pinned.length, dropped: [...currentTokens].filter((token) => !finalSet.has(token)) };
         }
-        if (held.length > 25) throw new ConflictError("The held trade universe exceeds 25 tokens.", "renewal_universe_unavailable");
-        const selected = [...held];
-        const selectedSet = new Set(selected.map((token) => token.toLowerCase()));
-        for (const candidate of pinned) {
-          if (selected.length >= 25) break;
-          if (!selectedSet.has(candidate.address.toLowerCase())) { selected.push(candidate.address); selectedSet.add(candidate.address.toLowerCase()); }
-        }
-        if (pinned.length < 5 || selected.length < 5) throw new ConflictError("The trading universe is below the minimum pin.", "renewal_universe_unavailable");
-        const currentTokens = new Set(pinnedTokens(facts).map((token) => token.toLowerCase()));
-        const added = selected.filter((token) => !currentTokens.has(token.toLowerCase()));
-        const nativeCaps = facts.spec.spendCaps.filter((cap) => cap.token === undefined);
-        if (nativeCaps.length === 0) throw new ConflictError("The native session cap is unavailable.", "renewal_universe_unavailable");
-        const generated = tradeSessionSpec({
-          venues: trade.venues,
-          ...(trade.feeTreasury === undefined ? {} : { treasury: trade.feeTreasury }),
-          tokens: added.map((token): TokenGrant => ({ token })), nativeCaps, expiresAt, nowSeconds: nowSec(),
-        });
-        const finalSet = new Set(selected.map((token) => token.toLowerCase()));
-        const keptCalls = facts.spec.allowedCalls.filter((rule) =>
-          !(rule.selector === APPROVE_SELECTOR && rule.to !== undefined) || finalSet.has(rule.to.toLowerCase()));
-        const addedCalls = generated.allowedCalls.filter((rule) =>
-          rule.selector === APPROVE_SELECTOR && rule.to !== undefined && added.some((token) => token.toLowerCase() === rule.to!.toLowerCase()));
-        const keptCaps = facts.spec.spendCaps.filter((cap) => cap.token === undefined || finalSet.has(cap.token.toLowerCase()));
-         const addedCaps = generated.spendCaps.filter((cap) => cap.token !== undefined && added.some((token) => token.toLowerCase() === cap.token!.toLowerCase()));
-         spec = { ...facts.spec, allowedCalls: [...keptCalls, ...addedCalls], spendCaps: [...keptCaps, ...addedCaps], expiresAt };
-         const grantedTokens = new Set(spec.allowedCalls
-           .filter((rule) => rule.selector === APPROVE_SELECTOR && rule.to !== undefined)
-           .map((rule) => rule.to!.toLowerCase()));
-         const cappedTokens = new Set(spec.spendCaps.filter((cap) => cap.token !== undefined).map((cap) => cap.token!.toLowerCase()));
-         if (held.some((token) => !grantedTokens.has(token.toLowerCase()) || !cappedTokens.has(token.toLowerCase()))) {
-           throw new ConflictError("A held trade token cannot be sold by the renewal spec.", "renewal_universe_unavailable");
-         }
-         const capDayWei = nativeCaps.find((cap) => cap.period === "day")?.limit;
-        if (capDayWei === undefined) throw new ConflictError("The native day cap is unavailable.", "renewal_universe_unavailable");
-        const sized = checkTradeSizing({ capDayWei, entryWei: BigInt(parsedSettings.value.effective.entryWei), maxOpenPositions: parsedSettings.value.effective.maxOpenPositions, grantedTokenCount: selected.length, platformFeeBps: tradeAgent.feeBps });
-        if (!sized.ok) throw new TradeCapitalTooSmallError(sized.minimumCapWei);
-        universe = { tokens: selected, held: held.length, pinned: pinned.length, dropped: [...currentTokens].filter((token) => !finalSet.has(token)) };
       } else {
         spec = { ...facts.spec, expiresAt };
       }
@@ -3074,14 +3723,22 @@ export function createServer(deps: ServerDeps): Hono {
       const sessionPublicKey = sessionAccount.publicKey;
       const sessionAddress = sessionAccount.address;
        const observedFunding = await hire!.evidence.readFunding(agent.walletAddress, hire!.grantGasHeadroomWei, nowSec(), signal);
+       const cmcExposureWei = tradeV2 ? await currentCmcExposure(agent.id, agent.ownerAddress) : 0n;
+       const observedFundingV2 = tradeV2 && facts.hireSizing?.capitalQuoteWei !== undefined
+         ? await enrichTradfiV2Funding({ funding: observedFunding, wallet: agent.walletAddress, capitalQuoteWei: portfolioRenewal ? 0n : BigInt(facts.hireSizing.capitalQuoteWei),
+           cmcTotalBudgetWei: cmcExposureWei, ...(signal === undefined ? {} : { signal }) })
+         : observedFunding;
        // AUDIT A1 (SESSION-RENEWAL R2.5): the requirement is the evidence reader's
        // observed one — registrations counted from the KeyStore's listed keys —
        // never an assumption that the wallet is still registered.
-       const funding: import("./store/agents.js").FundingRequirement = observedFunding;
+       const funding: import("./store/agents.js").FundingRequirement = observedFundingV2;
       if (funding.balanceWei === null) throw new Error("The agent wallet balance could not be read.");
-      if (BigInt(funding.balanceWei) < BigInt(funding.requiredWei)) {
+      const renewalNativeTarget = facts.spec.spendCaps.find((cap) => cap.token === undefined && cap.period === "day")?.limit ?? 0n;
+      if (BigInt(funding.balanceWei) < BigInt(funding.requiredWei) + renewalNativeTarget) {
         throw new ConflictError("The agent wallet is underfunded for the renewal grant.", "renewal_underfunded");
       }
+      // Operator ruling 2026-09-30: a renewal grants a session, it does not top up capital.
+      // The USDT shortfall stays on `funding` for display; only the native grant balance refuses.
       const previousAddress = getAddress(publicKeyToAddress(facts.publicKey));
       return {
         spec, permissions, funding, sessionKey, sessionAddress, sessionPublicKey,
@@ -3090,6 +3747,9 @@ export function createServer(deps: ServerDeps): Hono {
           capDayWei: (facts.spec.spendCaps.find((cap) => cap.token === undefined && cap.period === "day")?.limit ?? 0n).toString(10),
           sizingPreset: sizingName,
           sizingPresetVersion: 1 as const,
+          ...(tradeV2 ? { entryWei: facts.hireSizing?.entryWei, quotePerTradeWei: facts.hireSizing?.quotePerTradeWei, settlementAsset: "USDT" as const, minEntryWei: facts.hireSizing?.minEntryWei,
+            capitalQuoteWei: facts.hireSizing?.capitalQuoteWei, cmcNewsEnabled: facts.hireSizing?.cmcNewsEnabled,
+            ...(facts.hireSizing?.cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: facts.hireSizing.cmcTotalBudgetWei }) } : {}),
         },
         previous: { publicKey: facts.publicKey, keyStoreKeyId: keccak256(facts.publicKey), accountKeyHash: accountKeyHashForAddress(previousAddress), expiry: facts.expiry },
         expiresAt,
@@ -3151,6 +3811,7 @@ export function createServer(deps: ServerDeps): Hono {
       } catch (error) {
          if (error instanceof ConflictError) return c.json({ data: { eligible: false, reason: error.code ?? "renewal_universe_unavailable", funding: null, previous: { expiry: agent.sessionFacts?.expiry ?? null, expired: agent.sessionFacts !== null && agent.sessionFacts.expiry <= nowSec() }, quiescent } });
          if (error instanceof TradeCapitalTooSmallError) return c.json({ data: { eligible: false, reason: "capital_too_small", funding: null, previous: { expiry: agent.sessionFacts?.expiry ?? null, expired: agent.sessionFacts !== null && agent.sessionFacts.expiry <= nowSec() }, quiescent } });
+         if (error instanceof GuardUnverifiedError) return c.json({ data: { eligible: false, reason: "guard_unverified", funding: null, previous: { expiry: agent.sessionFacts?.expiry ?? null, expired: agent.sessionFacts !== null && agent.sessionFacts.expiry <= nowSec() }, quiescent } });
         return fail(c, 503, "evidence_unreadable");
       }
     });
@@ -3256,8 +3917,16 @@ export function createServer(deps: ServerDeps): Hono {
         let funding: import("./store/agents.js").FundingRequirement;
         try {
           funding = await hire!.evidence.readFunding(priorPending.walletAddress, hire!.grantGasHeadroomWei, nowSec(), c.req.raw.signal);
+          if (priorPending.sizing.settlementAsset === "USDT" && priorPending.sizing.capitalQuoteWei !== undefined) {
+            const retrySettings = await deps.tradeAgent?.settingsStore.get(owner.ownerAddress, id);
+            const retryParsed = retrySettings === null || retrySettings === undefined ? null : parseTradeSettings(retrySettings.params);
+            funding = await enrichTradfiV2Funding({ funding, wallet: priorPending.walletAddress,
+              capitalQuoteWei: retryParsed?.ok === true && isTradePortfolioSettings(retryParsed.value.effective) ? 0n : BigInt(priorPending.sizing.capitalQuoteWei),
+              cmcTotalBudgetWei: await currentCmcExposure(id, owner.ownerAddress), signal: c.req.raw.signal });
+          }
           if (funding.balanceWei === null) throw new Error("Funding balance is unreadable.");
-          if (BigInt(funding.balanceWei) < BigInt(funding.requiredWei)) {
+          const retryNativeTarget = BigInt(priorPending.sizing.capDayWei);
+          if (BigInt(funding.balanceWei) < BigInt(funding.requiredWei) + retryNativeTarget) {
             return c.json({ error: { code: "renewal_underfunded" }, data: { funding } }, 402);
           }
         } catch (error) {
@@ -3320,6 +3989,7 @@ export function createServer(deps: ServerDeps): Hono {
           ? fail(c, 402, "renewal_underfunded", error.message)
           : fail(c, 409, error.code ?? "conflict", error.message);
         if (error instanceof TradeCapitalTooSmallError) return fail(c, 400, "capital_too_small", error.message);
+        if (error instanceof GuardUnverifiedError) return fail(c, 503, "guard_unverified");
         return fail(c, 503, "evidence_unreadable");
       }
     });
@@ -3445,6 +4115,23 @@ export function createServer(deps: ServerDeps): Hono {
         || (grantPreset === "trade-v1" && pending.autoGrant !== true)
         || pending.cancelRequestedAtSec !== undefined) {
         return fail(c, 409, "conflict");
+      }
+      if (grantPreset === "trade-v1" && pending.sizing.settlementAsset === "USDT" && pending.sizing.capitalQuoteWei !== undefined
+        && pending.grantAttempt === undefined) {
+        try {
+          let funding = await hire!.evidence.readFunding(pending.walletAddress, hire!.grantGasHeadroomWei, nowSec(), c.req.raw.signal);
+          const nativeTarget = BigInt(pending.sizing.capDayWei);
+          const existingCmc = await deps.tradeAgent?.cmc?.get(continuation.agent.id, continuation.agent.ownerAddress);
+          const initialDataBudget = pending.sizing.cmcNewsEnabled === true && pending.sizing.cmcTotalBudgetWei !== undefined
+            && (existingCmc === null || existingCmc === undefined)
+            ? BigInt(pending.sizing.cmcTotalBudgetWei) : await currentCmcExposure(continuation.agent.id, continuation.agent.ownerAddress);
+          funding = await enrichTradfiV2Funding({ funding, wallet: pending.walletAddress, capitalQuoteWei: BigInt(pending.sizing.capitalQuoteWei),
+            cmcTotalBudgetWei: initialDataBudget, signal: c.req.raw.signal });
+          if (funding.balanceWei === null || BigInt(funding.balanceWei) < BigInt(funding.requiredWei) + nativeTarget
+            || funding.quoteShortfallWei !== undefined && BigInt(funding.quoteShortfallWei) > 0n) {
+            return c.json({ error: { code: "underfunded" }, data: { funding } }, 402);
+          }
+        } catch { return fail(c, 503, "evidence_unreadable"); }
       }
       const attemptId = keccak256(stringToBytes(canonicalEncode({
         // Namespaced per preset so a captured attempt id from one hire family
@@ -3747,6 +4434,23 @@ export function createServer(deps: ServerDeps): Hono {
           },
         });
       }
+      if (initial.status === "provisioning" && initial.pendingGrant !== null && initial.pendingGrant !== undefined
+        && initial.pendingGrant.sizing.settlementAsset === "USDT" && initial.pendingGrant.sizing.capitalQuoteWei !== undefined
+        && initial.pendingGrant.grantAttempt !== undefined) {
+        try {
+          let activationFunding = await hire!.evidence.readFunding(initial.walletAddress, hire!.grantGasHeadroomWei, nowSec(), evidenceSignal);
+          const activationExistingCmc = await deps.tradeAgent?.cmc?.get(initial.id, initial.ownerAddress);
+          const activationDataBudget = initial.pendingGrant.sizing.cmcNewsEnabled === true && initial.pendingGrant.sizing.cmcTotalBudgetWei !== undefined
+            && (activationExistingCmc === null || activationExistingCmc === undefined)
+            ? BigInt(initial.pendingGrant.sizing.cmcTotalBudgetWei) : await currentCmcExposure(initial.id, initial.ownerAddress);
+          activationFunding = await enrichTradfiV2Funding({ funding: activationFunding, wallet: initial.walletAddress,
+            capitalQuoteWei: BigInt(initial.pendingGrant.sizing.capitalQuoteWei), cmcTotalBudgetWei: activationDataBudget, signal: evidenceSignal });
+          if (activationFunding.balanceWei === null || BigInt(activationFunding.balanceWei) < BigInt(initial.pendingGrant.sizing.capDayWei)
+            || activationFunding.quoteShortfallWei !== undefined && BigInt(activationFunding.quoteShortfallWei) > 0n) {
+            return c.json({ error: { code: "underfunded" }, data: { ...provisioningView(initial, nowSec()), funding: activationFunding } }, 402);
+          }
+        } catch { return fail(c, 503, "evidence_unreadable"); }
+      }
       const cached = convergenceCache.get(cacheKey);
       let result;
       if (cached !== undefined && nowMs() - cached.at < 10_000
@@ -3837,12 +4541,23 @@ export function createServer(deps: ServerDeps): Hono {
   app.post("/agents/:id/pause", (c) =>
     ownerMutation(c, c.req.param("id"), "pause", "pause", async ({ agent }) => {
       requireStatus(agent, ["armed"]);
-      const updated = await deps.agentStore.transitionAgentStatus({
-        ownerAddress: agent.ownerAddress, agentId: agent.id, expectedStatus: "armed",
-        expectedRowVersion: agent.rowVersion, status: "paused",
-      });
-      if (updated === null) throw new ConflictError("The agent changed while this action was being applied.");
-      await deps.killswitch.pauseAgent(agent.id, agent.ownerAddress);
+      const applyPause = async () => {
+        const updated = await deps.agentStore.transitionAgentStatus({
+          ownerAddress: agent.ownerAddress, agentId: agent.id, expectedStatus: "armed",
+          expectedRowVersion: agent.rowVersion, status: "paused",
+        });
+        if (updated === null) throw new ConflictError("The agent changed while this action was being applied.");
+        await deps.killswitch.pauseAgent(agent.id, agent.ownerAddress);
+        return updated;
+      };
+      const row = await deps.tradeAgent?.settingsStore.get(agent.ownerAddress, agent.id);
+      const parsed = row === null || row === undefined ? null : parseTradeSettings(row.params);
+      const updated = parsed?.ok === true && isTradePortfolioSettings(parsed.value.effective)
+        ? await (async () => {
+            const fenced = await deps.tradeAgent!.settingsStore.withEntryFence(agent.ownerAddress, agent.id, applyPause);
+            return fenced.kind === "draining" ? applyPause() : fenced.value;
+          })()
+        : await applyPause();
       return { agent: agentOwnerView(updated) };
     }),
   );
@@ -3918,11 +4633,24 @@ export function createServer(deps: ServerDeps): Hono {
   );
 
   app.post("/agents/:id/revoke", (c) =>
-    ownerMutation(c, c.req.param("id"), "revoke", "revoke", async ({ agent }) => {
+    ownerMutation(c, c.req.param("id"), "revoke", "revoke", async ({ agent, params }) => {
+      const revokeParams = parseRevokeParams(params);
+      if (!revokeParams.ok) throw new BadRequestError(revokeParams.message);
+      const keep = revokeParams.value.keepPositions;
       if (agent.pendingRenewal !== null && agent.pendingRenewal !== undefined) {
         throw new ConflictError("A renewal is pending; finish or cancel it first.", "renewal_pending");
       }
+      // TRADFI-EXPIRY-KEEP-REMOVE §5.1: Keep is for an armed or paused agent only. An already removed one
+      // resumes at the on-chain tail, not here.
+      if (keep && agent.status !== "armed" && agent.status !== "paused") {
+        throw agent.status === "revoked" || agent.status === "retired"
+          ? new ConflictError("This agent is already removed; finish the on-chain revoke.", "already_revoked")
+          : new ConflictError("Keeping positions is only available for an armed or paused TradFi AI agent.", "keep_not_supported");
+      }
       requireStatus(agent, ["armed", "paused"]);
+      if (keep && agent.sessionFacts?.hireSizing?.name !== "trade-v1") {
+        throw new ConflictError("Keeping positions is only available for the TradFi AI trade agent.", "keep_not_supported");
+      }
       if (agent.sessionFacts?.hireSizing?.name === "trade-v1") {
         const tradeAgent = deps.tradeAgent;
         if (tradeAgent === undefined) throw new ConflictError("Trading agent state is unavailable.");
@@ -3931,15 +4659,77 @@ export function createServer(deps: ServerDeps): Hono {
           tradeAgent.positions.list(agent.ownerAddress, agent.id),
           tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id),
         ]);
-        if (settings?.drainingAt === null || settings === null) {
-          throw new ConflictError("Start Remove and drain this trading agent before revoking it.");
+        const parsedSettings = settings === null ? null : parseTradeSettings(settings.params);
+        const schedule = parsedSettings?.ok === true && isTradeScheduleSettings(parsedSettings.value.effective);
+        const portfolio = parsedSettings?.ok === true && isTradePortfolioSettings(parsedSettings.value.effective);
+        if (keep && !(parsedSettings?.ok === true && isTradfiAiSettings(parsedSettings.value.effective))) {
+          throw new ConflictError("Keeping positions is only available for the TradFi AI trade agent.", "keep_not_supported");
         }
-        if (positions.some((position) => position.status !== "closed") || unsettled.length > 0) {
-          throw new ConflictError("Trading positions or submitted trades are still settling.");
+        if (portfolio) {
+          const applyRevoke = async (sql?: SqlClient) => {
+            const current = await tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id, sql);
+            for (const intent of current) {
+              if (intent.portfolioSlot === undefined) continue;
+              const journal = await deps.journal.get(intent.idempotencyKey);
+              if (journal?.state === "PENDING" || journal?.state === "IN_PROGRESS") throw new ConflictError("A rebalance trade is still settling; retry in a minute.");
+            }
+            const updated = await deps.agentStore.transitionAgentStatus({ ownerAddress: agent.ownerAddress, agentId: agent.id,
+              expectedStatus: agent.status, expectedRowVersion: agent.rowVersion, status: "revoked" });
+            if (updated === null) throw new ConflictError("The agent changed while this action was being applied.");
+            await deps.killswitch.pauseAgent(agent.id, agent.ownerAddress);
+            return updated;
+          };
+          const fenced = await tradeAgent.settingsStore.withEntryFence(agent.ownerAddress, agent.id, applyRevoke);
+          const updated = fenced.kind === "draining" ? await applyRevoke() : fenced.value;
+          return { agent: agentOwnerView(updated), onChainRevoke: buildOnChainRevoke(updated, config) };
         }
-        const fence = await tradeAgent.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async () => true);
-        if (fence.kind !== "draining") {
-          throw new ConflictError("Trading entry gate is not closed.");
+        if (schedule) {
+          // A schedule agent buys only, never sells (TRADFI-SCHEDULE-BUY-SPEC §0):
+          // there is nothing to drain and its fills stay in the wallet as holdings
+          // the owner withdraws with the passkey. Serialise with a running cycle
+          // through the entry fence, then require no buy still in flight.
+          await tradeAgent.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async () => true);
+          const stillUnsettled = await tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id);
+          if (stillUnsettled.length > 0) {
+            throw new ConflictError("A scheduled buy is still settling; retry in a minute.");
+          }
+        } else if (keep) {
+          // Keep never drains and never requests an exit (draining means sell): the
+          // positions stay held. Only an intent still in flight refuses; a disposed
+          // inert sell is `rolled-back` and is not in this list.
+          if (unsettled.length > 0) throw new ConflictError("A trade is still settling; retry in a minute.");
+        } else {
+          if (settings?.drainingAt === null || settings === null) {
+            throw new ConflictError("Start Remove and drain this trading agent before revoking it.");
+          }
+          if (positions.some((position) => position.status !== "closed") || unsettled.length > 0) {
+            throw new ConflictError("Trading positions or submitted trades are still settling.");
+          }
+          const fence = await tradeAgent.settingsStore.withEntryFence(agent.ownerAddress, agent.id, async () => true);
+          if (fence.kind !== "draining") {
+            throw new ConflictError("Trading entry gate is not closed.");
+          }
+          // AUTO-DCA R2.8: refused while a batch is `intended`/`submitted` or while the
+          // chain (read here, never assumed) still shows DCA positions with liquidity.
+          // An `unknown` action does not block once the chain is empty.
+          if (parsedSettings?.ok === true && isTradeDcaSettings(parsedSettings.value.effective)) {
+            const dca = tradeAgent.dca;
+            const pool = dcaPoolForToken(parsedSettings.value.effective.dcaToken!);
+            if (dca === undefined || pool === null) throw new ConflictError("Auto DCA state is unavailable.");
+            const actions = await dca.store.listActions(agent.ownerAddress, agent.id);
+            if (actions.some((action) => action.state === "intended" || action.state === "submitted")) {
+              throw new ConflictError("An Auto DCA batch is still being submitted; retry in a minute.");
+            }
+            let live: readonly unknown[];
+            try {
+              live = await dcaChainPositions(dca.chain, pool, agent.walletAddress, (await dca.chain.reading(pool.pool)).block);
+            } catch {
+              throw new ConflictError("Auto DCA orders could not be read on chain; retry in a minute.");
+            }
+            if (live.length > 0) {
+              throw new ConflictError("Auto DCA orders still hold funds on chain; wait for Remove to collect them, or pull them with your passkey.");
+            }
+          }
         }
       }
       // (a) The guaranteed half: this server stops submitting, now and after a
@@ -4374,6 +5164,15 @@ export function createServer(deps: ServerDeps): Hono {
         "The pancake_v3 venue is not configured for this chain.",
       );
     }
+    const uniswapV3 = uniswapV3Venue(trade.venues);
+    if (request.venue === "uniswap_v3" && uniswapV3 === null) {
+      return fail(
+        c,
+        400,
+        "invalid_request",
+        "The uniswap_v3 venue is not configured for this chain.",
+      );
+    }
     // PHASE2.1 R5: the chain-support gate for Four.Meme is the HELPER, not a
     // configured manager. The manager is no longer configuration at all — it
     // comes from the read — but without a helper there is nothing to read, so
@@ -4401,7 +5200,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
 
     const { paramsHash, idempotencyKey } = tradeExecutionIdentity({
-      agentId: agent.id, chainId: config.chainId, request, trade, pancake, pancakeV3, flapPortal,
+      agentId: agent.id, chainId: config.chainId, request, trade, pancake, pancakeV3, uniswapV3, flapPortal,
     });
 
     // TRADING-AGENT R6: the extracted core owns `bypassLocalPolicyCheck: false`;
@@ -4417,12 +5216,14 @@ export function createServer(deps: ServerDeps): Hono {
         chainId: config.chainId,
         keyStore: config.keyStore,
         agentStore: deps.agentStore,
+        ...(deps.tradeAgent === undefined ? {} : { settingsStore: deps.tradeAgent.settingsStore }),
         journal: deps.journal,
         killswitch: deps.killswitch,
         providerRegistry: deps.providerRegistry,
         trade,
         pancake,
         pancakeV3,
+        uniswapV3,
         flapPortal,
         nowMs,
         routeThrottle: () => {
@@ -4472,17 +5273,64 @@ export function createServer(deps: ServerDeps): Hono {
         const capDayWei = nativeDayCapWei(agent.sessionFacts);
         if (capDayWei === null) throw new TradeNotExecutableError();
         const effective = parsed.value.effective;
-        const sized = checkTradeSizing({ capDayWei, entryWei: BigInt(effective.entryWei),
-          maxOpenPositions: effective.maxOpenPositions,
-          grantedTokenCount: pinnedTokens(agent.sessionFacts).length,
-          platformFeeBps: tradeAgent.feeBps });
-        if (!sized.ok) throw new TradeCapitalTooSmallError(sized.minimumCapWei);
+        const v2 = isTradfiV2Settings(effective);
+        const schedule = isTradeScheduleSettings(effective);
         const existingBeforeFence = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+        const priorPortfolioParsed = existingBeforeFence === null ? null : parseTradeSettings(existingBeforeFence.params);
+        const portfolio = priorPortfolioParsed?.ok === true && isTradePortfolioSettings(priorPortfolioParsed.value.effective);
+        if (priorPortfolioParsed?.ok === true && (portfolio || isTradePortfolioSettings(effective))) {
+          const immutable = immutableTradeSettingChange(priorPortfolioParsed.value.effective, effective);
+          if (immutable !== null) throw new BadRequestError(`${immutable} cannot be changed after deploy.`);
+        }
+        if (schedule && effective.scheduleEndAtSec !== null && effective.scheduleEndAtSec !== undefined && effective.scheduleEndAtSec <= nowSec()) {
+          throw new BadRequestError("schedule_end_in_past");
+        }
+        if (v2 && agent.sessionFacts?.hireSizing?.settlementAsset === "USDT" && agent.sessionFacts.hireSizing.entryWei !== undefined
+          && BigInt(effective.entryWei) > BigInt(agent.sessionFacts.hireSizing.entryWei)) {
+          throw new BadRequestError("entryWei cannot exceed the signed TradFi v2 hire maximum; renew or rehire to increase it.");
+        }
+        // An Auto DCA hire signs its per-entry ceiling with the DCA fee (0), not the global
+        // fee; the stored mode decides, and the edit must stay DCA (the fenced check below
+        // refuses a tradeMode change anyway).
+        const dca = priorPortfolioParsed?.ok === true && isTradeDcaSettings(priorPortfolioParsed.value.effective) && isTradeDcaSettings(effective);
+        const entryFeeBps = portfolio ? PORTFOLIO_PLATFORM_FEE_BPS : dca ? DCA_PLATFORM_FEE_BPS : tradeAgent.feeBps;
+        if (v2 && agent.sessionFacts?.hireSizing?.quotePerTradeWei !== undefined
+          && tradfiV2EntryReservation(BigInt(effective.entryWei), entryFeeBps) > BigInt(agent.sessionFacts.hireSizing.quotePerTradeWei)) {
+          throw new BadRequestError("The fee-inclusive TradFi v2 per-entry ceiling is immutable for this hire.");
+        }
+        const sized = portfolio
+          ? checkTradfiPortfolioSizing({ capDayWei, capitalQuoteWei: BigInt(effective.capitalQuoteWei!),
+            tokenCount: effective.portfolioTokens!.length, intervalSec: effective.portfolioIntervalSec! })
+          : schedule
+          ? checkTradfiScheduleSizing({ capDayWei, entryWei: BigInt(effective.entryWei), capitalQuoteWei: BigInt(effective.capitalQuoteWei!), platformFeeBps: tradeAgent.feeBps,
+              grantedTokenCount: pinnedTokens(agent.sessionFacts, true).length, intervalSec: effective.scheduleIntervalSec!, ttlSec: Math.max(0, agent.sessionFacts.expiry - (agent.sessionFacts.grantedAtSec ?? Math.floor(agent.createdAt / 1_000))),
+              endKind: effective.scheduleEndKind!, endRuns: effective.scheduleEndRuns!, endAtSec: effective.scheduleEndAtSec!, anchorAtSec: effective.scheduleFirstAtSec ?? nowSec() })
+          : v2
+          ? checkTradfiV2Sizing({ capDayWei, minEntryWei: BigInt(effective.minEntryWei!), maxEntryWei: BigInt(effective.entryWei),
+            capitalQuoteWei: BigInt(effective.capitalQuoteWei!), maxOpenPositions: effective.maxOpenPositions,
+            grantedTokenCount: pinnedTokens(agent.sessionFacts, v2).length, platformFeeBps: entryFeeBps })
+          : checkTradeSizing({ capDayWei, entryWei: BigInt(effective.entryWei), maxOpenPositions: effective.maxOpenPositions,
+            grantedTokenCount: pinnedTokens(agent.sessionFacts, v2).length, platformFeeBps: tradeAgent.feeBps });
+        // A settings edit cannot change the signed native cap, and the day meter
+        // already refuses a cadence it cannot fund (NATIVE_RESERVE, spec R2.13);
+        // re-sizing the BNB side here would only block a legitimate edit (2026-09-21:
+        // daily → hourly asked for 38R against a 36R grant). Edits check the USDT side.
+        if (schedule || portfolio ? ("shortfallQuoteWei" in sized && sized.shortfallQuoteWei > 0n) : !sized.ok) {
+          throw new TradeCapitalTooSmallError("shortfallQuoteWei" in sized ? sized.shortfallQuoteWei : sized.minimumCapWei);
+        }
         if (existingBeforeFence === null) {
           const stored = await tradeAgent.settingsStore.put({ agentId: agent.id,
             ownerAddress: agent.ownerAddress, params: parsed.value.raw, digest: tradeSettingsDigest(parsed.value.raw) });
           if (effective.crashProtection === false) {
             await tradeAgent.positions.clearCrashEvidenceForAgent(agent.ownerAddress, agent.id);
+          }
+          if (tradeAgent.cmc !== undefined && effective.settlementAsset === "USDT" && effective.cmcNewsEnabled === true) {
+            const total = effective.cmcTotalBudgetWei;
+            if (total !== undefined) {
+              const existingBudget = await tradeAgent.cmc.get(agent.id, agent.ownerAddress);
+              if (existingBudget === null) await tradeAgent.cmc.putInitial({ agentId: agent.id, ownerAddress: agent.ownerAddress, wallet: agent.walletAddress, totalWei: BigInt(total) });
+              else await tradeAgent.cmc.toggle({ agentId: agent.id, ownerAddress: agent.ownerAddress, optedIn: true });
+            }
           }
           return { settings: stored.params, digest: stored.digest, updatedAt: stored.updatedAt };
         }
@@ -4502,8 +5350,241 @@ export function createServer(deps: ServerDeps): Hono {
           return { settings: stored.params, digest: stored.digest, updatedAt: stored.updatedAt };
         });
         if (fenced.kind === "draining") throw new ConflictError("Trade settings cannot change while the agent is draining.");
+        // AFTER the fence, never inside it: the CMC store opens its own
+        // transaction and takes pg_advisory_xact_lock(hashtext(agentId)) — the
+        // very key the entry fence holds — so a toggle inside the fence
+        // deadlocks on PostgreSQL (first live v2 settings edit, 2026-09-21).
+        if (tradeAgent.cmc !== undefined && effective.settlementAsset === "USDT") {
+          await tradeAgent.cmc.toggle({ agentId: agent.id, ownerAddress: agent.ownerAddress, optedIn: effective.cmcNewsEnabled === true });
+        }
         return fenced.value;
       });
+    });
+
+    app.post("/agents/:id/trade/cmc-budget", async (c) => {
+      const id = c.req.param("id");
+      const continuationHeader = c.req.header("x-provision-action");
+      const renewHeader = c.req.header("x-renew-action");
+      if (continuationHeader !== undefined && renewHeader !== undefined) return fail(c, 400, "ambiguous_owner_auth");
+      if (continuationHeader !== undefined) return continueTradeCmcBudget(c, id, continuationHeader);
+      if (renewHeader !== undefined) return continueRenewalCmcRebind(c, id, renewHeader);
+      if (tradeAgent === undefined || !tradeAgent.readiness.ready) return fail(c, 503, "trade_not_ready");
+      return ownerMutation(c, id, "tradeCmcBudget", "tradeCmcBudget", async ({ agent, params }) => {
+        const parsed = parseTradeCmcBudgetParams(params);
+        if (!parsed.ok) throw new BadRequestError(parsed.message);
+        return prepareTradeCmcBudget(agent, parsed.value);
+      });
+    });
+
+    /**
+     * CMC-HIRE-SETUP R1.5: the body shared by the signed `tradeCmcBudget` owner
+     * action and the provision continuation. Mechanical extraction; behaviour and
+     * response for the signed path are unchanged.
+     */
+    async function prepareTradeCmcBudget(agent: AgentRecord, parsed: TradeCmcBudgetParams): Promise<Record<string, unknown>> {
+      if (tradeAgent === undefined || tradeAgent.cmc === undefined || tradeAgent.cmcOwner === undefined) {
+        throw new ConflictError("CMC budget capability is unavailable.");
+      }
+      const settings = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+      const parsedSettings = settings === null ? null : parseTradeSettings(settings.params);
+      if (parsedSettings?.ok !== true || parsedSettings.value.effective.settlementAsset !== "USDT" || parsedSettings.value.effective.cmcNewsEnabled !== true) {
+        throw new ConflictError("CMC news is not enabled for this TradFi v2 agent.");
+      }
+      if (agent.sessionFacts === null || agent.status === "revoked" || agent.status === "retired"
+        || agent.pendingRenewal !== null && agent.pendingRenewal !== undefined
+        || parsed.sessionPublicKey.toLowerCase() !== agent.sessionFacts.publicKey.toLowerCase()
+        || parsed.sessionExpiry !== agent.sessionFacts.expiry) {
+        throw new ConflictError("CMC owner setup must use the current active trading session.");
+      }
+      if (parsed.mode === "topup" && parsed.expectedGeneration === 0 && parsedSettings.value.effective.cmcTotalBudgetWei !== undefined
+        && await tradeAgent.cmc.get(agent.id, agent.ownerAddress) === null) {
+        await tradeAgent.cmc.putInitial({ agentId: agent.id, ownerAddress: agent.ownerAddress, wallet: agent.walletAddress, totalWei: BigInt(parsedSettings.value.effective.cmcTotalBudgetWei) });
+      }
+      // 2026-09-23: a capability refusal is named to the owner (the reason is a
+      // fixed gate code, e.g. `cmc-profile-unavailable`); every other refusal
+      // keeps the generic message.
+      let capabilityRefusal: string | null = null;
+      const prepared = await tradeAgent.cmcOwner.prepare({ operationId: parsed.operationId, agentId: agent.id, ownerAddress: agent.ownerAddress,
+        wallet: agent.walletAddress, mode: parsed.mode, expectedGeneration: parsed.expectedGeneration,
+        additionalBudgetWei: parsed.additionalBudgetWei, sessionPublicKey: parsed.sessionPublicKey, sessionExpiry: parsed.sessionExpiry,
+        onCapabilityRefusal: (reason) => { capabilityRefusal = reason; },
+        ...(parsed.expectedGeneration === 0 && parsedSettings.value.effective.cmcTotalBudgetWei !== undefined
+          ? { signedInitialTotalWei: BigInt(parsedSettings.value.effective.cmcTotalBudgetWei) } : {}) });
+      if (prepared === null && capabilityRefusal !== null) throw new ConflictError(capabilityRefusal, "cmc_capability_unavailable");
+      if (prepared === null) throw new ConflictError("CMC owner setup is unavailable or has an unresolved prior operation.");
+      const calls = prepared.calls.map((call) => ({ to: call.to, value: call.value.toString(10), data: call.data }));
+      // MEASURED 2026-09-20 (G1): the browser validator (`validateCmcBudgetCallPlan`)
+      // binds the calls to a nested `operation` record — id, mode, generation,
+      // delta, session key, wallet, key hash, old checker — and refused every
+      // live prepare while the route returned only the flat fields.
+      const operation = prepared.operation;
+      return { operationId: operation.operationId, mode: operation.mode, calls,
+        operation: { operationId: operation.operationId, mode: operation.mode, expectedGeneration: operation.expectedGeneration,
+          incrementWei: operation.incrementWei.toString(10), sessionPublicKey: operation.sessionPublicKey, sessionExpiry: operation.sessionExpiry,
+          wallet: operation.wallet, keyHash: operation.keyHash, oldCheckerKeyHash: operation.oldCheckerKeyHash,
+          callsDigest: operation.callsDigest, state: operation.state, calls },
+        budget: cmcBudgetView(prepared.budget, true), state: operation.state };
+    }
+
+    /**
+     * CMC-HIRE-SETUP R1: the signed `provisionAgent` envelope already carries the
+     * owner's CMC opt-in (`settings.cmcNewsEnabled` + `cmcTotalBudgetWei`), so the
+     * hire run completes the data-budget setup as a continuation of that one
+     * signature instead of asking for a second `tradeCmcBudget` signature. The
+     * authority checks mirror `continueGridArm` exactly (R1.1); R1.2′/R1.3 are the
+     * TradFi-specific bindings from Revision 2.
+     */
+    async function continueTradeCmcBudget(c: Context, id: string, header: string): Promise<Response> {
+      if (tradeAgent === undefined || !tradeAgent.readiness.ready) return fail(c, 503, "trade_not_ready");
+      if (c.req.header("x-owner-action") !== undefined || c.req.header("authorization") !== undefined) {
+        return fail(c, 400, "ambiguous_owner_auth");
+      }
+      const rawBody = await c.req.text();
+      if (rawBody.trim() !== "{}") return fail(c, 400, "ambiguous_owner_auth");
+      const decoded = decodeOwnerActionHeader(header);
+      if (!decoded.ok) return fail(c, 401, "owner_auth_failed");
+      if (hireContinuationForArms === undefined) return fail(c, 404, "not_found");
+      const continuation = await hireContinuationForArms(id, decoded.value, true);
+      if (continuation.kind === "error") {
+        return continuation.code === "not_found"
+          ? fail(c, 404, "not_found")
+          : continuation.code === "conflict"
+            ? fail(c, 409, "conflict")
+            : fail(c, 401, "owner_auth_failed");
+      }
+      const agent = continuation.agent;
+      const params = parseHireParams(decoded.value.params);
+      if (!params.ok || params.value.sizingPreset !== "trade-v1") {
+        return fail(c, 409, "conflict", "This hire did not opt in to CMC data.");
+      }
+      const signedSettings = params.value.settings;
+      if (signedSettings.settlementAsset !== "USDT" || signedSettings.cmcNewsEnabled !== true || signedSettings.cmcTotalBudgetWei === undefined) {
+        return fail(c, 409, "conflict", "This hire did not opt in to CMC data.");
+      }
+      const cmc = tradeAgent.cmc;
+      if (cmc === undefined || tradeAgent.cmcOwner === undefined) {
+        return fail(c, 409, "conflict", "CMC budget capability is unavailable.");
+      }
+      const storedSettings = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+      if (storedSettings === null || storedSettings.digest.toLowerCase() !== tradeSettingsDigest(params.value.settingsParams).toLowerCase()) {
+        return fail(c, 409, "conflict", "Settings changed since the hire; set up data access from the agent page.");
+      }
+      if (agent.sessionFacts === null || agent.status === "revoked" || agent.status === "retired"
+        || (agent.pendingRenewal !== null && agent.pendingRenewal !== undefined)) {
+        return fail(c, 409, "conflict", "CMC owner setup must use the current active trading session.");
+      }
+      if (!ownerLimiter.tryConsume(agent.ownerAddress.toLowerCase())) return fail(c, 429, "rate_limited");
+      const provisionActionId = agent.pendingGrant?.provisionActionId ?? agent.sessionFacts.provisionActionId;
+      if (provisionActionId === undefined) return fail(c, 409, "conflict");
+      const operationId = hireCmcUuid(provisionActionId, "cmc-hire-setup:v1");
+      const continuationAttemptId = hireCmcUuid(provisionActionId, "cmc-hire-attempt:v1");
+      try {
+        const data = await prepareTradeCmcBudget(agent, {
+          operationId, mode: "topup", expectedGeneration: 0, additionalBudgetWei: signedSettings.cmcTotalBudgetWei,
+          sessionPublicKey: agent.sessionFacts.publicKey, sessionExpiry: agent.sessionFacts.expiry,
+        });
+        return c.json({
+          data: { ...data, continuationAttemptId },
+          meta: { action: "tradeCmcBudget", agentId: id, authority: "provision-continuation" },
+        });
+      } catch (error) {
+        if (!(error instanceof ConflictError)) throw error;
+        const budget = await cmc.get(agent.id, agent.ownerAddress);
+        if (budget !== null && ((budget.pendingOwnerOperationId !== null && budget.pendingOwnerOperationId !== operationId) || budget.setupProved === true)) {
+          return fail(c, 409, "conflict", "Data access was already set up or has another operation pending.");
+        }
+        return fail(c, 409, "cmc_setup_unavailable", error.code === "cmc_capability_unavailable" ? error.message : "Data access cannot be prepared yet.");
+      }
+    }
+
+    async function continueRenewalCmcRebind(c: Context, id: string, header: string): Promise<Response> {
+      if (tradeAgent === undefined || !tradeAgent.readiness.ready) return fail(c, 503, "trade_not_ready");
+      if (c.req.header("x-owner-action") !== undefined || c.req.header("authorization") !== undefined) {
+        return fail(c, 400, "ambiguous_owner_auth");
+      }
+      const rawBody = await c.req.text();
+      if (rawBody.trim() !== "{}") return fail(c, 400, "ambiguous_owner_auth");
+      const decoded = decodeOwnerActionHeader(header);
+      if (!decoded.ok || requireBinding(decoded.value, "renewSession", id) !== null) return fail(c, 401, "owner_auth_failed");
+      if (paramsHash(decoded.value.signed.action, decoded.value.params).toLowerCase() !== decoded.value.signed.paramsHash.toLowerCase()) return fail(c, 401, "owner_auth_failed");
+      const agent = await deps.agentStore.getAgent(getAddress(decoded.value.signed.owner), id);
+      const renewActionId = ownerActionIdempotencyKey(decoded.value.signed) as Hex;
+      // The swap stores this id only after verifying the exact renew signature.
+      if (agent === null || agent.ownerAddress.toLowerCase() !== decoded.value.signed.owner.toLowerCase()
+        || agent.pendingRenewal !== null && agent.pendingRenewal !== undefined
+        || agent.sessionFacts === null || agent.status === "revoked" || agent.status === "retired"
+        || agent.sessionFacts.renewActionId?.toLowerCase() !== renewActionId.toLowerCase()) return fail(c, 409, "conflict");
+      const settings = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+      const parsedSettings = settings === null ? null : parseTradeSettings(settings.params);
+      if (parsedSettings?.ok !== true || parsedSettings.value.effective.executionModel !== "tradfi"
+        || parsedSettings.value.effective.settlementAsset !== "USDT" || parsedSettings.value.effective.cmcNewsEnabled !== true) {
+        return fail(c, 409, "conflict", "CMC data is not enabled for this agent");
+      }
+      const cmc = tradeAgent.cmc;
+      if (cmc === undefined || tradeAgent.cmcOwner === undefined) return fail(c, 409, "conflict", "CMC budget capability is unavailable.");
+      const budget = await cmc.get(agent.id, agent.ownerAddress);
+      const operationId = hireCmcUuid(renewActionId, "cmc-renew-rebind:v1");
+      const continuationAttemptId = hireCmcUuid(renewActionId, "cmc-renew-rebind-attempt:v1");
+      if (budget === null || budget.setupProved !== true || budget.generation <= 0
+        || budget.pendingOwnerOperationId !== null && budget.pendingOwnerOperationId !== operationId) {
+        return fail(c, 409, "conflict", "Data access is not set up or has another operation pending.");
+      }
+      if (budget.checkerSessionPublicKey?.toLowerCase() === agent.sessionFacts.publicKey.toLowerCase()) {
+        return c.json({ data: { alreadyBound: true, budget: cmcBudgetView(budget, true) } });
+      }
+      if (!ownerLimiter.tryConsume(agent.ownerAddress.toLowerCase())) return fail(c, 429, "rate_limited");
+      try {
+        const data = await prepareTradeCmcBudget(agent, {
+          operationId, mode: "rebind", expectedGeneration: budget.generation, additionalBudgetWei: "0",
+          sessionPublicKey: agent.sessionFacts.publicKey, sessionExpiry: agent.sessionFacts.expiry,
+        });
+        return c.json({ data: { ...data, continuationAttemptId },
+          meta: { action: "tradeCmcBudget", agentId: id, authority: "renew-continuation" } });
+      } catch (error) {
+        if (!(error instanceof ConflictError)) throw error;
+        return fail(c, 409, "cmc_setup_unavailable", error.code === "cmc_capability_unavailable" ? error.message : "Data access cannot be prepared yet.");
+      }
+    }
+
+    app.post("/agents/:id/trade/cmc-budget/attempt", async (c) => {
+      if (tradeAgent === undefined || !tradeAgent.readiness.ready) return fail(c, 503, "trade_not_ready");
+      const auth = await authorizeAccountRead(c, c.req.param("id"));
+      if (auth.kind !== "ok") return auth.response;
+      const body = await readJsonBody(c, maxBodyBytes);
+      if (body.kind === "error") return body.response;
+      const parsed = parseTradeCmcAttemptParams(body.value);
+      if (!parsed.ok) return fail(c, 400, "invalid_request", parsed.message);
+      if (tradeAgent.cmcOwner === undefined) return fail(c, 409, "conflict", "CMC budget capability is unavailable.");
+      const agent = await deps.agentStore.getAgent(auth.owner.ownerAddress, c.req.param("id"));
+      if (agent === null) return fail(c, 404, "not_found");
+      const operation = await tradeAgent.cmcOwner.recordAttempt({ agentId: agent.id, ownerAddress: agent.ownerAddress, ...parsed.value });
+      if (operation === null) return fail(c, 409, "conflict", "CMC owner operation is not pending or has already been attempted.");
+      return c.json({ data: { operationId: operation.operationId, attemptId: operation.attemptId, state: operation.state }, meta: { ownerRead: true } });
+    });
+
+    app.post("/agents/:id/trade/cmc-budget/confirm", async (c) => {
+      if (tradeAgent === undefined || !tradeAgent.readiness.ready) return fail(c, 503, "trade_not_ready");
+      const auth = await authorizeAccountRead(c, c.req.param("id"));
+      if (auth.kind !== "ok") return auth.response;
+      const body = await readJsonBody(c, maxBodyBytes);
+      if (body.kind === "error") return body.response;
+      const parsed = parseTradeCmcConfirmParams(body.value);
+      if (!parsed.ok) return fail(c, 400, "invalid_request", parsed.message);
+      if (tradeAgent.cmcOwner === undefined) return fail(c, 409, "conflict", "CMC budget capability is unavailable.");
+      const agent = await deps.agentStore.getAgent(auth.owner.ownerAddress, c.req.param("id"));
+      if (agent === null) return fail(c, 404, "not_found");
+      let confirmed = await tradeAgent.cmcOwner.confirm({ agentId: agent.id, ownerAddress: agent.ownerAddress, ...parsed.value });
+      if (confirmed === null && tradeAgent.cmcOwnerResumePending !== undefined) {
+        const resumed = await tradeAgent.cmcOwnerResumePending({ operationId: parsed.value.operationId, agentId: agent.id,
+          ownerAddress: agent.ownerAddress, callsId: parsed.value.callsId });
+        if (resumed.operation?.state === "confirmed" && tradeAgent.cmc !== undefined) {
+          const budget = await tradeAgent.cmc.get(agent.id, agent.ownerAddress);
+          if (budget !== null) confirmed = { budget, operation: resumed.operation };
+        }
+      }
+      if (confirmed === null) return fail(c, 409, "conflict", "CMC owner operation is not finalized or its evidence does not match.");
+      return c.json({ data: { budget: cmcBudgetView(confirmed.budget, true), operationId: confirmed.operation.operationId,
+        generation: confirmed.operation.expectedGeneration, callsId: parsed.value.callsId }, meta: { ownerRead: true } });
     });
 
     app.post("/agents/:id/trade/drain", async (c) => {
@@ -4516,6 +5597,12 @@ export function createServer(deps: ServerDeps): Hono {
           throw new BadRequestError("tradeDrain params must be exactly an empty object.");
         }
         requireStatus(agent, ["armed", "paused"]);
+        const stored = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+        if (stored !== null) {
+          const parsed = parseTradeSettings(stored.params);
+          if (parsed.ok && isTradeScheduleSettings(parsed.value.effective)) throw new ConflictError("Schedule agents do not sell holdings.", "schedule_no_sell");
+          if (parsed.ok && isTradePortfolioSettings(parsed.value.effective)) throw new ConflictError("Smart Portfolio stocks stay in the wallet on Remove.", "portfolio_no_sell");
+        }
         const settings = await tradeAgent.settingsStore.requestDrain(agent.ownerAddress, agent.id);
         if (settings === null) throw new NotFoundError();
         const open = await tradeAgent.positions.listOpen(agent.ownerAddress, agent.id);
@@ -4531,10 +5618,34 @@ export function createServer(deps: ServerDeps): Hono {
         if (!isRecord(params) || Object.keys(params).length !== 1 || params["positionId"] !== positionId) {
           throw new BadRequestError("tradeExit params must contain exactly the route positionId.");
         }
+        const stored = await tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+        if (stored !== null) {
+          const parsed = parseTradeSettings(stored.params);
+          if (parsed.ok && isTradeScheduleSettings(parsed.value.effective)) throw new ConflictError("Schedule agents do not sell holdings.", "schedule_no_sell");
+          if (parsed.ok && isTradePortfolioSettings(parsed.value.effective)) throw new ConflictError("Smart Portfolio stocks stay in the wallet on Remove.", "portfolio_no_sell");
+          // AUTO-DCA §13.3: a DCA agent holds no position an owner sells; Remove is the door.
+          if (parsed.ok && isTradeDcaSettings(parsed.value.effective)) throw new ConflictError("Auto DCA orders are removed with Remove, not sold one by one.", "dca_no_manual_sell");
+        }
         const row = await tradeAgent.positions.requestExit(agent.ownerAddress, agent.id, positionId);
         if (row === null) throw new NotFoundError();
         return { positionId: row.positionId, exitRequestedAt: row.exitRequestedAt };
       });
+    });
+
+    app.get("/agents/:id/trade/simulations", async (c) => {
+      if (tradeAgent === undefined || !tradeAgent.readiness.ready) return fail(c, 503, "trade_not_ready");
+      const id = c.req.param("id");
+      const auth = await authorizeAccountRead(c, id);
+      if (auth.kind !== "ok") return auth.response;
+      const agent = await deps.agentStore.getAgent(auth.owner.ownerAddress, id);
+      if (agent === null) return fail(c, 404, "not_found");
+      if (tradeAgent.simulations === undefined) return c.json({ data: { rows: [], unavailable: "store-unavailable" } });
+      try {
+        const log = await tradeAgent.simulations.listForAgent({ agentId: agent.id, ownerAddress: agent.ownerAddress, limit: 200 });
+        return c.json({ data: { rows: log.rows, unavailable: log.unavailable } });
+      } catch {
+        return c.json({ data: { rows: [], unavailable: "store-unavailable" } });
+      }
     });
 
     app.get("/agents/:id/trade/view", async (c) => {
@@ -4544,31 +5655,462 @@ export function createServer(deps: ServerDeps): Hono {
       if (auth.kind !== "ok") return auth.response;
       const agent = await deps.agentStore.getAgent(auth.owner.ownerAddress, id);
       if (agent === null) return fail(c, 404, "not_found");
-      const [settings, positions, runs, unsettled] = await Promise.all([
+      if (tradeAgent.cmc !== undefined && tradeAgent.cmcOwnerResumePending !== undefined) {
+        const budgetRow = await tradeAgent.cmc.get(agent.id, agent.ownerAddress);
+        const pendingOwnerId = budgetRow?.pendingOwnerOperationId;
+        if (pendingOwnerId !== null && pendingOwnerId !== undefined) {
+          const operation = await tradeAgent.cmc.getOwnerOperation(agent.id, agent.ownerAddress, pendingOwnerId);
+          if (operation?.callsId !== null && operation?.callsId !== undefined && operation.state !== "confirmed" && operation.state !== "failed") {
+            await tradeAgent.cmcOwnerResumePending({ operationId: pendingOwnerId, agentId: agent.id, ownerAddress: agent.ownerAddress, callsId: operation.callsId });
+          }
+        }
+      }
+      const [settings, positions, windowRuns, executedRuns, unsettled] = await Promise.all([
         tradeAgent.settingsStore.get(agent.ownerAddress, agent.id),
         tradeAgent.positions.list(agent.ownerAddress, agent.id),
-        tradeAgent.positions.listRuns(agent.ownerAddress, agent.id, 10),
+        // Operator ruling 2026-09-20: the whole retained window (the store prunes
+        // at 200), not the last twenty minutes — a night of cycles must be readable.
+        tradeAgent.positions.listRuns(agent.ownerAddress, agent.id, 200),
+        // Operator ruling 2026-09-21: every cycle that bought or sold stays readable
+        // after the window rolled past it — the store keeps them through the prune.
+        tradeAgent.positions.listExecutedRuns(agent.ownerAddress, agent.id),
         tradeAgent.intents.listUnsettled(agent.ownerAddress, agent.id),
       ]);
-      const observations = await tradeAgent.observer.observe(agent, positions, c.req.raw.signal);
-      const observationById = new Map(observations.map((item) => [item.positionId, item]));
+      const runsById = new Map([...windowRuns, ...executedRuns].map((run) => [run.id, run]));
+      const runs = [...runsById.values()].sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
       const parsedStoredSettings = settings === null ? null : parseTradeSettings(settings.params);
+      const schedule = parsedStoredSettings?.ok === true && isTradeScheduleSettings(parsedStoredSettings.value.effective);
+      const dcaAgent = parsedStoredSettings?.ok === true && isTradeDcaSettings(parsedStoredSettings.value.effective);
+      const portfolioAgent = parsedStoredSettings?.ok === true && isTradePortfolioSettings(parsedStoredSettings.value.effective);
+      // TRADFI-EXPIRY-KEEP-REMOVE §5.3: for a removed TradFi AI agent every
+      // non-closed position is a KEPT holding — not observed, not in the summary
+      // (so PnL is exactly the realised, closed results), counted on its own.
+      const tradfiAi = parsedStoredSettings?.ok === true && isTradfiAiSettings(parsedStoredSettings.value.effective);
+      const keptView = tradfiAi && (agent.status === "revoked" || agent.status === "retired");
+      const countedPositions = keptView ? positions.filter((position) => position.status === "closed") : positions;
+      const observations = schedule || dcaAgent || portfolioAgent ? [] : await tradeAgent.observer.observe(agent, countedPositions, c.req.raw.signal);
+      const observationById = new Map(observations.map((item) => [item.positionId, item]));
       const maxOpenPositions = parsedStoredSettings?.ok === true ? parsedStoredSettings.value.effective.maxOpenPositions : null;
       const marketHours = (token: Address): "us-equities" | null =>
         tradeAgent.readiness.bstocksAddresses.has(token.toLowerCase()) ? "us-equities" : null;
       const open = positions.filter((position) => position.status !== "closed");
       const closed = positions.filter((position) => position.status === "closed").slice(0, 50);
+      const cmcBudget = tradeAgent.cmc === undefined || parsedStoredSettings?.ok !== true
+        ? null
+        : cmcBudgetView(await tradeAgent.cmc.get(agent.id, agent.ownerAddress), parsedStoredSettings.value.effective.cmcNewsEnabled === true,
+          undefined, agent.sessionFacts === null ? undefined : { generation: agent.sessionFacts.generation ?? 0, publicKey: agent.sessionFacts.publicKey });
+      // Owner-readable CMC log (2026-09-20): what was asked, what came back, what it cost.
+      // TRADFI-CMC-EQUITY R2.7: old `_GLOBAL` crypto-tool rows, `_PROBE` rows and
+      // the dossier skill are filtered OUT of this view (never deleted from the
+      // store) — only the current five-skill set is shown to the owner.
+      const cmcLog = tradeAgent.cmc === undefined || cmcBudget === null ? null : {
+        // AUDIT L1: a probe ran under a skill name that IS still current (4 of
+        // the 5 retired probe skills reused a live skill name), so the ticker
+        // must be checked too — `_PROBE` rows are filtered out regardless of skill.
+        news: (await tradeAgent.cmc.listNews(agent.id, agent.ownerAddress))
+          .filter((row) => row.ticker !== "_PROBE" && isCurrentCmcSkill(row.skill)).slice(0, 50).map((row) => ({
+          ticker: row.ticker, skill: row.skill, status: row.status, asOfMs: row.asOfMs, expiresAtMs: row.expiresAtMs,
+          sourceUrl: row.sourceUrl, paymentOperationId: row.paymentOperationId,
+          requestedBy: row.requestedBy ?? null, requestReason: row.requestReason ?? null,
+          // Bounded CMC text; `sanitizeMessage` is an error-message helper capped at 280 chars, not a fit here.
+          context: row.context === null ? null : row.context.replace(/[ --]/gu, "").slice(0, 3_000),
+        })),
+        attempts: (await tradeAgent.cmc.listAttempts(agent.id, agent.ownerAddress)).slice(0, 50).map((row) => ({
+          operationId: row.operationId, attemptId: row.attemptId, state: row.state, contentState: row.contentState,
+          amountWei: row.amountWei.toString(10), txHash: row.txHash, settlementTxHint: row.settlementTxHint,
+          createdAt: row.createdAt, updatedAt: row.updatedAt,
+        })),
+      };
+      let scheduleView: Record<string, unknown> | undefined;
+      let scheduleSlotByPosition: ReadonlyMap<string, number | null> | null = null;
+      if (schedule) {
+        const effective = parsedStoredSettings.value.effective;
+        const scheduleIntents = await tradeAgent.intents.listSchedule(agent.ownerAddress, agent.id);
+        scheduleSlotByPosition = new Map(scheduleIntents.map((intent) => [intent.positionId, intent.scheduleSlot ?? null]));
+        const ledger = scheduleLedger({ anchorMs: scheduleAnchorMs(effective.scheduleFirstAtSec, agent.createdAt), intervalSec: effective.scheduleIntervalSec!, nowMs: nowMs(),
+          capitalQuoteWei: BigInt(effective.capitalQuoteWei!), entryWei: BigInt(effective.entryWei), platformFeeBps: tradeAgent.feeBps,
+          ttlSec: Math.max(0, (agent.sessionFacts?.expiry ?? 0) - (agent.sessionFacts?.grantedAtSec ?? Math.floor(agent.createdAt / 1_000))),
+          endKind: effective.scheduleEndKind!, endAtSec: effective.scheduleEndAtSec!, endRuns: effective.scheduleEndRuns!, intents: scheduleIntents });
+        const token = effective.scheduleToken! as Address;
+        const walletBalance = await deps.providerRegistry.get(config.chainId).getTokenBalance({ wallet: { address: agent.walletAddress, ownerAddress: agent.ownerAddress, custodyModel: agent.custodyModel, chainId: config.chainId }, token, ...(c.req.raw.signal === undefined ? {} : { signal: c.req.raw.signal }) });
+        const fills = positions.filter((position) => position.status !== "closed");
+        const verifiedFills = fills.filter((position) => position.fillStatus === "verified");
+        let quoteWei: string | null = null;
+        let quoteReason: string | null = walletBalance === 0n ? "balance-zero" : "quote-unavailable";
+        if (walletBalance > 0n && tradeAgent.scheduleQuotes !== undefined) {
+          try {
+            const quote = await tradeAgent.scheduleQuotes.sell({ token, amountInAtomic: walletBalance, slippageBps: effective.slippageBps, ...(c.req.raw.signal === undefined ? {} : { signal: c.req.raw.signal }) });
+            quoteWei = quote.quotedOutAtomic.toString(10); quoteReason = null;
+          } catch { /* the view keeps the dash and its reason */ }
+        }
+        let decimals: number | null = null;
+        let symbol = token.slice(0, 8);
+        try {
+          // Called on the provider, never detached: the method reads `this`.
+          const metadata = await deps.providerRegistry.get(config.chainId).getTokenMetadata?.({ token, ...(c.req.raw.signal === undefined ? {} : { signal: c.req.raw.signal }) });
+          if (metadata === undefined) throw new Error("metadata unavailable");
+          if (Number.isInteger(metadata.decimals)) decimals = metadata.decimals;
+          if (typeof metadata.symbol === "string" && metadata.symbol.length > 0) symbol = metadata.symbol;
+        } catch { /* symbol/address fallback */ }
+        // The current reference premium, read exactly as the worker's schedule gate does
+        // (readRwaLaneSnapshot + rwaPremiumBps): the view is read-only, so a missing row, a
+        // missing fact, a missing venue, or the data-plane call itself failing all fall
+        // through to `null` — the view must never throw over a stale or unreachable lane.
+        let premiumBps: number | null = null;
+        try {
+          const bstocksRows = await tradeAgent.dataPlane.universe("bstocks", c.req.raw.signal);
+          const universeRow = bstocksRows?.find((candidate) => candidate.address.toLowerCase() === token.toLowerCase());
+          // The lane row names the token when the chain metadata read did not (RPC flake): the
+          // page never falls back to an address slice for a token the plane itself listed.
+          if (symbol === token.slice(0, 8) && universeRow !== undefined && universeRow.symbol.length > 0) symbol = universeRow.symbol;
+          const fact = universeRow?.rwa;
+          if (fact !== undefined) {
+            const factWithVenues = fact.venues === undefined && universeRow?.venues !== undefined
+              ? { ...fact, venues: universeRow.venues, onchainPriceUsd: admittedVenueRows(universeRow.venues)[0]?.priceUsd ?? null }
+              : fact;
+            premiumBps = rwaPremiumBps(factWithVenues, nowMs());
+          }
+        } catch { /* premiumBps stays null; the view never throws over a data-plane read */ }
+        // B2 (TRADFI-SCHEDULE-NATIVE-CAP-PLAN): the live native day meter and wallet
+        // balance, read-only and NEVER throwing — an unreadable chain leaves every
+        // field null rather than failing the view. `nativeBuysRefused` applies the
+        // SAME A1 override the gate and the owner view use (ONE token, never the
+        // chain grant), so the three cannot disagree about why buys are stopped.
+        let nativeCapWei: string | null = null;
+        let nativeSpentWei: string | null = null;
+        let nativeBalanceWei: string | null = null;
+        let nativeBuysRefused: boolean | null = null;
+        try {
+          const provider = deps.providerRegistry.get(config.chainId);
+          try {
+            const balance = await provider.getBalance({ address: agent.walletAddress,
+              ...(c.req.raw.signal === undefined ? {} : { signal: c.req.raw.signal }) });
+            nativeBalanceWei = balance.toString(10);
+          } catch { /* nativeBalanceWei stays null */ }
+          if (agent.sessionFacts !== null && provider.nativeDayMeter !== undefined) {
+            try {
+              const meter = await provider.nativeDayMeter({ walletAddress: agent.walletAddress, publicKey: agent.sessionFacts.publicKey,
+                ...(c.req.raw.signal === undefined ? {} : { signal: c.req.raw.signal }) });
+              if (meter.kind === "day") {
+                nativeCapWei = meter.limitWei.toString(10);
+                nativeSpentWei = meter.currentSpentWei.toString(10);
+                nativeBuysRefused = !nativeReserveFloor({ ...meter, grantedTokenCount: 1, submissionNativeWei: 0n }).sufficient;
+              }
+            } catch { /* nativeCapWei/nativeSpentWei/nativeBuysRefused stay null */ }
+          }
+        } catch { /* no provider configured for this chain; every native field stays null */ }
+        scheduleView = { token, symbol, decimals, amountWei: effective.entryWei, intervalSec: effective.scheduleIntervalSec,
+          anchorMs: scheduleAnchorMs(effective.scheduleFirstAtSec, agent.createdAt), nextDueAtMs: ledger.nextDueAtMs, currentSlot: ledger.currentSlot,
+          currentSlotTaken: ledger.currentSlotTaken, fills: ledger.fills, postponed: ledger.postponed, plannedBuys: ledger.plannedBuys,
+          buysThisSession: ledger.buysThisSession, spentWei: ledger.spentWei.toString(10), remainingWei: ledger.remainingWei.toString(10), finished: ledger.finished,
+          endKind: effective.scheduleEndKind, endAtSec: effective.scheduleEndAtSec, endRuns: effective.scheduleEndRuns,
+          marketHoursOnly: effective.scheduleMarketHoursOnly, maxPremiumBps: effective.scheduleMaxPremiumBps, firstAtSec: effective.scheduleFirstAtSec,
+          premiumBps, premiumLimitBps: effective.scheduleMaxPremiumBps,
+          nativeCapWei, nativeSpentWei, nativeBalanceWei, nativeBuysRefused, sessionExpiresAtSec: agent.sessionFacts?.expiry ?? null,
+          holding: { walletBalance: walletBalance.toString(10), boughtAtomic: verifiedFills.reduce((sum, position) => sum + (position.tokenAmount ?? 0n), 0n).toString(10),
+            verifiedSpentWei: verifiedFills.reduce((sum, position) => sum + (position.verifiedEntryAtomic ?? 0n), 0n).toString(10), verifiedFills: verifiedFills.length, quoteWei, quoteReason } };
+      }
+      // AUTO-DCA §13.3 + R2.16: the round, its orders and the wallet, from the DCA store
+      // and one finalized reading. A figure the plane cannot read is `null` with its
+      // reason, never a number.
+      let dcaView: Record<string, unknown> | undefined;
+      if (dcaAgent) {
+        const effective = parsedStoredSettings.value.effective;
+        const pool = dcaPoolForToken(effective.dcaToken!)!;
+        const dca = tradeAgent.dca;
+        const e8 = (price: DcaPrice): string => ((price.num * 100_000_000n) / price.den).toString(10);
+        const [round, rounds, actions]: readonly [DcaRoundRow | null, readonly DcaRoundRow[], readonly DcaActionRow[]] = dca === undefined ? [null, [], []] : await Promise.all([
+          dca.store.getOpenRound(agent.ownerAddress, agent.id),
+          dca.store.listRounds(agent.ownerAddress, agent.id),
+          dca.store.listActions(agent.ownerAddress, agent.id),
+        ]);
+        const orders = dca === undefined || round === null ? [] : await dca.store.listOrders(agent.id, round.roundNo);
+        const settledRounds = rounds.filter((row) => row.phase === "settled");
+        const realizedPnlWei = settledRounds.reduce((sum, row) => sum + (row.realizedPnlWei ?? 0n), 0n);
+        const txByAction = new Map(actions.map((action) => [action.actionKey, action.txHash]));
+        const p0: DcaPrice | null = round !== null && round.p0UsdtWei !== null && round.p0StockWei !== null && round.p0StockWei > 0n
+          ? { num: round.p0UsdtWei, den: round.p0StockWei } : null;
+        const rangeMin = effective.dcaRangeMinE8 === null || effective.dcaRangeMinE8 === undefined ? null : BigInt(effective.dcaRangeMinE8);
+        // DCA-DETAIL §5: the tick-edge price a level/TP order shows, orientation-proof
+        // (max edge for a TP, min edge for a level); `null` for an order never minted.
+        const edgePriceE8 = (order: (typeof orders)[number]): string | null => {
+          if (order.tokenId === null && (order.state === "pending" || order.state === "skipped")) return null;
+          const lower = e8(dcaPriceAtTick(pool, order.tickLower));
+          const upper = e8(dcaPriceAtTick(pool, order.tickUpper));
+          const higher = BigInt(lower) >= BigInt(upper) ? lower : upper;
+          const lowerOfTwo = higher === lower ? upper : lower;
+          return order.role === "tp" ? higher : lowerOfTwo;
+        };
+        const orderView = (order: (typeof orders)[number]) => ({ tokenId: order.tokenId === null ? null : order.tokenId.toString(10),
+          tickLower: order.tickLower, tickUpper: order.tickUpper, closedBy: order.closedBy,
+          usdtWei: (order.state === "exited" ? order.collectedUsdtWei : order.mintedUsdtWei).toString(10),
+          stockWei: (order.state === "exited" ? order.collectedStockWei : order.mintedStockWei).toString(10),
+          txHash: order.createdByAction === null ? null : txByAction.get(order.createdByAction) ?? null,
+          edgePriceE8: edgePriceE8(order),
+          exitTxHash: order.exitedByAction === null ? null : txByAction.get(order.exitedByAction) ?? null });
+        // DCA-DETAIL §3.2: the newest committed/finished action that started round N
+        // (a plain `start`) or closed round N−1 while opening N (`close-start`, whose
+        // plan carries the CLOSING round's number, `buildDcaStart` in worker.ts).
+        const baseFor = (row: DcaRoundRow): { usdtWei: string; stockWei: string; txHash: string | null; atMs: number | null } | null => {
+          if (row.p0UsdtWei === null || row.p0StockWei === null) return null;
+          const action = actions.filter((a) => (a.state === "committed" || a.state === "finished")
+            && ((a.kind === "start" && a.roundNo === row.roundNo) || (a.kind === "close-start" && a.roundNo === row.roundNo - 1)))
+            .sort((a, b) => b.createdAtMs - a.createdAtMs)[0];
+          return { usdtWei: row.p0UsdtWei.toString(10), stockWei: row.p0StockWei.toString(10), txHash: action?.txHash ?? null, atMs: action?.createdAtMs ?? null };
+        };
+        const base = round === null ? null : baseFor(round);
+        // R3.8 / I13: a level's price comes from the round's one ladder anchor (review C4).
+        const anchor = round === null ? null : dcaRoundAnchor(round, actions);
+        const levels = orders.filter((order) => order.role === "level" && order.levelNo !== null).map((order) => {
+          const price = anchor === null ? null : dcaLevelPrice(anchor, order.levelNo!, effective.dcaStepBps!);
+          // D5 view state: a level below the owner's range min is "skipped (below your price range)".
+          const belowRange = price !== null && rangeMin !== null && price.num * 100_000_000n < rangeMin * price.den;
+          const state = order.state === "exited" ? (order.collectedStockWei > 0n ? "filled" : "collected")
+            : order.state === "pending" || order.state === "skipped" ? (belowRange ? "below-range" : order.state) : "resting";
+          return { levelNo: order.levelNo, levelPriceE8: price === null ? null : e8(price), state, ...orderView(order) };
+        });
+        const tp = orders.filter((order) => order.role === "tp").at(-1);
+        const tpEnds = tp === undefined ? null : [dcaPriceAtTick(pool, tp.tickLower), dcaPriceAtTick(pool, tp.tickUpper)].map(e8).sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+        let equity: Record<string, string | null> | null = null;
+        let wallet: Record<string, string> | null = null;
+        // DCA-DETAIL §3.2: set whenever the reading succeeds, unlike `equity.markE8`
+        // which only exists for an active round.
+        let mark: { e8: string; block: string } | null = null;
+        let reason: string | null = dca === undefined ? "dca-unavailable" : null;
+        if (dca !== undefined) {
+          try {
+            const reading = await dca.chain.reading(pool.pool);
+            mark = { e8: e8(dcaMidPrice(pool, reading.sqrtPriceX96)), block: reading.block.toString(10) };
+            const [usdtWei, stockWei] = await Promise.all([dca.chain.tokenBalance(USDT_56, agent.walletAddress, reading.block),
+              dca.chain.tokenBalance(pool.stock, agent.walletAddress, reading.block)]);
+            wallet = { usdtWei: usdtWei.toString(10), stockWei: stockWei.toString(10) };
+            if (round !== null && round.phase === "active") {
+              // The worker's own equity (§7.1): live orders at the reading, the wallet's round stock, less the cost basis.
+              let orderUsdt = 0n, orderStock = 0n, liveLevelMinted = 0n, tpPrincipal = 0n;
+              for (const order of orders) {
+                if (order.state !== "live" && order.state !== "exiting") continue;
+                const amounts = getAmountsForLiquidity(reading.sqrtPriceX96, order.tickLower, order.tickUpper, order.liquidity);
+                orderUsdt += pool.usdtIsToken0 ? amounts.amount0 : amounts.amount1;
+                orderStock += pool.usdtIsToken0 ? amounts.amount1 : amounts.amount0;
+                if (order.role === "level") liveLevelMinted += order.mintedUsdtWei;
+                else tpPrincipal += order.mintedStockWei;
+              }
+              const roundStock = round.stockAcquiredWei > tpPrincipal ? round.stockAcquiredWei - tpPrincipal : 0n;
+              const equityWei = dcaEquityWei({ capitalQuoteWei: BigInt(effective.capitalQuoteWei!), realizedPnlWei,
+                ledger: { costUsdtWei: round.costUsdtWei, stockAcquiredWei: round.stockAcquiredWei, usdtCollectedWei: round.usdtCollectedWei, saleProceedsWei: round.saleProceedsWei },
+                liveLevelMintedUsdtWei: liveLevelMinted, orderUsdtWei: orderUsdt, orderStockWei: orderStock,
+                walletRoundStockWei: stockWei < roundStock ? stockWei : roundStock, mid: dcaMidPrice(pool, reading.sqrtPriceX96) });
+              const stopLossBps = effective.dcaStopLossBps ?? null;
+              equity = { equityWei: equityWei.toString(10), baselineWei: round.slBaselineWei.toString(10),
+                stopAtWei: stopLossBps === null ? null : dcaStopLineWei(round.slBaselineWei, stopLossBps).toString(10),
+                markE8: e8(dcaMidPrice(pool, reading.sqrtPriceX96)), readingBlock: reading.block.toString(10) };
+            } else reason = "no-active-round";
+          } catch { reason = "chain-unreadable"; }
+        }
+        const inFlight = actions.find((action) => action.state === "intended" || action.state === "submitted");
+        const unknown = actions.filter((action) => action.state === "unknown").at(-1);
+        // DCA-DETAIL §3.2: settled rounds newest-first, capped, with their own orders
+        // (a store read failure here leaves the history arrays empty, never throws the view).
+        const DCA_VIEW_HISTORY_ROUNDS = 12;
+        const historyRoundsAll = [...settledRounds].sort((a, b) => b.roundNo - a.roundNo).slice(0, DCA_VIEW_HISTORY_ROUNDS);
+        let historyOrdersAll: readonly (readonly DcaOrderRow[])[] | null = historyRoundsAll.length === 0 ? [] : null;
+        if (dca !== undefined && historyRoundsAll.length > 0) {
+          try { historyOrdersAll = await Promise.all(historyRoundsAll.map((row) => dca.store.listOrders(agent.id, row.roundNo))); }
+          catch { if (reason === null) reason = "dca-unavailable"; }
+        }
+        // A history read failure drops the whole history slice rather than a
+        // half-populated one (§3.2's "leaves the new arrays empty").
+        const historyRoundsDesc = historyOrdersAll === null ? [] : historyRoundsAll;
+        const historyOrdersByRound = historyOrdersAll ?? [];
+        // DCA-DETAIL fix pass, LOW 7: `atMs` is nullable — a base fill whose committed
+        // start/close-start action was rolled back after `p0` was written has no
+        // timestamp to report, and the web renders "—" rather than the 1970 epoch.
+        type DcaFillRow = { readonly atMs: number | null; readonly roundNo: number; readonly kind: "base" | "level" | "take-profit" | "remove-sale";
+          readonly levelNo: number | null; readonly side: "buy" | "sell"; readonly usdtWei: string; readonly stockWei: string; readonly txHash: string | null };
+        const fillsForRound = (roundNo: number, roundOrders: readonly DcaOrderRow[], roundBase: ReturnType<typeof baseFor>): DcaFillRow[] => {
+          const rows: DcaFillRow[] = [];
+          if (roundBase !== null) rows.push({ atMs: roundBase.atMs, roundNo, kind: "base", levelNo: null, side: "buy", usdtWei: roundBase.usdtWei, stockWei: roundBase.stockWei, txHash: roundBase.txHash });
+          for (const order of roundOrders) {
+            const exitAction = order.exitedByAction === null ? undefined : actions.find((a) => a.actionKey === order.exitedByAction);
+            const exitTxHash = order.exitedByAction === null ? null : txByAction.get(order.exitedByAction) ?? null;
+            const exitAtMs = exitAction?.createdAtMs ?? order.updatedAtMs;
+            if (order.role === "level" && order.state === "exited" && order.collectedStockWei > 0n) {
+              const usdtWei = order.mintedUsdtWei > order.collectedUsdtWei ? order.mintedUsdtWei - order.collectedUsdtWei : 0n;
+              rows.push({ atMs: exitAtMs, roundNo, kind: "level", levelNo: order.levelNo, side: "buy", usdtWei: usdtWei.toString(10), stockWei: order.collectedStockWei.toString(10), txHash: exitTxHash });
+            } else if (order.role === "tp" && order.state === "exited" && order.collectedUsdtWei > 0n) {
+              const stockWei = order.mintedStockWei > order.collectedStockWei ? order.mintedStockWei - order.collectedStockWei : 0n;
+              rows.push({ atMs: exitAtMs, roundNo, kind: "take-profit", levelNo: null, side: "sell", usdtWei: order.collectedUsdtWei.toString(10), stockWei: stockWei.toString(10), txHash: exitTxHash });
+            }
+          }
+          const removeActions = actions.filter((a) => a.roundNo === roundNo && a.kind === "remove" && a.state === "finished" && a.plan.swap?.side === "sell");
+          if (removeActions.length > 0) {
+            const newest = [...removeActions].sort((a, b) => b.createdAtMs - a.createdAtMs)[0]!;
+            const stockWei = removeActions.reduce((sum, a) => sum + (a.plan.swap?.amountInWei ?? 0n), 0n);
+            const roundRow = roundNo === round?.roundNo ? round : historyRoundsDesc.find((r) => r.roundNo === roundNo);
+            rows.push({ atMs: newest.createdAtMs, roundNo, kind: "remove-sale", levelNo: null, side: "sell",
+              stockWei: stockWei.toString(10), usdtWei: (roundRow?.saleProceedsWei ?? 0n).toString(10), txHash: newest.txHash });
+          }
+          return rows;
+        };
+        const fillsAll: DcaFillRow[] = round === null ? [] : fillsForRound(round.roundNo, orders, base);
+        historyRoundsDesc.forEach((histRound, index) => {
+          fillsAll.push(...fillsForRound(histRound.roundNo, historyOrdersByRound[index] ?? [], baseFor(histRound)));
+        });
+        fillsAll.sort((a, b) => (b.atMs ?? 0) - (a.atMs ?? 0));
+        const roundsHistoryView = historyRoundsDesc.map((histRound, index) => {
+          const histOrders = historyOrdersByRound[index] ?? [];
+          const filledLevels = histOrders.filter((order) => order.role === "level" && order.state === "exited" && order.collectedStockWei > 0n).length;
+          const markedPnlWei = dcaMarkedPnlWei(histRound);
+          return { roundNo: histRound.roundNo, closeCause: histRound.closeCause, openedAt: histRound.openedAtMs, settledAt: histRound.settledAtMs,
+            filledLevels, realizedPnlWei: histRound.realizedPnlWei === null ? null : histRound.realizedPnlWei.toString(10), unreliable: histRound.unreliable,
+            unsoldStockWei: histRound.unsoldStockWei === null ? null : histRound.unsoldStockWei.toString(10),
+            markedPnlWei: markedPnlWei === null ? null : markedPnlWei.toString(10) };
+        });
+        const actionsView = [...actions].filter((action) => action.txHash !== null).sort((a, b) => b.createdAtMs - a.createdAtMs).slice(0, 50)
+          .map((action) => ({ kind: action.kind, roundNo: action.roundNo, state: action.state, txHash: action.txHash!, createdAt: action.createdAtMs, updatedAt: action.updatedAtMs }));
+        dcaView = { token: pool.stock, symbol: pool.symbol, fee: pool.fee, usdtIsToken0: pool.usdtIsToken0, mark,
+          settings: { stepBps: effective.dcaStepBps, takeProfitBps: effective.dcaTakeProfitBps, baseWei: effective.entryWei, orderWei: effective.dcaOrderWei,
+            maxOrders: effective.dcaMaxOrders, triggerE8: effective.dcaTriggerPriceE8, rangeMinE8: effective.dcaRangeMinE8, rangeMaxE8: effective.dcaRangeMaxE8,
+            stopLossBps: effective.dcaStopLossBps },
+          round: round === null ? null : { roundNo: round.roundNo, phase: round.phase, closeCause: round.closeCause, openedAt: round.openedAtMs,
+            unreliable: round.unreliable, p0E8: p0 === null ? null : e8(p0),
+            avgCostE8: round.stockAcquiredWei > 0n ? e8({ num: round.costUsdtWei, den: round.stockAcquiredWei }) : null,
+            tpTargetE8: round.stockAcquiredWei > 0n && round.costUsdtWei > 0n
+              ? e8(dcaTpTarget({ costUsdtWei: round.costUsdtWei, stockWei: round.stockAcquiredWei, takeProfitBps: effective.dcaTakeProfitBps! })) : null,
+            costUsdtWei: round.costUsdtWei.toString(10), stockHeldWei: round.stockAcquiredWei.toString(10),
+            realizedPnlWei: round.realizedPnlWei === null ? null : round.realizedPnlWei.toString(10), levels, base,
+            tp: tp === undefined ? null : { state: tp.state === "exited" ? "collected" : tp.state === "pending" || tp.state === "skipped" ? tp.state : "resting",
+              rangeLowE8: tpEnds![0], rangeHighE8: tpEnds![1], ...orderView(tp) } },
+          rounds: { settled: settledRounds.length, realizedPnlWei: realizedPnlWei.toString(10),
+            markedPnlWei: settledRounds.reduce((sum, row) => sum + (dcaMarkedPnlWei(row) ?? row.realizedPnlWei ?? 0n), 0n).toString(10),
+            lastSettledAt: settledRounds.at(-1)?.settledAtMs ?? null, history: roundsHistoryView },
+          equity, wallet, reason,
+          inFlight: inFlight === undefined ? null : { kind: inFlight.kind, state: inFlight.state, txHash: inFlight.txHash },
+          unknownAction: unknown === undefined ? null : { kind: unknown.kind, actionKey: unknown.actionKey, note: unknown.note },
+          history: { fills: fillsAll.slice(0, 60) }, actions: actionsView };
+      }
+      let portfolioView: Record<string, unknown> | undefined;
+      if (portfolioAgent) {
+        const effective = parsedStoredSettings.value.effective;
+        const ledger = await tradeAgent.intents.listPortfolio(agent.ownerAddress, agent.id);
+        const displayedLegs = [...ledger].reverse().slice(0, 50);
+        const firstBuys = effective.portfolioTokens!.map((token) => ledger.find((intent) => intent.side === "buy" && intent.token.toLowerCase() === token.toLowerCase()));
+        const evidenceIntents = [...new Map([...displayedLegs, ...firstBuys.filter((intent) => intent !== undefined)].map((intent) => [intent.idempotencyKey, intent])).values()];
+        const journalEvidence = new Map(await Promise.all(evidenceIntents.map(async (intent) => {
+          try {
+            const row = await deps.journal.get(intent.idempotencyKey);
+            return [intent.idempotencyKey, row !== null && row.ownerAddress.toLowerCase() === intent.ownerAddress.toLowerCase()
+              && row.agentId === intent.agentId && row.decisionId === intent.decisionId ? row : null] as const;
+          } catch { return [intent.idempotencyKey, undefined] as const; }
+        })));
+        const portfolioFillEvidence = new Map(await Promise.all(evidenceIntents.map(async (intent) => {
+          const journal = journalEvidence.get(intent.idempotencyKey);
+          const txHash = intent.txHash ?? journal?.externalRef.txHash;
+          const resolveFill = tradeAgent.portfolio?.resolveFill;
+          if (journal?.state !== "COMMITTED" || resolveFill === undefined
+            || typeof txHash !== "string" || !/^0x[0-9a-fA-F]{64}$/u.test(txHash)) return [intent.idempotencyKey, null] as const;
+          try {
+            return [intent.idempotencyKey, await resolveFill({ agent, intent, journalEntry: journal, txHash: txHash as Hex })] as const;
+          } catch { return [intent.idempotencyKey, null] as const; }
+        })));
+        let portfolioNames = new Map<string, string>();
+        try {
+          const universe = await tradeAgent.dataPlane.universe("bstocks", c.req.raw.signal);
+          portfolioNames = new Map((universe ?? []).flatMap((row) => typeof row.name === "string" && row.name.trim() !== ""
+            ? [[row.address.toLowerCase(), row.name.trim()] as const] : []));
+        } catch { /* supplementary names do not gate the view */ }
+        const verifiedBuy = (intent: typeof ledger[number]) => {
+          const row = journalEvidence.get(intent.idempotencyKey);
+          const debit = row?.state === "COMMITTED" ? row.externalRef.actualQuoteSpendWei : undefined;
+          return typeof debit === "string" && /^[1-9]\d*$/u.test(debit) ? debit : null;
+        };
+        const netInvested = ledger.reduce((sum, intent) => sum + (intent.side === "buy" ? intent.entryWei : -(intent.portfolioProceedsAtomic ?? 0n)), 0n);
+        const capital = BigInt(effective.capitalQuoteWei!);
+        const cashCap = capital > netInvested ? capital - netInvested : 0n;
+        const provider = deps.providerRegistry.get(config.chainId);
+        const wallet = { address: agent.walletAddress, ownerAddress: agent.ownerAddress, custodyModel: agent.custodyModel, chainId: config.chainId };
+        const walletUsdt = await provider.getTokenBalance({ wallet, token: USDT_56, signal: c.req.raw.signal });
+        const pending = await deps.journal.sumPendingQuoteSpendSince(agent.id, 0);
+        const spendable = walletUsdt > pending ? walletUsdt - pending : 0n;
+        const portfolioCash = spendable < cashCap ? spendable : cashCap;
+        const idleUsdt = walletUsdt > cashCap ? walletUsdt - cashCap : 0n;
+        const balances = await Promise.all(effective.portfolioTokens!.map((token) => provider.getTokenBalance({ wallet, token: getAddress(token), signal: c.req.raw.signal })));
+        const values = await Promise.all(effective.portfolioTokens!.map((token, index) =>
+          tradeAgent.portfolioValue?.({ token: getAddress(token), amountInAtomic: balances[index]!, signal: c.req.raw.signal }) ?? Promise.resolve(null)));
+        const complete = values.every((value) => value !== null);
+        const stockValue = complete ? values.reduce<bigint>((sum, value) => sum + value!, 0n) : null;
+        const totalValue = stockValue === null ? null : stockValue + portfolioCash;
+        const targets = totalValue === null ? null : effective.portfolioWeightsBps!.map((weight) => totalValue * BigInt(weight) / 10_000n);
+        const tokenView = effective.portfolioTokens!.map((token, index) => {
+          const value = values[index] ?? null;
+          const target = targets?.[index];
+          const drift = complete && value !== null && target !== undefined && target > 0n
+            ? Number((value > target ? value - target : target - value) * 10_000n / target) : null;
+          const first = firstBuys[index];
+          const firstFill = first === undefined ? null : portfolioFillEvidence.get(first.idempotencyKey) ?? null;
+          const firstJournal = first === undefined ? undefined : journalEvidence.get(first.idempotencyKey);
+          const firstCost = first === undefined ? null : firstFill?.quoteWei ?? verifiedBuy(first);
+          return { token, symbol: dcaPoolForToken(token)!.symbol, displayName: portfolioNames.get(token.toLowerCase()) ?? null,
+            initial: { quantityAtomic: firstFill?.quantityAtomic ?? null,
+              quantityReason: first === undefined ? "no-buy" : firstJournal === undefined ? "unavailable" : firstFill === null ? "not-verified" : null,
+              quoteWei: firstCost, quoteReason: first === undefined ? "no-buy" : journalEvidence.get(first.idempotencyKey) === undefined ? "unavailable" : firstCost === null ? "not-verified" : null },
+            targetBps: effective.portfolioWeightsBps![index],
+            balanceAtomic: balances[index]!.toString(10), valueWei: value?.toString(10) ?? null,
+            valueReason: value === null ? "quote-unavailable" : null,
+            weightBps: complete && value !== null && totalValue !== null && totalValue > 0n ? Number(value * 10_000n / totalValue) : null,
+            driftBps: drift };
+        });
+        const slot = currentSlot(agent.createdAt, effective.portfolioIntervalSec!, nowMs());
+        const check = slot === null ? null : await tradeAgent.intents.getPortfolioCheck(agent.ownerAddress, agent.id, slot);
+        portfolioView = { tokens: tokenView, capitalQuoteWei: capital.toString(10), netInvestedWei: netInvested.toString(10),
+          cashCapWei: cashCap.toString(10), walletUsdtWei: walletUsdt.toString(10), portfolioCashWei: portfolioCash.toString(10), idleUsdtWei: idleUsdt.toString(10),
+          stockValueWei: stockValue?.toString(10) ?? null, totalValueWei: totalValue?.toString(10) ?? null,
+          pnlWei: stockValue === null ? null : (stockValue - netInvested).toString(10),
+          driftBps: complete ? Math.max(...tokenView.map((token) => token.driftBps ?? 0)) : null,
+          intervalSec: effective.portfolioIntervalSec, anchorMs: agent.createdAt, currentSlot: slot,
+          nextCheckAtMs: agent.createdAt + ((slot ?? 0) + 1) * effective.portfolioIntervalSec! * 1_000,
+          check: check === null ? null : { slot: check.slot, state: check.state, maxDriftBps: check.maxDriftBps,
+            valueWei: check.valueWei.toString(10), checkedAt: check.checkedAt },
+          legs: displayedLegs.map((intent) => {
+            const journal = journalEvidence.get(intent.idempotencyKey);
+            const fill = portfolioFillEvidence.get(intent.idempotencyKey) ?? null;
+            const quoteWei = fill?.quoteWei ?? (intent.side === "buy" ? verifiedBuy(intent)
+              : intent.portfolioReceiptKey && intent.portfolioProceedsAtomic !== null && intent.portfolioProceedsAtomic !== undefined
+                && intent.portfolioProceedsAtomic > 0n ? intent.portfolioProceedsAtomic.toString(10) : null);
+            const hash = intent.txHash ?? journal?.externalRef.txHash ?? null;
+            return { slot: intent.portfolioSlot, side: intent.side,
+            token: intent.token, symbol: dcaPoolForToken(intent.token)?.symbol ?? intent.token.slice(0, 8),
+            amountWei: intent.amountWei.toString(10), quotedOutAtomic: intent.quotedOutAtomic?.toString(10) ?? null,
+            minOutAtomic: intent.minOutAtomic?.toString(10) ?? null, proceedsAtomic: intent.portfolioProceedsAtomic?.toString(10) ?? null,
+            state: intent.state, txHash: typeof hash === "string" && /^0x[0-9a-fA-F]{64}$/u.test(hash) ? hash : null, createdAt: intent.createdAt,
+            detail: { id: intent.decisionId, executionState: journal?.state ?? null,
+              executionReason: journal === undefined ? "unavailable" : journal === null ? "not-recorded" : null,
+              quantityAtomic: fill?.quantityAtomic ?? null,
+              quantityReason: journal === undefined ? "unavailable" : journal === null ? "not-recorded" : fill === null ? "not-verified" : null, quoteWei,
+              quoteReason: quoteWei === null ? intent.side === "buy" && journal === undefined ? "unavailable" : "not-verified" : null } };
+          }) };
+      }
       return c.json({ data: {
         settings: settings?.params ?? null,
-        open: open.map((position) => positionView(position, marketHours(position.token), observationById.get(position.positionId))),
+        ...(scheduleView === undefined ? {} : { schedule: scheduleView }),
+        ...(dcaView === undefined ? {} : { dca: dcaView }),
+        ...(portfolioView === undefined ? {} : { portfolio: portfolioView }),
+        ...(cmcBudget === null ? {} : { cmcBudget }),
+        ...(cmcLog === null ? {} : { cmcLog }),
+        open: open.map((position) => {
+          const view = positionView(position, marketHours(position.token), observationById.get(position.positionId), keptView);
+          return schedule ? { ...view, scheduleSlot: scheduleSlotByPosition?.get(position.positionId) ?? null } : view;
+        }),
         closed: closed.map((position) => positionView(position, marketHours(position.token), observationById.get(position.positionId))),
         runs: runs.map(runView),
-        summary: tradeSummary(positions, observations, maxOpenPositions),
+        summary: tradeSummary(countedPositions, observations, maxOpenPositions),
+        tradfiAi,
+        keptPositions: keptView ? positions.length - countedPositions.length : 0,
         lifecycle: { draining: settings?.drainingAt !== null && settings !== null, drainingAt: settings?.drainingAt ?? null },
         pendingIntents: unsettled.map((intent) => ({ decisionId: intent.decisionId, side: intent.side,
           token: intent.token, state: intent.state, txHash: intent.txHash, createdAt: intent.createdAt })),
-        pinned: pinnedTokens(agent.sessionFacts).map((address) => ({ address,
-          marketHours: marketHours(address) })),
+        pinned: pinnedTokens(agent.sessionFacts, parsedStoredSettings?.ok === true && isTradfiV2Settings(parsedStoredSettings.value.effective)).map((address) => ({ address,
+          marketHours: marketHours(address), symbol: tradeAgent.readiness.bstocksSymbols?.get(address.toLowerCase()) ?? null })),
         marketHours: { usEquitiesOpen: isUsEquityOpen(nowMs()), holidaysModeled: false },
       } });
     });
@@ -4772,6 +6314,20 @@ export function createServer(deps: ServerDeps): Hono {
       return undefined;
     }
     if (provider.nativeDayMeter === undefined) return undefined;
+    // Same override as the gate (`nativeReserveFloor` in `src/trade/execute.ts`,
+    // TRADFI-SCHEDULE-NATIVE-CAP-PLAN A2): a schedule agent's reserve counts ONE
+    // token, decided ONLY from the stored, owner-signed settings row, so the
+    // owner view and the gate cannot disagree about why buys are refused.
+    let scheduleAgent = false;
+    if (deps.tradeAgent !== undefined) {
+      try {
+        const stored = await deps.tradeAgent.settingsStore.get(agent.ownerAddress, agent.id);
+        if (stored !== null) {
+          const parsedStored = parseTradeSettings(stored.params);
+          if (parsedStored.ok) scheduleAgent = isTradeScheduleSettings(parsedStored.value.effective);
+        }
+      } catch { /* an unreadable settings row keeps the chain count — the higher, safe reserve */ }
+    }
     let meter: NativeDayMeterReading;
     try {
       meter = await provider.nativeDayMeter({
@@ -4839,7 +6395,8 @@ export function createServer(deps: ServerDeps): Hono {
     // the gate — it is exactly the largest trade the gate would still authorise,
     // so a UI can say "buys up to X" instead of implying all of `remainingWei`
     // is spendable, which is the number the pre-A1 view published.
-    const floor = nativeReserveFloor({ ...meter, submissionNativeWei: 0n });
+    const effectiveGrantedTokenCount = scheduleAgent ? 1 : meter.grantedTokenCount;
+    const floor = nativeReserveFloor({ ...meter, grantedTokenCount: effectiveGrantedTokenCount, submissionNativeWei: 0n });
     return {
       readable: true,
       metered: true,
@@ -4847,7 +6404,9 @@ export function createServer(deps: ServerDeps): Hono {
       currentSpentWei: meter.currentSpentWei,
       remainingWei: floor.remainingWei,
       overCap: floor.overCap,
-      grantedTokenCount: meter.grantedTokenCount,
+      // The count the floor actually used, not the chain's raw grant — so the
+      // owner view and the gate cannot disagree (A2).
+      grantedTokenCount: effectiveGrantedTokenCount,
       reserveWei: floor.reserveWei,
       ownFeeWei: floor.ownFeeWei,
       requiredWei: floor.requiredWei,
@@ -4909,7 +6468,8 @@ export function createServer(deps: ServerDeps): Hono {
    * The account-session capability is accepted only by these account-read GETs
    * (the complete `authorizeAccountRead(` call-site list):
    * `/account/portfolio`, `/agents`, `/agents/:id/owner-view`,
-   * `/agents/:id/session`, `/agents/:id/trade/view`, `/agents/:id/lp`, and
+   * `/agents/:id/session`, `/agents/:id/trade/view`,
+   * `/agents/:id/trade/simulations`, `/agents/:id/lp`, and
    * `/agents/:id/lending/view`. Keeping it separate from `authorizeRead` makes
    * it structurally unavailable to every owner mutation and every other owner
    * read. Header presence is XOR, including empty or malformed raw values.
@@ -13263,6 +14823,8 @@ class HireAgentExistsError extends Error {
 }
 class HireWalletOwnerError extends Error {}
 class HireEvidenceError extends Error {}
+/** R2.7/R3.5: a configured aggregator guard failed verification at hire or renewal. Retryable. */
+class GuardUnverifiedError extends Error {}
 class TradeCapitalTooSmallError extends Error {
   constructor(readonly minimumWei: bigint) { super("Trade capital is too small."); }
 }

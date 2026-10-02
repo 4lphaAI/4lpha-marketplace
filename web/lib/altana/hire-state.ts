@@ -10,6 +10,10 @@ export type HireFunding = {
   readonly relayGasHeadroomWei: string;
   readonly requiredWei: string;
   readonly balanceWei: string | null;
+  readonly quoteAsset?: "USDT";
+  readonly quoteRequiredWei?: string;
+  readonly quoteBalanceWei?: string | null;
+  readonly quoteShortfallWei?: string;
 };
 
 export type HireArmPlanOutcome = {
@@ -56,6 +60,16 @@ export type HireSessionView = {
   readonly activationError?: "wallet_in_use" | "settings_conflict";
   /** Present once armed: the immutable hire profile the grid arm must stay inside. */
   readonly hireSizing?: { readonly name: "grid-v1" | "grid-shift-v1" | "lp-v1" | "trade-v1" | "lending-v1"; readonly version: 1; readonly openNativeBudgetWei: string } | null;
+  /**
+   * CMC-HIRE-SETUP R5.1′: the field the plane's `provisioningView` already
+   * returns for `armed` only (a `paused` row renders `{ status }`) — typed here, no plane change. The
+   * top-level `sessionPublicKey`/`expiresAt` above exist only while
+   * `provisioning`; the CMC continuation step reads the session from here.
+   */
+  readonly agent?: {
+    readonly walletAddress: string;
+    readonly session: { readonly publicKey: `0x${string}`; readonly expiresAt: number } | null;
+  };
 };
 
 export type HireResumeStep = "s1" | "fund-and-grant" | "converge" | "poll" | "arm" | "terminal";

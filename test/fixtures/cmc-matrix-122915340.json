@@ -1,0 +1,71 @@
+{
+  "kind": "cmc-capability-matrix-v1",
+  "chainId": 56,
+  "forkBlock": 122915340,
+  "verdict": "PASS",
+  "grantShapeDigest": "0x86dce5f53fb4ad5a4c810fd0a8d8cf6613bff7458f7e5a581ead835395390067",
+  "accountCodeHash": "0x2f17b34a1c33b5fb9bd06422cec6782b367aa0e0bb09ee3c5263b14f4112a00f",
+  "tokenCodeHash": "0x97a48aa4c129657440dafdacd4c836389734d28cc4a0ca7403e68da660a74a59",
+  "permit2CodeHash": "0x48774d936722dd7002887f307f58bcddb3eeabad39149e7dcb5c08e4ebe3310f",
+  "settlerCodeHash": "0x0ba2481269cc11da9a6208fb34ea1c04cc05152551660b94465f65920b05bb71",
+  "proofDigests": [
+    "0xad84ce8a9b34558a5e837c80859389d37a7d5b6f4af0ebb8c4fe5539b3ce35da",
+    "0xef782221101dbb3ee171a0cd270afb7fea976dcf22d12110dacbd4863c9e8327",
+    "0xff812f23cca8015dbd6a36dca4cf889b0fff5c26e254ca4f33d2765745631053",
+    "0x0bfeff4474f67bc79f464f5d9d0b84e43fe92dfc3af4278599944cc56401409e",
+    "0x29af6875f06d915358ad0985b2ef285934cb65b925345c31b170bff0eac71a4b",
+    "0xc9d379ad4394a1de11243175d85322575907c39b237f48b3467f0ef9268d4b37",
+    "0xbdfa68a91e9e1ad2f539326c44d1effb87f717a6ae6ed3d92132dc8949a44ab2",
+    "0x94088860700eb5ee4d5b631be50c6c5d5927d25e449a44324ffaa5385d8227c7"
+  ],
+  "traceVerdicts": [
+    {
+      "index": 1,
+      "fact": "ownerApprovalPersists",
+      "verdict": "PASS"
+    },
+    {
+      "index": 2,
+      "fact": "unrelatedTradingPreservesAllowance",
+      "verdict": "PASS"
+    },
+    {
+      "index": 3,
+      "fact": "sessionApproveCannotIncreaseAllowance",
+      "verdict": "PASS"
+    },
+    {
+      "index": 4,
+      "fact": "noTemporaryApproveConsumePath",
+      "verdict": "PASS"
+    },
+    {
+      "index": 5,
+      "fact": "temporaryApproveCallbackReentryExcluded",
+      "verdict": "PASS"
+    },
+    {
+      "index": 6,
+      "fact": "revokeExpiryRejectsPayment",
+      "verdict": "PASS"
+    },
+    {
+      "index": 7,
+      "fact": "walletKeyExclusive",
+      "verdict": "PASS"
+    },
+    {
+      "index": 8,
+      "fact": "additiveIncreaseAllowance",
+      "verdict": "PASS"
+    }
+  ],
+  "sessionApproveObservations": {
+    "ownerAllowanceBefore": "2000000000000000000",
+    "ownerAllowanceAfterInCapApprove": "0",
+    "ownerValueRestored": false,
+    "inCapAmount": "50000000000000000000",
+    "inCapStatus": "success",
+    "overCapStatus": "reverted"
+  }
+}

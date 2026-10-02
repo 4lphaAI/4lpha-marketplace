@@ -454,6 +454,16 @@ export class AltanaProvider implements WalletProvider {
     });
   }
 
+  submitPreparedTrade(params: PortoStagedLpSubmit): Promise<ExecutionReceipt> {
+    if (this.#stagedLp === undefined) {
+      throw new ProviderError("Staged LP submission is unavailable for this chain/provider registry.");
+    }
+    return this.#stagedLp.submit(params).catch((cause: unknown) => {
+      if (isProvenPreBindStagedLpError(cause)) throw cause;
+      throw mapProviderError(cause);
+    });
+  }
+
   /**
    * Resolve a usable RPC endpoint, once per provider instance.
    *

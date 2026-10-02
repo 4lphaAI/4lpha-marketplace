@@ -38,4 +38,18 @@ describe("TRADING-AGENT R5/C29 hire wire", () => {
     assert.equal(parsed.value.settings.crashProtection, false);
     assert.equal(Object.hasOwn(parsed.value.settingsParams, "crashProtection"), false);
   });
+
+  it("accepts tradfi for a new hire but keeps blue-chip parseable only as stored legacy data", () => {
+    const base = { walletAddress: WALLET, capDayWei: "30000000000000000", ttlSec: 604800,
+      sizingPreset: "trade-v1" as const, executionModel: "tradfi" as const,
+      hireRunId: "11111111-1111-4111-8111-111111111111", autoGrant: true,
+      settings: { ...DEFAULT_TRADE_SETTINGS, executionModel: "tradfi" as const, settlementAsset: "USDT" as const,
+        entryWei: "20000000000000000000", minEntryWei: "5000000000000000", capitalQuoteWei: "60000000000000000", cmcNewsEnabled: false } };
+    assert.equal(parseHireParams(base).ok, true);
+    const legacy = { ...base, executionModel: "blue-chip" as const,
+      settings: { ...DEFAULT_TRADE_SETTINGS, executionModel: "blue-chip" as const } };
+    const parsed = parseHireParams(legacy);
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? "" : parsed.message, /tradfi.*mid-cap.*degen.*sigma/u);
+  });
 });

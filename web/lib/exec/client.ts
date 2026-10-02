@@ -65,6 +65,16 @@ export function execAccountRead(path: string, bearer: string, headers: Record<st
   return forward(path, { method: "GET", headers: { authorization: `Bearer ${bearer}`, ...headers } });
 }
 
+/** Account-read authorized POST used by bounded owner control seams. */
+export function execAccountReadMutation(path: string, bearer: string, rawBody: string): Promise<ExecResponse> {
+  return forward(path, { method: "POST", headers: { authorization: `Bearer ${bearer}` }, body: rawBody });
+}
+
+/** Signed owner-read authorized POST; the body remains an untrusted lookup hint. */
+export function execOwnerReadMutation(path: string, ownerActionHeader: string, rawBody: string): Promise<ExecResponse> {
+  return forward(path, { method: "POST", headers: { "x-owner-action": ownerActionHeader }, body: rawBody });
+}
+
 /**
  * A plane read that takes only the service perimeter (no owner action) —
  * today just the pool-state read the grid geometry is derived from.
@@ -79,13 +89,13 @@ export function execOwnerMutation(path: string, rawBody: string): Promise<ExecRe
 }
 
 /** Exact hire continuation for the two arm routes; it never carries a signed body. */
-export function execProvisionContinuationMutation(path: string, provisionActionHeader: string): Promise<ExecResponse> {
+export function execProvisionContinuationMutation(path: string, provisionActionHeader: string, headerName: "x-provision-action" | "x-renew-action" = "x-provision-action"): Promise<ExecResponse> {
   if (provisionActionHeader.length === 0 || provisionActionHeader.length > 64 * 1024) {
     return Promise.reject(new Error("The provision continuation header is too large."));
   }
   return forward(path, {
     method: "POST",
-    headers: { "x-provision-action": provisionActionHeader },
+    headers: { [headerName]: provisionActionHeader },
     body: "{}",
   });
 }

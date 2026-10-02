@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
-import { forwardAgentMutation } from "./mutation-bff";
+import { forwardAccountReadMutation, forwardAgentMutation } from "./mutation-bff";
 
 describe("owner mutation BFF", () => {
   it("forwards signature-covered bytes exactly", async () => {
@@ -49,6 +49,16 @@ describe("owner mutation BFF", () => {
     expect(await response.text()).toBe('{"error":{"code":"execution_unavailable"}}');
   });
 
+  it("requires the existing account-read credential for CMC control lookups", async () => {
+    const response = await forwardAccountReadMutation(
+      new NextRequest("https://app.test/api/agents/agent-1/trade/cmc-budget/attempt", { method: "POST", body: '{"operationId":"x","attemptId":"y"}' }),
+      "agent-1",
+      "/trade/cmc-budget/attempt",
+    );
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe('{"error":{"code":"owner_auth_required"}}');
+  });
+
   it("pins every mutation route to its one plane suffix", () => {
     const routes = [
       ["../../app/api/agents/[id]/pause/route.ts", '"/pause"'],
@@ -57,6 +67,9 @@ describe("owner mutation BFF", () => {
       ["../../app/api/agents/[id]/lp/settings/route.ts", '"/lp/settings"'],
       ["../../app/api/agents/[id]/lp/[positionId]/exit/route.ts", "`/lp/${encodeURIComponent(positionId)}/exit`"],
       ["../../app/api/agents/[id]/trade/settings/route.ts", '"/trade/settings"'],
+      ["../../app/api/agents/[id]/trade/cmc-budget/route.ts", '"/trade/cmc-budget"'],
+      ["../../app/api/agents/[id]/trade/cmc-budget/attempt/route.ts", '"/trade/cmc-budget/attempt"'],
+      ["../../app/api/agents/[id]/trade/cmc-budget/confirm/route.ts", '"/trade/cmc-budget/confirm"'],
       ["../../app/api/agents/[id]/trade/positions/[positionId]/exit/route.ts", "`/trade/positions/${encodeURIComponent(positionId)}/exit`"],
     ] as const;
     for (const [path, suffix] of routes) {

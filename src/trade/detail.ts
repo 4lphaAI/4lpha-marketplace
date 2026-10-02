@@ -1,10 +1,14 @@
 /** Read-only, bounded trade-position valuation for the owner detail page. */
+import type { Address } from "viem";
 import type { WalletProvider } from "../core/types.js";
 import type { AgentRecord } from "../store/agents.js";
 import type { TradePositionRecord } from "../store/tradePositions.js";
 import { canonicalEncode } from "../auth/canonical.js";
 import { pnlBps } from "./exits.js";
-import { quoteSellAlongRoute, type RouteQuoteReader } from "./route.js";
+import { quoteBestTradfiSell, quoteSellAlongRoute, type RouteQuoteReader, type TradeVenueId } from "./route.js";
+
+/** A Flash-derived value is cached longer than a direct quote (5s) to protect the shared 5 rps Binance key. */
+const FLASH_QUOTE_CACHE_MS = 60_000;
 
 export type TradeQuoteStatus = "quoted" | "unattributed" | "balance-gone" | "unavailable" | "closed";
 
@@ -34,6 +38,8 @@ export function createTradeDetailObserver(input: {
   readonly routeReader?: RouteQuoteReader;
   readonly now?: () => number;
   readonly maxAgeMs?: number;
+  /** Fallback for a pool-less USDT position when `quoteBestTradfiSell` throws (no direct AMM route). */
+  readonly flashSellQuote?: (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly signal?: AbortSignal }) => Promise<bigint>;
 }): TradeDetailObserver {
   const now = input.now ?? Date.now;
   const maxAgeMs = input.maxAgeMs ?? 5_000;
@@ -69,9 +75,11 @@ export function createTradeDetailObserver(input: {
       }
       return Promise.all(positions.map(async (position): Promise<TradePositionObservation> => {
         const at = now();
+        const venue: TradeVenueId = position.venue ?? (position.route.fees.length === 0 ? "pancake_v2" : "pancake_v3");
         const identityKey = canonicalEncode({
           owner: agent.ownerAddress.toLowerCase(), agentId: agent.id, positionId: position.positionId,
-          token: position.token.toLowerCase(), route: position.route,
+          token: position.token.toLowerCase(), venue, route: position.route,
+          settlementAsset: position.settlementAsset ?? null,
           recordedAmount: position.tokenAmount?.toString(10) ?? null, status: position.status,
         });
         const meta = await tokenMeta(position.token, signal);
@@ -83,6 +91,7 @@ export function createTradeDetailObserver(input: {
           observedAt: at,
         };
         let value: TradePositionObservation;
+        let usedFlashQuote = false;
         if (position.status === "closed") {
           value = { ...base, liveWalletBalance: null, currentQuoteWei: null, pnlBps: null,
             quoteStatus: "closed", reason: "Position is closed." };
@@ -107,17 +116,32 @@ export function createTradeDetailObserver(input: {
               value = { ...base, liveWalletBalance: balance.toString(10), currentQuoteWei: null, pnlBps: null,
                 quoteStatus: "unattributed", reason: "The live wallet balance cannot be attributed to this whole position." };
             } else {
-              const quote = await quoteSellAlongRoute({
-                token: position.token,
-                amountInWei: balance,
-                venue: position.route.fees.length === 0 ? "pancake_v2" : "pancake_v3",
-                route: position.route,
-                rpcUrls: input.rpcUrls,
-                ...(signal === undefined ? {} : { signal }),
-                ...(input.routeReader === undefined ? {} : { reader: input.routeReader }),
-              });
-              value = { ...base, liveWalletBalance: balance.toString(10), currentQuoteWei: quote.toString(10),
-                pnlBps: pnlBps(quote, position.entryWei)?.toString(10) ?? null,
+              let quoteValue: bigint;
+              if (position.settlementAsset === "USDT") {
+                try {
+                  const quote = await quoteBestTradfiSell({ token: position.token, amountInAtomic: balance, slippageBps: 300, rpcUrls: input.rpcUrls,
+                    ...(signal === undefined ? {} : { signal }), ...(input.routeReader === undefined ? {} : { reader: input.routeReader }) });
+                  quoteValue = quote.quotedOutAtomic;
+                } catch (error) {
+                  signal?.throwIfAborted();
+                  if (input.flashSellQuote === undefined) throw error;
+                  quoteValue = await input.flashSellQuote({ token: position.token, amountInAtomic: balance, ...(signal === undefined ? {} : { signal }) });
+                  usedFlashQuote = true;
+                }
+              } else {
+                quoteValue = await quoteSellAlongRoute({
+                  token: position.token,
+                  amountInWei: balance,
+                  venue,
+                  route: position.route,
+                  rpcUrls: input.rpcUrls,
+                  ...(signal === undefined ? {} : { signal }),
+                  ...(input.routeReader === undefined ? {} : { reader: input.routeReader }),
+                });
+              }
+              const basis = position.settlementAsset === "USDT" ? position.verifiedEntryAtomic : position.entryWei;
+              value = { ...base, liveWalletBalance: balance.toString(10), currentQuoteWei: quoteValue.toString(10),
+                pnlBps: basis === null || basis === undefined ? null : pnlBps(quoteValue, basis)?.toString(10) ?? null,
                 quoteStatus: "quoted", reason: null };
             }
           } catch {
@@ -129,7 +153,7 @@ export function createTradeDetailObserver(input: {
         if (value.quoteStatus === "quoted") {
           const balanceKey = value.liveWalletBalance ?? "";
           cache.set(`${identityKey}:${balanceKey}`,
-            { value, expiresAt: at + maxAgeMs });
+            { value, expiresAt: at + (usedFlashQuote ? FLASH_QUOTE_CACHE_MS : maxAgeMs) });
         }
         return value;
       }));

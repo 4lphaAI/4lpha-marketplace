@@ -18,6 +18,7 @@ import { WBNB_56 } from "@/lib/exec/pairs";
 import { freshWbnbPriceMicros } from "@/lib/exec/agent-detail";
 import type { OwnerActionEnvelope } from "@/lib/exec/owner-action";
 import { nextFreeAgentId } from "./HireGridDeploy";
+import { DEPLOYED_HOLD_MS, DeployRunModal, IDLE_DEPLOY_STEPS, type DeployStep, type DeployStepDef, type DeployStepKey, type DeployStepState } from "./DeployRunModal";
 import {
   INVALID,
   LENDING_ACTIONS,
@@ -235,11 +236,7 @@ type GrantCallPermission =
   | { readonly to: Address }
   | { readonly signature: string };
 
-type DeployStepKey = "hire" | "fund" | "grant" | "converge" | "arm";
-type DeployStepState = "pending" | "active" | "done" | "failed" | "skipped";
-type DeployStep = { readonly state: DeployStepState; readonly detail?: string };
-
-const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: string; readonly hint: string }[] = [
+const DEPLOY_STEPS: readonly DeployStepDef[] = [
   { key: "hire", title: "Sign the hire", hint: "One passkey signature creates the scoped session key (a read session may be authorized first)" },
   { key: "fund", title: "Fund the agent wallet", hint: "The reserve, the registration fee and the relay gas" },
   { key: "grant", title: "Grant the session on chain", hint: "Your passkey authorises the session; the relay submits it" },
@@ -247,40 +244,7 @@ const DEPLOY_STEPS: readonly { readonly key: DeployStepKey; readonly title: stri
   { key: "arm", title: "Place the reserve", hint: "Signs lendingArm: one batch swaps BNB to USDT and supplies it to Venus" },
 ];
 
-const STEP_MARK: Record<DeployStepState, string> = {
-  pending: "○", active: "◐", done: "●", failed: "✕", skipped: "–",
-};
-
-const IDLE_STEPS: Record<DeployStepKey, DeployStep> = {
-  hire: { state: "pending" }, fund: { state: "pending" }, grant: { state: "pending" },
-  converge: { state: "pending" }, arm: { state: "pending" },
-};
-
-function DeployProgress({ steps }: { readonly steps: Record<DeployStepKey, DeployStep> }) {
-  return (
-    <div style={{ display: "grid", gap: 2, padding: 12, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)" }}>
-      {DEPLOY_STEPS.map(({ key, title, hint }, index) => {
-        const step = steps[key];
-        const colour = step.state === "done" ? "var(--profit)"
-          : step.state === "failed" ? "var(--loss)"
-            : step.state === "active" ? "var(--cat-health)" : "var(--text-subtle)";
-        return (
-          <div key={key} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "8px 6px" }}>
-            <span style={{ color: colour, font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-mono)", width: 44, flex: "0 0 auto" }}>
-              {STEP_MARK[step.state]} {index + 1}
-            </span>
-            <span style={{ display: "grid", gap: 3, minWidth: 0 }}>
-              <span style={{ font: "var(--weight-medium) var(--text-sm)/1.2 var(--font-sans)", color: step.state === "pending" ? "var(--text-subtle)" : "var(--ink-1)" }}>{title}</span>
-              <span style={{ font: "var(--weight-regular) var(--text-xs)/1.4 var(--font-sans)", color: step.state === "failed" ? "var(--loss)" : "var(--text-subtle)", overflowWrap: "anywhere" }}>
-                {step.detail ?? hint}
-              </span>
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+const IDLE_STEPS = IDLE_DEPLOY_STEPS;
 
 function agentIdFromName(name: string): string {
   const slug = name.trim().toLowerCase().replace(/[^a-z0-9._:-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 96);
@@ -760,6 +724,16 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     }).finally(() => { if (mounted.current) setWorking(null); });
   }, [beginPolling, owner.passkey]);
 
+  const openAgentPage = (id: string): void => {
+    if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+  };
+  /** The popup's "Open the agent page" during the deployed hold: end the run so it cannot navigate a second time. */
+  const openDeployedAgent = (): void => {
+    if (agentId === null) return;
+    activeRun.current?.stop();
+    openAgentPage(agentId);
+  };
+
   const mark = (key: DeployStepKey, state: DeployStepState, detail?: string): void => {
     setSteps((current) => ({ ...current, [key]: detail === undefined ? { state } : { state, detail } }));
   };
@@ -1222,7 +1196,9 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
       if (armParams === null || !sameLendingArmValues(armParams, recovery.values)) {
         confirmedArm.current = null;
         setArmRecovered({ agentId: id, values: recovery.values });
-        mark("arm", "active", "Review the current signed settings, then confirm to place the reserve.");
+        // A pause for the owner, not a failure: `pending`, and the popup steps
+        // aside (see `deployModal`) so the review below is reachable.
+        mark("arm", "pending", "Review the current signed settings, then confirm to place the reserve.");
         return;
       }
       const armValues = recovery.values;
@@ -1243,13 +1219,15 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
       // L9: a replayed envelope carries NO outcome. Nothing here may infer one —
       // the navigation below lands on the agent page, which re-reads
       // `GET /lending/view` and renders whatever the plane actually recorded.
-      mark("arm", "done", armed.replayed
-        ? "This arm was already submitted. Opening the agent page to read what the plane recorded…"
-        : "Reserve placed.");
+      // A replay is `skipped`, not `done`: the popup's "Agent deployed" would be an inferred outcome.
+      if (armed.replayed) mark("arm", "skipped", "This arm was already submitted. Opening the agent page to read what the plane recorded…");
+      else mark("arm", "done", "Reserve placed.");
 
       forgetLendingHire(hireStorage, id);
       confirmedArm.current = null;
-      if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
+      // A replayed envelope carries no outcome (L9): no "Agent deployed" hold for it.
+      if (!armed.replayed) await run.wait(DEPLOYED_HOLD_MS);
+      openAgentPage(id);
     } catch (error) {
       if (!mounted.current || run.stopped || currentOwnerIdentity.current !== ownerIdentity) return;
       const text = error instanceof Error ? error.message : "The deploy could not be completed.";
@@ -1261,6 +1239,8 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
         // forever, so the owner belongs on the agent page where the guard's own
         // state is shown — not here with a retry that cannot run.
         if (error.status === "held") {
+          // Neutral, never a red ✕: an ambiguous submission is not a failed deploy.
+          mark("arm", "skipped", "The placement is held: the relay's answer was ambiguous. Continue from the agent page.");
           if (mounted.current) setRunning(false);
           if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`);
           return;
@@ -1390,12 +1370,19 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     <span style={{ color: "var(--text-subtle)" }}>{LENDING_CUSTODY_COPY}</span>
   </div>;
 
+  // ONE popup instance for every branch below: keyed, so it survives the
+  // switch into the arm branch mid-run instead of remounting.
+  const deployModal = <DeployRunModal key="deploy-run" label="Lending Agent" color="var(--cat-health)" agentId={agentId}
+    stepDefs={DEPLOY_STEPS} steps={steps} running={running} suspended={deposit || (!running && armRecovered !== null && armRecovered.agentId === agentId)} message={message} note={working}
+    onCancel={view?.status === "provisioning" && view.cancelRequested !== true ? () => void cancelHire() : null}
+    cancelDisabled={working !== null && !running} onOpenAgent={openDeployedAgent} />;
+
   if (step === "arm" && agentId !== null) {
     // Deploy already continues through the arm. Recovery controls must not
     // look like extra required steps while that same run is in progress.
     if (running) return <div data-testid="lending-deploy-running" style={{ display: "grid", gap: 12 }}>
       <p role="status" style={{ color: "var(--text-muted)", font: "var(--type-body-sm)", margin: 0 }}>Approve any wallet prompts to continue. This page will advance automatically.</p>
-      {Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
+      {deployModal}
       {message ? <p role="status" style={{ color: "var(--text-muted)", margin: 0 }}>{message}</p> : null}
     </div>;
     const openAgent = (id: string): void => { if (props.go) props.go(`/account/${id}`); else window.location.assign(`/account/${encodeURIComponent(id)}`); };
@@ -1456,7 +1443,7 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
             </button>}
       </div>
       {blocked !== null && armOutcome?.status !== "held" && armPastArm === null ? <p role="status" style={{ color: "var(--warn)", margin: 0 }}>{blocked}</p> : null}
-      {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
+      {deployModal}
       {message && message !== armOutcome?.reason ? <p style={{ color: "var(--loss)" }}>{message}</p> : null}
       {armOutcome?.status === "held" || armPastArm !== null ? null : <div><button type="button" style={{ ...secondaryBtn, padding: "10px 16px", font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)" }} onClick={() => openAgent(agentId)}>Open the agent page without placing the reserve</button></div>}
     </div>;
@@ -1487,14 +1474,13 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     </div> : null}
     {step === "s1" || step === "fund-and-grant" || step === "converge" || (step === "poll" && view?.cancelRequested !== true) ? <div style={{ display: "grid", gap: 12 }}>
       <button type="button" style={busyBtn(running || working !== null || blocked !== null, primaryBtn)} onClick={() => void deployAll()} disabled={running || working !== null || blocked !== null}>
-        {running ? "Deploying…" : step === "s1" ? "Deploy Lending Agent" : "Continue deploy"}
+        {running ? "Deploying…" : step === "s1" ? "Sign hire and create the session key" : "Continue deploy"}
       </button>
       {blocked !== null ? <p role="alert" style={{ color: "var(--loss)", margin: 0 }}>{blocked}</p> : null}
       {walletBlocked !== null ? <p role="alert" style={{ color: "var(--loss)", margin: 0 }}>
         {walletBlocked}{" "}
         <a href="/account" style={{ color: "inherit", textDecoration: "underline" }} onClick={(event) => { if (props.go) { event.preventDefault(); props.go("/account"); } }}>Create account</a>
       </p> : null}
-      {running || Object.values(steps).some((entry) => entry.state !== "pending") ? <DeployProgress steps={steps} /> : null}
     </div> : null}
     {(step === "poll" || step === "converge") && view !== null ? <p>{view.cancelRequested === true ? cancellationMessage(view) : pollStatusText(view)}</p> : null}
     {view?.status === "provisioning" && view.cancelRequested !== true ? <button type="button" style={busyBtn(working !== null && !running, secondaryBtn)} onClick={() => void cancelHire()} disabled={working !== null && !running}>Cancel hire safely</button> : null}
@@ -1520,5 +1506,6 @@ export function HireLendingDeploy(props: HireLendingDeployProps) {
     }} wallet={fundsWallet} connectedAddress={connectedAddress} passkey={owner.passkey} ownerAddress={owner.ownerAddress} initialTab="deposit"
       {...(depositWei === null ? {} : { fixedDepositWei: depositWei, autoSubmitDeposit: true })}
       onDepositSubmitted={() => { mark("fund", "active", "Deposit sent. Waiting for it to land in the agent wallet…"); setDeposit(false); }} /> : null}
+    {deployModal}
   </div>;
 }

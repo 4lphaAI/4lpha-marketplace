@@ -94,6 +94,7 @@ export type OwnerActionType =
   | "tradeSettings"
   | "tradeExit"
   | "tradeDrain"
+  | "tradeCmcBudget"
   | "resolveUnknown"
   | "resolveUnknownLandingV1"
   | "retireLpPreBindV1"
@@ -211,6 +212,7 @@ const OWNER_ACTIONS: ReadonlySet<string> = new Set<OwnerActionType>([
   "tradeSettings",
   "tradeExit",
   "tradeDrain",
+  "tradeCmcBudget",
   "resolveUnknown",
   "resolveUnknownLandingV1",
   "retireLpPreBindV1",

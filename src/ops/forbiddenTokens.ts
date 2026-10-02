@@ -6,6 +6,7 @@ export function forbiddenTokenAddresses(input: { readonly wallet: Address; reado
   readonly venues: VenueConfig; readonly treasury?: Address }): ReadonlySet<string> {
   const out = new Set<string>([input.wallet.toLowerCase(), input.keyStore.toLowerCase(), zeroAddress.toLowerCase()]);
   for (const address of [input.venues.pancakeRouterV2, input.venues.pancakeRouterV3, input.venues.wbnb,
+    input.venues.uniswapRouterV3, input.venues.uniswapQuoterV3,
     input.venues.fourMemeTokenManager, input.venues.flapPortal, input.treasury]) {
     if (address !== undefined) out.add(address.toLowerCase());
   }

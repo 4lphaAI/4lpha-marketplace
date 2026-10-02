@@ -82,6 +82,8 @@ export type KeyStoreReader = {
 export type KeyStoreBlockReference = {
   readonly number: bigint | null;
   readonly hash: Hex | null;
+  /** The header's own timestamp, seconds. Optional for legacy fixtures; a finalized read without it is `unreadable`. */
+  readonly timestampSec?: bigint | null;
 };
 
 /**
@@ -105,7 +107,16 @@ export type SessionRevocationEvidenceV1 = {
 export type FinalizedKeyStoreObservation = {
   readonly blockNumber: string;
   readonly blockHash: Hex;
+  /** The finalized block's timestamp, whole seconds, agreed by both header reads of the same height. */
+  readonly blockTimeSec: number;
 };
+
+/** Both header reads of ONE height must carry the same positive, safely representable timestamp. */
+function agreedBlockTimeSec(first: KeyStoreBlockReference, second: KeyStoreBlockReference): number | null {
+  const time = first.timestampSec;
+  if (typeof time !== "bigint" || time <= 0n || time > BigInt(Number.MAX_SAFE_INTEGER) || second.timestampSec !== time) return null;
+  return Number(time);
+}
 
 export type FinalizedSessionRevocationVerdict =
   | { readonly kind: "invalid" | "missing"; readonly evidence: SessionRevocationEvidenceV1; readonly observation: FinalizedKeyStoreObservation }
@@ -179,7 +190,9 @@ export async function readFinalizedSessionRevocation(input: {
       if (second.number !== first.number || second.hash === null
         || !isHex(second.hash) || size(second.hash) !== 32
         || second.hash.toLowerCase() !== first.hash.toLowerCase()) return { kind: "unreadable" };
-      const observation = { blockNumber: first.number.toString(10), blockHash: first.hash } as const;
+      const blockTimeSec = agreedBlockTimeSec(first, second);
+      if (blockTimeSec === null) return { kind: "unreadable" };
+      const observation = { blockNumber: first.number.toString(10), blockHash: first.hash, blockTimeSec } as const;
       return {
         kind: "missing",
         observation,
@@ -209,7 +222,9 @@ export async function readFinalizedSessionRevocation(input: {
     if (second.number !== first.number || second.hash === null
       || !isHex(second.hash) || size(second.hash) !== 32
       || second.hash.toLowerCase() !== first.hash.toLowerCase()) return { kind: "unreadable" };
-    const observation = { blockNumber: first.number.toString(10), blockHash: first.hash } as const;
+    const blockTimeSec = agreedBlockTimeSec(first, second);
+    if (blockTimeSec === null) return { kind: "unreadable" };
+    const observation = { blockNumber: first.number.toString(10), blockHash: first.hash, blockTimeSec } as const;
     if (valid) return { kind: "registered", observation };
     return {
       kind: "invalid",
@@ -426,14 +441,14 @@ export function createKeyStoreReader(options: CreateKeyStoreReaderOptions): KeyS
       const publicClient = await connected();
       const block = await publicClient.getBlock({ blockTag: "finalized", includeTransactions: false });
       signal?.throwIfAborted();
-      return { number: block.number, hash: block.hash };
+      return { number: block.number, hash: block.hash, timestampSec: block.timestamp };
     },
     async blockAt(blockNumber: bigint, signal?: AbortSignal): Promise<KeyStoreBlockReference> {
       signal?.throwIfAborted();
       const publicClient = await connected();
       const block = await publicClient.getBlock({ blockNumber, includeTransactions: false });
       signal?.throwIfAborted();
-      return { number: block.number, hash: block.hash };
+      return { number: block.number, hash: block.hash, timestampSec: block.timestamp };
     },
     async listKeysAt(wallet: Address, blockNumber: bigint, signal?: AbortSignal): Promise<readonly Hex[]> {
       signal?.throwIfAborted();

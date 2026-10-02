@@ -516,7 +516,9 @@ describe("E9 item 2's tripwire — where INFRASTRUCTURE_ERROR is branched on", (
     // resubmission decision, because nothing has been submitted when it runs.
     assert.deepEqual(
       sites,
-      ["lp/sagas.ts", "wallet/altana.ts", "wallet/altana.ts", "wallet/altana.ts"],
+      // Pre-flight classification is strictly above both trade submits and the DCA submit.
+      // Both class checks turn an unavailable simulation into proceed, never a resubmission.
+      ["lp/sagas.ts", "trade/simulate.ts", "trade/simulate.ts", "wallet/altana.ts", "wallet/altana.ts", "wallet/altana.ts"],
       E9,
     );
   });

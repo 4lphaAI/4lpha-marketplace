@@ -1,10 +1,13 @@
 /** Trading positions and bounded worker-run history (TRADING-AGENT R8/R9/R4). */
 import { randomUUID } from "node:crypto";
 import { getAddress, isHex, type Address, type Hex } from "viem";
-import { sanitizeMessage } from "../core/errors.js";
-import type { TradeRoute } from "../ops/route.js";
+import { sanitizeNote } from "../core/errors.js";
+/** Owner-readable notes (LLM exit reasoning) keep up to this many chars — operator 2026-09-20, was 200. */
+const MAX_NOTE_CHARS = 1_200;
+import type { TradeRoute, TradeVenueId } from "../ops/route.js";
 import { decodeJsonb, encodeJsonbParam } from "./codec.js";
 import { createPgSqlClient, type SqlClient } from "./sql.js";
+import { MAX_UINT256 } from "../trade/settlement.js";
 
 import { normalizeTradeRunEvents, type TradeRunEvent } from "./tradeRunTrace.js";
 
@@ -43,6 +46,7 @@ export type TradePositionRecord = {
   readonly ownerAddress: Address;
   readonly token: Address;
   readonly route: TradeRoute;
+  readonly venue: TradeVenueId | null;
   readonly entryWei: bigint;
   readonly tokenAmount: bigint | null;
   readonly fillStatus: TradeFillStatus;
@@ -77,12 +81,34 @@ export type TradePositionRecord = {
   readonly autoExitAtMs: number | null;
   readonly autoExitNote: string | null;
   readonly sessionGeneration?: number;
+  /** Null/absent means the historical native denomination. */
+  readonly settlementAsset?: "USDT" | null;
+  /** Requested input stays separate from verified receipt basis for v2. */
+  readonly requestedEntryAtomic?: bigint | null;
+  readonly verifiedEntryAtomic?: bigint | null;
+  /** Unique finalized receipt ownership claim, absent while basis is unknown. */
+  readonly receiptOwnershipKey?: string | null;
+  /** Unique finalized receipt ownership claim for the exit leg. */
+  readonly exitReceiptOwnershipKey?: string | null;
+  /** TRADFI-AI-TRADE-V3 §3.1: last tradfi exit-LLM ask context, absent means "never asked". */
+  readonly exitLlmContext?: ExitLlmContextRecord | null;
+};
+
+export type ExitLlmContextRecord = {
+  readonly askedAtMs: number;
+  readonly pnlBps: number;
+  readonly peakPnlBps: number | null;
+  readonly macdHistSign: -1 | 0 | 1 | null;
+  readonly emaSpreadSign: -1 | 0 | 1 | null;
+  readonly regime: string;
+  readonly session: string;
+  readonly trigger: string;
 };
 
 export type OpenTradePositionInput = Pick<
   TradePositionRecord,
   "positionId" | "agentId" | "ownerAddress" | "token" | "route" | "entryWei" | "tokenAmount" | "fillStatus" | "openedAt"
-> & { readonly entryTxHash?: Hex | null; readonly crashBasisVerified?: boolean; readonly sessionGeneration?: number };
+> & { readonly venue?: TradeVenueId | null; readonly entryTxHash?: Hex | null; readonly crashBasisVerified?: boolean; readonly sessionGeneration?: number; readonly settlementAsset?: "USDT" | null; readonly requestedEntryAtomic?: bigint | null; readonly verifiedEntryAtomic?: bigint | null; readonly receiptOwnershipKey?: string | null };
 
 /** Closed telemetry fields; event projection discards arbitrary payloads and credentials. */
 export type TradeRunInput = {
@@ -112,6 +138,8 @@ export interface TradePositionStore {
   list(ownerAddress: Address, agentId: string): Promise<readonly TradePositionRecord[]>;
   listOpen(ownerAddress: Address, agentId: string, sql?: SqlClient): Promise<readonly TradePositionRecord[]>;
   requestExit(ownerAddress: Address, agentId: string, positionId: string): Promise<TradePositionRecord | null>;
+  /** TRADFI-AI-TRADE-V3 §3.1: written after every exit-LLM ask, whatever the answer. */
+  setExitLlmContext(ownerAddress: Address, agentId: string, positionId: string, context: ExitLlmContextRecord, sql?: SqlClient): Promise<TradePositionRecord | null>;
   markOrphaned(ownerAddress: Address, agentId: string, positionId: string, sql?: SqlClient): Promise<TradePositionRecord | null>;
   closePosition(input: {
     readonly ownerAddress: Address;
@@ -121,6 +149,7 @@ export interface TradePositionStore {
     readonly exitTxHash?: Hex | null;
     readonly soldTokenAmount?: bigint | null;
     readonly exitFillStatus?: TradeFillStatus;
+    readonly exitReceiptOwnershipKey?: string;
     readonly reason?: TradeCloseReason;
     readonly note?: string | null;
   }, sql?: SqlClient): Promise<TradePositionRecord | null>;
@@ -135,6 +164,21 @@ export interface TradePositionStore {
     readonly agentId: string;
     readonly positionId: string;
     readonly tokenAmount: bigint;
+  }, sql?: SqlClient): Promise<TradePositionRecord | null>;
+  adoptVerifiedEntry(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly positionId: string;
+    readonly verifiedEntryAtomic: bigint;
+    readonly receiptOwnershipKey?: string;
+    readonly tokenAmount?: bigint;
+  }, sql?: SqlClient): Promise<TradePositionRecord | null>;
+  adoptVerifiedExit(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly positionId: string;
+    readonly exitWei: bigint;
+    readonly receiptOwnershipKey: string;
   }, sql?: SqlClient): Promise<TradePositionRecord | null>;
   recordQuote(input: {
     readonly ownerAddress: Address;
@@ -167,11 +211,20 @@ export interface TradePositionStore {
   resetNoPrice(ownerAddress: Address, agentId: string, positionId: string): Promise<TradePositionRecord | null>;
   insertRun(input: TradeRunInput): Promise<TradeRunRecord>;
   listRuns(ownerAddress: Address, agentId: string, limit?: number): Promise<readonly TradeRunRecord[]>;
+  /** Every retained run that committed a buy or a sell, newest first: these survive the 200-row prune. */
+  listExecutedRuns(ownerAddress: Address, agentId: string): Promise<readonly TradeRunRecord[]>;
   close(): Promise<void>;
 }
 
 function ownerKey(ownerAddress: Address): Address {
   return `0x${getAddress(ownerAddress).slice(2).toLowerCase()}`;
+}
+
+/** Executed runs are bounded by the positions a session can open; the read still caps them. */
+const EXECUTED_RUN_LIMIT = 1_000;
+
+function runExecuted(run: TradeRunRecord): boolean {
+  return run.entries > 0 || run.exits > 0;
 }
 
 function assertRunLimit(limit: number): void {
@@ -229,7 +282,7 @@ function applyEvidence(row: TradePositionRecord, action: TradeCrashEvidenceActio
   return { ...row, crashPendingSinceMs: null, crashPendingKind: null,
     crashRefQuoteWei: null, crashRefBalance: null, crashRefAtMs: null, crashRefRoute: null,
     autoExitReason: action.reason, autoExitAtMs: action.atMs,
-    autoExitNote: action.note === null ? null : sanitizeMessage(action.note).slice(0, 200) };
+    autoExitNote: action.note === null ? null : sanitizeNote(action.note, MAX_NOTE_CHARS) };
 }
 
 export class MemoryTradePositionStore implements TradePositionStore {
@@ -250,8 +303,13 @@ export class MemoryTradePositionStore implements TradePositionStore {
     if (input.fillStatus === "unverified" && input.tokenAmount !== null) {
       throw new Error("An unverified trade fill must not claim a token amount.");
     }
+    const ownershipKey = normalizeReceiptOwnershipKey(input.receiptOwnershipKey);
+    validateV2PositionFacts(input.settlementAsset, input.requestedEntryAtomic, input.verifiedEntryAtomic, input.fillStatus, ownershipKey);
     if (this.#positions.has(input.positionId)) {
       throw new Error(`Trade position "${input.positionId}" already exists.`);
+    }
+    if (ownershipKey !== null && [...this.#positions.values()].some((row) => row.receiptOwnershipKey === ownershipKey)) {
+      throw new Error("Receipt ownership is already claimed by another trade position.");
     }
     const row: TradePositionRecord = {
       ...input,
@@ -259,6 +317,7 @@ export class MemoryTradePositionStore implements TradePositionStore {
       ownerAddress: ownerKey(input.ownerAddress),
       token: getAddress(input.token),
       route: structuredClone(input.route),
+      venue: positionVenue(input.venue),
       status: "open",
       exitRequestedAt: null,
       orphanedAt: null,
@@ -290,6 +349,10 @@ export class MemoryTradePositionStore implements TradePositionStore {
       autoExitAtMs: null,
       autoExitNote: null,
        sessionGeneration: input.sessionGeneration ?? 0,
+      ...(input.settlementAsset === undefined || input.settlementAsset === null ? {} : { settlementAsset: input.settlementAsset }),
+      ...(input.settlementAsset === "USDT" && input.requestedEntryAtomic !== undefined ? { requestedEntryAtomic: input.requestedEntryAtomic } : {}),
+      ...(input.settlementAsset === "USDT" && input.verifiedEntryAtomic !== undefined ? { verifiedEntryAtomic: input.verifiedEntryAtomic } : {}),
+      ...(ownershipKey === null ? {} : { receiptOwnershipKey: ownershipKey }),
     };
     this.#positions.set(row.positionId, structuredClone(row));
     return structuredClone(row);
@@ -344,9 +407,12 @@ export class MemoryTradePositionStore implements TradePositionStore {
     readonly exitTxHash?: Hex | null;
     readonly soldTokenAmount?: bigint | null;
     readonly exitFillStatus?: TradeFillStatus;
+    readonly exitReceiptOwnershipKey?: string;
     readonly reason?: TradeCloseReason;
     readonly note?: string | null;
   }): Promise<TradePositionRecord | null> {
+    const ownershipKey = input.exitReceiptOwnershipKey === undefined ? null : normalizeReceiptOwnershipKey(input.exitReceiptOwnershipKey);
+    if (ownershipKey !== null && [...this.#positions.values()].some((candidate) => candidate.exitReceiptOwnershipKey === ownershipKey && candidate.positionId !== input.positionId)) return null;
     return this.#mutateOpen(input.ownerAddress, input.agentId, input.positionId, (row) => ({
       ...row,
       status: "closed",
@@ -355,8 +421,9 @@ export class MemoryTradePositionStore implements TradePositionStore {
       exitTxHash: hashOrNull(input.exitTxHash),
       soldTokenAmount: input.soldTokenAmount ?? null,
       exitFillStatus: input.exitFillStatus ?? "unverified",
+      ...(ownershipKey === null ? {} : { exitReceiptOwnershipKey: ownershipKey }),
       closeReason: input.reason ?? null,
-      closeNote: input.note === null || input.note === undefined ? null : sanitizeMessage(input.note).slice(0, 200),
+      closeNote: input.note === null || input.note === undefined ? null : sanitizeNote(input.note, MAX_NOTE_CHARS),
       lastSellRefusal: null,
       lastSellRefusalAt: null,
       crashPendingSinceMs: null,
@@ -384,6 +451,10 @@ export class MemoryTradePositionStore implements TradePositionStore {
     }));
   }
 
+  async setExitLlmContext(ownerAddress: Address, agentId: string, positionId: string, context: ExitLlmContextRecord): Promise<TradePositionRecord | null> {
+    return this.#mutateOpen(ownerAddress, agentId, positionId, (row) => ({ ...row, exitLlmContext: context }));
+  }
+
   async resolveFill(input: {
     readonly ownerAddress: Address;
     readonly agentId: string;
@@ -396,6 +467,37 @@ export class MemoryTradePositionStore implements TradePositionStore {
       tokenAmount: input.tokenAmount,
       fillStatus: "verified",
     }));
+  }
+
+  async adoptVerifiedEntry(input: { ownerAddress: Address; agentId: string; positionId: string; verifiedEntryAtomic: bigint; receiptOwnershipKey?: string; tokenAmount?: bigint }): Promise<TradePositionRecord | null> {
+    if (input.verifiedEntryAtomic <= 0n || input.verifiedEntryAtomic > MAX_UINT256) return null;
+    const ownershipKey = normalizeReceiptOwnershipKey(input.receiptOwnershipKey);
+    const row = this.#owned(input.ownerAddress, input.agentId, input.positionId);
+    if (row === undefined || (row.status !== "open" && row.status !== "closed")) return null;
+    if (row.settlementAsset !== "USDT" || row.verifiedEntryAtomic !== null && row.verifiedEntryAtomic !== undefined || ownershipKey === null) return row;
+    const claimed = [...this.#positions.values()].find((candidate) => candidate.receiptOwnershipKey === ownershipKey);
+    if (claimed !== undefined && claimed.positionId !== row.positionId) return row;
+    const tokenAmount = input.tokenAmount ?? row.tokenAmount;
+    if (tokenAmount === null || tokenAmount === undefined || tokenAmount <= 0n || tokenAmount > MAX_UINT256) return null;
+    const next = { ...row, verifiedEntryAtomic: input.verifiedEntryAtomic, fillStatus: "verified" as const,
+      tokenAmount, receiptOwnershipKey: ownershipKey };
+    this.#positions.set(row.positionId, structuredClone(next));
+    return structuredClone(next);
+  }
+
+  async adoptVerifiedExit(input: { ownerAddress: Address; agentId: string; positionId: string; exitWei: bigint; receiptOwnershipKey: string }): Promise<TradePositionRecord | null> {
+    if (input.exitWei <= 0n || input.exitWei > MAX_UINT256) return null;
+    const ownershipKey = normalizeReceiptOwnershipKey(input.receiptOwnershipKey);
+    if (ownershipKey === null) return null;
+    const row = this.#owned(input.ownerAddress, input.agentId, input.positionId);
+    if (row === undefined || row.status !== "closed" ||
+        !(row.exitWei === null || row.exitWei === 0n && row.closeReason === "balance-gone" && row.exitFillStatus !== "verified")) return null;
+    if (row.exitReceiptOwnershipKey !== null && row.exitReceiptOwnershipKey !== undefined) return row;
+    const claimed = [...this.#positions.values()].find((candidate) => candidate.exitReceiptOwnershipKey === ownershipKey);
+    if (claimed !== undefined && claimed.positionId !== row.positionId) return row;
+    const next = { ...row, exitWei: input.exitWei, exitFillStatus: "verified" as const, exitReceiptOwnershipKey: ownershipKey };
+    this.#positions.set(row.positionId, structuredClone(next));
+    return structuredClone(next);
   }
 
   async recordQuote(input: {
@@ -538,8 +640,18 @@ export class MemoryTradePositionStore implements TradePositionStore {
     const rows = this.#runs.get(input.agentId) ?? [];
     rows.push(structuredClone(row));
     rows.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
-    this.#runs.set(input.agentId, rows.slice(0, 200));
+    // The prune keeps the latest 200 cycles plus every cycle that executed: a fill's run
+    // stays readable after a night of refusals has rolled the window past it.
+    this.#runs.set(input.agentId, rows.filter((candidate, index) => index < 200 || runExecuted(candidate)));
     return structuredClone(row);
+  }
+
+  async listExecutedRuns(ownerAddress: Address, agentId: string): Promise<readonly TradeRunRecord[]> {
+    const owner = ownerKey(ownerAddress);
+    return (this.#runs.get(agentId) ?? [])
+      .filter((row) => row.ownerAddress === owner && runExecuted(row))
+      .slice(0, EXECUTED_RUN_LIMIT)
+      .map((row) => structuredClone(row));
   }
 
   async listRuns(ownerAddress: Address, agentId: string, limit = 10): Promise<readonly TradeRunRecord[]> {
@@ -576,7 +688,7 @@ export class MemoryTradePositionStore implements TradePositionStore {
 }
 
 type PositionRow = {
-  id: string; agent_id: string; owner_address: string; token: string; route: unknown;
+  id: string; agent_id: string; owner_address: string; token: string; route: unknown; venue?: string | null;
   entry_wei: string; token_amount: string | null; fill_status: string; opened_at: Date;
   entry_tx_hash: string | null; status: string;
   exit_requested_at: Date | null; orphaned_at: Date | null; closed_at: Date | null;
@@ -590,13 +702,19 @@ type PositionRow = {
   crash_ref_route: string | null; auto_exit_reason: string | null; auto_exit_at: Date | null;
   auto_exit_note: string | null; close_note: string | null;
   session_generation?: number;
+  settlement_asset?: string | null;
+  requested_entry_atomic?: string | null;
+  verified_entry_atomic?: string | null;
+  receipt_ownership_key?: string | null;
+  exit_receipt_ownership_key?: string | null;
+  exit_llm_context?: unknown;
 };
 type RunRow = {
   id: string; agent_id: string; owner_address: string; dry_run: boolean;
   events?: unknown; reason: string; candidates: number; refusals: number; entries: number; exits: number; created_at: Date;
 };
 
-const POSITION_COLUMNS = "id, agent_id, owner_address, token, route, entry_wei, token_amount, fill_status, opened_at, entry_tx_hash, status, exit_requested_at, orphaned_at, closed_at, exit_wei, exit_tx_hash, sold_token_amount, exit_fill_status, close_reason, last_sell_refusal, last_sell_refusal_at, no_price_count, crash_basis_verified, last_quote_wei, last_quote_balance, last_quote_route, last_quote_at, peak_pnl_bps, crash_pending_since, crash_pending_kind, crash_ref_quote_wei, crash_ref_balance, crash_ref_at, crash_ref_route, auto_exit_reason, auto_exit_at, auto_exit_note, close_note, session_generation";
+const POSITION_COLUMNS = "id, agent_id, owner_address, token, route, entry_wei, token_amount, fill_status, opened_at, entry_tx_hash, status, exit_requested_at, orphaned_at, closed_at, exit_wei, exit_tx_hash, sold_token_amount, exit_fill_status, close_reason, last_sell_refusal, last_sell_refusal_at, no_price_count, crash_basis_verified, last_quote_wei, last_quote_balance, last_quote_route, last_quote_at, peak_pnl_bps, crash_pending_since, crash_pending_kind, crash_ref_quote_wei, crash_ref_balance, crash_ref_at, crash_ref_route, auto_exit_reason, auto_exit_at, auto_exit_note, close_note, session_generation, venue, settlement_asset, requested_entry_atomic, verified_entry_atomic, receipt_ownership_key, exit_receipt_ownership_key, exit_llm_context";
 const RUN_COLUMNS = "id, agent_id, owner_address, dry_run, reason, candidates, refusals, entries, exits, created_at, events";
 
 const TRADE_POSITIONS_DDL = `
@@ -639,7 +757,14 @@ const TRADE_POSITIONS_DDL = `
     auto_exit_at timestamptz,
     auto_exit_note text,
     close_note text,
-    session_generation integer not null default 0
+    session_generation integer not null default 0,
+    venue text,
+    settlement_asset text check (settlement_asset is null or settlement_asset = 'USDT'),
+    requested_entry_atomic numeric(78,0),
+    verified_entry_atomic numeric(78,0),
+    receipt_ownership_key text,
+    exit_receipt_ownership_key text,
+    exit_llm_context jsonb
   )
 `;
 const TRADE_RUNS_DDL = `
@@ -657,6 +782,8 @@ const TRADE_RUNS_DDL = `
   )
 `;
 const TRADE_POSITION_INDEX_DDL = `create index if not exists trade_positions_agent_idx on trade_positions (owner_address, agent_id, opened_at desc)`;
+const TRADE_RECEIPT_OWNERSHIP_INDEX_DDL = `create unique index if not exists trade_positions_receipt_ownership_idx on trade_positions (receipt_ownership_key) where receipt_ownership_key is not null`;
+const TRADE_EXIT_RECEIPT_OWNERSHIP_INDEX_DDL = `create unique index if not exists trade_positions_exit_receipt_ownership_idx on trade_positions (exit_receipt_ownership_key) where exit_receipt_ownership_key is not null`;
 const TRADE_RUN_INDEX_DDL = `create index if not exists trade_runs_agent_idx on trade_runs (owner_address, agent_id, created_at desc, id desc)`;
 
 export class PostgresTradePositionStore implements TradePositionStore {
@@ -700,6 +827,13 @@ export class PostgresTradePositionStore implements TradePositionStore {
       await tx.query(`alter table trade_positions add column if not exists auto_exit_note text`);
       await tx.query(`alter table trade_positions add column if not exists close_note text`);
       await tx.query(`alter table trade_positions add column if not exists session_generation integer not null default 0`);
+      await tx.query(`alter table trade_positions add column if not exists venue text`);
+      await tx.query(`alter table trade_positions add column if not exists settlement_asset text`);
+      await tx.query(`alter table trade_positions add column if not exists requested_entry_atomic numeric(78,0)`);
+      await tx.query(`alter table trade_positions add column if not exists verified_entry_atomic numeric(78,0)`);
+      await tx.query(`alter table trade_positions add column if not exists receipt_ownership_key text`);
+      await tx.query(`alter table trade_positions add column if not exists exit_receipt_ownership_key text`);
+      await tx.query(`alter table trade_positions add column if not exists exit_llm_context jsonb`);
       // R3.6/R4.4: the name is deliberately scoped to this table, so another
       // store's constraint cannot satisfy the migration check.
       await tx.query(`select pg_advisory_xact_lock(hashtext('trade_positions'))`);
@@ -714,6 +848,8 @@ export class PostgresTradePositionStore implements TradePositionStore {
           check (close_reason is null or close_reason in ('owner-request','stop-loss','take-profit','max-hold','llm','balance-gone','crash-stop','session-expiring'))`);
       }
       await tx.query(TRADE_POSITION_INDEX_DDL);
+      await tx.query(TRADE_RECEIPT_OWNERSHIP_INDEX_DDL);
+      await tx.query(TRADE_EXIT_RECEIPT_OWNERSHIP_INDEX_DDL);
       await tx.query(TRADE_RUN_INDEX_DDL);
     });
     return new PostgresTradePositionStore(sql, now);
@@ -727,17 +863,20 @@ export class PostgresTradePositionStore implements TradePositionStore {
     if (input.fillStatus === "unverified" && input.tokenAmount !== null) {
       throw new Error("An unverified trade fill must not claim a token amount.");
     }
+    const ownershipKey = normalizeReceiptOwnershipKey(input.receiptOwnershipKey);
+    validateV2PositionFacts(input.settlementAsset, input.requestedEntryAtomic, input.verifiedEntryAtomic, input.fillStatus, ownershipKey);
     const result = await this.#sql.query<PositionRow>(
       `/* tradePositions.open */ insert into trade_positions (${POSITION_COLUMNS})
        values ($1,$2,$3,$4,$5::jsonb,$6::numeric,$7::numeric,$8,$9,$10,'open',
-          null,null,null,null,null,null,null,null,null,null,0,$11,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,$12)
+          null,null,null,null,null,null,null,null,null,null,0,$11,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,$12,$13,$14,$15,$16,$17,null,null)
        on conflict (id) do nothing returning ${POSITION_COLUMNS}`,
       [input.positionId, input.agentId, ownerKey(input.ownerAddress), getAddress(input.token),
         encodeJsonbParam(input.route), input.entryWei.toString(10), input.tokenAmount?.toString(10) ?? null,
         input.fillStatus, new Date(input.openedAt), hashOrNull(input.entryTxHash),
          input.crashBasisVerified === true && input.fillStatus === "verified" && input.tokenAmount !== null
            && input.tokenAmount > 0n && input.entryTxHash !== null && input.entryTxHash !== undefined,
-         input.sessionGeneration ?? 0],
+         input.sessionGeneration ?? 0, positionVenue(input.venue), input.settlementAsset ?? null,
+         input.requestedEntryAtomic?.toString(10) ?? null, input.verifiedEntryAtomic?.toString(10) ?? null, ownershipKey],
     );
     const row = result.rows[0];
     if (row === undefined) throw new Error(`Trade position "${input.positionId}" already exists.`);
@@ -783,22 +922,61 @@ export class PostgresTradePositionStore implements TradePositionStore {
       [positionId, agentId, ownerKey(ownerAddress), new Date(this.#now())], sql);
   }
 
-  async closePosition(input: { readonly ownerAddress: Address; readonly agentId: string; readonly positionId: string; readonly exitWei: bigint | null; readonly exitTxHash?: Hex | null; readonly soldTokenAmount?: bigint | null; readonly exitFillStatus?: TradeFillStatus; readonly reason?: TradeCloseReason; readonly note?: string | null }, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
+  async closePosition(input: { readonly ownerAddress: Address; readonly agentId: string; readonly positionId: string; readonly exitWei: bigint | null; readonly exitTxHash?: Hex | null; readonly soldTokenAmount?: bigint | null; readonly exitFillStatus?: TradeFillStatus; readonly exitReceiptOwnershipKey?: string; readonly reason?: TradeCloseReason; readonly note?: string | null }, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
+    const ownershipKey = input.exitReceiptOwnershipKey === undefined ? null : normalizeReceiptOwnershipKey(input.exitReceiptOwnershipKey);
     return this.#update("tradePositions.close",
-      "status = 'closed', closed_at = $4, exit_wei = $5::numeric, close_reason = $6, exit_tx_hash = $7, sold_token_amount = $8::numeric, exit_fill_status = $9, close_note = $10, last_sell_refusal = null, last_sell_refusal_at = null, crash_pending_since = null, crash_pending_kind = null, crash_ref_quote_wei = null, crash_ref_balance = null, crash_ref_at = null, crash_ref_route = null, auto_exit_reason = null, auto_exit_at = null, auto_exit_note = null",
+      "status = 'closed', closed_at = $4, exit_wei = $5::numeric, close_reason = $6, exit_tx_hash = $7, sold_token_amount = $8::numeric, exit_fill_status = $9, close_note = $10, exit_receipt_ownership_key = $11, last_sell_refusal = null, last_sell_refusal_at = null, crash_pending_since = null, crash_pending_kind = null, crash_ref_quote_wei = null, crash_ref_balance = null, crash_ref_at = null, crash_ref_route = null, auto_exit_reason = null, auto_exit_at = null, auto_exit_note = null",
       [input.positionId, input.agentId, ownerKey(input.ownerAddress), new Date(this.#now()), input.exitWei?.toString(10) ?? null, input.reason ?? null,
-        hashOrNull(input.exitTxHash), input.soldTokenAmount?.toString(10) ?? null, input.exitFillStatus ?? "unverified", input.note === null || input.note === undefined ? null : sanitizeMessage(input.note).slice(0, 200)], sql);
+        hashOrNull(input.exitTxHash), input.soldTokenAmount?.toString(10) ?? null, input.exitFillStatus ?? "unverified", input.note === null || input.note === undefined ? null : sanitizeNote(input.note, MAX_NOTE_CHARS), ownershipKey], sql);
   }
 
   async recordSellRefusal(input: { readonly ownerAddress: Address; readonly agentId: string; readonly positionId: string; readonly refusal: string | null }): Promise<TradePositionRecord | null> {
-    return this.#update("tradePositions.sellRefusal", "last_sell_refusal = $4, last_sell_refusal_at = case when $4::text is null then null else $5 end",
+    // MEASURED 2026-09-20 (`agent-error` cycle on tradfi-agent-01): without the
+    // cast PostgreSQL types the CASE as text and refuses the timestamptz column.
+    return this.#update("tradePositions.sellRefusal", "last_sell_refusal = $4, last_sell_refusal_at = case when $4::text is null then null else $5::timestamptz end",
       [input.positionId, input.agentId, ownerKey(input.ownerAddress), input.refusal, new Date(this.#now())]);
+  }
+
+  async setExitLlmContext(ownerAddress: Address, agentId: string, positionId: string, context: ExitLlmContextRecord, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
+    return this.#update("tradePositions.exitLlmContext", "exit_llm_context = $4::jsonb",
+      [positionId, agentId, ownerKey(ownerAddress), JSON.stringify(context)], sql);
   }
 
   async resolveFill(input: { readonly ownerAddress: Address; readonly agentId: string; readonly positionId: string; readonly tokenAmount: bigint }, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
     if (input.tokenAmount <= 0n) return null;
     return this.#update("tradePositions.resolveFill", "token_amount = $4::numeric, fill_status = 'verified'",
       [input.positionId, input.agentId, ownerKey(input.ownerAddress), input.tokenAmount.toString(10)], sql);
+  }
+
+  async adoptVerifiedEntry(input: { readonly ownerAddress: Address; readonly agentId: string; readonly positionId: string; readonly verifiedEntryAtomic: bigint; readonly receiptOwnershipKey?: string; readonly tokenAmount?: bigint }, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
+    if (input.verifiedEntryAtomic <= 0n || input.verifiedEntryAtomic > MAX_UINT256) return null;
+    if (input.tokenAmount !== undefined && (input.tokenAmount <= 0n || input.tokenAmount > MAX_UINT256)) return null;
+    const existing = (await this.get(input.ownerAddress, input.agentId, input.positionId, sql))?.tokenAmount;
+    if ((input.tokenAmount ?? existing) === null || (input.tokenAmount ?? existing) === undefined || (input.tokenAmount ?? existing)! <= 0n) return null;
+    const ownershipKey = normalizeReceiptOwnershipKey(input.receiptOwnershipKey);
+    if (ownershipKey === null) return null;
+    const claimed = await sql.query<{ readonly id: string }>(`/* tradePositions.receiptOwnership */ select id from trade_positions where receipt_ownership_key = $1`, [ownershipKey]);
+    if (claimed.rows[0] !== undefined && claimed.rows[0].id !== input.positionId) return null;
+    const result = await sql.query<PositionRow>(`/* tradePositions.adoptVerifiedEntry */ update trade_positions set verified_entry_atomic = $4::numeric, token_amount = coalesce($5::numeric, token_amount), fill_status = 'verified', receipt_ownership_key = $6
+      where id=$1 and agent_id=$2 and owner_address=$3 and status in ('open','closed') and settlement_asset='USDT' and verified_entry_atomic is null and receipt_ownership_key is null
+      returning ${POSITION_COLUMNS}`,
+      [input.positionId, input.agentId, ownerKey(input.ownerAddress), input.verifiedEntryAtomic.toString(10), input.tokenAmount?.toString(10) ?? existing?.toString(10) ?? null, ownershipKey]);
+    return result.rows[0] === undefined ? this.get(input.ownerAddress, input.agentId, input.positionId, sql) : rowToPosition(result.rows[0]);
+  }
+
+  async adoptVerifiedExit(input: { readonly ownerAddress: Address; readonly agentId: string; readonly positionId: string; readonly exitWei: bigint; readonly receiptOwnershipKey: string }, sql: SqlClient = this.#sql): Promise<TradePositionRecord | null> {
+    if (input.exitWei <= 0n || input.exitWei > MAX_UINT256) return null;
+    const ownershipKey = normalizeReceiptOwnershipKey(input.receiptOwnershipKey);
+    if (ownershipKey === null) return null;
+    const claimed = await sql.query<{ readonly id: string }>(`/* tradePositions.exitReceiptOwnership */ select id from trade_positions where exit_receipt_ownership_key = $1`, [ownershipKey]);
+    if (claimed.rows[0] !== undefined && claimed.rows[0].id !== input.positionId) return null;
+    const result = await sql.query<PositionRow>(`/* tradePositions.adoptVerifiedExit */ update trade_positions set exit_wei = $4::numeric, exit_fill_status = 'verified', exit_receipt_ownership_key = $5
+      where id=$1 and agent_id=$2 and owner_address=$3 and status='closed'
+        and (exit_wei is null or (close_reason='balance-gone' and exit_wei=0 and exit_fill_status is distinct from 'verified'))
+        and exit_receipt_ownership_key is null
+      returning ${POSITION_COLUMNS}`,
+      [input.positionId, input.agentId, ownerKey(input.ownerAddress), input.exitWei.toString(10), ownershipKey]);
+    return result.rows[0] === undefined ? this.get(input.ownerAddress, input.agentId, input.positionId, sql) : rowToPosition(result.rows[0]);
   }
 
   async recordQuote(input: {
@@ -879,7 +1057,7 @@ export class PostgresTradePositionStore implements TradePositionStore {
         new Date(input.action.reference.atMs), input.action.reference.routeKey];
     } else if (input.action.kind === "marker") {
       assignment = "crash_pending_since = null, crash_pending_kind = null, crash_ref_quote_wei = null, crash_ref_balance = null, crash_ref_at = null, crash_ref_route = null, auto_exit_reason = $17, auto_exit_at = $18, auto_exit_note = $19";
-      actionParams = [input.action.reason, new Date(input.action.atMs), input.action.note === null ? null : sanitizeMessage(input.action.note).slice(0, 200)];
+      actionParams = [input.action.reason, new Date(input.action.atMs), input.action.note === null ? null : sanitizeNote(input.action.note, MAX_NOTE_CHARS)];
     } else {
       assignment = "crash_pending_since = null, crash_pending_kind = null, crash_ref_quote_wei = null, crash_ref_balance = null, crash_ref_at = null, crash_ref_route = null";
       actionParams = [];
@@ -989,6 +1167,7 @@ export class PostgresTradePositionStore implements TradePositionStore {
       );
       await tx.query(
         `/* tradeRuns.prune */ delete from trade_runs where agent_id = $1
+         and entries = 0 and exits = 0
          and id not in (select id from trade_runs where agent_id = $1
                         order by created_at desc, id desc limit 200)`,
         [row.agentId],
@@ -1003,6 +1182,16 @@ export class PostgresTradePositionStore implements TradePositionStore {
       `/* tradeRuns.list */ select ${RUN_COLUMNS} from trade_runs
        where owner_address = $1 and agent_id = $2 order by created_at desc, id desc limit $3`,
       [ownerKey(ownerAddress), agentId, limit],
+    );
+    return result.rows.map(rowToRun);
+  }
+
+  async listExecutedRuns(ownerAddress: Address, agentId: string): Promise<readonly TradeRunRecord[]> {
+    const result = await this.#sql.query<RunRow>(
+      `/* tradeRuns.listExecuted */ select ${RUN_COLUMNS} from trade_runs
+       where owner_address = $1 and agent_id = $2 and (entries > 0 or exits > 0)
+       order by created_at desc, id desc limit $3`,
+      [ownerKey(ownerAddress), agentId, EXECUTED_RUN_LIMIT],
     );
     return result.rows.map(rowToRun);
   }
@@ -1024,11 +1213,27 @@ function positionStatus(value: string): TradePositionStatus {
   if (value === "open" || value === "closed" || value === "orphaned") return value;
   throw new Error("Stored trade position status is invalid.");
 }
+function positionVenue(value: string | null | undefined): TradeVenueId | null {
+  if (value === undefined || value === null) return null;
+  if (value === "pancake_v2" || value === "pancake_v3" || value === "uniswap_v3") return value;
+  throw new Error("Stored trade position venue is invalid.");
+}
+function positionSettlementAsset(value: string | null | undefined): "USDT" | null {
+  if (value === undefined || value === null) return null;
+  if (value === "USDT") return "USDT";
+  throw new Error("Stored trade position settlement asset is invalid.");
+}
 function epoch(value: Date | null | undefined): number | null { return value === null || value === undefined ? null : value.getTime(); }
 function rowToPosition(row: PositionRow): TradePositionRecord {
+  const storedSettlement = positionSettlementAsset(row.settlement_asset);
+  const storedRequested = row.requested_entry_atomic === null || row.requested_entry_atomic === undefined ? undefined : BigInt(row.requested_entry_atomic);
+  const storedVerified = row.verified_entry_atomic === null || row.verified_entry_atomic === undefined ? undefined : BigInt(row.verified_entry_atomic);
+  const storedOwnership = normalizeReceiptOwnershipKey(row.receipt_ownership_key);
+  const storedExitOwnership = normalizeReceiptOwnershipKey(row.exit_receipt_ownership_key);
+  validateV2PositionFacts(storedSettlement, storedRequested, storedVerified, fillStatus(row.fill_status), storedOwnership);
   return {
     positionId: row.id, agentId: row.agent_id, ownerAddress: ownerKey(getAddress(row.owner_address)),
-    token: getAddress(row.token), route: decodeJsonb(row.route) as TradeRoute,
+    token: getAddress(row.token), route: decodeJsonb(row.route) as TradeRoute, venue: positionVenue(row.venue),
     entryWei: BigInt(row.entry_wei), tokenAmount: row.token_amount === null ? null : BigInt(row.token_amount),
     fillStatus: fillStatus(row.fill_status), openedAt: row.opened_at.getTime(), entryTxHash: hashOrNull(row.entry_tx_hash as Hex | null),
     status: positionStatus(row.status), exitRequestedAt: epoch(row.exit_requested_at), orphanedAt: epoch(row.orphaned_at),
@@ -1049,7 +1254,54 @@ function rowToPosition(row: PositionRow): TradePositionRecord {
     crashRefAtMs: epoch(row.crash_ref_at), crashRefRoute: row.crash_ref_route ?? null,
     autoExitReason: autoExitReason(row.auto_exit_reason), autoExitAtMs: epoch(row.auto_exit_at), autoExitNote: row.auto_exit_note ?? null,
     sessionGeneration: row.session_generation ?? 0,
+    ...(storedSettlement === null ? {} : { settlementAsset: storedSettlement }),
+    ...(storedRequested === undefined ? {} : { requestedEntryAtomic: storedRequested }),
+    ...(storedVerified === undefined ? {} : { verifiedEntryAtomic: storedVerified }),
+    ...(storedOwnership === null ? {} : { receiptOwnershipKey: storedOwnership }),
+    ...(storedExitOwnership === null ? {} : { exitReceiptOwnershipKey: storedExitOwnership }),
+    ...(row.exit_llm_context === null || row.exit_llm_context === undefined ? {} : { exitLlmContext: decodeExitLlmContext(row.exit_llm_context) }),
   };
+}
+
+function decodeExitLlmContext(raw: unknown): ExitLlmContextRecord | null {
+  const value = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
+  if (typeof value !== "object" || value === null) return null;
+  const row = value as Record<string, unknown>;
+  const sign = (input: unknown): -1 | 0 | 1 | null => input === -1 || input === 0 || input === 1 ? input : null;
+  if (typeof row.askedAtMs !== "number" || typeof row.pnlBps !== "number"
+    || typeof row.regime !== "string" || typeof row.session !== "string" || typeof row.trigger !== "string") return null;
+  return {
+    askedAtMs: row.askedAtMs, pnlBps: row.pnlBps,
+    peakPnlBps: typeof row.peakPnlBps === "number" ? row.peakPnlBps : null,
+    macdHistSign: sign(row.macdHistSign), emaSpreadSign: sign(row.emaSpreadSign),
+    regime: row.regime, session: row.session, trigger: row.trigger,
+  };
+}
+
+function validateV2PositionFacts(
+  asset: "USDT" | null | undefined,
+  requested: bigint | null | undefined,
+  verified: bigint | null | undefined,
+  fillStatus: TradeFillStatus,
+  ownershipKey: string | null = null,
+): void {
+  if (asset === undefined || asset === null) {
+    if (requested !== undefined || verified !== undefined || ownershipKey !== null) throw new Error("Legacy trade positions cannot carry v2 settlement facts.");
+    return;
+  }
+  if (asset !== "USDT" || requested === undefined || requested === null || requested <= 0n) {
+    throw new Error("USDT trade positions require a positive requested entry amount.");
+  }
+  if (requested > MAX_UINT256 || verified !== undefined && verified !== null && verified > MAX_UINT256) throw new Error("V2 position facts exceed uint256.");
+  if (verified !== undefined && verified !== null && verified <= 0n) throw new Error("Verified entry basis must be positive or null.");
+  if (verified !== undefined && verified !== null && fillStatus !== "verified") throw new Error("An unverified v2 fill cannot claim verified entry basis.");
+}
+function normalizeReceiptOwnershipKey(value: string | null | undefined): string | null {
+  if (value === undefined || value === null) return null;
+  if (!/^56\|0x[0-9a-f]{64}\|0x[0-9a-f]{40}\|\d{1,78}\|0x[0-9a-f]{64}$/iu.test(value)) {
+    throw new Error("Trade receipt ownership key is invalid.");
+  }
+  return value.toLowerCase();
 }
 function fillStatus(value: string): TradeFillStatus {
   if (value === "verified" || value === "unverified") return value;

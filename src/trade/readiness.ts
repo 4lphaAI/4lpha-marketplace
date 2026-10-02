@@ -17,6 +17,8 @@ export type TradeReadiness = {
   readonly ready: boolean;
   readonly allowlistAvailable: boolean;
   readonly bstocksAddresses: ReadonlySet<string>;
+  /** Lowercased address → lane symbol, from the same probe; display only (run log tickers). */
+  readonly bstocksSymbols?: ReadonlyMap<string, string>;
   stop(): void;
 };
 
@@ -28,6 +30,16 @@ export type CreateTradeReadinessInput = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function symbolsOf(envelope: DataPlaneEnvelope<unknown> | null): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  if (envelope === null || !Array.isArray(envelope.data)) return out;
+  for (const value of envelope.data) {
+    if (!isRecord(value) || typeof value["address"] !== "string" || typeof value["symbol"] !== "string" || value["symbol"].length === 0) continue;
+    try { out.set(getAddress(value["address"]).toLowerCase(), value["symbol"].slice(0, 16)); } catch { /* skip */ }
+  }
+  return out;
 }
 
 function rows(envelope: DataPlaneEnvelope<unknown> | null, lane: UniverseLane): readonly string[] | null {
@@ -60,14 +72,18 @@ export async function createTradeReadiness(input: CreateTradeReadinessInput): Pr
   let ready = false;
   let allowlistAvailable = false;
   let bstocksAddresses: ReadonlySet<string> = new Set<string>();
+  let bstocksSymbols: ReadonlyMap<string, string> = new Map<string, string>();
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
 
   const probe = async (): Promise<void> => {
     try {
-      const [bstocks, allowlist] = await Promise.all([
+      const [bstocks, allowlist, ondo] = await Promise.all([
         input.dataPlane.probeUniverse("bstocks"),
         input.dataPlane.probeUniverse("allowlist"),
+        // Display only: the Ondo lane names the `…on` tokens the pin carries; a
+        // failed read leaves them unnamed and never touches readiness.
+        input.dataPlane.probeUniverse("ondo").catch(() => null),
       ]);
       const bstockRows = bstocks.status === 200 ? rows(bstocks.envelope, "bstocks") : null;
       // The static floor is 25 (REVIEW2 R9). The lane grew past it on
@@ -75,6 +91,9 @@ export async function createTradeReadiness(input: CreateTradeReadinessInput): Pr
       // static rows (46 that day) and `=== 25` stood every worker down.
       ready = bstockRows !== null && bstockRows.length >= 25;
       bstocksAddresses = ready ? new Set(bstockRows) : new Set<string>();
+      bstocksSymbols = ready
+        ? new Map([...symbolsOf(ondo !== null && ondo.status === 200 ? ondo.envelope : null), ...symbolsOf(bstocks.envelope)])
+        : new Map<string, string>();
       const allowlistRows = allowlist.status === 200 ? rows(allowlist.envelope, "allowlist") : null;
       const legacyUnavailable = allowlist.status === 400
         && allowlist.envelope?.error?.code === "invalid_lane";
@@ -86,6 +105,7 @@ export async function createTradeReadiness(input: CreateTradeReadinessInput): Pr
       ready = false;
       allowlistAvailable = false;
       bstocksAddresses = new Set<string>();
+      bstocksSymbols = new Map<string, string>();
       input.log?.(`[trade-readiness] probe failed: ${sanitizeMessage(error instanceof Error ? error.message : "unknown error")}`);
     }
   };
@@ -99,6 +119,7 @@ export async function createTradeReadiness(input: CreateTradeReadinessInput): Pr
     get ready() { return ready; },
     get allowlistAvailable() { return allowlistAvailable; },
     get bstocksAddresses() { return bstocksAddresses; },
+    get bstocksSymbols() { return bstocksSymbols; },
     stop() {
       stopped = true;
       if (timer !== undefined) clearInterval(timer);

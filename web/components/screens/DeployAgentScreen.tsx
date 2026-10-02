@@ -28,10 +28,13 @@ import type { GridHireChoices } from "@/lib/altana/grid-hire-recovery";
 import { GuardedAccountSection } from "@/components/deploy/GuardedAccountSection";
 import { lendingControlNumber } from "@/lib/lending/form";
 import { TradeModelSelect } from "@/components/deploy/TradeModelSelect";
+import { fetchSchedulable, type SchedulableTokenDto } from "@/lib/exec/schedulable";
+import { TokenIcon, useTokenIcons } from "@/components/TokenIcon";
 import { MAX_INSTRUCTIONS_ENCODED_BYTES,
+  DEFAULT_CMC_TOTAL_BUDGET_WEI, DEFAULT_TRADFI_V2_MAX_ENTRY_WEI, DEFAULT_TRADFI_V2_MIN_ENTRY_WEI,
   MIN_TRADE_CAPITAL_WEI, MIN_TRADE_ENTRY_WEI, checkBoundedText,
-  parseBnbToWei, type TradeSettings, validateSkillMarkdown,
-  TRADE_LLM_MODELS, stopLossBpsWhenEnabled, stopLossPercentFromBps, tradeModelId } from "@/lib/trade";
+  parseBnbToWei, scheduleBuysThisSession, type TradeSettings, validateSkillMarkdown,
+  TRADE_LLM_MODELS, dcaMaxStepBps, stopLossBpsWhenEnabled, stopLossPercentFromBps, tradeModelId } from "@/lib/trade";
 import { MAX_RANGE_WIDTH_TICKS, derivedRangeTicks, formatPrice, livePriceInsideBand, poolQuote, priceFromTick, rangeWidthPct, snapTickDown, snapTickUp } from "@/lib/lp/range";
 
 const WORDS = [
@@ -50,11 +53,15 @@ const KINDS = [
       { label: "Four.meme", asset: "/design/protocols/fourmeme.png" },
       { label: "Flap.sh", asset: "/design/protocols/flapsh.png" },
       { label: "bStocks", asset: "/design/protocols/bstocks.png" },
+      { label: "Uniswap", asset: "/design/protocols/uniswap.png" },
+      { label: "Ondo", asset: "/design/protocols/ondo.png" },
       { label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" },
     ], live: [
       { label: "Four.meme", asset: "/design/protocols/fourmeme.png" },
       { label: "Flap.sh", asset: "/design/protocols/flapsh.png" },
       { label: "bStocks", asset: "/design/protocols/bstocks.png" },
+      { label: "Uniswap", asset: "/design/protocols/uniswap.png" },
+      { label: "Ondo", asset: "/design/protocols/ondo.png" },
       { label: "PancakeSwap", asset: "/design/protocols/pancakeswap.png" },
     ] },
     blurb: "Screens eligible markets, sizes entries, and automatically manages buys & exits 24/7.",
@@ -98,8 +105,8 @@ const PRESETS = {
       set: { takeProfit: "25", stopLoss: "25" } },
   ],
   trading: [
-    { id: "bluechip", label: "Blue Chip", executionModel: "blue-chip", note: "> $1B and bStocks. Established on-chain equities.",
-      set: { confidence: "80", minMcap: "1,000,000,000", maxMcap: "", perTrade: "0.002", capital: "0.01", tp1: "40", stopLoss: "25", holdTime: "1,440", maxPositions: "3" } },
+    { id: "tradfi", label: "TradFi", executionModel: "tradfi", note: "Tokenized US stocks only (bStocks, Ondo).",
+      set: { confidence: "80", minMcap: "", maxMcap: "", minEntry: weiToBnb(DEFAULT_TRADFI_V2_MIN_ENTRY_WEI), perTrade: weiToBnb(DEFAULT_TRADFI_V2_MAX_ENTRY_WEI), capital: "63", maxPositions: "3" } },
     { id: "degen", label: "Degen", executionModel: "degen", note: "Runners under $1M selected from Four.meme and Flap.sh",
       set: { confidence: "75", minMcap: "", maxMcap: "1,000,000", perTrade: "0.01", capital: "0.02", tp1: "60", stopLoss: "35", holdTime: "480", maxPositions: "4" } },
     { id: "sigma", label: "Sigma", executionModel: "sigma", note: "Machine learning to spot daily runners by 4lpha",
@@ -125,7 +132,7 @@ const PRESETS = {
   ],
 };
 
-const DEFAULT_PRESET = { grid: "balanced", trading: "sigma", lp: "blue", health: "balanced" };
+const DEFAULT_PRESET = { grid: "balanced", trading: "tradfi", lp: "blue", health: "balanced" };
 
 const CONFIG = {
   grid: [
@@ -153,6 +160,8 @@ const CONFIG = {
   trading: [
     { title: "Agent", fields: [
       { k: "agentName", label: "Agent name", type: "text", v: "Trading Agent 01" },
+      { k: "tradfiV2", type: "hidden", v: true, tradfiOnly: true },
+      { k: "minEntry", label: "Min entry", type: "stepper", v: "5", step: 1, min: 0.000000000000000001, suffix: "USDT", tradfiOnly: true },
       { k: "perTrade", label: "BNB per entry", type: "stepper", v: "0.005", step: 0.002, min: 0.005, suffix: "BNB" },
       { k: "capital", label: "Total capital", type: "stepper", v: "0.02", step: 0.01, min: 0.02, suffix: "BNB" },
       { k: "maxPositions", label: "Max open positions", type: "stepper", v: "3", step: 1, min: 1 },
@@ -181,6 +190,7 @@ const CONFIG = {
       { k: "quicknode", label: "QuickNode RPC x402", type: "toggle", v: false, text: "Pay per request for faster reads", exclusiveWith: "customRpc" },
       { k: "customRpc", label: "Custom RPC", type: "toggle", v: false, text: "Use your own RPC endpoint", exclusiveWith: "quicknode", inputKey: "customRpcUrl", inputPlaceholder: "https://your-rpc-endpoint.com" },
       { k: "cmcHub", label: "CMC Agent Hub x402", type: "toggle", v: false, text: "Pay per request for CoinMarketCap agent data" },
+      { k: "cmcTotalBudget", label: "CMC total budget", type: "stepper", v: weiToBnb(DEFAULT_CMC_TOTAL_BUDGET_WEI), step: 1, min: 0.000000000000000001, suffix: "USDT", cmcOnly: true, hint: "Finite total allowance for this agent. There is no daily reset; top up only with an owner action." },
       { k: "instructions", label: "Instructions", type: "textarea", v: "", byteLimit: MAX_INSTRUCTIONS_ENCODED_BYTES, placeholder: "Example: Prefer clean momentum reclaims with confirming volume. Avoid chasing vertical candles after the first impulse.", hint: "Soft preference layer only. Use plain English or Chinese to describe the setups this agent should favor or avoid. This is applied during entry timing only." },
       { k: "skillFile", label: "Add Skill", type: "skillFile", v: null },
     ] },
@@ -298,8 +308,659 @@ const CONFIG = {
   ],
 };
 
-function sectionsFor(kind, presetId, mode = "Live") {
+/* TradFi — tokenized equities. One execution model with four modes; each mode
+   swaps the whole form, so the filters stay specific to what that mode does.
+   Only "AI Trade" reaches the plane today; the other three are ported UI and
+   their Deploy stays locked until a backend exists for them. */
+const TRADFI_MODES = [
+  { id: "ai", label: "AI Trade", icon: RESOURCES.modeAi, note: "The model screens tokenized equities and manages entries and exits." },
+  { id: "sched", label: "Schedule buy", icon: RESOURCES.modeSched, note: "Buys a fixed amount of one tokenized stock on a set frequency." },
+  { id: "dca", label: "Auto DCA", icon: RESOURCES.modeDca, note: "Opens with a base order, then adds a DCA order each time price drops one step." },
+  { id: "smart", label: "Smart Portfolio", icon: RESOURCES.modeSmart, note: "Holds a weighted basket and rebalances back to target." },
+];
+
+function TradFiModes({ value, onChange }) {
+  const [hover, setHover] = React.useState(null);
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 10 }}>
+      {TRADFI_MODES.map((m) => {
+        const on = m.id === (value || "ai");
+        const tip = hover === m.id;
+        return (
+          <div key={m.id} style={{ position: "relative" }} onMouseEnter={() => setHover(m.id)} onMouseLeave={() => setHover((h) => (h === m.id ? null : h))}>
+            <button type="button" onClick={() => onChange(m.id)} title=""
+              style={{ width: "100%", textAlign: "center", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 12, padding: "10px 14px", borderRadius: "var(--radius-sm)", background: on ? "var(--cat-yield-tint)" : "var(--surface-sunken)", border: `1px solid ${on ? "var(--cat-yield)" : "var(--line-1)"}` }}>
+              <span aria-hidden="true" style={{ width: 32, height: 32, flex: "0 0 auto", display: "block", background: on ? "var(--cat-yield)" : "var(--ink-1)", opacity: on ? 1 : 0.65, WebkitMaskImage: `url("${m.icon}")`, maskImage: `url("${m.icon}")`, WebkitMaskSize: "contain", maskSize: "contain", WebkitMaskRepeat: "no-repeat", maskRepeat: "no-repeat", WebkitMaskPosition: "center", maskPosition: "center" }} />
+              <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: on ? "var(--cat-yield)" : "var(--ink-1)" }}>{m.label}</span>
+            </button>
+            {tip ? (
+              <span role="tooltip"
+                style={{ position: "absolute", left: 0, right: 0, bottom: "calc(100% + 8px)", zIndex: 20, padding: "8px 10px", borderRadius: "var(--radius-sm)", background: "var(--surface-raised, #1a1d21)", border: "1px solid var(--line-2, var(--line-1))", boxShadow: "0 8px 24px rgba(0,0,0,.45)", font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--ink-1)", display: "block" }}>
+                {m.note}
+              </span>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* Smart Portfolio (operator rulings 2026-09-26): 2–5 stocks from the same
+   17-stock liquid universe as Auto DCA, every weight at least 10 %, capital
+   at least 50 USDT for two stocks plus 25 per extra stock. */
+const SP_MIN_STOCKS = 2, SP_MAX_STOCKS = 5, SP_MIN_WEIGHT = 10;
+const spMinCapital = (n: number): number => 50 + 25 * Math.max(0, n - SP_MIN_STOCKS);
+const SP_DEFAULT_WEIGHTS = [
+  { sym: "NVDAB", w: "25" },
+  { sym: "MSFTB", w: "25" },
+  { sym: "GOOGLB", w: "25" },
+  { sym: "SPYB", w: "25" },
+];
+/* Quick-fill baskets: the data plane's bStock sector labels (2026-09-26),
+   narrowed to the liquid universe. Fixed here; the UI does not read them live. */
+const SP_BASKETS = [
+  { name: "Magnificent", syms: ["MSFTB", "GOOGLB", "NVDAB", "TSLAB", "METAB"] },
+  { name: "AI Chips", syms: ["NVDAB", "TSMB", "INTCB"] },
+  { name: "ETF", syms: ["SPYB", "QQQB"] },
+  { name: "Crypto Stocks", syms: ["CRCLB", "MSTRB", "HOODB"] },
+  { name: "Memory", syms: ["SKHYB", "SNDKB"] },
+  { name: "Elon Musk", syms: ["SPCXB", "TSLAB"] },
+];
+/* "Smart" weighting favours liquidity, fixed from the on-chain depth measured
+   2026-09-24 (no live read): QQQB / SPYB have 0.01 % pools plus the deepest
+   books, the other ten deep stocks come next, the five thin ones last. */
+const SP_SMART_SCORE: Readonly<Record<string, number>> = {
+  QQQB: 4, SPYB: 4,
+  NVDAB: 3, SPCXB: 3, BABAB: 3, TSLAB: 3, GOOGLB: 3, CRCLB: 3, SKHYB: 3, METAB: 3, MSFTB: 3, TSMB: 3,
+  INTCB: 1, MSTRB: 1, HOODB: 1, SOXLB: 1, SNDKB: 1,
+};
+function spFixSum(ws: readonly number[]): number[] {
+  const out = ws.map((w) => Math.floor(w));
+  let left = 100 - out.reduce((a, b) => a + b, 0);
+  const order = ws.map((w, i) => [w - Math.floor(w), i] as const).sort((a, b) => b[0] - a[0]);
+  for (let k = 0; left > 0; k++, left--) out[order[k % order.length][1]]++;
+  return out;
+}
+const spEqual = (syms: readonly string[]): number[] => spFixSum(syms.map(() => 100 / syms.length));
+function spSmart(syms: readonly string[]): number[] {
+  const sc = syms.map((s) => SP_SMART_SCORE[s] ?? 1);
+  const fixed = syms.map(() => false);
+  let ws: number[] = [];
+  for (let pass = 0; pass < syms.length; pass++) {
+    const free = 100 - fixed.filter(Boolean).length * SP_MIN_WEIGHT;
+    const sum = sc.reduce((a, s, i) => a + (fixed[i] ? 0 : s), 0);
+    ws = sc.map((s, i) => (fixed[i] ? SP_MIN_WEIGHT : (s / sum) * free));
+    const low = ws.findIndex((w, i) => !fixed[i] && w < SP_MIN_WEIGHT);
+    if (low < 0) break;
+    fixed[low] = true;
+  }
+  return spFixSum(ws);
+}
+const spAddress = (sym: string): string => (DCA_BSTOCKS.find((s) => s.symbol === sym) ?? DCA_BSTOCKS[0]).address;
+const spRows = (value) => (Array.isArray(value) ? value : SP_DEFAULT_WEIGHTS) as readonly { readonly sym: string; readonly w: string }[];
+
+/* Same hand-drawn listbox as DcaStockField, so each row carries a logo. */
+function SpStockPicker({ value, options, icons, onChange }) {
+  const [open, setOpen] = React.useState(false);
+  const rootRef = React.useRef<HTMLSpanElement | null>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (event: MouseEvent) => { if (rootRef.current !== null && !rootRef.current.contains(event.target as Node)) setOpen(false); };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+  return (
+    <span ref={rootRef} style={{ position: "relative", flex: "0 0 auto", width: 112 }}>
+      <button type="button" aria-haspopup="listbox" aria-expanded={open} aria-label={"Change " + value} onClick={() => setOpen((v) => !v)}
+        style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 8, padding: "4px 0", background: "transparent", border: "none", color: "var(--ink-1)", font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)" }}>
+        <TokenIcon src={icons[spAddress(value)] ?? null} symbol={value} size={22} />
+        <span>{value}</span>
+        <Icon name="chevron-down" size={13} />
+      </button>
+      {open ? <div role="listbox" aria-label="Tokenized stock" style={{ position: "absolute", top: "calc(100% + 4px)", left: -8, width: "max-content", minWidth: 124, zIndex: 20, maxHeight: 320, overflowY: "auto",
+        background: "var(--surface-input)", border: "var(--border-width) solid var(--border-control)", borderRadius: "var(--radius-sm)", padding: 4 }}>
+        {options.map((sym) => <button key={sym} type="button" role="option" aria-selected={sym === value} onClick={() => { onChange(sym); setOpen(false); }}
+          style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 10px", border: 0, background: sym === value ? "var(--surface-sunken)" : "transparent", color: "var(--ink-1)", font: "var(--type-body-md)", cursor: "pointer", textAlign: "left" }}>
+          <TokenIcon src={icons[spAddress(sym)] ?? null} symbol={sym} size={20} />
+          <span>{sym}</span>
+        </button>)}
+      </div> : null}
+    </span>
+  );
+}
+
+function WeightsField({ value, onChange: setRows, values, set }) {
+  const rows = spRows(value);
+  const icons = useTokenIcons(DCA_BSTOCKS.map((s) => s.address));
+  // weighting: "smart" | "equal" while the rows are exactly what that button
+  // produced; any hand edit clears the highlight.
+  const onChange = (next, weighting: string | null = null) => {
+    setRows(next);
+    set("weighting", weighting);
+    // Total capital follows the stock count while it sits at the old floor
+    // (the default), and is always raised to the new floor.
+    const c = dcaNum(values.capital), m = spMinCapital(next.length), old = spMinCapital(rows.length);
+    if (!Number.isFinite(c) || c < m || (c === old && m !== old)) set("capital", String(m));
+  };
+  const total = rows.reduce((a, r) => a + (parseFloat(r.w) || 0), 0);
+  const remaining = 100 - total;
+  const setRow = (i, patch) => onChange(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const avail = DCA_BSTOCKS.map((s) => s.symbol as string).filter((s) => !rows.some((r) => r.sym === s));
+  const apply = (syms: readonly string[], fn: (s: readonly string[]) => number[], weighting: string) => { const ws = fn(syms); onChange(syms.map((s, i) => ({ sym: s, w: String(ws[i]) })), weighting); };
+  const canAdd = rows.length < SP_MAX_STOCKS && avail.length > 0;
+  const canRemove = rows.length > SP_MIN_STOCKS;
+  const pill = { cursor: "pointer", padding: "7px 14px", borderRadius: 999, background: "var(--surface-sunken)", border: "1px solid var(--line-1)", color: "var(--text-muted)", font: "var(--weight-medium) var(--text-xs)/1 var(--font-sans)" };
+  const pillOn = (on: boolean) => (on ? { ...pill, background: "var(--cat-yield-tint)", border: "1px solid var(--cat-yield)", color: "var(--cat-yield)" } : pill);
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+        {SP_BASKETS.map((b) => (
+          <button key={b.name} type="button" onClick={() => apply(b.syms, spEqual, "equal")} title={b.syms.join(", ")}
+            style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 12, padding: "8px 14px 8px 10px", borderRadius: 999, background: "var(--surface-sunken)", border: "1px solid var(--line-1)" }}>
+            <span style={{ display: "flex" }}>{b.syms.map((s, i) => <TokenIcon key={s} src={icons[spAddress(s)] ?? null} symbol={s} size={22} offset={i ? -7 : 0} />)}</span>
+            <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)", whiteSpace: "nowrap" }}>{b.name}</span>
+          </button>
+        ))}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button type="button" aria-pressed={values.weighting === "smart"} style={pillOn(values.weighting === "smart")} title="More weight on the most liquid stocks, each at least 10 %." onClick={() => apply(rows.map((r) => r.sym), spSmart, "smart")}>Smart</button>
+          <button type="button" aria-pressed={values.weighting === "equal"} style={pillOn(values.weighting === "equal")} onClick={() => apply(rows.map((r) => r.sym), spEqual, "equal")}>Equal</button>
+        </div>
+        <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--text-muted)" }}>
+          Remaining <span style={{ color: remaining === 0 ? "var(--ink-1)" : "var(--loss)" }}>{remaining > 0 ? "+" : ""}{remaining}%</span>/100%
+        </span>
+      </div>
+      <div style={{ display: "grid", gap: 8 }}>
+        {rows.map((r, i) => (
+          <div key={r.sym} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)" }}>
+            <SpStockPicker value={r.sym} options={[r.sym, ...avail]} icons={icons} onChange={(sym) => setRow(i, { sym })} />
+            <span style={{ flex: 1, minWidth: 40, height: 6, borderRadius: 999, background: "var(--line-1)", overflow: "hidden", display: "block" }}>
+              <span style={{ display: "block", height: "100%", width: `${Math.min(100, parseFloat(r.w) || 0)}%`, background: "var(--cat-yield)" }} />
+            </span>
+            <span style={{ width: 148, flex: "0 0 auto" }}>
+              <NumStepper value={r.w} onChange={(v) => setRow(i, { w: v })} step={5} min={SP_MIN_WEIGHT} max={100 - SP_MIN_WEIGHT * (rows.length - 1)} suffix="%" />
+            </span>
+            <button type="button" disabled={!canRemove} onClick={() => onChange(rows.filter((_, j) => j !== i))} aria-label={"Remove " + r.sym}
+              style={{ cursor: canRemove ? "pointer" : "not-allowed", opacity: canRemove ? 1 : 0.35, width: 26, height: 26, borderRadius: 6, border: "1px solid var(--line-1)", background: "transparent", color: "var(--text-subtle)", fontSize: 15, lineHeight: 1, flex: "0 0 auto" }}>×</button>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
+        {canAdd ? (
+          <select value="" onChange={(e) => e.target.value && onChange([...rows, { sym: e.target.value, w: String(SP_MIN_WEIGHT) }])} style={{ ...pill, padding: "7px 10px" }}>
+            <option value="">+ Add Stocks</option>
+            {avail.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        ) : <span />}
+      </div>
+    </div>
+  );
+}
+
+function SpChips({ options, value, onChange, fmt = (o) => o }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`, gap: 8 }}>
+      {options.map((o) => {
+        const on = o === value;
+        return <button key={o} type="button" aria-pressed={on} onClick={() => onChange(o)}
+          style={{ cursor: "pointer", padding: "12px 10px", borderRadius: "var(--radius-sm)", background: on ? "var(--cat-yield-tint)" : "var(--surface-sunken)", border: `1px solid ${on ? "var(--cat-yield)" : "var(--line-1)"}`, font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: on ? "var(--cat-yield)" : "var(--ink-1)" }}>{fmt(o)}</button>;
+      })}
+    </div>
+  );
+}
+
+/* The design referenced `FieldLabel` without shipping it. It wraps a control
+   in the label / control / hint order every other field on this screen uses.
+   `tooltip` reuses the generic per-field renderer's own info-glyph affordance
+   (line ~1316) instead of a second hint line, for a label whose explanation
+   is long enough to crowd the field. */
+function FieldLabel({ label, hint, tooltip, children }) {
+  return (
+    <>
+      <label className="fl-field__label">{label}{typeof tooltip === "string" ? <span aria-label={tooltip} title={tooltip} tabIndex={0} style={{ display: "inline-grid", placeItems: "center", width: 13, height: 13, marginLeft: 6, border: "1px solid var(--line-1)", borderRadius: "50%", color: "var(--text-subtle)", cursor: "help", font: "var(--weight-medium) 9px/1 var(--font-mono)" }}>i</span> : null}</label>
+      {children}
+      {hint ? <span className="fl-field__hint">{hint}</span> : null}
+    </>
+  );
+}
+
+const SCHED_FREQS = ["1 hour", "4 hours", "8 hours", "12 hours", "Daily", "Weekly"];
+const SCHED_INTERVALS: Record<string, 3600 | 14400 | 28800 | 43200 | 86400> = { "1 hour": 3600, "4 hours": 14400, "8 hours": 28800, "12 hours": 43200, Daily: 86400 };
+const SCHED_FIRST = ["Now", "Custom"];
+const SCHED_TIMES = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, "0") + ":00");
+
+/* Conservative buys estimate for the deploy screen's own hints — no live
+   preview fetch exists here (only the hire flow reads one), so this mirrors
+   the same MAX_PLATFORM_FEE_BPS ceiling the schedule blocked-reason check
+   below already uses for "at least one buy plus the platform fee". */
+function scheduleBuysEstimate(values) {
+  const amountWei = parseBnbToWei(String(values.schedAmount ?? "0"));
+  const totalWei = parseBnbToWei(String(values.capital ?? "0"));
+  const reservation = amountWei + amountWei * 500n / 10_000n;
+  const intervalSec = SCHED_INTERVALS[String(values.schedFreq ?? "Daily")] ?? 86400;
+  if (reservation <= 0n) return { plannedBuys: 0, buysThisSession: scheduleBuysThisSession(604_800, intervalSec) };
+  const raw = Number(totalWei / reservation);
+  const bounded = Number.isSafeInteger(raw) ? raw : Number.MAX_SAFE_INTEGER;
+  const byRuns = values.endRule === "runs" ? Math.min(bounded, Math.max(1, Math.min(1000, Number(values.endRuns ?? 1)))) : bounded;
+  const firstAtSec = values.schedFirst === "Custom" && values.schedStartDate
+    ? Math.floor(new Date(`${values.schedStartDate}T${values.schedStartTime || "00:00"}:00`).getTime() / 1_000) : Math.floor(Date.now() / 1_000);
+  const endAtSec = values.endRule === "date" && values.endDate ? Math.floor(new Date(`${values.endDate}T23:59:59`).getTime() / 1_000) : null;
+  const plannedBuys = values.endRule === "date" && endAtSec !== null
+    ? Math.min(byRuns, Math.max(0, Math.floor((endAtSec * 1_000 - firstAtSec * 1_000 - 1) / (intervalSec * 1_000)) + 1))
+    : byRuns;
+  return { plannedBuys, buysThisSession: scheduleBuysThisSession(604_800, intervalSec) };
+}
+
+function ScheduleField({ values, set }) {
+  const freq = values.schedFreq || "Daily";
+  const first = values.schedFirst || "Now";
+  const estimate = scheduleBuysEstimate(values);
+  return (
+    <div style={{ display: "grid", gap: 16 }}>
+      <div style={{ display: "grid", gap: 8 }}>
+        <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>Frequency</span>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(118px, 1fr))", gap: 8 }}>
+          {SCHED_FREQS.map((o) => {
+            const on = o === freq;
+            return (
+              <button key={o} type="button" disabled={o === "Weekly"} aria-disabled={o === "Weekly"} title={o === "Weekly" ? "Needs a session longer than 7 days." : undefined} onClick={() => o !== "Weekly" && set("schedFreq", o)}
+                style={{ cursor: o === "Weekly" ? "not-allowed" : "pointer", opacity: o === "Weekly" ? 0.4 : 1, padding: "12px 10px", borderRadius: "var(--radius-sm)", background: on ? "var(--cat-yield-tint)" : "var(--surface-sunken)", border: `1px solid ${on ? "var(--cat-yield)" : "var(--line-1)"}`, font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: on ? "var(--cat-yield)" : "var(--ink-1)" }}>{o}</button>
+            );
+          })}
+        </div>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
+        <div className="fl-field">
+          <FieldLabel label="First buy time" tooltip={first === "Now" ? "The first cycle runs as soon as the agent is deployed, then repeats on the frequency above." : "The first cycle runs at the date and time you pick, then repeats on the frequency above."}>
+            <Select value={first} options={SCHED_FIRST} onChange={(e) => set("schedFirst", e.target.value)} />
+          </FieldLabel>
+        </div>
+        {first === "Custom" ? (
+          <div className="fl-field">
+            <label className="fl-field__label">Start date</label>
+            <input type="date" value={values.schedStartDate || ""} onChange={(e) => set("schedStartDate", e.target.value)}
+              style={{ width: "100%", padding: "10px 12px", borderRadius: "var(--radius-sm)", background: "var(--surface-input)", border: "1px solid var(--line-1)", color: "var(--ink-1)", font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", outline: "none" }} />
+          </div>
+        ) : null}
+        {first === "Custom" ? (
+          <div className="fl-field">
+            <label className="fl-field__label">Start time <span style={{ color: "var(--text-subtle)", fontWeight: "var(--weight-regular)" }}>(your local time)</span></label>
+            <Select value={values.schedStartTime || "18:00"} options={SCHED_TIMES} onChange={(e) => set("schedStartTime", e.target.value)} />
+          </div>
+        ) : null}
+      </div>
+      <span data-testid="schedule-session-hint" style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)" }}>
+        Your 7-day session covers up to {estimate.buysThisSession} buys; {estimate.plannedBuys} are planned. Renew the session after it expires to continue.
+      </span>
+    </div>
+  );
+}
+
+/* Auto DCA universe (operator 2026-09-24): bStocks with a usable Pancake V3
+   USDT pool, measured on chain that day. QQQB and SPYB use their 0.01% pools;
+   the rest sit on 0.25%. */
+const DCA_BSTOCKS = [
+  { symbol: "NVDAB", address: "0x02fca66c1d1afb4e2a7884261eb00f63598a7436", feeBps: 25 },
+  { symbol: "SPCXB", address: "0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1", feeBps: 25 },
+  { symbol: "BABAB", address: "0x4ef9d3062c7f6eba4aae4990c5036598c6eff4ec", feeBps: 25 },
+  { symbol: "TSLAB", address: "0x5b1910eaad6450e50f816082aa078c41f10c292f", feeBps: 25 },
+  { symbol: "QQQB", address: "0x205812cdbed920aff76c6580abd681a46d11efc7", feeBps: 1 },
+  { symbol: "GOOGLB", address: "0x3f53de71c126bdabae20f9cd64848d317f6c3238", feeBps: 25 },
+  { symbol: "CRCLB", address: "0x80f3d493ebce97e343c53d29a137942416b4ffc0", feeBps: 25 },
+  { symbol: "SKHYB", address: "0xca750ef65f295bbecd685abf54e82caf297bdb61", feeBps: 25 },
+  { symbol: "METAB", address: "0x7425889fe94f9d693e8daefe88bcced6acfef4c0", feeBps: 25 },
+  { symbol: "MSFTB", address: "0x80106cb3ead06659a5ad19df39d9b4733863b9b0", feeBps: 25 },
+  { symbol: "TSMB", address: "0xab78b89b5bb00236be0b4b20704cbfa04efc711c", feeBps: 25 },
+  { symbol: "SPYB", address: "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8", feeBps: 1 },
+  { symbol: "INTCB", address: "0xe614e2fc6c787035ff51f452e8e826bfd32d5283", feeBps: 25 },
+  { symbol: "MSTRB", address: "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14", feeBps: 25 },
+  { symbol: "HOODB", address: "0xa394dcea3fd3847fd793afbfd163e2e3858b7c65", feeBps: 25 },
+  { symbol: "SOXLB", address: "0xd97d097a89113fa59b76c572e5b2eb647e8eefaf", feeBps: 25 },
+  { symbol: "SNDKB", address: "0x3ee4df61bd4f867e349beae8bfe07bc31b4850fb", feeBps: 25 },
+] as const;
+/** Max DCA orders default: 3 on the 0.25 % pools, 4 on the 0.01 % pools (operator 2026-09-25, D4). */
+const dcaDefaultMaxOrders = (symbol): string => ((DCA_BSTOCKS.find((stock) => stock.symbol === symbol) ?? DCA_BSTOCKS[0]).feeBps === 1 ? "4" : "3");
+const dcaNum = (s) => parseFloat(String(s == null ? "" : s).replace(/,/gu, ""));
+/* A USDT price as the signed ×1e8 canonical decimal (§8.1); null when not a positive number. */
+const dcaE8 = (s): string | null => {
+  const text = String(s == null ? "" : s).replace(/,/gu, "").trim();
+  if (!/^\d+(?:\.\d{0,8})?$/u.test(text)) return null;
+  const [whole = "0", fraction = ""] = text.split(".");
+  const value = BigInt(whole) * 100_000_000n + BigInt(fraction.padEnd(8, "0"));
+  return value > 0n ? value.toString(10) : null;
+};
+
+/* Same hand-drawn listbox as BstockField (a native <option> cannot carry a
+   logo), over the fixed Auto DCA universe instead of live quotes. */
+function DcaStockField({ f, value, onChange }) {
+  const selected = DCA_BSTOCKS.find((s) => s.symbol === value) ?? DCA_BSTOCKS[0];
+  const icons = useTokenIcons(DCA_BSTOCKS.map((s) => s.address));
+  const [open, setOpen] = React.useState(false);
+  const rootRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (event: MouseEvent) => { if (rootRef.current !== null && !rootRef.current.contains(event.target as Node)) setOpen(false); };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+  const rowStyle = (active: boolean) => ({ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px var(--space-5)", border: 0,
+    background: active ? "var(--surface-sunken)" : "transparent", color: "var(--ink-1)", font: "var(--type-body-md)", cursor: "pointer", textAlign: "left" as const });
+  return <div className="fl-field" ref={rootRef}>
+    <label className="fl-field__label" htmlFor="fl-sel-dca-stock">{f.label}</label>
+    <div className="fl-select-wrap" style={{ position: "relative" }}>
+      <button id="fl-sel-dca-stock" type="button" className="fl-select" aria-haspopup="listbox" aria-expanded={open}
+        style={{ display: "flex", alignItems: "center", gap: 10, textAlign: "left" }} onClick={() => setOpen((v) => !v)}>
+        <TokenIcon src={icons[selected.address] ?? null} symbol={selected.symbol} size={20} />
+        <span>{selected.symbol}</span>
+      </button>
+      <span className="fl-select__chev"><Icon name="chevron-down" size={15} /></span>
+      {open ? <div role="listbox" aria-label={f.label} style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 20, maxHeight: 320, overflowY: "auto",
+        background: "var(--surface-input)", border: "var(--border-width) solid var(--border-control)", borderRadius: "var(--radius-sm)", padding: 4 }}>
+        {DCA_BSTOCKS.map((s) => <button key={s.address} type="button" role="option" aria-selected={s.symbol === selected.symbol} style={rowStyle(s.symbol === selected.symbol)}
+          onClick={() => { onChange(s.symbol); setOpen(false); }}>
+          <TokenIcon src={icons[s.address] ?? null} symbol={s.symbol} size={20} />
+          <span>{s.symbol}</span>
+        </button>)}
+      </div> : null}
+    </div>
+  </div>;
+}
+
+/* Price range: buys (base + DCA) only fill while price sits inside [min, max]. */
+function DcaRangeField({ values, set }) {
+  const on = !!values.dcaRangeOn;
+  const lo = dcaNum(values.dcaRangeMin), hi = dcaNum(values.dcaRangeMax);
+  const bad = on && Number.isFinite(lo) && Number.isFinite(hi) && lo >= hi;
+  return (
+    <div style={{ gridColumn: "span 2", display: "grid", gap: 8 }}>
+      <Checkbox checked={on} onChange={(v) => set("dcaRangeOn", v)}>Price range</Checkbox>
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: 8, opacity: on ? 1 : 0.4, pointerEvents: on ? "auto" : "none" }}>
+        <NumStepper prefix="Min" value={values.dcaRangeMin} onChange={(v) => set("dcaRangeMin", v)} step={1} min={0} suffix="USDT" />
+        <NumStepper prefix="Max" value={values.dcaRangeMax} onChange={(v) => set("dcaRangeMax", v)} step={1} min={0} suffix="USDT" />
+      </div>
+      {bad ? <span style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--warn)" }}>Min must be below max.</span> : null}
+    </div>
+  );
+}
+
+/* Total capital = base order + DCA order × max DCA orders. Read-only. */
+function DcaTotalField({ f, values }) {
+  const b = dcaNum(values.dcaBase), o = dcaNum(values.dcaOrder), m = dcaNum(values.dcaMaxOrders);
+  const ok = Number.isFinite(b) && Number.isFinite(o) && Number.isFinite(m);
+  return (
+    <div className="fl-field">
+      <label className="fl-field__label">{f.label}</label>
+      <div aria-readonly="true" title="Base order size + DCA order size × Max DCA orders" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, height: 40, boxSizing: "border-box", padding: "0 12px", borderRadius: "var(--radius-sm)", background: "var(--cat-yield-tint)", border: "1px solid var(--cat-yield)", cursor: "not-allowed" }}>
+        <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", color: ok ? "var(--ink-1)" : "var(--text-subtle)" }}>{ok ? (b + o * m).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "--"}</span>
+        <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", color: "var(--text-subtle)" }}>USDT</span>
+      </div>
+    </div>
+  );
+}
+
+function BstockField({ values, set }) {
+  const [state, setState] = React.useState<{ kind: "idle" | "loading" | "ready" | "empty" | "error"; tokens: readonly SchedulableTokenDto[]; message?: string }>({ kind: "idle", tokens: [] });
+  React.useEffect(() => {
+    const amount = parseBnbToWei(String(values.schedAmount ?? "0"));
+    const slippageBps = Math.round(Number(values.slippage ?? "1") * 100);
+    if (amount < 5n * 10n ** 18n || !Number.isInteger(slippageBps)) { setState({ kind: "idle", tokens: [] }); return; }
+    const controller = new AbortController();
+    // Re-quoting keeps the previous list selectable (stale-while-revalidate):
+    // the set of quotable bStocks barely moves between amounts, and a blank
+    // control on every keystroke reads as broken.
+    setState((previous) => ({ kind: "loading", tokens: previous.tokens }));
+    const timer = window.setTimeout(() => {
+      void fetchSchedulable(amount.toString(10), slippageBps, controller.signal)
+        .then((result) => setState(result.tokens.length === 0 ? { kind: "empty", tokens: [] } : { kind: "ready", tokens: result.tokens }))
+        .catch((error: unknown) => { if (!controller.signal.aborted) setState((previous) => ({ kind: "error", tokens: previous.tokens, message: error instanceof Error ? error.message : "Quotes are unavailable." })); });
+    }, 600);
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [values.schedAmount, values.slippage]);
+  const selected = values.schedAsset?.address ?? "";
+  const icons = useTokenIcons(state.tokens.map((token) => token.address));
+  const selectedToken = state.tokens.find((token) => token.address.toLowerCase() === selected.toLowerCase()) ?? null;
+  React.useEffect(() => {
+    // A token that stopped quoting at the new amount must not stay in the signed tuple.
+    if (state.kind === "ready" && selected !== "" && selectedToken === null) set("schedAsset", null);
+  }, [state.kind, selected, selectedToken]);
+  // A listbox drawn by hand, because a native <option> cannot carry a logo. The
+  // trigger reuses the design-system .fl-select look so the row matches the
+  // three controls beside it.
+  const [open, setOpen] = React.useState(false);
+  const rootRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (event: MouseEvent) => { if (rootRef.current !== null && !rootRef.current.contains(event.target as Node)) setOpen(false); };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+  const hint = state.kind === "loading" ? undefined
+    : state.kind === "empty" ? "No bStock quotes at this amount. Lower the amount per buy."
+      : state.kind === "error" ? "— quotes unavailable right now; try again in a moment." : undefined;
+  const choose = (token: SchedulableTokenDto | null) => { set("schedAsset", token === null ? null : { address: token.address.toLowerCase(), symbol: token.symbol }); setOpen(false); };
+  const rowStyle = (active: boolean) => ({ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px var(--space-5)", border: 0,
+    background: active ? "var(--surface-sunken)" : "transparent", color: "var(--ink-1)", font: "var(--type-body-md)", cursor: "pointer", textAlign: "left" as const });
+  return <div className="fl-field" ref={rootRef}>
+    <label className="fl-field__label" htmlFor="fl-sel-tokenized-stock">Tokenized stock</label>
+    <div className="fl-select-wrap" style={{ position: "relative" }}>
+      <button id="fl-sel-tokenized-stock" type="button" className="fl-select" disabled={state.tokens.length === 0} aria-haspopup="listbox" aria-expanded={open}
+        style={{ display: "flex", alignItems: "center", gap: 10, textAlign: "left" }} onClick={() => setOpen((value) => !value)}>
+        {selectedToken !== null ? <TokenIcon src={icons[selectedToken.address.toLowerCase()] ?? null} symbol={selectedToken.symbol} size={20} /> : null}
+        <span>{selectedToken !== null ? selectedToken.symbol : state.tokens.length > 0 ? "Select a bStock" : state.kind === "loading" || state.kind === "idle" ? "Loading…" : "No quoted bStocks yet"}</span>
+      </button>
+      <span className="fl-select__chev"><Icon name="chevron-down" size={15} /></span>
+      {open ? <div role="listbox" aria-label="Tokenized stock" style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 20, maxHeight: 320, overflowY: "auto",
+        background: "var(--surface-input)", border: "var(--border-width) solid var(--border-control)", borderRadius: "var(--radius-sm)", padding: 4 }}>
+        <button type="button" role="option" aria-selected={selectedToken === null} style={rowStyle(selectedToken === null)} onClick={() => choose(null)}>Select a bStock</button>
+        {state.tokens.map((token) => <button key={token.address} type="button" role="option" aria-selected={selectedToken?.address === token.address} style={rowStyle(selectedToken?.address === token.address)} onClick={() => choose(token)}>
+          <TokenIcon src={icons[token.address.toLowerCase()] ?? null} symbol={token.symbol} size={20} />
+          <span>{token.symbol}</span>
+        </button>)}
+      </div> : null}
+    </div>
+    {hint !== undefined ? <span className="fl-field__hint">{hint}</span> : null}
+  </div>;
+}
+
+/* NAV guard: a premium ceiling against the underlying stock. A breach holds the
+   cycle rather than cancelling the agent, the same way a buy price range does. */
+function NavGuardField({ values, set }) {
+  const on = values.navGuard !== false;
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <Checkbox checked={on} onChange={(v) => set("navGuard", v)}>Guard NAV — do not buy while the token trades above the stock it tracks.</Checkbox>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
+        <div className="fl-field" style={{ opacity: on ? 1 : 0.4, pointerEvents: on ? "auto" : "none" }}>
+          <FieldLabel label="Max premium to NAV" tooltip="A breach postpones that cycle instead of cancelling it: the buy is skipped for the period and the schedule resumes at the next cycle once the premium is back inside the limit — the same behaviour as a buy price range. The platform never buys above +1.5% regardless.">
+            <NumStepper value={values.navPremium} onChange={(v) => set("navPremium", v)} step={0.1} min={0.5} max={1.5} suffix="%" />
+          </FieldLabel>
+        </div>
+        <div className="fl-field">
+          <FieldLabel label="Slippage tolerance" hint="Between 0.5% and 5%.">
+            <NumStepper value={values.slippage} onChange={(v) => set("slippage", v)} step={0.5} min={0.5} max={5} suffix="%" />
+          </FieldLabel>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const END_RULES = [
+  { id: "budget", label: "Run until the budget is spent" },
+  { id: "date", label: "Run until a date" },
+  { id: "runs", label: "Run a set number of times" },
+];
+
+function EndRuleField({ values, set }) {
+  const sel = values.endRule || "budget";
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 8, alignItems: "start" }}>
+      {END_RULES.map((r) => {
+        const on = r.id === sel;
+        return (
+          <div key={r.id} style={{ display: "grid", gap: 10, padding: "12px 14px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: `1px solid ${on ? "var(--cat-yield)" : "var(--line-1)"}` }}>
+            <Checkbox checked={on} onChange={() => set("endRule", r.id)}>{r.label}</Checkbox>
+            {r.id === "date" && on ? (
+              <input type="date" value={values.endDate || ""} onChange={(e) => set("endDate", e.target.value)}
+                style={{ width: "100%", padding: "10px 12px", borderRadius: "var(--radius-sm)", background: "var(--surface-input)", border: "1px solid var(--line-1)", color: "var(--ink-1)", font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", outline: "none" }} />
+            ) : null}
+            {r.id === "runs" && on ? (
+              <NumStepper value={values.endRuns} onChange={(v) => set("endRuns", v)} step={1} min={1} suffix="runs" />
+            ) : null}
+          </div>
+        );
+      })}
+      </div>
+      <span style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)" }}>Pick one. Postponed cycles do not count as runs.</span>
+    </div>
+  );
+}
+
+const TF_MODE_SECTION = { title: "Mode", fields: [{ k: "tradfiMode", type: "tradfiModes", v: "ai" }] };
+
+const TF_RISK = { title: "Risk and execution", checkRow: true, poweredBy: "0g", fields: [
+  { k: "slippage", label: "Slippage tolerance", type: "stepper", v: "1", step: 0.5, min: 0.5, max: 5, suffix: "%", hint: "Between 0.5% and 5%." },
+  { k: "crashProtection", label: "check", type: "check", v: true, text: "Crash protection" },
+  { k: "noReentry", label: "check", type: "check", v: false, text: "No re-entry" },
+  { k: "gas", label: "Gas priority", type: "select", v: "Standard", options: ["Low", "Standard", "High"] },
+  { k: "primary", label: "Primary model", type: "select", v: MODELS[0], options: MODELS, excludeValueOf: "fallback", showDisabledOption: true },
+  { k: "fallback", label: "Fallback model", type: "select", v: MODELS[1], options: FALLBACKS, excludeValueOf: "primary", showDisabledOption: true },
+] };
+
+/* Schedule buy, DCA and portfolio rebalancing are deterministic: no model row. */
+const TF_RISK_RULES = { title: "Risk and execution", cols: 4, fields: [
+  { k: "slippage", label: "Slippage tolerance", type: "stepper", v: "1", step: 0.5, min: 0.5, max: 5, suffix: "%", hint: "Between 0.5% and 5%." },
+] };
+
+/* Schedule buy, Auto DCA and Smart Portfolio run to fixed rules: no model
+   guidance, no paid market data — only routing and gas. */
+const TF_ADV_RULES = { title: "Advanced settings", adv: true, note: "Execution routing. These never override wallet controls, slippage, stop-loss, or the market-hours guard.", fields: [
+  { k: "gas", label: "Gas priority", type: "select", v: "Standard", options: ["Low", "Standard", "High"] },
+  { k: "quicknode", label: "QuickNode RPC x402", type: "toggle", v: false, text: "Pay per request for faster reads", exclusiveWith: "customRpc" },
+  { k: "customRpc", label: "Custom RPC", type: "toggle", v: false, text: "Use your own RPC endpoint", exclusiveWith: "quicknode", inputKey: "customRpcUrl", inputPlaceholder: "https://your-rpc-endpoint.com" },
+] };
+const TF_ADV_PORTFOLIO = { ...TF_ADV_RULES, note: "Execution routing. These never override wallet controls, slippage or stop-loss." };
+
+const TF_ADV = { title: "Advanced settings", adv: true, note: "Pay-per-call data feeds and optional trading guidance. These never override wallet controls, slippage, stop-loss, or the market-hours guard.", fields: [
+  { k: "quicknode", label: "QuickNode RPC x402", type: "toggle", v: false, text: "Pay per request for faster reads", exclusiveWith: "customRpc" },
+  { k: "customRpc", label: "Custom RPC", type: "toggle", v: false, text: "Use your own RPC endpoint", exclusiveWith: "quicknode", inputKey: "customRpcUrl", inputPlaceholder: "https://your-rpc-endpoint.com" },
+  { k: "cmcHub", label: "CMC Agent Hub x402", type: "toggle", v: false, text: "Pay per request for CoinMarketCap agent data" },
+  { k: "cmcTotalBudget", label: "CMC total budget", type: "stepper", v: weiToBnb(DEFAULT_CMC_TOTAL_BUDGET_WEI), step: 1, min: 0.000000000000000001, suffix: "USDT", cmcOnly: true, hint: "Finite total allowance for this agent. There is no daily reset; top up only with an owner action." },
+  { k: "instructions", label: "Instructions", type: "textarea", v: "", byteLimit: MAX_INSTRUCTIONS_ENCODED_BYTES, placeholder: "Example: Favour post-earnings drift on large-cap tech. Stay flat through rate decisions.", hint: "Soft preference layer only. Use plain English or Chinese to describe the setups this agent should favor or avoid." },
+  { k: "skillFile", label: "Add Skill", type: "skillFile", v: null },
+] };
+
+const TRADFI_SECTIONS = {
+  ai: [
+    { title: "Agent", cols: 5, fields: [
+      { k: "agentName", label: "Agent name", type: "text", v: "TradFi Trade Agent" },
+      { k: "tradfiV2", type: "hidden", v: true },
+      { k: "capital", label: "Total capital", type: "stepper", v: "63", step: 1, min: 0.000000000000000001, suffix: "USDT" },
+      { k: "minEntry", label: "Min per entry", type: "stepper", v: weiToBnb(DEFAULT_TRADFI_V2_MIN_ENTRY_WEI), step: 1, min: 0.000000000000000001, suffix: "USDT" },
+      { k: "perTrade", label: "Max per entry", type: "stepper", v: weiToBnb(DEFAULT_TRADFI_V2_MAX_ENTRY_WEI), step: 1, min: 0.000000000000000001, suffix: "USDT" },
+      { k: "maxPositions", label: "Max open positions", type: "stepper", v: "3", step: 1, min: 1 },
+    ] },
+    { title: "Exit (if you do not make a choice, the LLM model will decide)", fields: [
+      { k: "tp1On", type: "hidden", v: false },
+      { k: "tp1", label: "Take profit", type: "numToggle", on: "tp1On", v: "25", suffix: "%", step: 5, min: 0 },
+      { k: "stopLossOn", type: "hidden", v: false },
+      { k: "stopLoss", label: "Stop loss", type: "numToggle", on: "stopLossOn", v: "15", suffix: "%", step: 5, min: 0, max: 100 },
+      { k: "holdTimeOn", type: "hidden", v: false },
+      { k: "holdTime", label: "Max holding time", type: "numToggle", on: "holdTimeOn", v: "4,320", suffix: "min", step: 60, min: 60, offNote: "No limit — LLM model decides when to exit." },
+    ] },
+    TF_RISK, TF_ADV,
+  ],
+  sched: [
+    // R2.10 (LOW-7): no model row (deterministic, no LLM) — this note explains why in its place.
+    { title: "Agent", fields: [
+      { k: "agentName", label: "Agent name", type: "text", v: "TradFi Schedule Agent" },
+      { k: "schedAsset", type: "bstockSelect", v: null },
+      { k: "capital", label: "Total budget", type: "stepper", v: "50", step: 5, min: 5, suffix: "USDT" },
+      { k: "schedAmount", label: "Amount per buy", type: "stepper", v: "5", step: 1, min: 5, suffix: "USDT" },
+    ] },
+    { title: "Schedule", fields: [
+      { k: "schedFreq", type: "hidden", v: "Daily" },
+      { k: "schedFirst", type: "hidden", v: "Now" },
+      { k: "schedStartDate", type: "hidden", v: "2026-09-21" },
+      { k: "schedStartTime", type: "hidden", v: "18:00" },
+      { k: "scheduleUI", type: "scheduleGroup", v: null },
+    ] },
+    { title: "Risk and execution", fields: [
+      { k: "navGuard", type: "hidden", v: true },
+      { k: "navPremium", type: "hidden", v: "1.5" },
+      { k: "slippage", type: "hidden", v: "1" },
+      { k: "navGuardUI", type: "navGuard", v: null },
+      { k: "sessionGuard", label: "check", type: "check", v: false, text: "Only buy during US market hours (9:30–16:00 ET, Mon–Fri). Exchange holidays are not modelled." },
+    ] },
+    { title: "Finish", fields: [
+      { k: "endRule", type: "hidden", v: "budget" },
+      { k: "endDate", type: "hidden", v: "2026-12-31" },
+      { k: "endRuns", type: "hidden", v: "12" },
+      { k: "endRuleUI", type: "endRule", v: null },
+    ] },
+    TF_ADV_RULES,
+  ],
+  // Auto DCA (AUTO-DCA-SPEC §14.1): wired to the signed DCA tuple; bounds follow
+  // the operator's rulings (operator 2026-09-25: base at least 25 USDT, take profit at least 1.5 % on every stock; the plane still accepts 15 / 1 %).
+  dca: [
+    { title: "Agent", cols: 4, fields: [
+      { k: "agentName", label: "Agent name", type: "text", v: "TradFi DCA Agent" },
+      { k: "dcaAsset", label: "Tokenized stock", type: "dcaStock", v: "NVDAB" },
+      { k: "dcaStep", label: "Price drop steps", type: "stepper", v: "1", step: 0.5, min: 1, max: 30, suffix: "%" },
+      { k: "dcaTp", label: "Take profit", type: "stepper", v: "1.5", step: 0.5, min: 1.5, suffix: "%" },
+      { k: "dcaBase", label: "Base order size", type: "stepper", v: "25", step: 5, min: 25, suffix: "USDT" },
+      { k: "dcaOrder", label: "DCA order size", type: "stepper", v: "10", step: 10, min: 10, suffix: "USDT" },
+      { k: "dcaMaxOrders", label: "Max DCA orders", type: "stepper", v: "3", step: 1, min: 1, max: 8 },
+      { k: "dcaTotal", label: "Total Delegated", type: "dcaTotal", v: null },
+    ] },
+    { title: "Entry", cols: 3, fields: [
+      { k: "dcaTriggerOn", type: "hidden", v: false },
+      { k: "dcaTrigger", label: "Trigger price", type: "numToggle", on: "dcaTriggerOn", v: "178", suffix: "USDT", step: 1, min: 0, offNote: "Off. The base order buys at market on deploy." },
+      { k: "dcaRangeOn", type: "hidden", v: false },
+      { k: "dcaRangeMin", type: "hidden", v: "150" },
+      { k: "dcaRangeMax", type: "hidden", v: "200" },
+      { k: "dcaRangeUI", type: "dcaRange", v: null },
+    ] },
+    { title: "Exit", cols: 4, fields: [
+      { k: "dcaSlOn", type: "hidden", v: false },
+      { k: "dcaSl", label: "Stop loss", type: "numToggle", on: "dcaSlOn", v: "15", suffix: "%", step: 1, min: 0 },
+      { k: "slippage", label: "Slippage tolerance", type: "num", alignAsCheckbox: true, v: "1", step: 0.5, min: 0.5, max: 5, suffix: "%" },
+    ] },
+    TF_ADV_RULES,
+  ],
+  smart: [
+    { title: "Agent", fields: [
+      { k: "agentName", label: "Agent name", type: "text", v: "TradFi Portfolio Agent" },
+      { k: "capital", label: "Total capital", type: "stepper", v: "100", step: 25, min: 50, suffix: "USDT" },
+    ] },
+    { title: "Allocation", fields: [
+      { k: "weighting", type: "hidden", v: "equal" },
+      { k: "weights", type: "weights", v: null },
+    ] },
+    { title: "Rebalance", cols: 4, fields: [
+      { k: "drift", label: "Rebalance when drift exceeds", type: "stepper", v: "5", step: 0.5, min: 0.5, max: 15, suffix: "%" },
+      { k: "rebalanceEvery", label: "Rebalance every", type: "segChips", span: 3, v: "Daily", options: ["4h", "8h", "12h", "Daily"] },
+    ] },
+    TF_RISK_RULES, TF_ADV_PORTFOLIO,
+  ],
+};
+
+function tradfiSections(mode) {
+  return [TF_MODE_SECTION].concat(TRADFI_SECTIONS[mode] || TRADFI_SECTIONS.ai);
+}
+
+function sectionsFor(kind, presetId, mode = "Live", values) {
   if (kind === "lp") return presetId === "blue" ? CONFIG.lpCustom : CONFIG.lp;
+  if (kind === "trading" && presetId === "tradfi") return tradfiSections(values && values.tradfiMode);
   const sections = CONFIG[kind];
   return mode === "Live" ? sections : sections.map((section) => ({
     ...section,
@@ -310,7 +971,13 @@ function sectionsFor(kind, presetId, mode = "Live") {
 function defaults(kind, presetId) {
   const pid = presetId || DEFAULT_PRESET[kind];
   const out = {};
-  sectionsFor(kind, pid).forEach((s) => s.fields.forEach((f) => { out[f.k] = f.v; }));
+  const collect = (secs) => secs.forEach((s) => s.fields.forEach((f) => { out[f.k] = f.v; }));
+  if (kind === "trading" && pid === "tradfi") {
+    /* Reverse order so the default mode's values win on shared keys. */
+    TRADFI_MODES.slice().reverse().forEach((m) => collect(tradfiSections(m.id)));
+  } else {
+    collect(sectionsFor(kind, pid));
+  }
   const p = PRESETS[kind].find((x) => x.id === pid);
   return p ? { ...out, ...p.set } : out;
 }
@@ -850,13 +1517,22 @@ function UnitStepper({ label, value, onChange, unit, onUnitChange, options, step
 
 function Field({ f, value, onChange, values, set, preset }) {
   const [fieldError, setFieldError] = React.useState("");
+  const tradfiV2 = preset === "tradfi" && values.tradfiV2 !== false;
+  if (f.tradfiOnly && !tradfiV2) return null;
+  if (f.cmcOnly && (!tradfiV2 || values.cmcHub !== true)) return null;
   if (f.type === "hidden") return null;
   if (f.type === "toggle") return (
     <div style={{ display: "grid", gap: 8 }}>
       <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: "var(--ink-1)" }}>{f.label}</span>
       <div style={{ display: "flex", alignItems: "center", minHeight: 42 }}>
-        <Checkbox checked={!!value} onChange={(v) => { onChange(v); if (v && f.exclusiveWith) set(f.exclusiveWith, false); }}>{f.text}</Checkbox>
+        <Checkbox checked={f.k === "cmcHub" && !tradfiV2 ? false : !!value}
+          locked={f.k === "cmcHub" && !tradfiV2}
+          onChange={(v) => {
+            if (f.k === "cmcHub" && !tradfiV2) return;
+            onChange(v); if (v && f.exclusiveWith) set(f.exclusiveWith, false);
+          }}>{f.text}</Checkbox>
       </div>
+      {f.k === "cmcHub" && !tradfiV2 ? <span className="fl-field__hint">TradFi v2 hires only. This legacy control cannot authorize a payer.</span> : null}
       {f.inputKey && value ? (
         <input value={(values && values[f.inputKey]) || ""} onChange={(e) => set(f.inputKey, e.target.value)} placeholder={f.inputPlaceholder}
           style={{ width: "100%", padding: "11px 12px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)", color: "var(--ink-1)", font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)", outline: "none" }} />
@@ -866,22 +1542,56 @@ function Field({ f, value, onChange, values, set, preset }) {
   if (f.type === "numToggle") {
     const on = !!values[f.on];
     return (
-      <div style={{ display: "grid", gap: 8 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 8 }}>
         <Checkbox checked={on} onChange={(v) => set(f.on, v)}>{f.label}</Checkbox>
-        <div style={{ opacity: on ? 1 : 0.4, pointerEvents: on ? "auto" : "none" }}>
-          <NumStepper value={value} onChange={onChange} step={f.step || 1} min={f.min} max={f.max} suffix={f.suffix} />
-        </div>
+        {!on && f.offNote ? (
+          <div style={{ display: "flex", alignItems: "center", minHeight: 42, padding: "0 12px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)", font: "var(--weight-regular) var(--text-xs)/1.3 var(--font-sans)", color: "var(--text-subtle)" }}>{f.offNote}</div>
+        ) : (
+          <div style={{ opacity: on ? 1 : 0.4, pointerEvents: on ? "auto" : "none" }}>
+            <NumStepper value={value} onChange={onChange} step={f.step || 1} min={f.min} max={f.max} suffix={f.suffix} />
+          </div>
+        )}
+        {on && f.hint ? <span className="fl-field__hint">{f.hint}</span> : null}
       </div>
     );
   }
+  if (f.type === "tradfiModes") return <TradFiModes value={value} onChange={(mode) => {
+    onChange(mode);
+    // `agentName` is shared too: swap the default name, never a name the user typed.
+    const defaultNames = { ai: "TradFi Trade Agent", sched: "TradFi Schedule Agent", dca: "TradFi DCA Agent", smart: "TradFi Portfolio Agent" };
+    const currentName = String(values.agentName ?? "");
+    if (currentName === "" || Object.values(defaultNames).includes(currentName)) set("agentName", defaultNames[mode] ?? defaultNames.ai);
+    // `capital` is one key shared by every TradFi mode; each mode has its own default
+    // (AI Trade: 3 positions × 21 USDT = 63; Schedule buy: 50 / 5 per buy).
+    if (mode === "sched") { set("capital", "50"); set("schedAmount", "5"); }
+    else if (mode === "ai") set("capital", "63");
+    else if (mode === "smart") set("capital", String(spMinCapital(spRows(values.weights).length)));
+  }} />;
+  if (f.type === "bstockSelect") return <BstockField values={values} set={set} />;
+  if (f.type === "dcaStock") return <DcaStockField f={f} value={value} onChange={onChange} />;
+  if (f.type === "dcaRange") return <DcaRangeField values={values} set={set} />;
+  if (f.type === "dcaTotal") return <DcaTotalField f={f} values={values} />;
+  if (f.type === "weights") return <WeightsField value={value} onChange={onChange} values={values} set={set} />;
+  if (f.type === "segChips") return <div className="fl-field" style={{ gridColumn: `span ${f.span ?? 1}` }}><FieldLabel label={f.label}><SpChips options={f.options} value={String(value ?? f.v)} onChange={onChange} /></FieldLabel></div>;
+  if (f.type === "scheduleGroup") return <ScheduleField values={values} set={set} />;
+  if (f.type === "navGuard") return <NavGuardField values={values} set={set} />;
+  if (f.type === "endRule") return <EndRuleField values={values} set={set} />;
   if (f.type === "stepper") {
+    const tradfi = tradfiV2;
+    const tradfiEntry = f.k === "perTrade" && tradfi;
+    const tradfiCapital = f.k === "capital" && tradfi;
+    // The TradFi sections carry their own labels ("Min per entry" / "Max per entry").
+    const label = f.label;
+    const suffix = tradfiEntry || tradfiCapital ? "USDT" : f.suffix;
+    const min = tradfiEntry || tradfiCapital ? 0.000000000000000001 : f.min;
+    const step = tradfiEntry || tradfiCapital ? 1 : f.step;
     const typed = value === "" || value == null ? null : parseFloat(String(value).replace(/,/gu, ""));
     const below = f.floor != null && typed != null && typed < f.min;
     return (
       <div className="fl-field">
-        <label className="fl-field__label">{f.label}{typeof f.tooltip === "string" ? <span aria-label={f.tooltip} title={f.tooltip} tabIndex={0} style={{ display: "inline-grid", placeItems: "center", width: 13, height: 13, marginLeft: 6, border: "1px solid var(--line-1)", borderRadius: "50%", color: "var(--text-subtle)", cursor: "help", font: "var(--weight-medium) 9px/1 var(--font-mono)" }}>i</span> : null}</label>
-        <NumStepper value={value} onChange={onChange} step={f.step || 1} min={f.min} max={f.max} prefix={f.prefix} suffix={f.suffix} noClamp={f.floor != null} preciseStep={f.preciseStep} disabled={f.lockedByPreset && f.lockedByPreset.includes(preset)} />
-        {below ? <span role="alert" style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--loss)" }}>Minimum {f.floor} {f.suffix ?? ""}</span>
+        <label className="fl-field__label">{label}{typeof f.tooltip === "string" ? <span aria-label={f.tooltip} title={f.tooltip} tabIndex={0} style={{ display: "inline-grid", placeItems: "center", width: 13, height: 13, marginLeft: 6, border: "1px solid var(--line-1)", borderRadius: "50%", color: "var(--text-subtle)", cursor: "help", font: "var(--weight-medium) 9px/1 var(--font-mono)" }}>i</span> : null}</label>
+        <NumStepper value={value} onChange={onChange} step={step || 1} min={min} max={f.max} prefix={f.prefix} suffix={suffix} noClamp={f.floor != null} preciseStep={f.preciseStep} disabled={f.lockedByPreset && f.lockedByPreset.includes(preset)} />
+        {below ? <span role="alert" style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--loss)" }}>Minimum {f.floor} {suffix ?? ""}</span>
           : f.hint ? <span className="fl-field__hint">{f.hint}</span> : null}
       </div>
     );
@@ -965,7 +1675,7 @@ function Field({ f, value, onChange, values, set, preset }) {
     return <Select label={f.label} value={value} options={options} hint={f.hint} disabled={!!f.disabled} onChange={(e) => onChange(e.target.value)} />;
   }
   if (f.alignAsCheckbox) return (
-    <div style={{ display: "grid", gap: 8 }}>
+    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 8 }}>
       <span style={{ display: "flex", alignItems: "flex-start", font: "var(--type-body-md)", color: "var(--ink-1)" }}>{f.label}</span>
       <NumStepper value={value} onChange={onChange} step={f.step || 1} min={f.min} max={f.max} suffix={f.suffix} noLimitAtMin={f.noLimitAtMin} />
     </div>
@@ -986,15 +1696,21 @@ function Group({ section, values, set, preset, overrides }) {
     <div style={{ display: "grid", gap: 14 }}>
       {section.title ? <span className="fl-eyebrow">{section.title}{section.titleSuffix ? <span style={{ letterSpacing: "0.9px" }}> {section.titleSuffix}</span> : null}</span> : null}
       {section.note ? <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)", marginTop: -6 }}>{section.note}</p> : null}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 16, alignItems: "start" }}>
-        {section.fields.filter((f) => !"check codeToggle radioCheck pool textarea skillFile liquidityChart priceRangeGroup modeRows".split(" ").includes(f.type)).map((f) => (
+      <div style={{ display: "grid", gridTemplateColumns: section.cols ? `repeat(${section.cols}, minmax(0, 1fr))` : "repeat(auto-fit, minmax(190px, 1fr))", gap: 16, alignItems: "start" }}>
+      {section.fields.filter((f) => !"check codeToggle radioCheck pool textarea skillFile liquidityChart priceRangeGroup scheduleGroup navGuard endRule modeRows tradfiModes weights".split(" ").includes(f.type)).map((f) => (
           <Field key={f.k} f={F(f)} value={values[f.k]} onChange={(v) => set(f.k, v)} values={values} set={set} preset={preset} />
         ))}
       </div>
-      {section.fields.filter((f) => f.type === "pool" || f.type === "textarea" || f.type === "skillFile" || f.type === "liquidityChart" || f.type === "priceRangeGroup" || f.type === "modeRows").map((f) => (
+      {section.fields.filter((f) => f.type === "pool" || f.type === "textarea" || f.type === "skillFile" || f.type === "liquidityChart" || f.type === "priceRangeGroup" || f.type === "scheduleGroup" || f.type === "navGuard" || f.type === "endRule" || f.type === "modeRows" || f.type === "tradfiModes" || f.type === "weights").map((f) => (
         <Field key={f.k} f={F(f)} value={values[f.k]} onChange={(v) => set(f.k, v)} values={values} set={set} preset={preset} />
       ))}
-      {section.fields.filter((f) => f.type === "check" || f.type === "codeToggle" || f.type === "radioCheck").map((f, i) => (
+      {section.checkRow ? (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "14px 32px" }}>
+          {section.fields.filter((f) => f.type === "check" || f.type === "codeToggle" || f.type === "radioCheck").map((f, i) => (
+            <Field key={f.k + i} f={F(f)} value={values[f.k]} onChange={(v) => set(f.k, v)} values={values} set={set} preset={preset} />
+          ))}
+        </div>
+      ) : section.fields.filter((f) => f.type === "check" || f.type === "codeToggle" || f.type === "radioCheck").map((f, i) => (
         <Field key={f.k + i} f={F(f)} value={values[f.k]} onChange={(v) => set(f.k, v)} values={values} set={set} preset={preset} />
       ))}
       {section.poweredBy === "0g" ? (
@@ -1073,6 +1789,13 @@ function DeployAgentScreen({ kind, go }) {
   const set = (k, v) => {
     if (k === "capital") { capitalTouched.current = true; restoredCapital.current = false; }
     if (k === "maxRepay") repayTouched.current = true;
+    // Operator 2026-09-25 (D4): Max DCA orders defaults to 3 on the 0.25 % pools and 4 on the
+    // 0.01 % pools; a count still on the old stock's default follows the new stock's.
+    if (k === "dcaAsset") {
+      setValues((s) => ({ ...s, dcaAsset: v,
+        ...(String(s.dcaMaxOrders) === dcaDefaultMaxOrders(s.dcaAsset) ? { dcaMaxOrders: dcaDefaultMaxOrders(v) } : {}) }));
+      return;
+    }
     setValues((s) => ({ ...s, [k]: v }));
   };
   // A restore arrives from HireGridDeploy's mount-time resume effect, which
@@ -1201,16 +1924,28 @@ function DeployAgentScreen({ kind, go }) {
     try {
       const saved = JSON.parse(raw);
       const settings = saved.settings ?? saved;
-      // A saved `mid-cap` redeploy has no panel any more; it falls through the `some` check below and is ignored.
-      const presetId = settings.executionModel === "blue-chip" ? "bluechip" : settings.executionModel;
+      // A saved legacy `blue-chip` or `mid-cap` redeploy has no panel any more; it falls through the `some` check below and is ignored.
+      const presetId = settings.executionModel;
       if (!PRESETS.trading.some((entry) => entry.id === presetId)) return;
       setPreset(presetId);
-      setValues((current) => ({ ...current,
-        agentName: settings.name, capital: saved.capitalBnb ?? current.capital, perTrade: weiToBnb(settings.entryWei), maxPositions: String(settings.maxOpenPositions),
+      // Start from the saved preset's own table: the mount-time defaults are
+      // TradFi's, whose keys and hidden flags differ from the BNB presets'.
+      const current = defaults(id, presetId);
+      setValues(() => ({ ...current,
+        agentName: settings.name,
+        capital: settings.settlementAsset === "USDT" ? weiToBnb(settings.capitalQuoteWei ?? "0") : saved.capitalBnb ?? current.capital,
+        perTrade: settings.settlementAsset === "USDT" ? weiToBnb(settings.entryWei) : weiToBnb(settings.entryWei),
+        minEntry: settings.settlementAsset === "USDT" ? weiToBnb(settings.minEntryWei ?? "0") : current.minEntry,
+        tradfiV2: settings.settlementAsset === "USDT",
+        cmcHub: settings.settlementAsset === "USDT" && settings.cmcNewsEnabled === true,
+        cmcTotalBudget: settings.cmcTotalBudgetWei === undefined ? current.cmcTotalBudget : weiToBnb(settings.cmcTotalBudgetWei),
+        maxPositions: String(settings.maxOpenPositions),
         minMcap: settings.minMarketCapUsd === null ? "" : String(settings.minMarketCapUsd), maxMcap: settings.maxMarketCapUsd === null ? "" : String(settings.maxMarketCapUsd),
         noReentry: settings.noReentry, tp1On: settings.takeProfitBps !== null, tp1: settings.takeProfitBps === null ? "0" : String(settings.takeProfitBps / 100),
         stopLossOn: settings.stopLossBps !== null, stopLoss: settings.stopLossBps === null ? "50" : String(Math.abs(stopLossPercentFromBps(settings.stopLossBps))),
-        holdTime: settings.maxHoldSec === null ? "0" : String(settings.maxHoldSec / 60),
+        holdTimeOn: settings.maxHoldSec !== null,
+        holdTime: settings.maxHoldSec === null ? (presetId === "tradfi" ? "4,320" : "0") : String(settings.maxHoldSec / 60),
+        ...(presetId === "tradfi" ? { tradfiMode: "ai" } : {}),
         crashProtection: settings.crashProtection !== false,
         slippage: String(settings.slippageBps / 100), gas: settings.gasPriority[0].toUpperCase() + settings.gasPriority.slice(1),
         instructions: settings.instructions ?? "", skillFile: settings.skillMarkdown === null ? null : { name: "Previous skill.md", text: settings.skillMarkdown },
@@ -1337,14 +2072,17 @@ function DeployAgentScreen({ kind, go }) {
 
   const applyPreset = (p) => {
     setPreset(p.id);
-    if (id === "lp") setValues(defaults(id, p.id));
-    else setValues((s) => ({ ...s, ...p.set }));
+    // TradFi has its own section table, so crossing that boundary in either
+    // direction starts from that table's defaults (the merge would carry the
+    // other table's keys and hidden flags across).
+    if (id === "lp" || p.id === "tradfi" || preset === "tradfi") setValues(defaults(id, p.id));
+    else setValues((s) => ({ ...s, ...p.set, tradfiV2: p.id === "tradfi", ...(p.id === "tradfi" ? {} : { cmcHub: false }) }));
     setSim(null);
   };
   const presetIdx = Math.max(0, presets.findIndex((p) => p.id === preset));
   const runSim = () => setSim(SIM[id][presetIdx] || SIM[id][0]);
 
-  const sections = sectionsFor(id, preset, mode);
+  const sections = sectionsFor(id, preset, mode, values);
   const primary = sections.filter((s) => !s.adv);
   const advanced = sections.filter((s) => s.adv);
   // Per-field overrides the CONFIG table cannot carry, because they depend on
@@ -1353,16 +2091,44 @@ function DeployAgentScreen({ kind, go }) {
     if (id === "health") return { maxRepay: { hint: repaySuggestion === null
       ? "Suggested from supported debt and Total capital once account data and BNB price are available. You can enter your own amount."
       : `Suggested $${repaySuggestion} from supported debt and Total capital. You can edit this amount.` } };
+    // Schedule buy is the one non-ai TradFi mode with a derived, value-dependent
+    // hint (the others keep their own table minimums untouched, hint: null).
+    if (id === "trading" && preset === "tradfi" && values.tradfiMode === "sched") {
+      // R2.10 (LOW-7): the per-buy stepper's max is bound to the total budget above it.
+      const scheduleTotalBudget = Number(String(values.capital ?? "0").replace(/,/gu, ""));
+      return { capital: { hint: `≈ ${scheduleBuysEstimate(values).plannedBuys} buys at the amount per buy above.` },
+        ...(Number.isFinite(scheduleTotalBudget) && scheduleTotalBudget > 0 ? { schedAmount: { max: scheduleTotalBudget } } : {}) };
+    }
+    if (id === "trading" && preset === "tradfi" && values.tradfiMode === "dca") {
+      // D1: the step's max follows N (a bound, not a control); the copy is R2.14 / R2.16's.
+      const orders = dcaNum(values.dcaMaxOrders);
+      const base = dcaNum(values.dcaBase), total = base + dcaNum(values.dcaOrder) * orders, stop = dcaNum(values.dcaSl);
+      const baseOnlyFall = Math.min(100, Math.round((stop * total) / base));
+      // RV-1 (operator 2026-09-25): the 0.01 % pools need a take profit of at least 1.5 %.
+      const lowFeeStock = (DCA_BSTOCKS.find((stock) => stock.symbol === values.dcaAsset) ?? DCA_BSTOCKS[0]).feeBps === 1;
+      return {
+        ...(lowFeeStock ? { dcaTp: { min: 1.5 } } : {}),
+        ...(Number.isInteger(orders) && orders >= 1 && orders <= 8 ? { dcaStep: { max: dcaMaxStepBps(orders) / 100,
+          hint: "Orders sit on the pool's price grid, never above the price you set. On 0.25 % pools a level can sit up to 0.5 % deeper than its step." } } : {}),
+        dcaTrigger: { hint: `The base order fires when it can fill at or below ${String(values.dcaTrigger ?? "")} after slippage.` },
+        ...(Number.isFinite(baseOnlyFall) ? { dcaSl: { hint: `Stop loss is measured on your total deposit. With only the base order filled, the stock must fall about ${baseOnlyFall} % to reach a ${stop} % stop; with every DCA order filled, about ${stop} % below your average price.` } } : {}),
+      };
+    }
+    if (id === "trading" && preset === "tradfi" && values.tradfiMode === "smart") {
+      const floor = spMinCapital(spRows(values.weights).length);
+      return { capital: { min: floor, floor: String(floor), hint: null } };
+    }
+    if (id === "trading" && preset === "tradfi" && (values.tradfiMode ?? "ai") !== "ai") return null;
     if (id === "trading") return {
-      perTrade: { min: 0.005, floor: "0.005", max: undefined },
-      capital: { min: 0.02, floor: "0.02", hint: null },
+      perTrade: preset === "tradfi" ? { min: 0.000000000000000001, max: undefined } : { min: 0.005, floor: "0.005", max: undefined },
+      capital: preset === "tradfi" ? { min: 0.000000000000000001, max: undefined, hint: null } : { min: 0.02, floor: "0.02", hint: null },
       maxPositions: { min: 1, max: 10 },
     };
     if (id !== "grid" || capitalFloorText === null || capitalFloorBnb === null) return null;
     // `floor` turns the stepper strict: the − button stops here and a smaller
     // typed number goes red instead of being silently rewritten.
     return { capital: { min: capitalFloorBnb, floor: capitalFloorText, hint: capitalFloorHint } };
-  }, [id, capitalFloorText, capitalFloorBnb, capitalFloorHint, repaySuggestion]);
+  }, [id, preset, values, capitalFloorText, capitalFloorBnb, capitalFloorHint, repaySuggestion]);
 
   const capitalBelowFloor = capitalFloorBnb !== null
     && Number(String(values.capital ?? "").replace(/,/gu, "")) < capitalFloorBnb;
@@ -1372,21 +2138,116 @@ function DeployAgentScreen({ kind, go }) {
         : mode === "Live" && (values.tpOn || values.slOn) ? "This grid model closes rungs on price crossings, not on a % target. Turn Take profit and Stop loss off to deploy."
           : capitalBelowFloor ? `Total capital is below this pool's minimum of ${capitalFloorText} BNB.` : null;
   const tradePreset = id === "trading" ? presets.find((entry) => entry.id === preset) : null;
+  const tradfiV2 = id === "trading" && tradePreset?.id === "tradfi" && values.tradfiV2 !== false;
+  const tradfiSchedule = tradfiV2 && values.tradfiMode === "sched";
+  const scheduleFirstAtSec = tradfiSchedule && values.schedFirst === "Custom" && values.schedStartDate
+    ? Math.floor(new Date(`${values.schedStartDate}T${values.schedStartTime || "00:00"}:00`).getTime() / 1_000) : null;
+  const scheduleEndAtSec = tradfiSchedule && values.endRule === "date" && values.endDate
+    ? Math.floor(new Date(`${values.endDate}T23:59:59`).getTime() / 1_000) : null;
+  const scheduleToken = typeof values.schedAsset?.address === "string" ? values.schedAsset.address.toLowerCase() : undefined;
+  // Auto DCA (§14.1): the mock's fields map one-to-one onto the signed DCA tuple;
+  // everything the mode does not use is pinned to its unset value (§8.2).
+  const tradfiDca = tradfiV2 && values.tradfiMode === "dca";
+  // Smart Portfolio: crash protection is off and not shown (operator 2026-09-26).
+  const tradfiSmart = tradfiV2 && values.tradfiMode === "smart";
+  const smartRows = spRows(values.weights);
+  const smartCapitalWei = parseBnbToWei(String(values.capital ?? "0"));
+  const smartInterval = ({ "4h": 14400, "8h": 28800, "12h": 43200, Daily: 86400 } as const)[String(values.rebalanceEvery) as "4h" | "8h" | "12h" | "Daily"] ?? 86400;
+  const dcaStock = DCA_BSTOCKS.find((stock) => stock.symbol === values.dcaAsset) ?? DCA_BSTOCKS[0];
+  const dcaMaxOrders = dcaNum(values.dcaMaxOrders);
+  const dcaBaseWei = parseBnbToWei(String(values.dcaBase ?? "0"));
+  const dcaOrderWei = parseBnbToWei(String(values.dcaOrder ?? "0"));
+  const dcaCapitalWei = Number.isInteger(dcaMaxOrders) && dcaMaxOrders > 0 ? dcaBaseWei + dcaOrderWei * BigInt(dcaMaxOrders) : 0n;
   const tradeSettings = id === "trading" ? ({
     name: String(values.agentName ?? "Trading Agent 01"), executionModel: tradePreset?.executionModel ?? "sigma",
-    entryWei: parseBnbToWei(String(values.perTrade ?? "0")).toString(10), maxOpenPositions: Number(values.maxPositions),
-    minMarketCapUsd: decimalOrNull(values.minMcap), maxMarketCapUsd: decimalOrNull(values.maxMcap), noReentry: !!values.noReentry,
-    takeProfitBps: values.tp1On ? Math.round(Number(values.tp1) * 100) : null, stopLossBps: stopLossBpsWhenEnabled(!!values.stopLossOn, Number(values.stopLoss)),
-    maxHoldSec: Number(values.holdTime) > 0 ? Math.round(Number(values.holdTime) * 60) : null, breakEvenAfterTp: false,
-    crashProtection: values.crashProtection !== false,
+    entryWei: tradfiDca ? dcaBaseWei.toString(10) : tradfiSmart ? smartCapitalWei.toString(10) : parseBnbToWei(String(tradfiSchedule ? values.schedAmount ?? "0" : values.perTrade ?? "0")).toString(10), maxOpenPositions: tradfiSchedule || tradfiDca || tradfiSmart ? 1 : Number(values.maxPositions),
+    minMarketCapUsd: tradfiDca || tradfiSmart ? null : decimalOrNull(values.minMcap), maxMarketCapUsd: tradfiDca || tradfiSmart ? null : decimalOrNull(values.maxMcap), noReentry: !tradfiDca && !tradfiSmart && !!values.noReentry,
+    takeProfitBps: tradfiSchedule || tradfiDca || tradfiSmart ? null : values.tp1On ? Math.round(Number(values.tp1) * 100) : null, stopLossBps: tradfiSchedule || tradfiDca || tradfiSmart ? null : stopLossBpsWhenEnabled(!!values.stopLossOn, Number(values.stopLoss)),
+    // `holdTimeOn` exists only on the TradFi form (a toggle); the BNB presets
+    // keep the "0 = no limit" stepper. A preset value like "4,320" carries a comma.
+    maxHoldSec: tradfiSchedule || tradfiDca || tradfiSmart ? null : values.holdTimeOn !== false && (decimalOrNull(values.holdTime) ?? 0) > 0 ? Math.round((decimalOrNull(values.holdTime) ?? 0) * 60) : null, breakEvenAfterTp: false,
+    crashProtection: !tradfiDca && !tradfiSmart && values.crashProtection !== false,
     slippageBps: Math.round(Number(values.slippage) * 100), gasPriority: String(values.gas ?? "Standard").toLowerCase(),
     primaryModel: tradeModelId(String(values.primary ?? MODELS[0])),
     fallbackModel: tradeModelId(String(values.fallback ?? MODELS[1])),
-    instructions: String(values.instructions ?? "").trim() === "" ? null : String(values.instructions), skillMarkdown: values.skillFile?.text ?? null,
+    instructions: tradfiDca || tradfiSmart || String(values.instructions ?? "").trim() === "" ? null : String(values.instructions), skillMarkdown: tradfiDca || tradfiSmart ? null : values.skillFile?.text ?? null,
+    ...(tradfiV2 ? {
+      settlementAsset: "USDT" as const,
+      minEntryWei: tradfiDca ? dcaBaseWei.toString(10) : tradfiSmart ? (10n ** 17n).toString(10) : parseBnbToWei(String(tradfiSchedule ? values.schedAmount ?? "0" : values.minEntry ?? "0")).toString(10),
+      capitalQuoteWei: tradfiDca ? dcaCapitalWei.toString(10) : parseBnbToWei(String(values.capital ?? "0")).toString(10),
+      cmcNewsEnabled: tradfiSchedule || tradfiDca ? false : tradfiSmart ? false : values.cmcHub === true,
+      ...(tradfiSchedule ? {
+        tradeMode: "schedule" as const, scheduleToken: scheduleToken ?? "", scheduleIntervalSec: SCHED_INTERVALS[String(values.schedFreq ?? "Daily")] ?? 86400,
+        scheduleFirstAtSec, scheduleEndKind: values.endRule ?? "budget", scheduleEndAtSec,
+        scheduleEndRuns: values.endRule === "runs" ? Math.max(1, Math.min(1000, Number(values.endRuns ?? 1))) : null,
+        scheduleMarketHoursOnly: values.sessionGuard === true, scheduleMaxPremiumBps: values.navGuard === false ? 150 : Math.max(50, Math.min(150, Math.round(Number(values.navPremium ?? "1.5") * 100))),
+      } : tradfiDca ? {
+        tradeMode: "dca" as const, dcaToken: dcaStock.address, dcaStepBps: Math.round(dcaNum(values.dcaStep) * 100), dcaStepMultiplierBps: 12_000,
+        dcaTakeProfitBps: Math.round(dcaNum(values.dcaTp) * 100), dcaOrderWei: dcaOrderWei.toString(10), dcaMaxOrders,
+        dcaTriggerPriceE8: values.dcaTriggerOn ? dcaE8(values.dcaTrigger) : null,
+        dcaRangeMinE8: values.dcaRangeOn ? dcaE8(values.dcaRangeMin) : null, dcaRangeMaxE8: values.dcaRangeOn ? dcaE8(values.dcaRangeMax) : null,
+        dcaStopLossBps: values.dcaSlOn ? Math.round(dcaNum(values.dcaSl) * 100) : null,
+      } : tradfiSmart ? {
+        tradeMode: "portfolio" as const, portfolioTokens: smartRows.map((row) => spAddress(row.sym).toLowerCase()),
+        portfolioWeightsBps: smartRows.map((row) => Math.round(Number(row.w) * 100)),
+        portfolioDriftBps: Math.round(Number(values.drift) * 100), portfolioIntervalSec: smartInterval,
+      } : values.cmcHub === true ? { cmcTotalBudgetWei: parseBnbToWei(String(values.cmcTotalBudget ?? "0")).toString(10) } : {}),
+    } : {}),
   } satisfies TradeSettings) : null;
   const tradeBlockedReason = tradeSettings === null ? null : (() => {
     const entryWei = BigInt(tradeSettings.entryWei);
     const totalWei = parseBnbToWei(String(values.capital ?? "0"));
+    if (tradfiV2) {
+      if (tradfiSchedule) {
+        const amountWei = BigInt(tradeSettings.entryWei);
+        if (amountWei < 5n * 10n ** 18n) return "Amount per buy must be at least 5 USDT.";
+        if (totalWei < amountWei) return "Total budget must be at least the amount per buy.";
+        const reservation = amountWei + amountWei * 500n / 10_000n;
+        if (totalWei < reservation) return "Total budget must cover at least one buy plus the platform fee.";
+        if (typeof scheduleToken !== "string" || !/^0x[0-9a-f]{40}$/u.test(scheduleToken)) return "Select a quoted bStock.";
+        if (values.endRule === "date" && scheduleEndAtSec !== null && scheduleEndAtSec <= Math.floor(Date.now() / 1_000)) return "The schedule end date must be in the future.";
+        if (values.schedFirst === "Custom" && (scheduleFirstAtSec === null || scheduleFirstAtSec < Math.floor(Date.now() / 1_000) - 300 || scheduleFirstAtSec > Math.floor(Date.now() / 1_000) + 604_800 - 7200)) return "First buy must fall inside the 7-day session.";
+        return null;
+      }
+      if (tradfiDca) {
+        // §14.1 / R2.16 blocked reasons, in form order.
+        const step = dcaNum(values.dcaStep), tp = dcaNum(values.dcaTp), stop = dcaNum(values.dcaSl);
+        if (!Number.isInteger(dcaMaxOrders) || dcaMaxOrders < 1 || dcaMaxOrders > 8) return "Max DCA orders must be a whole number from 1 through 8.";
+        if (!(step >= 1 && step <= 30)) return "Price drop step must be between 1 % and 30 %.";
+        if (Math.round(step * 100) > dcaMaxStepBps(dcaMaxOrders)) return `With ${dcaMaxOrders} DCA orders the price drop step can be at most ${(dcaMaxStepBps(dcaMaxOrders) / 100).toFixed(2)} %.`;
+        if (!(tp >= 1.5)) return "Take profit must be at least 1.5 %.";
+        if (dcaStock.feeBps === 1 && !(tp >= 1.5)) return `On ${dcaStock.symbol} the take profit must be at least 1.5 %.`;
+        if (dcaBaseWei < 25n * 10n ** 18n) return "Base order must be at least 25 USDT.";
+        if (dcaOrderWei < 10n * 10n ** 18n) return "DCA order must be at least 10 USDT.";
+        if (values.dcaTriggerOn && dcaE8(values.dcaTrigger) === null) return "Trigger price must be above 0.";
+        if (values.dcaRangeOn && (dcaE8(values.dcaRangeMin) === null || !(dcaNum(values.dcaRangeMin) < dcaNum(values.dcaRangeMax)))) return "Min must be below max.";
+        if (values.dcaSlOn && !(stop >= 1 && stop <= 99)) return "Stop loss must be between 1 % and 99 %.";
+        return null;
+      }
+      if (tradfiSmart) {
+        if (smartRows.length < 2 || smartRows.length > 5 || new Set(smartRows.map((row) => row.sym)).size !== smartRows.length
+          || smartRows.some((row) => !DCA_BSTOCKS.some((stock) => stock.symbol === row.sym))) return "Pick 2 to 5 stocks.";
+        const weights = smartRows.map((row) => Number(row.w));
+        if (weights.some((weight) => !Number.isInteger(weight) || weight < 10)) return "Each stock needs a whole percent of at least 10 %.";
+        if (weights.reduce((sum, weight) => sum + weight, 0) !== 100) return "Weights must add up to 100 %.";
+        const minimum = spMinCapital(smartRows.length);
+        if (totalWei < BigInt(minimum) * 10n ** 18n) return `Total capital must be at least ${minimum} USDT for ${smartRows.length} stocks.`;
+        const drift = Number(values.drift);
+        if (!Number.isInteger(drift * 2) || drift < 0.5 || drift > 15) return "Drift must be 0.5 % to 15 % in 0.5 % steps.";
+        return null;
+      }
+      if ((values.tradfiMode ?? "ai") !== "ai") return "";
+      const minEntryWei = BigInt(tradeSettings.minEntryWei ?? "0");
+      const cmcBudgetWei = values.cmcHub === true ? BigInt(tradeSettings.cmcTotalBudgetWei ?? "0") : 0n;
+      if (minEntryWei <= 0n) return "Min entry must be greater than 0 USDT.";
+      if (entryWei < minEntryWei) return "Max entry must be at least Min entry.";
+      if (!Number.isInteger(tradeSettings.maxOpenPositions) || tradeSettings.maxOpenPositions < 1 || tradeSettings.maxOpenPositions > 10) return "Max open positions must be an integer from 1 through 10.";
+      if (totalWei <= 0n) return "Enter positive USDT capital; the live preview will calculate the configured buy-fee headroom.";
+      if (values.cmcHub === true && cmcBudgetWei <= 0n) return "CMC total budget must be greater than 0 USDT.";
+      const stopLossPercent = Number(values.stopLoss);
+      if (values.stopLossOn && (!Number.isFinite(stopLossPercent) || stopLossPercent < 1 || stopLossPercent > 100)) return "Stop loss must be between 1% and 100%.";
+      return null;
+    }
     if (entryWei < MIN_TRADE_ENTRY_WEI) return "BNB per entry must be at least 0.002 BNB.";
     if (!Number.isInteger(tradeSettings.maxOpenPositions) || tradeSettings.maxOpenPositions < 1
       || tradeSettings.maxOpenPositions > 10) return "Max open positions must be an integer from 1 through 10.";
@@ -1471,7 +2332,10 @@ function DeployAgentScreen({ kind, go }) {
               );
             })}
           </div>
-          {id === "trading" ? <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)" }}>Trades only the tokens pinned when you deploy (up to 25). New launches need a new agent.</p> : null}
+          {id === "trading" ? preset === "tradfi"
+            ? <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)" }}>Trades only the tokens pinned when you deploy (up to 28). New launches need a new agent.</p>
+            : <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)" }}>Trades only the tokens pinned when you deploy (up to 25). New launches need a new agent.</p>
+            : null}
         </div>
 
         <div style={{ display: "grid", gap: 24 }}>
@@ -1557,6 +2421,19 @@ function DeployAgentScreen({ kind, go }) {
             } : {})}
             blockedReason={gridBlockedReason}
           />
+        ) : id === "trading" && preset === "tradfi" && values.tradfiMode === "smart" && mode === "Demo" ? (
+          <div style={{ display: "grid", gap: 14, marginTop: 26, paddingTop: 20, borderTop: "1px solid var(--line-1)" }}>
+            <span className="fl-eyebrow">Hire the scoped agent session</span>
+            <p style={{ font: "var(--type-body-sm)", color: "var(--text-muted)" }}>Smart Portfolio has no demo engine.</p>
+            <Button variant="primary" size="lg" disabled>Sign hire and create the session key</Button>
+          </div>
+        ) : id === "trading" && preset === "tradfi" && values.tradfiMode === "dca" && mode === "Demo" ? (
+          // D8: Auto DCA has no demo engine; the Demo tab shows the mode disabled with its reason.
+          <div style={{ display: "grid", gap: 14, marginTop: 26, paddingTop: 20, borderTop: "1px solid var(--line-1)" }}>
+            <span className="fl-eyebrow">Hire the scoped agent session</span>
+            <p style={{ font: "var(--type-body-sm)", color: "var(--text-muted)" }}>Auto DCA runs live only.</p>
+            <Button variant="primary" size="lg" disabled>Sign hire and create the session key</Button>
+          </div>
         ) : id === "trading" && tradeSettings !== null ? (
           // Demo and Live are two components, never one with a flag: the live
           // one is the passkey hire (wallet, grant fence, session) and a demo
@@ -1574,8 +2451,8 @@ function DeployAgentScreen({ kind, go }) {
               maxOpenPositions={tradeSettings.maxOpenPositions} />
           ) : (
           <HireTradeDeploy agentName={tradeSettings.name} executionModel={tradeSettings.executionModel}
-            capitalBnb={String(values.capital ?? "0")} settings={tradeSettings} go={go}
-            blockedReason={tradeBlockedReason} />
+            capitalBnb={tradfiV2 ? "" : String(values.capital ?? "0")} settings={tradeSettings} go={go}
+            blockedReason={tradeBlockedReason} showCrashProtection={!tradfiSmart} />
           )
         ) : id === "lp" ? (
           <HireLpDeploy

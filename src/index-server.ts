@@ -23,7 +23,7 @@
 import { buildDemoWiring } from "./demo/wiring.js";
 import { startDemoWorker } from "./demo/worker.js";
 import { serve } from "@hono/node-server";
-import { getAddress, type Address } from "viem";
+import { createPublicClient, getAddress, http, type Address } from "viem";
 import { BNB, BNB_TESTNET, type NetworkConfig } from "@altananetwork/sdk";
 import { createServer, type ServerConfig } from "./server.js";
 import { createAgentStore } from "./store/agents.js";
@@ -45,6 +45,8 @@ import { createProviderRegistry } from "./wallet/registry.js";
 import { HttpDataPlaneClient } from "./clients/dataPlane.js";
 import { sanitizeMessage } from "./core/errors.js";
 import {
+  resolveDcaEnabled,
+  resolvePortfolioEnabled,
   resolveExecuteRawEnabled,
   resolveGridEnabled,
   resolveHireEnabled,
@@ -80,10 +82,24 @@ import { assessRenewalQuiescence } from "./wallet/provisioning.js";
 import { createTradeSettingsStore } from "./store/tradeSettings.js";
 import { createTradePositionStore } from "./store/tradePositions.js";
 import { createTradeIntentStore } from "./store/tradeIntents.js";
+import { createTradeCmcStore } from "./store/tradeCmc.js";
+import { PostgresTradeSimulationStore } from "./store/tradeSimulations.js";
+import { createPgSqlClient } from "./store/sql.js";
+import { createDcaRoundStore } from "./store/dcaRounds.js";
+import { createDcaChainReads } from "./trade/dcaResolve.js";
+import { NFPM_56 } from "./ops/nfpm.js";
 import { HttpTradeDataPlaneReads } from "./trade/dataPlaneReads.js";
 import { createHttpTradeReadinessDataPlane, createTradeReadiness } from "./trade/readiness.js";
 import { createTradeDetailObserver } from "./trade/detail.js";
-import { createRouteQuoteReader } from "./trade/route.js";
+import { createRouteQuoteReader, quoteBestTradfiBuy, quoteBestTradfiSell } from "./trade/route.js";
+import { portfolioStockValue } from "./trade/portfolio.js";
+import { createPortfolioFillCache, verifyPortfolioFill } from "./trade/portfolioReceipt.js";
+import { createTradfiV2ReceiptReader } from "./trade/receipt.js";
+import { assertTradfiGuardRuntimeExact, cachedGuardVerification, classifyTradfiFlashError, createTradfiCapabilityProbeCache, flashRequest, TRADFI_BINANCE_FLASH_ROUTER_56, TRADFI_BINANCE_FLASH_SPENDER_56, TRADFI_SWAP_GUARD_ABI, type TradfiCapabilityProbeResult } from "./trade/guard.js";
+import { USDT_56 } from "./trade/settlement.js";
+import { admittedVenueRows } from "./trade/rwa.js";
+import { uniswapV3Venue } from "./ops/venues.js";
+import { createCmcRuntime } from "./trade/cmcRuntime.js";
 
 const DEFAULT_PORT = 8090;
 
@@ -171,6 +187,8 @@ const serverConfig: ServerConfig = {
   executeRawEnabled,
   trade: tradeConfig,
   passkey: passkeyConfig,
+  // The deploy screen's defaults (5 USDT per buy, 1 % slippage): keep that schedulable list warm.
+  schedulableWarm: { amountWei: 5n * 10n ** 18n, slippageBps: 100 },
   runtimeAuth: runtimeAuthConfig,
   hireEnabled,
   tradeAgentEnabled,
@@ -224,6 +242,11 @@ const tradeDataPlaneOptions = {
 const tradeSettingsStore = tradeAgentEnabled ? await createTradeSettingsStore(agentStore) : undefined;
 const tradePositions = tradeAgentEnabled ? await createTradePositionStore() : undefined;
 const tradeIntents = tradeAgentEnabled ? await createTradeIntentStore() : undefined;
+const tradeCmc = tradeAgentEnabled ? await createTradeCmcStore() : undefined;
+// Read-only owner view of the pre-flight simulation log: the constructor runs no DDL
+// (the trade-worker owns the tables); a missing table reads as `no-table`.
+const tradeSimulations = tradeAgentEnabled && readEnv("DATABASE_URL") !== ""
+  ? new PostgresTradeSimulationStore(await createPgSqlClient(readEnv("DATABASE_URL"), { max: 2 })) : undefined;
 const tradeDataPlane = tradeAgentEnabled ? new HttpTradeDataPlaneReads(tradeDataPlaneOptions) : undefined;
 const tradeReadiness = tradeAgentEnabled ? await createTradeReadiness({
   dataPlane: createHttpTradeReadinessDataPlane(tradeDataPlaneOptions),
@@ -242,11 +265,126 @@ const lpReaderNetwork = {
   publicRpcUrl: network.publicRpcUrl,
 };
 const tradeRpcUrls = tradeAgentEnabled ? resolveLpRpcUrls(process.env, lpReaderNetwork) : undefined;
-const tradeRouteReader = tradeRpcUrls === undefined ? undefined : createRouteQuoteReader({ rpcUrls: tradeRpcUrls });
+const portfolioReceiptReader = tradeRpcUrls === undefined || tradeRpcUrls.length < 2
+  ? undefined : createTradfiV2ReceiptReader({ rpcUrls: tradeRpcUrls.slice(0, 2) });
+const portfolioFillCache = createPortfolioFillCache();
+const tradeRouteReader = tradeRpcUrls === undefined ? undefined : createRouteQuoteReader({
+  rpcUrls: tradeRpcUrls,
+  ...(tradeConfig.venues.uniswapQuoterV3 === undefined ? {} : { uniswapQuoter: tradeConfig.venues.uniswapQuoterV3 }),
+});
+const cmcRpcPair = tradeRpcUrls !== undefined && tradeRpcUrls.length >= 2
+  ? [tradeRpcUrls[0]!, tradeRpcUrls[1]!] as const : undefined;
+const cmcRuntime = tradeCmc === undefined ? undefined : createCmcRuntime({
+  store: tradeCmc,
+  ...(cmcRpcPair === undefined || network.relayUrl === undefined ? {} : { owner: { rpcUrls: cmcRpcPair, relayUrl: network.relayUrl,
+    // Live grant shape for the capability reader: the persisted descriptor
+    // only, never the session ciphertext, and only for the requested wallet.
+    sessionSpec: async (request) => {
+      const agent = await agentStore.getAgentById(request.agentId);
+      if (agent === null || agent.walletAddress.toLowerCase() !== request.wallet.toLowerCase()) return null;
+      return agent.sessionFacts?.spec ?? null;
+    } } }),
+});
+const cmcOwner = cmcRuntime?.owner.service ?? undefined;
+const cmcNews = cmcRuntime?.worker?.news ?? undefined;
+const tradfiGuardVerified = tradeConfig.aggregatorGuard === undefined ? undefined : async (guard: Address): Promise<boolean> => {
+  try {
+    const client = createPublicClient({ chain: network.chain, transport: http(network.publicRpcUrl) });
+    const runtime = await client.getBytecode({ address: guard });
+    if (runtime === undefined) return false;
+    assertTradfiGuardRuntimeExact({ deployedRuntime: runtime, router: TRADFI_BINANCE_FLASH_ROUTER_56,
+      spender: TRADFI_BINANCE_FLASH_SPENDER_56, canonicalUSDT: USDT_56 });
+    const [router, spender, canonicalUSDT] = await Promise.all([
+      client.readContract({ address: guard, abi: TRADFI_SWAP_GUARD_ABI, functionName: "router" }),
+      client.readContract({ address: guard, abi: TRADFI_SWAP_GUARD_ABI, functionName: "spender" }),
+      client.readContract({ address: guard, abi: TRADFI_SWAP_GUARD_ABI, functionName: "canonicalUSDT" }),
+    ]);
+    return getAddress(router as Address) === TRADFI_BINANCE_FLASH_ROUTER_56
+      && getAddress(spender as Address) === TRADFI_BINANCE_FLASH_SPENDER_56
+      && getAddress(canonicalUSDT as Address) === USDT_56;
+  } catch { return false; }
+};
+// C9: a `false` verdict (which a transient RPC blip can produce, `catch { return false; }`
+// above) is retried after 60 s; a `true` verdict, once observed, is never re-read for the
+// process lifetime — the deployed runtime is immutable.
+const cachedTradfiGuardVerified = tradeConfig.aggregatorGuard === undefined || tradfiGuardVerified === undefined
+  ? undefined
+  : cachedGuardVerification(() => tradfiGuardVerified!(tradeConfig.aggregatorGuard!));
+// R2.4/R2.8 (H3/M3): the tri-state probe, cached only on a definite answer and
+// deduped in-flight per (token, minEntryAtomic); the request slippage is fixed
+// at 300 bps (the Flash maximum) — capability means "a route exists both
+// ways", execution slippage still binds every trade at submit time.
+const tradfiCapabilityProbeCache = createTradfiCapabilityProbeCache();
+const tradfiV2CapabilityDetail = tradeDataPlane === undefined ? undefined : async (input: {
+  readonly candidate: import("./trade/universe.js").PinnedCandidate;
+  readonly minEntryAtomic: bigint;
+  readonly signal?: AbortSignal;
+}): Promise<TradfiCapabilityProbeResult> => {
+  if (admittedVenueRows(input.candidate.venues).length > 0) return "capable";
+  const guard = tradeConfig.aggregatorGuard;
+  // Bound: the HTTP client's method reads private fields, so a detached
+  // reference throws a TypeError before any request (every probe was "unknown").
+  const flash = tradeDataPlane.binanceQuoteAndSwap?.bind(tradeDataPlane);
+  if (guard === undefined || flash === undefined || cachedTradfiGuardVerified === undefined) return "unknown";
+  if (!await cachedTradfiGuardVerified()) return "unknown";
+  let buy: Awaited<ReturnType<typeof flash>>;
+  try {
+    buy = await flash(flashRequest({ tokenIn: USDT_56, tokenOut: input.candidate.address, amountAtomic: input.minEntryAtomic.toString(10), slippageBps: 300, ...(input.signal === undefined ? {} : { signal: input.signal }) }));
+  } catch (error) { return classifyTradfiFlashError(error); }
+  if (buy.observedAt > Date.now() || Date.now() - buy.observedAt > 30_000 || buy.expiresAt <= Date.now()
+    || buy.amountInAtomic !== input.minEntryAtomic.toString(10) || buy.tokenIn.toLowerCase() !== USDT_56.toLowerCase()
+    || buy.tokenOut.toLowerCase() !== input.candidate.address.toLowerCase() || getAddress(buy.taker) !== getAddress(guard)
+    || buy.quotedOutAtomic === "0" || buy.minOutAtomic === "0") return "incapable";
+  const sellAmount = BigInt(buy.minOutAtomic);
+  if (sellAmount <= 0n) return "incapable";
+  let sell: Awaited<ReturnType<typeof flash>>;
+  try {
+    sell = await flash(flashRequest({ tokenIn: input.candidate.address, tokenOut: USDT_56, amountAtomic: sellAmount.toString(10), slippageBps: 300, ...(input.signal === undefined ? {} : { signal: input.signal }) }));
+  } catch (error) { return classifyTradfiFlashError(error); }
+  return sell.observedAt > 0 && sell.observedAt <= Date.now() && Date.now() - sell.observedAt <= 30_000
+    && sell.expiresAt > Date.now() && sell.amountInAtomic === sellAmount.toString(10)
+    && sell.tokenIn.toLowerCase() === input.candidate.address.toLowerCase() && sell.tokenOut.toLowerCase() === USDT_56.toLowerCase()
+    && getAddress(sell.taker) === getAddress(guard) && BigInt(sell.quotedOutAtomic) > 0n && BigInt(sell.minOutAtomic) > 0n
+    ? "capable" : "incapable";
+};
+// G5: direct-venue candidates return `capable` without a call (unchanged) and
+// are never cached; only a Flash-backed answer is worth remembering.
+const tradfiV2CapabilityProbe = tradfiV2CapabilityDetail === undefined ? undefined : async (input: {
+  readonly candidate: import("./trade/universe.js").PinnedCandidate;
+  readonly minEntryAtomic: bigint;
+  readonly signal?: AbortSignal;
+}): Promise<TradfiCapabilityProbeResult> => {
+  if (admittedVenueRows(input.candidate.venues).length > 0) return "capable";
+  const key = `${input.candidate.address.toLowerCase()}:${input.minEntryAtomic.toString(10)}`;
+  // AUDIT LOW-3: the shared/deduped probe (R2.8) is not scoped to any one
+  // caller's request, so it must not carry any one caller's own abort signal
+  // — a closed preview tab must not cancel a concurrent hire's in-flight
+  // probe for the same (token, minEntryAtomic).
+  return tradfiCapabilityProbeCache.probe(key, () => tradfiV2CapabilityDetail({
+    candidate: input.candidate, minEntryAtomic: input.minEntryAtomic,
+  }));
+};
+// Residual L6 (guard-preference review): a pool-less bStock's detail-page mark
+// falls back to the same Flash guard the worker trades through, read-only.
+const flashSellQuote = tradeDataPlane === undefined || tradeConfig.aggregatorGuard === undefined || cachedTradfiGuardVerified === undefined
+  ? undefined
+  : async (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly signal?: AbortSignal }): Promise<bigint> => {
+    if (!await cachedTradfiGuardVerified()) throw new Error("Tradfi guard is not verified.");
+    const flash = await tradeDataPlane.binanceQuoteAndSwap!(flashRequest({ tokenIn: input.token, tokenOut: USDT_56,
+      amountAtomic: input.amountInAtomic.toString(10), slippageBps: 300, ...(input.signal === undefined ? {} : { signal: input.signal }) }));
+    if (getAddress(flash.taker) !== getAddress(tradeConfig.aggregatorGuard!) || flash.tokenIn.toLowerCase() !== input.token.toLowerCase()
+      || flash.tokenOut.toLowerCase() !== USDT_56.toLowerCase() || flash.amountInAtomic !== input.amountInAtomic.toString(10)
+      || flash.expiresAt <= Date.now()) {
+      throw new Error("Tradfi Flash mark quote failed validation.");
+    }
+    return BigInt(flash.quotedOutAtomic);
+  };
+const scheduleFlashMarks = new Map<string, { readonly quotedOutAtomic: bigint; readonly expiresAt: number }>();
 const tradeObserver = tradeRpcUrls === undefined ? undefined : createTradeDetailObserver({
   provider: providerRegistry.get(network.chainId),
   rpcUrls: tradeRpcUrls,
   ...(tradeRouteReader === undefined ? {} : { routeReader: tradeRouteReader }),
+  ...(flashSellQuote === undefined ? {} : { flashSellQuote }),
 });
 // PHASE3.15 (L3). Grid deps are built INSIDE the LP branch below, so a boot
 // with `GRID_ENABLED="true"` and LP off would otherwise produce a
@@ -256,6 +394,18 @@ const tradeObserver = tradeRpcUrls === undefined ? undefined : createTradeDetail
 // the flag itself (which `buildLpServerDeps` resolves again, once, at the one
 // site that composes `LpServerDeps`).
 resolveGridEnabled(process.env);
+// AUTO-DCA §0.2 (D17). The same boot rule for `DCA_ENABLED`: a bad value, or
+// "true" with the trade agent off, fails the boot here rather than serving a
+// hire branch that cannot run.
+// DEPLOYMENT ORDER (§11.2): every service that calls `reconcile` must run the
+// commit that knows the `dcaRange` journal kind before this is "true" anywhere.
+const dcaEnabled = resolveDcaEnabled(process.env);
+const portfolioEnabled = resolvePortfolioEnabled(process.env);
+// AUTO-DCA §13: composed whatever the flag says, as the worker's are — the flag
+// gates the hire and its preview; revoke and the view serve an existing DCA agent.
+const tradeDca = tradeAgentEnabled && tradeRpcUrls !== undefined
+  ? { enabled: dcaEnabled, store: await createDcaRoundStore(), chain: createDcaChainReads({ rpcUrls: tradeRpcUrls.slice(0, 2), nfpm: NFPM_56 }) }
+  : undefined;
 const lpBuilt: BuiltLpServerDeps | undefined = resolveLpEnabled(process.env)
   ? await buildLpServerDeps({
       env: process.env,
@@ -547,6 +697,10 @@ const demoWiring = await buildDemoWiring({
   ...(readEnv("DATA_PLANE_TOKEN") === undefined ? {} : { dataPlaneToken: readEnv("DATA_PLANE_TOKEN") }),
 });
 
+// R2.7 (LOW-3): the same Uniswap ROUTER value scripts/trade-worker.ts computes for the
+// worker (uniswapV3Venue's router, gated on the quoter being configured), never the quoter.
+const scheduleUniswapV3 = uniswapV3Venue(tradeConfig.venues);
+
 const app = createServer({
   agentStore,
   journal,
@@ -586,6 +740,46 @@ const app = createServer({
       dataPlane: tradeDataPlane,
       readiness: tradeReadiness,
       feeBps: tradeConfig.feeBps ?? 0,
+      ...(tradeCmc === undefined ? {} : { cmc: tradeCmc }),
+      ...(cmcOwner === undefined ? {} : { cmcOwner }),
+      ...(cmcRuntime === undefined ? {} : { cmcOwnerResumePending: cmcRuntime.owner.resumePending }),
+      ...(cmcRuntime === undefined ? {} : { cmcProtectedExposure: cmcRuntime.owner.protectedExposure }),
+      ...(cmcNews === undefined ? {} : { cmcNews }),
+      ...(tradfiGuardVerified === undefined ? {} : { guardVerified: tradfiGuardVerified }),
+      ...(tradfiV2CapabilityProbe === undefined ? {} : { tradfiV2CapabilityProbe }),
+      ...(tradeDca === undefined ? {} : { dca: tradeDca }),
+      portfolio: { enabled: portfolioEnabled,
+        ...(portfolioReceiptReader === undefined ? {} : { resolveFill: ({ agent, intent, journalEntry, txHash }) =>
+          portfolioFillCache.resolve(`${intent.idempotencyKey.toLowerCase()}:${txHash.toLowerCase()}`, () =>
+            verifyPortfolioFill({ agent, intent, journalEntry, txHash, reader: portfolioReceiptReader, trade: tradeConfig })) }),
+      },
+      ...(tradeSimulations === undefined ? {} : { simulations: tradeSimulations }),
+      ...(tradeRouteReader === undefined ? {} : { portfolioValue: (input: { readonly token: Address; readonly amountInAtomic: bigint }) =>
+        portfolioStockValue(tradeRouteReader, input.token, input.amountInAtomic) }),
+      ...(tradeRpcUrls === undefined || tradeRouteReader === undefined ? {} : { scheduleQuotes: {
+        buy: (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly slippageBps: number; readonly venues?: readonly import("./trade/dataPlaneReads.js").VenueRow[]; readonly signal?: AbortSignal }) => quoteBestTradfiBuy({
+          token: input.token, amountInAtomic: input.amountInAtomic, slippageBps: input.slippageBps, rpcUrls: tradeRpcUrls, reader: tradeRouteReader,
+          ...(input.venues === undefined ? {} : { venues: input.venues }), ...(scheduleUniswapV3 === null || tradeConfig.venues.uniswapQuoterV3 === undefined ? {} : { uniswapRouter: scheduleUniswapV3.router }), ...(input.signal === undefined ? {} : { signal: input.signal }),
+        }),
+        sell: async (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly slippageBps: number; readonly venues?: readonly import("./trade/dataPlaneReads.js").VenueRow[]; readonly signal?: AbortSignal }) => {
+          try {
+            return await quoteBestTradfiSell({
+              token: input.token, amountInAtomic: input.amountInAtomic, slippageBps: input.slippageBps, rpcUrls: tradeRpcUrls, reader: tradeRouteReader,
+              ...(input.venues === undefined ? {} : { venues: input.venues }), ...(scheduleUniswapV3 === null || tradeConfig.venues.uniswapQuoterV3 === undefined ? {} : { uniswapRouter: scheduleUniswapV3.router }), ...(input.signal === undefined ? {} : { signal: input.signal }),
+            });
+          } catch (error) {
+            // Schedule holding mark for a pool-less bStock: the same Flash fallback as the
+            // position observer, cached 60 s per (token, amount) for the shared 5 rps key.
+            if (flashSellQuote === undefined) throw error;
+            const key = `${input.token.toLowerCase()}:${input.amountInAtomic.toString(10)}`;
+            const cached = scheduleFlashMarks.get(key);
+            if (cached !== undefined && cached.expiresAt > Date.now()) return { quotedOutAtomic: cached.quotedOutAtomic };
+            const quotedOutAtomic = await flashSellQuote({ token: input.token, amountInAtomic: input.amountInAtomic, ...(input.signal === undefined ? {} : { signal: input.signal }) });
+            scheduleFlashMarks.set(key, { quotedOutAtomic, expiresAt: Date.now() + 60_000 });
+            return { quotedOutAtomic };
+          }
+        },
+      } }),
     } }),
   ...(hireEnabled && lpBuilt !== undefined && hireEvidence !== undefined
     && hireRelayFeePerSubmitWei !== undefined && hireGrantGasHeadroomWei !== undefined
@@ -642,6 +836,7 @@ const provisioningWorker = hireEvidence === undefined ? undefined : createProvis
   }),
   renewalQuiescence: async (agent) => assessRenewalQuiescence(agent, {
     ...(tradeIntents === undefined ? {} : { tradeIntents }),
+    ...(tradeSettingsStore === undefined ? {} : { tradeSettings: tradeSettingsStore }),
     ...(lpBuilt === undefined ? {} : { lpSequences: lpBuilt.lp.store }),
     journal,
   }),
@@ -726,6 +921,7 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   await closeVenusServerDeps(venusBuilt);
   // The lending stores, on the same terms and for the same reason.
   await closeLendingServerDeps(lendingBuilt);
+  await cmcRuntime?.close();
   // Closed in dependency order; each `close` is independent, so one failure must
   // not strand the others.
   for (const closeable of [
@@ -739,6 +935,7 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
     ...(tradeSettingsStore === undefined ? [] : [tradeSettingsStore]),
     ...(tradePositions === undefined ? [] : [tradePositions]),
     ...(tradeIntents === undefined ? [] : [tradeIntents]),
+    ...(tradeCmc === undefined ? [] : [tradeCmc]),
     ...(preBindRetirementFinalizer?.close === undefined ? [] : [{
       close: () => preBindRetirementFinalizer.close!(),
     }]),

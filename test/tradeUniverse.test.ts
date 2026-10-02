@@ -8,7 +8,9 @@ import {
   type TokenBatchRow,
   type TradeDataPlaneReads,
   type UniverseRow,
+  type VenueRow,
 } from "../src/trade/dataPlaneReads.js";
+import type { RwaFact } from "../src/trade/rwa.js";
 import {
   MIN_PIN,
   ModelUnavailableError,
@@ -18,11 +20,15 @@ import {
   TRADE_READ_BUDGET,
   createTradeVerdictCache,
   isEntryExcludedToken,
+  inModelBand,
   isUsEquityOpen,
+  lanesFor,
   marketHoursByAddress,
   partitionPinnedCandidates,
   pinUniverse,
+  rwaMarketClosed,
   rerankHeld,
+  scheduleGrantList,
   selectEntryCandidates,
   type PinnedCandidate,
 } from "../src/trade/universe.js";
@@ -74,11 +80,11 @@ describe("TRADING-AGENT R3 pin universe", () => {
     const byAddress = new Map(rows.map((row) => [row.address.toLowerCase(), row]));
     const pinned = await pinUniverse("degen", { dataPlane: fakeReads({
       async universe(lane) { return lane === "meme" ? rows : []; },
-      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => ({
-        address,
-        symbol: byAddress.get(address.toLowerCase())?.symbol,
-        priceUsd: 1, marketCapUsd: 1_000, volume24hUsd: 1, holders: 1, priceChange24hPct: 1,
-      })); },
+      async tokensBatch(addresses) { return addresses.map((address): TokenBatchRow => {
+        const symbol = byAddress.get(address.toLowerCase())?.symbol;
+        return { address, ...(symbol === undefined ? {} : { symbol }),
+          priceUsd: 1, marketCapUsd: 1_000, volume24hUsd: 1, holders: 1, priceChange24hPct: 1 };
+      }); },
     }) });
     assert.equal(pinned.length, MIN_PIN);
     assert.equal(pinned.some((row) => excluded.some((item) => item.address === row.address)), false);
@@ -249,6 +255,29 @@ describe("TRADING-AGENT C24 held re-rank and C25 hours", () => {
     assert.equal(isUsEquityOpen(Date.UTC(2026, 8, 7, 20, 0)), false);
     assert.equal(isUsEquityOpen(Date.UTC(2026, 8, 6, 14, 0)), false);
   });
+
+  it("tracks Eastern Time through EST and DST boundaries", () => {
+    const winter = (hour: number, minute: number) => Date.UTC(2026, 0, 15, hour, minute);
+    assert.equal(isUsEquityOpen(winter(14, 29)), false);
+    assert.equal(isUsEquityOpen(winter(14, 30)), true);
+    assert.equal(isUsEquityOpen(winter(20, 59)), true);
+    assert.equal(isUsEquityOpen(winter(21, 0)), false);
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 2, 8, 13, 30)), false);
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 2, 8, 14, 30)), false);
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 10, 1, 13, 30)), false);
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 10, 1, 14, 30)), false);
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 0, 17, 15, 0)), false);
+    // R2.11: the Sunday vectors above prove only the weekend rule. These are
+    // the trading weekdays straddling each 2026 DST transition (spring-forward
+    // 2026-03-08, fall-back 2026-11-01), which is what actually proves DST awareness.
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 2, 6, 13, 30)), false, "Fri before spring-forward, still EST: 8:30am not yet open");
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 2, 6, 14, 30)), true, "Fri before spring-forward, still EST: 9:30am open");
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 2, 9, 13, 30)), true, "Mon after spring-forward, now EDT: 9:30am open");
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 2, 9, 20, 0)), false, "Mon after spring-forward, now EDT: 4:00pm closed");
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 9, 30, 13, 30)), true, "Fri before fall-back, still EDT: 9:30am open");
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 10, 2, 13, 30)), false, "Mon after fall-back, now EST: 8:30am not yet open");
+    assert.equal(isUsEquityOpen(Date.UTC(2026, 10, 2, 14, 30)), true, "Mon after fall-back, now EST: 9:30am open");
+  });
 });
 
 describe("TRADING-AGENT R3.4/C26 entry pipeline", () => {
@@ -268,7 +297,8 @@ describe("TRADING-AGENT R3.4/C26 entry pipeline", () => {
       previouslyEnteredAddresses: new Set<string>(),
       openPositionAddresses: new Set<string>(),
       forbiddenAddresses: new Set<string>(),
-      usEquityAddresses: new Set<string>(),
+      rwaAddresses: new Set<string>(),
+      rwaFacts: new Map(),
       dataPlane,
       signal: new AbortController().signal,
       nowMs: Date.UTC(2026, 8, 7, 14),
@@ -385,6 +415,136 @@ describe("TRADING-AGENT R3.4/C26 entry pipeline", () => {
   });
 });
 
+describe("TradFi universe and RWA screening", () => {
+  const USDT = getAddress("0x55d398326f99059fF775485246999027B3197955");
+  const nowMs = Date.UTC(2026, 8, 17, 14);
+
+  function row(index: number, lane: "bstocks" | "ondo", ticker: string | null, liquidity: number, options: { readonly openState?: boolean; readonly reasonCode?: string; readonly venues?: readonly VenueRow[] } = {}): UniverseRow {
+    const address = getAddress(`0x${index.toString(16).padStart(40, "0")}`);
+    const venue: VenueRow = { dex: "uniswap", version: "v3", pool: getAddress(`0x${(index + 100).toString(16).padStart(40, "0")}`),
+      feeTier: 500, quote: USDT, quoteSymbol: "USDT", priceUsd: 100, liquidityUsd: liquidity, volume24hUsd: 1, asOf: nowMs };
+    const venues = options.venues ?? [venue];
+    const rwa: RwaFact = { platform: lane === "bstocks" ? "bstock" : "ondo", underlyingTicker: ticker,
+      tokenPriceUsd: 100, referencePriceUsd: 100, premiumBps: 0, openState: options.openState ?? true,
+      marketStatus: null, reasonCode: options.reasonCode ?? "TRADING", staleness: "fresh", tokenToShareRatio: 1,
+      onchainPriceUsd: 100, venues };
+    return { address, symbol: `${lane}${index}`, lane, source: "fixture", rwa, venues };
+  }
+
+  it("pins TradFi lanes with admission, bStocks precedence, ticker dedupe, and deepest-venue ranking", async () => {
+    // Liquidity in USD; the $10k floor (RWA_MIN_VENUE_LIQUIDITY_USD) admits only pools at or above it.
+    const bNvda = row(1, "bstocks", " nvda ", 10_000);
+    const oNvda = row(2, "ondo", "NVDA", 100_000);
+    const oEemWeak = row(3, "ondo", "EEM", 50_000);
+    const oEemDeep = row(4, "ondo", " eem ", 80_000);
+    const oNullOne = row(5, "ondo", null, 20_000);
+    const oNullTwo = row(6, "ondo", null, 30_000);
+    const bAapl = row(7, "bstocks", "AAPL", 200_000);
+    const invalid = [
+      row(8, "ondo", "BAD1", 100_000, { venues: [] }),
+      row(9, "ondo", "BAD2", 100_000, { openState: false }),
+      row(10, "ondo", "BAD3", 100_000, { reasonCode: "UNSUPPORTED" }),
+      row(11, "ondo", "THIN", 9_999),
+    ];
+    const all = [bNvda, oNvda, oEemWeak, oEemDeep, oNullOne, oNullTwo, bAapl, ...invalid];
+    const reads: TradeDataPlaneReads = {
+      async universe(lane) { return lane === "bstocks" ? [bNvda, bAapl] : lane === "ondo" ? [oNvda, oEemWeak, oEemDeep, oNullOne, oNullTwo, ...invalid] : []; },
+      async tokensBatch(addresses) { return addresses.map((address) => {
+        const symbol = all.find((candidate) => candidate.address.toLowerCase() === address.toLowerCase())?.symbol;
+        return { address, ...(symbol === undefined ? {} : { symbol }), priceUsd: 100, marketCapUsd: null,
+          volume24hUsd: 1, holders: 1, priceChange24hPct: 0 };
+      }); },
+      async eligibilityBatch(addresses) { return addresses.map((address) => ({ address, eligible: true, reason: "binance_rwa", source: "binance-rwa" as const, venue: null })); },
+      async security() { return { riskLevel: "ok", flags: [] }; },
+    };
+    const pinned = await pinUniverse("tradfi", { dataPlane: reads });
+    assert.deepEqual(pinned.map((candidate) => candidate.address), [bAapl.address, oEemDeep.address, oNullTwo.address, oNullOne.address, bNvda.address]);
+    assert.equal(pinned.some((candidate) => candidate.address === oNvda.address), false);
+    assert.equal(pinned.length, 5);
+  });
+
+  it("keeps the wrapper exception lane-bound and applies the RWA guard before token/eligibility reads", async () => {
+    const wrapper = getAddress("0xa9eE28C80f960B889dFbd1902055218cBa016F75");
+    assert.equal(isEntryExcludedToken(wrapper, "NVDAon"), true);
+    assert.equal(isEntryExcludedToken(wrapper, "NVDAon", "ondo"), false);
+    assert.deepEqual(lanesFor("tradfi"), ["bstocks", "ondo"]);
+    assert.equal(inModelBand("tradfi", { address: wrapper, symbol: "NVDAon", lane: "ondo", source: "fixture" }, {
+      address: wrapper, priceUsd: 1, marketCapUsd: null, volume24hUsd: null, holders: null, priceChange24hPct: null,
+    }), true);
+    assert.equal(rwaMarketClosed({ marketStatus: "overnight" } as RwaFact, nowMs), true);
+
+    const candidate: PinnedCandidate = { address: wrapper, symbol: "NVDAon", lane: "ondo", marketCapUsd: null,
+      priceUsd: null, volume24hUsd: null, priceChange24hPct: null, holders: null };
+    let reads = 0;
+    const result = await selectEntryCandidates({
+      model: "tradfi", settings: { minMarketCapUsd: null, maxMarketCapUsd: null, noReentry: false },
+      candidates: [candidate], pinnedAddresses: new Set([wrapper.toLowerCase()]), previouslyEnteredAddresses: new Set(),
+      openPositionAddresses: new Set(), forbiddenAddresses: new Set(), rwaAddresses: new Set([wrapper.toLowerCase()]),
+      rwaFacts: new Map([[wrapper.toLowerCase(), {
+        platform: "ondo", underlyingTicker: "NVDA", tokenPriceUsd: 100, referencePriceUsd: 100, premiumBps: 151,
+        openState: true, marketStatus: null, reasonCode: "TRADING", staleness: "fresh", tokenToShareRatio: 1,
+        onchainPriceUsd: 101.51, venues: [{ dex: "uniswap", version: "v3", pool: getAddress("0x9999999999999999999999999999999999999999"),
+          feeTier: 500, quote: USDT, quoteSymbol: "USDT", priceUsd: 101.51, liquidityUsd: 10_000, volume24hUsd: 1, asOf: nowMs }],
+      } satisfies RwaFact]]),
+      nowMs,
+      dataPlane: {
+        async tokensBatch() { reads += 1; return []; },
+        async eligibilityBatch() { reads += 1; return []; },
+        async security() { reads += 1; return null; },
+      },
+    });
+    assert.equal(result.kind, "selected");
+    assert.deepEqual(result.refusals, [{ address: wrapper, reason: "premium-too-high" }]);
+    assert.equal(reads, 0);
+  });
+
+  function tokenReads(all: readonly UniverseRow[]): TradeDataPlaneReads {
+    return {
+      async universe(lane) { return lane === "bstocks" ? all.filter((r) => r.lane === "bstocks") : lane === "ondo" ? all.filter((r) => r.lane === "ondo") : []; },
+      async tokensBatch(addresses) { return addresses.map((address) => {
+        const symbol = all.find((candidate) => candidate.address.toLowerCase() === address.toLowerCase())?.symbol;
+        return { address, ...(symbol === undefined ? {} : { symbol }), priceUsd: 100, marketCapUsd: null,
+          volume24hUsd: 1, holders: 1, priceChange24hPct: 0 };
+      }); },
+      async eligibilityBatch(addresses) { return addresses.map((address) => ({ address, eligible: true, reason: "binance_rwa", source: "binance-rwa" as const, venue: null })); },
+      async security() { return { riskLevel: "ok", flags: [] }; },
+    };
+  }
+
+  it("G2: a schedule-mode pin (lanes: ['bstocks']) never contains an Ondo row; AI mode still reads both lanes", async () => {
+    const bstocks = Array.from({ length: 5 }, (_, i) => row(i + 1, "bstocks", `B${i}`, 100_000));
+    const ondo = Array.from({ length: 3 }, (_, i) => row(i + 51, "ondo", `O${i}`, 100_000));
+    const reads = tokenReads([...bstocks, ...ondo]);
+
+    const aiPin = await pinUniverse("tradfi", { dataPlane: reads });
+    assert.ok(aiPin.some((candidate) => candidate.lane === "ondo"), "AI mode must still read both lanes");
+
+    const schedulePin = await pinUniverse("tradfi", { dataPlane: reads }, { lanes: ["bstocks"] });
+    assert.equal(schedulePin.some((candidate) => candidate.lane === "ondo"), false, "schedule mode must never admit an Ondo row");
+    assert.equal(schedulePin.length, 5);
+  });
+
+  it("G3: with more than 28 priced candidates, a pool-less bStock that passes the probe reaches the uncut schedule-mode pin; the default (slice-28) pin never probes it", async () => {
+    const priced = Array.from({ length: 29 }, (_, i) => row(i + 1, "bstocks", `T${i}`, 100_000 - i));
+    const poolLess = row(9_000, "bstocks", "POOLLESS", 0, { venues: [] });
+    const reads = tokenReads([...priced, poolLess]);
+    // The probe stands in for the full production wrapper: an admitted-venue
+    // candidate is always capable without a call (G5), and only the one
+    // pool-less candidate here clears the (stand-in) Flash check.
+    const probe = async (candidate: PinnedCandidate): Promise<boolean> =>
+      (candidate.venues?.length ?? 0) > 0 || candidate.address.toLowerCase() === poolLess.address.toLowerCase();
+
+    const defaultPin = await pinUniverse("tradfi", { dataPlane: reads, tradfiV2CapabilityProbe: probe });
+    assert.equal(defaultPin.some((candidate) => candidate.address.toLowerCase() === poolLess.address.toLowerCase()), false,
+      "without probeAll, a pool-less candidate sorted past position 28 is never probed");
+
+    const schedulePin = await pinUniverse("tradfi", { dataPlane: reads, tradfiV2CapabilityProbe: probe }, { probeAll: true });
+    assert.ok(schedulePin.some((candidate) => candidate.address.toLowerCase() === poolLess.address.toLowerCase()),
+      "probeAll must reach and admit a passing pool-less candidate sorted past position 28");
+    assert.ok(schedulePin.length > 28, "the schedule pin must not be cut to 28 (G3)");
+  });
+});
+
 describe("trade data-plane recorded envelopes", () => {
   it("reads the real envelope shapes and sends the existing x-dp-token header", async () => {
     const seen: Array<{ readonly url: string; readonly token: string | null }> = [];
@@ -415,5 +575,56 @@ describe("trade data-plane recorded envelopes", () => {
     });
     assert.equal(await client.universe("allowlist"), null);
     await assert.rejects(client.universe("coins"), /status 400/u);
+  });
+
+  it("parses RWA facts and venues strictly while dropping unknown venue identities", async () => {
+    const row = {
+      address: "0x0000000000000000000000000000000000000011", symbol: "NVDAB", lane: "bstocks", source: "rwa",
+      platform: "bstock", underlyingTicker: "NVDA", tokenPriceUsd: 100, referencePriceUsd: 100,
+      premiumBps: 900, openState: true, marketStatus: "regular", reasonCode: "TRADING", tokenToShareRatio: 1,
+      staleness: "fresh", venues: [
+        { dex: "uniswap", version: "v9", pool: "0x0000000000000000000000000000000000000012" },
+        { dex: "uniswap", version: "v3", pool: "0x0000000000000000000000000000000000000013", feeTier: 500,
+          quote: { address: "0x55d398326f99059fF775485246999027B3197955", symbol: "USDT" },
+          priceUsd: 100, liquidityUsd: 10_000, volume24hUsd: 1, asOf: 1_900_000_000_000 },
+      ],
+    };
+    const client = new HttpTradeDataPlaneReads({ baseUrl: "https://data.example/", fetch: async () => Response.json({ data: [row, {
+      address: "0x0000000000000000000000000000000000000014", symbol: "PLAIN", lane: "bstocks", source: "static",
+    }] }) });
+    const rows = await client.universe("bstocks");
+    assert.equal(rows?.[0]?.rwa?.onchainPriceUsd, 100);
+    assert.equal(rows?.[0]?.venues?.length, 1);
+    assert.equal(Object.hasOwn(rows?.[1] ?? {}, "rwa"), false);
+
+    const malformed = new HttpTradeDataPlaneReads({ baseUrl: "https://data.example/", fetch: async () => Response.json({ data: [{
+      ...row, platform: 7,
+    }] }) });
+    await assert.rejects(malformed.universe("bstocks"), /malformed universe/u);
+  });
+});
+
+describe("R2.3 (H2) scheduleGrantList", () => {
+  function candidate(index: number): PinnedCandidate {
+    return { address: getAddress(`0x${(index + 1).toString(16).padStart(40, "0")}`), symbol: `T${index}`,
+      lane: "bstocks", marketCapUsd: null, priceUsd: null, volume24hUsd: null, priceChange24hPct: null, holders: null };
+  }
+
+  it("puts the chosen candidate first, drops its duplicate from the pin, and cuts to the tradfi cap", () => {
+    const pinned = Array.from({ length: 40 }, (_, i) => candidate(i));
+    const chosen = pinned[35]!; // sorted well past position 28
+    const grantList = scheduleGrantList(pinned, chosen);
+    assert.equal(grantList.length, 28, "must cut to maxGrantedTokens('tradfi')");
+    assert.equal(grantList[0], chosen, "the chosen token must always be first");
+    assert.equal(grantList.filter((c) => c.address === chosen.address).length, 1, "no duplicate of the chosen token");
+  });
+
+  it("keeps a short pin intact, chosen first", () => {
+    const pinned = Array.from({ length: 5 }, (_, i) => candidate(i));
+    const chosen = pinned[2]!;
+    const grantList = scheduleGrantList(pinned, chosen);
+    assert.equal(grantList.length, 5);
+    assert.equal(grantList[0], chosen);
+    assert.deepEqual(grantList.slice(1).map((c) => c.address), pinned.filter((c) => c !== chosen).map((c) => c.address));
   });
 });
