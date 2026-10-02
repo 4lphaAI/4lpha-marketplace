@@ -127,6 +127,12 @@ export default defineRailway(() => {
     LENDING_RPC_URL: "https://bsc-dataseed.bnbchain.org",
   };
 
+  // TradFi Binance aggregator guard. Read by execution-api (hire/renewal grant +
+  // verification) AND trade-worker (no guard ⇒ no aggregator call).
+  const tradfiGuard = {
+    TRADFI_BINANCE_GUARD_ADDRESS: "0x16B24723aCE1Adc87243338d0A32C50BeC259650",
+  };
+
   const api = service("execution-api", {
     source,
     build: servicesImage,
@@ -153,6 +159,12 @@ export default defineRailway(() => {
       // stored the literal `$(openssl …)` string here before). Absent ⇒ S1 is
       // fail-closed and mints no receipt.
       LENDING_PREVIEW_SECRET: preserve(),
+      // Auto DCA. DEPLOYMENT ORDER: every service that calls `reconcile` must run
+      // the commit that knows the `dcaRange` journal kind before this is "true".
+      DCA_ENABLED: "true",
+      // Smart Portfolio. Flip only once execution-api and trade-worker both run the portfolio-aware code.
+      PORTFOLIO_ENABLED: "true",
+      ...tradfiGuard,
     },
   });
 
@@ -173,6 +185,10 @@ export default defineRailway(() => {
       ...fromApi,
       ...llm,
       TRADE_LLM_API_KEY: preserve(),
+      // Flip together with execution-api's.
+      DCA_ENABLED: "true",
+      PORTFOLIO_ENABLED: "true",
+      ...tradfiGuard,
     },
   });
 
@@ -313,6 +329,33 @@ export default defineRailway(() => {
     },
   });
 
+  // TermiX Agent.family Quant fixed-basket rebalancer ("Smart Portfolio by
+  // 4lpha (WBNB/ETH/CAKE)"). TermiX allows one strategy per agent, so it runs
+  // under its own agent `4lpha_dot_tech.agent` with its OWN envelope seed
+  // (`QUANT_ENVELOPE_KEY`, preserve(), set once in Railway; its X25519 public
+  // half is the key registered with TermiX for that agent). The linked web
+  // account key is shared with the Grid service by reference. The daemon
+  // refuses to boot unless the production profiles, the wallet-claim migration
+  // (installed 2026-09-30) and the registered key all match.
+  const quantRebalance = service("quant-rebalance-worker", {
+    source,
+    build: servicesImage,
+    deploy: {
+      startCommand: "node --import tsx scripts/quant-rebalance-worker.ts",
+      restartPolicyType: "ALWAYS",
+    },
+    env: {
+      ...plane,
+      QUANT_REBALANCING_ENABLED: "true",
+      QUANT_AGENT_ID: "cmuo8mnrsj73gzw01vzop6fjs",
+      QUANT_REBALANCE_STRATEGY_ID: "cmuo96mxb6cmhyt01lt57vqe6",
+      QUANT_API_BASE_URL: "https://platform-backend.prod.termix.live",
+      QUANT_RPC_URL: "https://bsc-dataseed.bnbchain.org",
+      QUANT_API_KEY: quant.env.QUANT_API_KEY,
+      QUANT_ENVELOPE_KEY: preserve(),
+    },
+  });
+
   const identity = service("identity-worker", {
     source,
     build: servicesImage,
@@ -345,7 +388,6 @@ export default defineRailway(() => {
     deploy: {
       healthcheckPath: "/api/pools",
       healthcheckTimeout: 120,
-      restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 5,
     },
     env: {
@@ -375,6 +417,6 @@ export default defineRailway(() => {
   });
 
   return project("4lpha-execution", {
-    resources: [db, api, lp, trade, lending, identity, quant, web],
+    resources: [db, api, lp, trade, lending, identity, quant, quantRebalance, web],
   });
 });
