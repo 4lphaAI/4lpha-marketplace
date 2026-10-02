@@ -234,6 +234,20 @@ describe("AGENT-GAS-ATTENTION review 3: the bucket predicates' controls", () => 
     expect(runFailed(entered)).toBe(false);
   });
 
+  it("a TradFi v2 attempt that did not commit is Failed: unknown outcome and executor codes", () => {
+    // Operator 2026-10-02: the stuck MSTRB buy wrote only `unknown` as the cycle
+    // reason (no buy event), so it never showed under Failed.
+    for (const reason of ["unknown;candidates=12", "RELAY_PREPARE_REFUSED;candidates=12", "SIMULATION_FAILED",
+      "NATIVE_RESERVE;candidates=3", "portfolio-submission-unknown"]) {
+      expect(runFailed(run({ reason }))).toBe(true);
+    }
+    // Postponements and holds that merely contain "unknown" stay quiet.
+    for (const reason of ["schedule-premium-unknown", "score-hold;candidates=12", "portfolio-premium-unknown", "paused"]) {
+      expect(runFailed(run({ reason }))).toBe(false);
+    }
+    expect(runFailed(run({ dryRun: true, reason: "unknown" }))).toBe(false);
+  });
+
   it("a DRY RUN is neither, even when it contains a refusal", () => {
     // A rehearsal that "failed" never risked anything; filing it under Failed
     // buries the live ones.

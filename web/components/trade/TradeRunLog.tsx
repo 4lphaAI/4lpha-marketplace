@@ -67,13 +67,24 @@ export function runSucceeded(run: Run): boolean {
   return !run.dryRun && hasExecutedTrade(run);
 }
 
+/**
+ * Operator 2026-10-02: a TradFi v2 attempt that did not commit writes no
+ * `buy`/`sell` event, only its executor outcome as the cycle reason: `unknown`
+ * (held for reconciliation), `portfolio-submission-unknown`, or an UPPER_SNAKE
+ * executor code (`RELAY_PREPARE_REFUSED`, `SIMULATION_FAILED`, `NATIVE_RESERVE`,
+ * `DAILY_CAP`, ...). Those cycles tried and could not, so they belong in Failed.
+ */
+function isExecutorFailureCode(code: string): boolean {
+  return code === "unknown" || code === "portfolio-submission-unknown" || /^[A-Z][A-Z0-9_]+$/u.test(code);
+}
+
 export function runFailed(run: Run): boolean {
   if (run.dryRun) return false;
   if (hasFailedExecution(run)) return true;
   const code = run.reason.split(";")[0] ?? run.reason;
   // The gas gate reports its remedy sentence rather than a code, and a cycle
   // the worker stood down is a cycle that could not run.
-  return FAILED_CODES.has(code) || code.startsWith("agent-error") || /^Deposit /u.test(run.reason);
+  return FAILED_CODES.has(code) || code.startsWith("agent-error") || /^Deposit /u.test(run.reason) || isExecutorFailureCode(code);
 }
 
 export function runOutcome(run: Run): RunOutcome {
