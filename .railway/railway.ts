@@ -189,6 +189,8 @@ export default defineRailway(() => {
       DCA_ENABLED: "true",
       PORTFOLIO_ENABLED: "true",
       ...tradfiGuard,
+      // Binance pre-flight simulation of every TradFi submission (worker-only).
+      TRADFI_PREFLIGHT_SIMULATE: "true",
     },
   });
 
