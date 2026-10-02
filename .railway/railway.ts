@@ -165,6 +165,9 @@ export default defineRailway(() => {
       // Smart Portfolio. Flip only once execution-api and trade-worker both run the portfolio-aware code.
       PORTFOLIO_ENABLED: "true",
       ...tradfiGuard,
+      // Staged TradFi submit: a relay pre-submission refusal becomes ROLLED_BACK
+      // instead of a stuck UNKNOWN. Production since 2026-10-02 06:36Z (operator go).
+      TRADE_STAGED_SUBMIT: "true",
     },
   });
 
@@ -191,6 +194,7 @@ export default defineRailway(() => {
       ...tradfiGuard,
       // Binance pre-flight simulation of every TradFi submission (worker-only).
       TRADFI_PREFLIGHT_SIMULATE: "true",
+      TRADE_STAGED_SUBMIT: "true",
     },
   });
 
