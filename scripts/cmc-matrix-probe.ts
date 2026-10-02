@@ -591,9 +591,12 @@ async function runReentryTrace(deps: SubTraceDeps & { readonly deployer: Address
     return deps.read<Address>(PANCAKE_V2_FACTORY_56, V2_FACTORY_ABI, "getPair", [USDT_56, evilAddress]);
   })();
   await deps.sendFrom(deps.deployer, evilAddress, encodeFunctionData({ abi: evil.abi, functionName: "mint", args: [pair, 1_000n * 10n ** 18n] }));
-  const seedUsdt = await deps.intent(deps.sHash, [
-    { to: USDT_56, value: 0n, data: encodeFunctionData({ abi: ERC20_ABI, functionName: "transfer", args: [pair, 10n * 10n ** 18n] }) },
-  ]);
+  // Seeding is fixture setup, not part of the fact under test, so it runs as the
+  // (impersonated) wallet itself rather than through the session key: a fee-free
+  // grant (FEE_BPS 0) carries no `USDT.transfer` rule, and a session-key seed
+  // would be refused before the hook could ever run (2026-10-02, fork 125238707).
+  const seedUsdt = await deps.sendFrom(deps.wallet, USDT_56,
+    encodeFunctionData({ abi: ERC20_ABI, functionName: "transfer", args: [pair, 10n * 10n ** 18n] }));
   await deps.sendFrom(deps.deployer, pair, encodeFunctionData({ abi: V2_PAIR_ABI, functionName: "mint", args: [deps.deployer] }));
 
   const payeeBefore = await deps.read<bigint>(USDT_56, ERC20_ABI, "balanceOf", [CMC_PAYEE]);

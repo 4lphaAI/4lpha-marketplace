@@ -269,6 +269,47 @@ export const CMC_REVIEWED_PROFILES: readonly CmcReviewedProfile[] = [
       ],
     },
   },
+  {
+    // Fifth reviewed profile (2026-10-02): the fee-free token-class grant. Since
+    // FEE_BPS 0 (2026-09-30) `tradeSessionSpec` no longer grants the platform-fee
+    // `USDT.transfer` rule, so every new hire is the fourth row's grant minus
+    // exactly that one rule (39 -> 38 rules, cap tokens unchanged) and missed
+    // every row. Matrix run for the production agent `tradfi-trade-agent` on
+    // fork block 125240425 (`MD here/CMC-MATRIX-125240425.md`), 8/8 PASS, with
+    // 20 members of `bstock-beacon-a` and 8 of `bstock-beacon-b`. Trace #5 seeds
+    // its fork-only pair from the impersonated wallet (fixture setup), because the
+    // fee-free session cannot `transfer` USDT.
+    profileId: "altana-c0f16888-bstock-class-feefree-v1",
+    chainId: 56,
+    accountCodeHash: "0x2f17b34a1c33b5fb9bd06422cec6782b367aa0e0bb09ee3c5263b14f4112a00f",
+    tokenCodeHash: "0x97a48aa4c129657440dafdacd4c836389734d28cc4a0ca7403e68da660a74a59",
+    permit2CodeHash: "0x48774d936722dd7002887f307f58bcddb3eeabad39149e7dcb5c08e4ebe3310f",
+    settlerCodeHash: "0x0ba2481269cc11da9a6208fb34ea1c04cc05152551660b94465f65920b05bb71",
+    checker: CMC_PERMIT2,
+    grantShapeVersion: 2,
+    grantShapeDigest: "0x95ed0ff0a4b23bf6578d4b18ac05dde779b9c8c4b1e6e95fc36d33e34218df03",
+    evidenceDigest: "0x57c6a3b80de12c2eb4180fbd8547d0f20ff0263fc2e4e8fbf79a2abe083f3cf1",
+    matrix: {
+      ownerApprovalPersists: true,
+      unrelatedTradingPreservesAllowance: true,
+      sessionApproveCannotIncreaseAllowance: true,
+      noTemporaryApproveConsumePath: true,
+      temporaryApproveCallbackReentryExcluded: true,
+      revokeExpiryRejectsPayment: true,
+      walletKeyExclusive: true,
+      additiveIncreaseAllowance: true,
+      proofDigests: [
+        "0x1428459fd340c68a88757f889be0d25a512b683196a99c1a413cdc7b5a4e6d8d",
+        "0xbf8fc0daf2149ed3d7e5cddce094c117f5885096e6dc1f186824c17683cef1ea",
+        "0x7c9983b768e5b4208670b586f0e46b6366d0e3426c532d6ea711154295493bfd",
+        "0xa9fcaf1f072ddcfff8c809f4acb5f0dc2f736a837e6916c36855e296e3e331f7",
+        "0x494cd96c992111340976477f9b08006bbf7de4e1454ca05d49601ce7302ebf0b",
+        "0x54e11c9d71180fd24806ed1923b89d8b5f9fd316ca2f1c71f3f41398e3b12b94",
+        "0xf8e4f5c3306d516c882bc9a11fb99accad30f4ce9f1539c259840da4c8338a19",
+        "0x6a8dacfaa4ed053bd01b3b5d911d851be1c9eef16fc5cf6a1f2662d301d701f3",
+      ],
+    },
+  },
 ];
 export function getCmcReviewedProfile(profileId: string): CmcReviewedProfile | null {
   return CMC_REVIEWED_PROFILES.find((profile) => profile.profileId === profileId) ?? null;

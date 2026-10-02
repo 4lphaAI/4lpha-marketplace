@@ -1,0 +1,297 @@
+{
+  "kind": "cmc-capability-matrix-v1",
+  "generatedAtMs": 1790921127692,
+  "chainId": 56,
+  "forkBlock": 125240425,
+  "agentId": "tradfi-trade-agent",
+  "wallet": "0x16a63074DB31DED8363E6050262B7f0B5395c076",
+  "grantShapeDigest": "0x1a60dd91d23180bfb0628e9bda118915f152a24c5751ff85c5fdf1d8cc121d36",
+  "grantShapeDigestV2": "0x95ed0ff0a4b23bf6578d4b18ac05dde779b9c8c4b1e6e95fc36d33e34218df03",
+  "tokenClassMembers": {
+    "0x02fca66c1d1afb4e2a7884261eb00f63598a7436": "bstock-beacon-a",
+    "0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1": "bstock-beacon-a",
+    "0x4ef9d3062c7f6eba4aae4990c5036598c6eff4ec": "bstock-beacon-a",
+    "0x205812cdbed920aff76c6580abd681a46d11efc7": "bstock-beacon-a",
+    "0x5b1910eaad6450e50f816082aa078c41f10c292f": "bstock-beacon-a",
+    "0x9b8e987e6fec8cf1380c4dca7071e2c7853aeea1": "bstock-beacon-b",
+    "0x3f53de71c126bdabae20f9cd64848d317f6c3238": "bstock-beacon-a",
+    "0x80f3d493ebce97e343c53d29a137942416b4ffc0": "bstock-beacon-a",
+    "0xca750ef65f295bbecd685abf54e82caf297bdb61": "bstock-beacon-a",
+    "0xe614e2fc6c787035ff51f452e8e826bfd32d5283": "bstock-beacon-a",
+    "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14": "bstock-beacon-a",
+    "0xa394dcea3fd3847fd793afbfd163e2e3858b7c65": "bstock-beacon-a",
+    "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8": "bstock-beacon-a",
+    "0x3ee4df61bd4f867e349beae8bfe07bc31b4850fb": "bstock-beacon-a",
+    "0x80106cb3ead06659a5ad19df39d9b4733863b9b0": "bstock-beacon-a",
+    "0x7425889fe94f9d693e8daefe88bcced6acfef4c0": "bstock-beacon-a",
+    "0xab78b89b5bb00236be0b4b20704cbfa04efc711c": "bstock-beacon-a",
+    "0xd97d097a89113fa59b76c572e5b2eb647e8eefaf": "bstock-beacon-a",
+    "0xc008c5f579ec1450f20099c39f587547e27c7523": "bstock-beacon-b",
+    "0xf69e40069ac227c11459e3f4e8a446b3401616b6": "bstock-beacon-b",
+    "0xf3e82ea164cb344b2b11bad4c24b0ea4f7ba4714": "bstock-beacon-b",
+    "0xeee9eee593cb8f7946260b4066cba7907f40acfa": "bstock-beacon-b",
+    "0x462b5f13b7c7748279358962925c5de83bb9e598": "bstock-beacon-a",
+    "0x7c4d7a180d737dd5a70d8065a90e6746a69c37ea": "bstock-beacon-a",
+    "0xdabb9aff4cf02f26d2014e4ca9f94ac6fe6572a3": "bstock-beacon-b",
+    "0x8b872732b07be325a8803cdb480d9d20b6f8d11b": "bstock-beacon-b",
+    "0x91fc7371d6de682a1e8cfcb4eb7da693312a03a4": "bstock-beacon-b",
+    "0x9e82e3da8f1115b73d24bb24113ab836ffdab6b6": "bstock-beacon-a"
+  },
+  "accountCodeHash": "0x2f17b34a1c33b5fb9bd06422cec6782b367aa0e0bb09ee3c5263b14f4112a00f",
+  "tokenCodeHash": "0x97a48aa4c129657440dafdacd4c836389734d28cc4a0ca7403e68da660a74a59",
+  "permit2CodeHash": "0x48774d936722dd7002887f307f58bcddb3eeabad39149e7dcb5c08e4ebe3310f",
+  "settlerCodeHash": "0x0ba2481269cc11da9a6208fb34ea1c04cc05152551660b94465f65920b05bb71",
+  "verdict": "PASS",
+  "proofDigests": [
+    "0x1428459fd340c68a88757f889be0d25a512b683196a99c1a413cdc7b5a4e6d8d",
+    "0xbf8fc0daf2149ed3d7e5cddce094c117f5885096e6dc1f186824c17683cef1ea",
+    "0x7c9983b768e5b4208670b586f0e46b6366d0e3426c532d6ea711154295493bfd",
+    "0xa9fcaf1f072ddcfff8c809f4acb5f0dc2f736a837e6916c36855e296e3e331f7",
+    "0x494cd96c992111340976477f9b08006bbf7de4e1454ca05d49601ce7302ebf0b",
+    "0x54e11c9d71180fd24806ed1923b89d8b5f9fd316ca2f1c71f3f41398e3b12b94",
+    "0xf8e4f5c3306d516c882bc9a11fb99accad30f4ce9f1539c259840da4c8338a19",
+    "0x6a8dacfaa4ed053bd01b3b5d911d851be1c9eef16fc5cf6a1f2662d301d701f3"
+  ],
+  "traces": [
+    {
+      "index": 1,
+      "fact": "ownerApprovalPersists",
+      "description": "admin intent: USDT.increaseAllowance(Permit2, 2e18) + setSignatureCheckerApproval(hash(S), Permit2, true)",
+      "verdict": "PASS",
+      "observations": {
+        "accountImplementation": "0xc0F16888F4198F53892c53AF859f673e23f26fA3",
+        "accountCodeHash": "0x2f17b34a1c33b5fb9bd06422cec6782b367aa0e0bb09ee3c5263b14f4112a00f",
+        "tokenCodeHash": "0x97a48aa4c129657440dafdacd4c836389734d28cc4a0ca7403e68da660a74a59",
+        "permit2CodeHash": "0x48774d936722dd7002887f307f58bcddb3eeabad39149e7dcb5c08e4ebe3310f",
+        "settlerCodeHash": "0x0ba2481269cc11da9a6208fb34ea1c04cc05152551660b94465f65920b05bb71",
+        "tx": "0x147c74c212c129b0e789f7b5321083eb86d9ef87c1238f6914339db6821133fe",
+        "status": "success",
+        "revertReason": null,
+        "allowance": "2000000000000000000",
+        "checkers": [
+          "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+        ]
+      },
+      "failures": [],
+      "proofDigest": "0x1428459fd340c68a88757f889be0d25a512b683196a99c1a413cdc7b5a4e6d8d"
+    },
+    {
+      "index": 2,
+      "fact": "unrelatedTradingPreservesAllowance",
+      "description": "session intent: USDT.approve(UniswapV3Router, 5e18) + exactInputSingle(USDT -> capped token)",
+      "verdict": "PASS",
+      "observations": {
+        "pool": {
+          "token": "0x02Fca66C1D1aFB4E2A7884261eB00F63598a7436",
+          "fee": 500,
+          "pool": "0xDD9d5164CcBc57bE377a964Fc064135b03D06177",
+          "depth": "239164135075954251801447"
+        },
+        "walletUsdtBalance": "101000000000000000000",
+        "tx": "0x8e898263be7f774dba0f6235fd7c4270e5867219e324b737e8e70c96ac2bc98a",
+        "status": "success",
+        "revertReason": null,
+        "permit2Allowance": "2000000000000000000",
+        "routerAllowance": "0",
+        "outputBalance": "21523673049703038"
+      },
+      "failures": [],
+      "proofDigest": "0xbf8fc0daf2149ed3d7e5cddce094c117f5885096e6dc1f186824c17683cef1ea"
+    },
+    {
+      "index": 3,
+      "fact": "sessionApproveCannotIncreaseAllowance",
+      "description": "session intents: USDT.approve(Permit2, 1e21) and USDT.approve(Permit2, half the USDT day cap) - the dangerous shape the v2 grant permits; PASS = the allowance after the in-cap approve is not HIGHER than the owner's",
+      "verdict": "PASS",
+      "observations": {
+        "ownerAllowanceBefore": "2000000000000000000",
+        "usdtDayCap": "500000000000000000000",
+        "overCap": {
+          "amount": "1000000000000000000000",
+          "tx": "0x6e244a9f58d796cedbd1977923a72d16c3677a64f4c988d44f3b65eeeb3c5157",
+          "status": "reverted",
+          "revertReason": "Execution reverted with reason: custom error 0x9054c912: 00000000000000000000000055d398326f99059ff775485246999027b3197955.  Raw Call Arguments:   from:  0xaf140d0416a994aebb3fa6212b16ce6700f09751",
+          "allowance": "2000000000000000000"
+        },
+        "inCap": {
+          "amount": "250000000000000000000",
+          "tx": "0xe32335506bdd71c657619c25bb0be15f01ba09ed365eeacf1d8588f94e176829",
+          "status": "success",
+          "revertReason": null,
+          "allowance": "0"
+        },
+        "ownerAllowanceAfterInCapApprove": "0",
+        "ownerValueRestored": false
+      },
+      "failures": [],
+      "proofDigest": "0x7c9983b768e5b4208670b586f0e46b6366d0e3426c532d6ea711154295493bfd"
+    },
+    {
+      "index": 4,
+      "fact": "noTemporaryApproveConsumePath",
+      "description": "enumerate the granted rules and assert no allowlisted target can pull USDT via Permit2, then re-check the approve-only intent",
+      "verdict": "PASS",
+      "observations": {
+        "ruleCount": 38,
+        "targets": [
+          "0x10ed43c718714eb63d5aa57b78b54704e256024e",
+          "0x1b81d678ffb9c0263b24a97847620c99d213eb14",
+          "0xb971ef87ede563556b2ed4b1c0b0019111dd85d2",
+          "0xb971ef87ede563556b2ed4b1c0b0019111dd85d2",
+          "0xb971ef87ede563556b2ed4b1c0b0019111dd85d2",
+          "0xb971ef87ede563556b2ed4b1c0b0019111dd85d2",
+          "0x5c952063c7fc8610ffdb798152d69f0b9550762b",
+          "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0",
+          "0x16b24723ace1adc87243338d0a32c50bec259650",
+          "0x02fca66c1d1afb4e2a7884261eb00f63598a7436",
+          "0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1",
+          "0x4ef9d3062c7f6eba4aae4990c5036598c6eff4ec",
+          "0x205812cdbed920aff76c6580abd681a46d11efc7",
+          "0x5b1910eaad6450e50f816082aa078c41f10c292f",
+          "0x9b8e987e6fec8cf1380c4dca7071e2c7853aeea1",
+          "0x3f53de71c126bdabae20f9cd64848d317f6c3238",
+          "0x80f3d493ebce97e343c53d29a137942416b4ffc0",
+          "0xca750ef65f295bbecd685abf54e82caf297bdb61",
+          "0xe614e2fc6c787035ff51f452e8e826bfd32d5283",
+          "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14",
+          "0xa394dcea3fd3847fd793afbfd163e2e3858b7c65",
+          "0x7138b48df7d98d7e3cc221bfe7192d0a178182d8",
+          "0x3ee4df61bd4f867e349beae8bfe07bc31b4850fb",
+          "0x80106cb3ead06659a5ad19df39d9b4733863b9b0",
+          "0x7425889fe94f9d693e8daefe88bcced6acfef4c0",
+          "0xab78b89b5bb00236be0b4b20704cbfa04efc711c",
+          "0xd97d097a89113fa59b76c572e5b2eb647e8eefaf",
+          "0xc008c5f579ec1450f20099c39f587547e27c7523",
+          "0xf69e40069ac227c11459e3f4e8a446b3401616b6",
+          "0xf3e82ea164cb344b2b11bad4c24b0ea4f7ba4714",
+          "0xeee9eee593cb8f7946260b4066cba7907f40acfa",
+          "0x462b5f13b7c7748279358962925c5de83bb9e598",
+          "0x7c4d7a180d737dd5a70d8065a90e6746a69c37ea",
+          "0xdabb9aff4cf02f26d2014e4ca9f94ac6fe6572a3",
+          "0x8b872732b07be325a8803cdb480d9d20b6f8d11b",
+          "0x91fc7371d6de682a1e8cfcb4eb7da693312a03a4",
+          "0x9e82e3da8f1115b73d24bb24113ab836ffdab6b6",
+          "0x55d398326f99059ff775485246999027b3197955"
+        ],
+        "reachesPermit2": false,
+        "reachesSettler": false,
+        "payeeBalance": "32080000000000000000",
+        "walletUsdtBalance": "101000000000000000000",
+        "allowanceAfterApproveOnly": "0"
+      },
+      "failures": [],
+      "proofDigest": "0xa9fcaf1f072ddcfff8c809f4acb5f0dc2f736a837e6916c36855e296e3e331f7"
+    },
+    {
+      "index": 5,
+      "fact": "temporaryApproveCallbackReentryExcluded",
+      "description": "fork-only malicious output token whose transfer hook calls the settler and Permit2 during an allowlisted session swap",
+      "verdict": "PASS",
+      "observations": {
+        "evilAddress": "0xe1d49a2f6fea30b7f7dbed62aba9ea697e7c100e",
+        "pair": "0x62F35bF6DaBAaB710b683FF78e0B88319b3b7a73",
+        "seedTx": "0x2258c6a77c70234fd310e93b155ac847071ebf3b8f2e02460ddd10f2e8605f23",
+        "swapTx": "0xb8af00ba8014c7ab4917df5c21545ec1fc6dcdb1970aa43701927c84d9cecc71",
+        "swapStatus": "success",
+        "swapRevertReason": null,
+        "hookRan": true,
+        "settleAccepted": false,
+        "permit2Accepted": false,
+        "settledEmitted": false,
+        "payeeBefore": "32080000000000000000",
+        "payeeAfter": "32080000000000000000",
+        "bitmapBefore": "0",
+        "bitmapAfter": "0",
+        "permit2Allowance": "2000000000000000000"
+      },
+      "failures": [],
+      "proofDigest": "0x494cd96c992111340976477f9b08006bbf7de4e1454ca05d49601ce7302ebf0b"
+    },
+    {
+      "index": 6,
+      "fact": "revokeExpiryRejectsPayment",
+      "description": "sign a Permit2 witness with S, settle it through the pinned settler, then prove expiry and revoke both refuse",
+      "verdict": "PASS",
+      "observations": {
+        "appDigest": "0x5f8918b51005443462696f348502a33c4f7120c20856aecfb091c1c682e7daf0",
+        "wrappedDigest": "0xe61a56aab7dd0462c842bb624ca38cb56bbbbaecce4d0e4b77f931d40f08579e",
+        "nonce": "4242424242",
+        "deadline": "1790921613",
+        "isValidSignature": "0x1626ba7e",
+        "settleTx": "0xf542b4d4ea303b8d8cb3a6783f1835de01c964cf0b06817b9500e64846090472",
+        "settleStatus": "success",
+        "settleRevertReason": null,
+        "payeeBefore": "32080000000000000000",
+        "payeeAfter": "32090000000000000000",
+        "settledEmitted": true,
+        "nonceBitmap": "383123885216472214589586756787577295904684780545900544",
+        "isValidSignatureAfterExpiry": "0xffffffff",
+        "expiredSettleStatus": "reverted",
+        "isValidSignatureAfterRevoke": "0xffffffff",
+        "revokedSettleStatus": "reverted"
+      },
+      "failures": [],
+      "proofDigest": "0x54e11c9d71180fd24806ed1923b89d8b5f9fd316ca2f1c71f3f41398e3b12b94"
+    },
+    {
+      "index": 7,
+      "fact": "walletKeyExclusive",
+      "description": "fork key-set sanity trace; the live reader proves exclusivity per read on mainnet",
+      "verdict": "PASS",
+      "observations": {
+        "keys": [
+          {
+            "expiry": 0,
+            "keyType": 1,
+            "isSuperAdmin": true,
+            "publicKey": "0x3b122cbad5c767353e718f85eda9f4cc03ddf1ecc83d271a947580fd3785c865ae897cf70abb31d9f16870ebfe619ba78d644a28f068a570fe58a8ffb8d6986a"
+          },
+          {
+            "expiry": 1791524015,
+            "keyType": 2,
+            "isSuperAdmin": false,
+            "publicKey": "0x0000000000000000000000009646a41e5bafc6e4d77a1a64545a8a9b69d67a08"
+          },
+          {
+            "expiry": 0,
+            "keyType": 2,
+            "isSuperAdmin": true,
+            "publicKey": "0x0000000000000000000000005d5c99edf529335160ff180fa141dd4967fc00d2"
+          },
+          {
+            "expiry": 1791525496,
+            "keyType": 2,
+            "isSuperAdmin": false,
+            "publicKey": "0x000000000000000000000000d8291e50e2e68fb2c70d77ccdc707d291a89f209"
+          }
+        ],
+        "keyHashes": [
+          "0xb4f5e20d291813f9df3254cfc0088c25a7faf9e46c18693eee1e90501c1621c5",
+          "0xa604d3690fedcd827589821b0264c4bbeccb395fcda940596d0e0961f09fb565",
+          "0x48f8cfaefee1b6985d8a3abfdff43c183da55df767269b2e882ab1916aa8d2e6",
+          "0xa7683df07c5e9e640f50a37c3e4be97e1037be2b16db90181a9b8c8d613a6bf1"
+        ],
+        "sessionKeyHash": "0xa7683df07c5e9e640f50a37c3e4be97e1037be2b16db90181a9b8c8d613a6bf1",
+        "adminKeyHash": "0x48f8cfaefee1b6985d8a3abfdff43c183da55df767269b2e882ab1916aa8d2e6"
+      },
+      "failures": [],
+      "proofDigest": "0xf8e4f5c3306d516c882bc9a11fb99accad30f4ce9f1539c259840da4c8338a19"
+    },
+    {
+      "index": 8,
+      "fact": "additiveIncreaseAllowance",
+      "description": "after the settlement, an admin increaseAllowance(+1e18) is additive over the remaining allowance",
+      "verdict": "PASS",
+      "observations": {
+        "allowanceBefore": "1990000000000000000",
+        "tx": "0x15882d89198fa32e9060643610510d265912484ddf816b46f60244a2cb85a94e",
+        "status": "success",
+        "revertReason": null,
+        "allowanceAfter": "2990000000000000000",
+        "expected": "2990000000000000000"
+      },
+      "failures": [],
+      "proofDigest": "0x6a8dacfaa4ed053bd01b3b5d911d851be1c9eef16fc5cf6a1f2662d301d701f3"
+    }
+  ]
+}

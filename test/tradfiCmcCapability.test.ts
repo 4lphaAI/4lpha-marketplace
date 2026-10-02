@@ -71,6 +71,8 @@ const LATER_ROWS = [
   { profileId: "altana-c0f16888-v3grant-v1", fixture: "./fixtures/cmc-matrix-123226705.json" },
   { profileId: "altana-c0f16888-aggregator-v1", fixture: "./fixtures/cmc-matrix-123599459.json" },
   { profileId: "altana-c0f16888-bstock-class-v1", fixture: "./fixtures/cmc-matrix-123610834.json" },
+  // 2026-10-02: the fee-free token-class grant (no platform-fee USDT.transfer rule).
+  { profileId: "altana-c0f16888-bstock-class-feefree-v1", fixture: "./fixtures/cmc-matrix-125240425.json" },
 ] as const;
 
 test("every later reviewed row recomputes from its own 8/8-PASS probe fixture", () => {
@@ -92,12 +94,27 @@ test("every later reviewed row recomputes from its own 8/8-PASS probe fixture", 
     assert.deepEqual(probe.traces.filter((trace) => trace.verdict !== "PASS"), []);
     assert.equal(row.grantShapeDigest, digest);
     assert.deepEqual(row.matrix.proofDigests, probe.proofDigests);
+    // The row's own identity fields, compared directly (the evidence digest below
+    // is recomputed from the FIXTURE's fields, so it cannot catch a wrong row field).
+    assert.equal(row.chainId, 56);
+    assert.equal(row.checker, CMC_PERMIT2);
+    assert.equal(row.accountCodeHash, probe.accountCodeHash);
+    assert.equal(row.tokenCodeHash, probe.tokenCodeHash);
+    assert.equal(row.permit2CodeHash, probe.permit2CodeHash);
+    assert.equal(row.settlerCodeHash, probe.settlerCodeHash);
+    assert.deepEqual({ ...row.matrix, proofDigests: [] }, { ...MATRIX, proofDigests: [] });
     assert.equal(row.evidenceDigest, cmcCapabilityEvidenceDigest({
       kind: "cmc-mainnet-capability-v1", source: "live-mainnet", chainId: 56,
       accountCodeHash: probe.accountCodeHash, tokenCodeHash: probe.tokenCodeHash,
       permit2CodeHash: probe.permit2CodeHash, settlerCodeHash: probe.settlerCodeHash,
       checker: CMC_PERMIT2, grantShapeDigest: digest, ...MATRIX, proofDigests: probe.proofDigests,
     }));
+    // End to end: evidence built from the fixture is admitted by the SHIPPED registry.
+    assert.equal(verdict(evidence({
+      accountCodeHash: probe.accountCodeHash, tokenCodeHash: probe.tokenCodeHash,
+      permit2CodeHash: probe.permit2CodeHash, settlerCodeHash: probe.settlerCodeHash,
+      grantShapeDigest: digest, profileId: row.profileId, proofDigests: probe.proofDigests,
+    }), CMC_REVIEWED_PROFILES), true, `${row.profileId} must admit its own probe's evidence`);
   }
 });
 
