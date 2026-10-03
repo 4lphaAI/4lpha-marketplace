@@ -1,8 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type { TradePositionView } from "@/lib/trade";
-import { closedNewestFirst, heldDuration } from "./TradeAgentDetail";
+import { closeReasonLabel, closedNewestFirst, heldDuration } from "./TradeAgentDetail";
 
 const MIN = 60_000;
+
+describe("close reason labels", () => {
+  it("names the two TRADFI-EXIT-RULES reasons and leaves the others as words", () => {
+    expect(closeReasonLabel("trailing-stop")).toBe("Trailing stop");
+    expect(closeReasonLabel("stale-exit")).toBe("Stale position exit");
+    expect(closeReasonLabel("crash-stop")).toBe("crash stop");
+    expect(closeReasonLabel(null)).toBe("\u2014");
+  });
+});
 
 describe("closed positions tab", () => {
   it("shows held as the open-to-close duration, never 'ago'", () => {

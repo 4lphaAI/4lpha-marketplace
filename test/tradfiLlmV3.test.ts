@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildEntryPrompt, buildExitPrompt, type EntryPromptCandidate, type ExitPromptPosition } from "../src/trade/llm.js";
 import { TRADFI_DOCTRINE } from "../src/trade/doctrine.js";
-import { TRADFI_COST_BAND_BPS } from "../src/trade/score.js";
 
 const OWNER = { instructions: null, skillMarkdown: null };
 
@@ -31,14 +30,15 @@ function position(overrides: Partial<ExitPromptPosition> = {}): ExitPromptPositi
   return { tokenAddress: "0x1", symbol: "AAPL", pnlBps: -50n, ageSec: 100, takeProfitBps: null, stopLossBps: null, ...overrides };
 }
 
-test("tradfi exit system text carries the doctrine and the cost band, no JSON feature block", () => {
+test("tradfi exit system text carries the doctrine and the net-of-cost sentence, no JSON feature block", () => {
   const messages = buildExitPrompt({ tradfi: true, timeLimitAuthority: true, owner: OWNER,
     positions: [position({ peakPnlBps: 300n, trigger: "peak-giveback", session: "rth", regime: "neutral", indicators: "1h EMA12 below EMA26" })],
     featureBlocks: ['{"scope":"exact_pool"}'] });
   const system = messages[0]!.content;
   const user = messages[1]!.content;
   assert.ok(system.includes(TRADFI_DOCTRINE));
-  assert.ok(system.includes(String(TRADFI_COST_BAND_BPS)));
+  assert.ok(system.includes("pnlBps is already net of the purchase cost and of the current sell quote, so a positive pnlBps is real profit after costs."));
+  assert.equal(system.includes("is spread, not a signal"), false);
   assert.ok(system.includes("hold is the default answer"));
   assert.equal(user.includes("exact_pool"), false);
   assert.ok(user.includes("peakPnlBps\ttrigger\tsession\tregime\tindicators"));

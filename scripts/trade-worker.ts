@@ -40,6 +40,7 @@ import { createTradeCmcStore } from "../src/store/tradeCmc.js";
 import { assertReconcileGuardCoversSubmitWindow, createJournal, reconcile, type JournalEntry } from "../src/store/journal.js";
 import { createKillSwitch } from "../src/killswitch/killswitch.js";
 import { resolveDcaEnabled, resolvePortfolioEnabled, resolveHireEnabled, resolveTradeConfig, type TradeRuntimeConfig } from "../src/ops/config.js";
+import { resolveEntryTimingMode } from "../src/trade/entryTiming.js";
 import { forbiddenTokenAddresses } from "../src/ops/forbiddenTokens.js";
 import { resolveLpRpcUrls } from "../src/lp/readers.js";
 import { sanitizeMessage } from "../src/core/errors.js";
@@ -58,6 +59,7 @@ import { PANCAKE_V2_FACTORY_56 } from "../src/quant/config.js";
 import { PANCAKE_V3_FACTORY_56 } from "../src/lp/readers.js";
 import type { WalletCall } from "../src/core/types.js";
 import type { TradeIntentRecord } from "../src/store/tradeIntents.js";
+import { resolveTradfiExitRulesMode } from "../src/trade/exitRules.js";
 
 const UNISWAP_V3_FACTORY_56: Address = getAddress("0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7");
 
@@ -419,6 +421,10 @@ async function main(): Promise<void> {
   // an agent hired while it was on (D17), so no owner's funds are trapped.
   const dcaEnabled = resolveDcaEnabled(process.env);
   const portfolioEnabled = resolvePortfolioEnabled(process.env);
+  const entryTimingMode = resolveEntryTimingMode(process.env["TRADFI_ENTRY_TIMING_MODE"], line => console.warn(line));
+  console.log(`[trade-worker] entry timing: ${entryTimingMode}`);
+  const tradfiExitRulesMode = resolveTradfiExitRulesMode(process.env["TRADFI_EXIT_RULES_MODE"], line => console.warn(line));
+  console.log(`[trade-worker] tradfi exit rules: ${tradfiExitRulesMode}`);
   const dcaStore = await createDcaRoundStore();
   const dcaCostWei = createTradfiNativeCostWeiOracle({ network: BNB });
   const dca: TradeWorkerDcaDeps = {
@@ -459,7 +465,7 @@ async function main(): Promise<void> {
       cmcWorker.enqueue(target);
     } }),
     agentStore, settingsStore, positions, intents, journal, dataPlane, provider, llmFor, executor,
-    portfolioEnabled,
+    portfolioEnabled, entryTimingMode, tradfiExitRulesMode,
     ...(llmModel === "" ? {} : { modelOverride: { primary: llmModel, ...(llmFallbackModel === "" ? {} : { fallback: llmFallbackModel }) } }),
     executorDeps, readiness, rpcUrls, routeReader,
     ...(rpcUrls[2] === undefined ? {} : { unknownReads: createTradeUnknownReads({

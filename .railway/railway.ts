@@ -195,6 +195,11 @@ export default defineRailway(() => {
       // Binance pre-flight simulation of every TradFi submission (worker-only).
       TRADFI_PREFLIGHT_SIMULATE: "true",
       TRADE_STAGED_SUBMIT: "true",
+      // Entry timing gate for the TradFi AI-trade lane: off | log | enforce. Log records would-defer events and changes no buy.
+      TRADFI_ENTRY_TIMING_MODE: "log",
+      // TradFi AI-trade robot exits (trailing stop, stale exit): log-only until the operator rules `enforce` after G1.
+      // Before `enforce`: the widened close-reason store must run everywhere; once an enforced sell has run, never roll back below this build.
+      TRADFI_EXIT_RULES_MODE: "log",
     },
   });
 

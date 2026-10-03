@@ -134,7 +134,8 @@ export function hasLlmDecision(run: Run): boolean {
 
 /** V3 cycles log one `score` event per candidate; summarise those instead of the routeable count. */
 export function runSummary(run: Run): string {
-  const scores = (run.events ?? []).filter((event) => event.stage === "score");
+  // Entry-timing events share the "score" stage but are not candidates scored.
+  const scores = (run.events ?? []).filter((event) => event.stage === "score" && !event.code.startsWith("timing:"));
   if (scores.length === 0) return `${run.candidates} shortlisted · ${run.entries} buy attempts · ${run.exits} closed · ${run.refusals} skipped/refused`;
   const passed = scores.filter((event) => event.code === "shortlisted" || event.code === "strong").length;
   const vetoed = scores.filter((event) => event.code.startsWith("vetoed")).length;
@@ -194,6 +195,14 @@ export function tradeCards(runs: readonly Run[]): readonly TradeCard[] {
   });
 }
 
+/** Readable text for the robot exit rule events (`rule:would-exit:<rule>`, `rule:exit:<rule>`, `rule:peak-implausible`); other codes keep the generic words. */
+export function eventLabel(code: string): string {
+  const rule = /^rule:(would-exit|exit):(trailing-stop|stale-exit)$/u.exec(code);
+  if (rule !== null) return `Robot exit rule ${rule[1] === "exit" ? "sells" : "would sell"}: ${rule[2] === "stale-exit" ? "stale position" : "trailing stop"}`;
+  if (code === "rule:peak-implausible") return "Robot exit rule skipped: the recorded peak is implausible";
+  return code.replace(/[-_]/gu, " ");
+}
+
 function scoreLine(event: RunEvent): string {
   const reason = event.reason ?? "";
   const score = /score=(-?[\d.]+)/u.exec(reason)?.[1];
@@ -205,6 +214,7 @@ export function runLabel(reason: string): string {
   const code = reason.split(";")[0] ?? reason;
   const labels: Record<string, string> = {
     "score-hold": "No candidate passed the score",
+    "timing-defer": "Entry deferred: waiting for a better entry",
     "buy-pacing": "Waiting: the last buy was under 5 minutes ago",
     "at-capacity": "All position slots occupied", "no-route": "No usable buy route",
     "entered": "Buy execution committed", "llm-hold": "LLM chose to wait",
@@ -450,7 +460,7 @@ export function TradeRunLog({ runs, symbols, schedule = false, portfolio = false
       <div className="fl-run-detail"><div className="fl-run-meta">{new Date(run.createdAt).toLocaleString()} · Run {run.id}</div>
         {(run.events?.length ?? 0) > 0 ? <><ol>{run.events!.filter((event) => !NOISE_CODES.has(event.code)).map((event, i) => <li key={i}>
           <span className="fl-run-stage">{event.stage.replace(/-/gu, " ")} <small>+{(event.elapsedMs / 1000).toFixed(1)}s</small></span>
-          <div><strong>{event.code.replace(/[-_]/gu, " ")}</strong>{event.token ? <span title={event.token}> · {symbols[event.token.toLowerCase()] ?? `${event.token.slice(0, 6)}…${event.token.slice(-4)}`}</span> : null}{event.confidence === undefined ? null : <span className="fl-run-confidence">{event.confidence}% confidence</span>}
+          <div><strong>{eventLabel(event.code)}</strong>{event.token ? <span title={event.token}> · {symbols[event.token.toLowerCase()] ?? `${event.token.slice(0, 6)}…${event.token.slice(-4)}`}</span> : null}{event.confidence === undefined ? null : <span className="fl-run-confidence">{event.confidence}% confidence</span>}
             {event.model ? <small className="fl-run-model">LLM model: {event.model}</small> : null}{event.reason ? <p>{event.reason}</p> : null}</div>
         </li>)}</ol>
         {run.events!.some((event) => NOISE_CODES.has(event.code)) ? <details className="fl-run-raw"><summary>Other events ({run.events!.filter((event) => NOISE_CODES.has(event.code)).length})</summary>

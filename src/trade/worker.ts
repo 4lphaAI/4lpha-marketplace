@@ -119,6 +119,8 @@ import { currentSlot, scheduleAnchorMs, scheduleLedger, type ScheduleIntervalSec
 import { enrichFeatures, featurePrompt, assessMomentum, featureModel, describeFeatures } from "./features.js";
 import { sessionState, SESSION_PROFILES } from "./session.js";
 import { evaluateExitTrigger, blendRegime, scoreToken, tradfiExitAllowed, type Regime, type ExitTriggerContext } from "./score.js";
+import { entryTimingGate, type EntryTimingMode } from "./entryTiming.js";
+import { tradfiPeakImplausible, tradfiRobotExit, type TradfiExitRulesMode } from "./exitRules.js";
 import { TRADFI_BINANCE_FLASH_ROUTER_56, TRADFI_BINANCE_FLASH_SPENDER_56, TRADFI_GUARD_MAX_DEADLINE_WINDOW_SEC, TRADFI_GUARD_MIN_REMAINING_MS, flashRequest } from "./guard.js";
 import { buildTradfiGuardSwapCall } from "./guard.js";
 import { buildTradfiApprove, buildTradfiPancakeV2Swap, buildTradfiPancakeV3Swap, buildTradfiUniswapV3Swap, buildTradfiPlatformFee } from "../ops/tradfi.js";
@@ -221,6 +223,8 @@ export type TradeWorkerDeps = {
     readonly read: (input: { readonly wallet: Address; readonly keyId: Hex; readonly publicKey: Hex; readonly signal?: AbortSignal }) => Promise<FinalizedSessionRevocationVerdict>;
   };
   readonly portfolioEnabled?: boolean;
+  /** TRADFI-ENTRY-TIMING: the daemon's `TRADFI_ENTRY_TIMING_MODE`; absent means off (offline fixtures stay unchanged). */
+  readonly entryTimingMode?: EntryTimingMode;
   readonly journal: Pick<ExecutionJournal, "get"> & { readonly sumPendingQuoteSpendSince?: ExecutionJournal["sumPendingQuoteSpendSince"]; readonly markCommitted?: ExecutionJournal["markCommitted"];
     readonly advanceUnknown?: ExecutionJournal["advanceUnknown"]; readonly resolveUnknown?: ExecutionJournal["resolveUnknown"] };
   readonly unknownReads?: TradeUnknownReads;
@@ -246,6 +250,8 @@ export type TradeWorkerDeps = {
   readonly uniswapRouter?: Address;
   /** The configured Flash guard (R2.6/R3.3): absent ⇒ every Flash call site is skipped. */
   readonly aggregatorGuard?: Address;
+  /** TRADFI-EXIT-RULES §3: read once at worker start; absent ⇒ `off` (every offline fixture). */
+  readonly tradfiExitRulesMode?: TradfiExitRulesMode;
   readonly knownRwaAddresses?: Set<string>;
   /** The same boot-resolved percentage used by the executor's fee policy. */
   readonly platformFeeBps: number;
@@ -2197,8 +2203,21 @@ async function runTradfiV2Exits(
     } else if (!decision.exit && basis !== undefined && basis !== null && basis > 0n && decisionPnlBps !== null && hasBlankThreshold({
       takeProfitBps: settings.takeProfitBps, stopLossBps: settings.stopLossBps, timeLimitAuthority: settings.maxHoldSec === null,
     })) {
-      const ticker = snapshot.rowsByAddress.get(position.token.toLowerCase())?.rwa?.underlyingTicker ?? "";
-      llmCandidates.push({ priced, pnlBps: decisionPnlBps, ticker });
+      // TRADFI-EXIT-RULES §3/§4: the owner's own exits and `decideExit` ran first. The peak is the stored one
+      // (loaded before this cycle's telemetry write) raised to the current reading.
+      const mode = isTradfiAiSettings(settings) ? deps.tradfiExitRulesMode ?? "off" : "off";
+      const peak = Math.max(Number(decisionPnlBps), position.peakPnlBps === null ? Number.NEGATIVE_INFINITY : Number(position.peakPnlBps));
+      // Review M1: a peak above TRADFI_TRAIL_MAX_PEAK_BPS never arms T (tradfiRobotExit); say so once per cycle.
+      if (mode !== "off" && tradfiPeakImplausible(peak)) observe(counts, { stage: "exit-llm", code: "rule:peak-implausible", token: position.token, reason: `peak=+${Math.trunc(peak)}` });
+      const robot = mode === "off" ? null : tradfiRobotExit({ pnlBps: Number(decisionPnlBps), peakPnlBps: peak,
+        openedAtMs: position.openedAt, nowMs, takeProfitBlank: settings.takeProfitBps === null, maxHoldBlank: settings.maxHoldSec === null });
+      if (robot !== null) observe(counts, { stage: "exit-llm", code: `rule:${mode === "enforce" ? "exit" : "would-exit"}:${robot.rule}`, token: position.token, reason: robot.detail });
+      if (robot !== null && mode === "enforce") {
+        await sellPosition(deps, agent, settings, priced, robot.rule, counts, signal, robot.detail);
+      } else {
+        const ticker = snapshot.rowsByAddress.get(position.token.toLowerCase())?.rwa?.underlyingTicker ?? "";
+        llmCandidates.push({ priced, pnlBps: decisionPnlBps, ticker });
+      }
     }
   }
   if (llmCandidates.length === 0) return;
@@ -2848,8 +2867,16 @@ async function runTradfiV2Entry(
       : result.strong ? "strong" : result.buy ? "shortlisted" : "below-threshold";
     observe(counts, { stage: "score", code, token: candidate.address, reason: `score=${result.score} active=${result.activeWeightShare.toFixed(2)} ${result.reasons.join(" ")}` });
   }
-  const shortlist = scored.filter(({ result }) => result.buy)
+  const scoredShortlist = scored.filter(({ result }) => result.buy)
     .sort((a, b) => (b.result.strong ? 1 : 0) - (a.result.strong ? 1 : 0) || b.result.score - a.result.score);
+  // TRADFI-ENTRY-TIMING: a gated candidate is only DEFERRED to a later cycle. `log` records the would-defer and changes nothing; `enforce` removes it before the entry LLM and the buy.
+  const entryTimingMode = deps.entryTimingMode ?? "off";
+  const shortlist = entryTimingMode === "off" ? scoredShortlist : scoredShortlist.filter(({ candidate }) => {
+    const gate = entryTimingGate(features.get(candidate.address.toLowerCase())?.["15m"], nowMs);
+    if (!gate.gated) return true;
+    observe(counts, { stage: "score", code: `timing:${entryTimingMode === "enforce" ? "deferred" : "would-defer"}:${gate.rule}`, token: candidate.address, reason: gate.detail });
+    return entryTimingMode !== "enforce";
+  });
   // R2.3/N2: the entry lane also passes the held tickers from the positions
   // it already read above, mapped exactly as the exit lane does. `enqueue`
   // (cmcRuntime.ts) merges this with whatever the exit lane enqueued in the
@@ -2863,7 +2890,7 @@ async function runTradfiV2Entry(
   if (dataRequestsEnabled) {
     void deps.refreshCmcNews!({ agent, heldTickers: entryHeldTickers, shortlistedTickers: entryShortlistedTickers, nowMs, ...(signal === undefined ? {} : { signal }) }).catch(() => undefined);
   }
-  if (shortlist.length === 0) return "score-hold";
+  if (shortlist.length === 0) return scoredShortlist.length > 0 ? "timing-defer" : "score-hold";
   const unsettledBuys = unsettled.filter((intent) => intent.side === "buy");
   const recentBuyAt = Math.max(-Infinity, ...open.map((position) => position.openedAt), ...unsettledBuys.map((intent) => intent.createdAt));
   if (Number.isFinite(recentBuyAt) && nowMs - recentBuyAt < 300_000) return "buy-pacing";

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateExitTrigger, tradfiExitAllowed, type ExitTriggerContext } from "../src/trade/score.js";
+import { evaluateExitTrigger, PEAK_GIVEBACK_REASK_BPS, tradfiExitAllowed, type ExitTriggerContext } from "../src/trade/score.js";
 
 function ctx(overrides: Partial<ExitTriggerContext> = {}): ExitTriggerContext {
   return { pnlBps: 0, peakPnlBps: null, macdHistSign: 1, emaSpreadSign: 1, regime: "neutral", session: "rth", ...overrides };
@@ -79,8 +79,17 @@ test("peak-giveback fires on a >=200bps drop from a >=300bps peak, once per give
   const prior = ctx({ pnlBps: 90, peakPnlBps: 300, trigger: "peak-giveback" });
   // Same or higher pnl than the last peak-giveback ask: does not re-fire.
   assert.equal(evaluateExitTrigger(prior, ctx({ pnlBps: 95, peakPnlBps: 300 })), null);
-  // A fresh drop below the last asked pnl re-fires.
-  assert.equal(evaluateExitTrigger(prior, ctx({ pnlBps: 50, peakPnlBps: 300 })), "peak-giveback");
+  // A fresh drop of at least PEAK_GIVEBACK_REASK_BPS (150) below the last asked pnl re-fires.
+  assert.equal(evaluateExitTrigger(prior, ctx({ pnlBps: -60, peakPnlBps: 300 })), "peak-giveback");
+});
+
+test("TRADFI-EXIT-RULES §5: after a giveback ask at -100, -150 does not re-fire and -250 does; the first giveback is unchanged", () => {
+  assert.equal(PEAK_GIVEBACK_REASK_BPS, 150);
+  assert.equal(evaluateExitTrigger(null, ctx({ pnlBps: -100, peakPnlBps: 300 })), "peak-giveback");
+  const prior = ctx({ pnlBps: -100, peakPnlBps: 300, trigger: "peak-giveback" });
+  assert.equal(evaluateExitTrigger(prior, ctx({ pnlBps: -150, peakPnlBps: 300 })), null, "a slow bleed does not re-ask on every new low");
+  assert.equal(evaluateExitTrigger(prior, ctx({ pnlBps: -249, peakPnlBps: 300 })), null);
+  assert.equal(evaluateExitTrigger(prior, ctx({ pnlBps: -250, peakPnlBps: 300 })), "peak-giveback");
 });
 
 test("peak-giveback is inactive below the 300bps peak floor", () => {

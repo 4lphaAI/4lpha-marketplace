@@ -14,7 +14,7 @@ import { normalizeTradeRunEvents, type TradeRunEvent } from "./tradeRunTrace.js"
 export type Clock = () => number;
 export type TradePositionStatus = "open" | "closed" | "orphaned";
 export type TradeFillStatus = "verified" | "unverified";
-export type TradeCloseReason = "owner-request" | "stop-loss" | "take-profit" | "max-hold" | "llm" | "balance-gone" | "crash-stop" | "session-expiring";
+export type TradeCloseReason = "owner-request" | "stop-loss" | "take-profit" | "max-hold" | "llm" | "balance-gone" | "crash-stop" | "session-expiring" | "trailing-stop" | "stale-exit";
 export type TradeCrashPendingKind = "collapse" | "dust";
 export type TradeAutoExitReason = "crash-stop" | "session-expiring";
 
@@ -839,13 +839,14 @@ export class PostgresTradePositionStore implements TradePositionStore {
       await tx.query(`select pg_advisory_xact_lock(hashtext('trade_positions'))`);
       await tx.query(`alter table trade_positions drop constraint if exists trade_positions_close_reason_check`);
       await tx.query(`alter table trade_positions drop constraint if exists trade_positions_close_reason_v2_check`);
+      await tx.query(`alter table trade_positions drop constraint if exists trade_positions_close_reason_v3_check`);
       const constraint = await tx.query(
-        `select 1 from pg_constraint c where c.conname = 'trade_positions_close_reason_v3_check'
+        `select 1 from pg_constraint c where c.conname = 'trade_positions_close_reason_v4_check'
          and c.conrelid = 'trade_positions'::regclass limit 1`,
       );
       if (constraint.rows.length === 0) {
-        await tx.query(`alter table trade_positions add constraint trade_positions_close_reason_v3_check
-          check (close_reason is null or close_reason in ('owner-request','stop-loss','take-profit','max-hold','llm','balance-gone','crash-stop','session-expiring'))`);
+        await tx.query(`alter table trade_positions add constraint trade_positions_close_reason_v4_check
+          check (close_reason is null or close_reason in ('owner-request','stop-loss','take-profit','max-hold','llm','balance-gone','crash-stop','session-expiring','trailing-stop','stale-exit'))`);
       }
       await tx.query(TRADE_POSITION_INDEX_DDL);
       await tx.query(TRADE_RECEIPT_OWNERSHIP_INDEX_DDL);
@@ -1309,7 +1310,7 @@ function fillStatus(value: string): TradeFillStatus {
 }
 function closeReason(value: string | null): TradeCloseReason | null {
   if (value === null) return null;
-  if (["owner-request", "stop-loss", "take-profit", "max-hold", "llm", "balance-gone", "crash-stop", "session-expiring"].includes(value)) {
+  if (["owner-request", "stop-loss", "take-profit", "max-hold", "llm", "balance-gone", "crash-stop", "session-expiring", "trailing-stop", "stale-exit"].includes(value)) {
     return value as TradeCloseReason;
   }
   throw new Error("Stored trade close reason is invalid.");

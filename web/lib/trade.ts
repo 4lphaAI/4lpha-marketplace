@@ -389,7 +389,7 @@ export type TradePositionView = {
   readonly exitTxHash: string | null;
   readonly soldTokenAmount: string | null;
   readonly exitFillStatus: "verified" | "unverified" | null;
-  readonly closeReason: "owner-request" | "stop-loss" | "take-profit" | "max-hold" | "llm" | "balance-gone" | "crash-stop" | "session-expiring" | null;
+  readonly closeReason: "owner-request" | "stop-loss" | "take-profit" | "max-hold" | "llm" | "balance-gone" | "crash-stop" | "session-expiring" | "trailing-stop" | "stale-exit" | null;
   readonly closeNote?: string | null;
   readonly autoExitReason?: "crash-stop" | "session-expiring" | null;
   readonly peakPnlBps?: string | null;

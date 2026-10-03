@@ -70,6 +70,9 @@ async function harness(input: {
   readonly secondCandidate?: boolean;
   /** TRADFI-LLM-CMC-REQUEST: TOKEN's underlying ticker, default "STOCK" (unmapped in `US_EQUITY_TICKER_CLASS`); pass a real pinned ticker (e.g. "NVDA") to exercise an accepted `dataRequests` entry. */
   readonly underlyingTicker?: string;
+  /** TRADFI-EXIT-RULES: owner exit settings (take profit / max hold) and the worker's rule mode; absent mode means `off`. */
+  readonly ownerSettings?: Partial<TradeSettings>;
+  readonly exitRulesMode?: "off" | "log" | "enforce";
 }) {
   const agents = new MemoryAgentStore();
   const positions = new MemoryTradePositionStore(input.now);
@@ -82,7 +85,7 @@ async function harness(input: {
       permissions: validateSessionSpec(policy, { nowSeconds: Math.floor(input.now() / 1000), minSessionSeconds: 0 }), publicKey: KEY,
       expiry: policy.expiresAt, grantedAtSec: Math.floor(input.now() / 1000) - 86_400, hireSizing: { name: "trade-v1", version: 1, openNativeBudgetWei: "0",
         settlementAsset: "USDT", minEntryWei: (5n * E).toString(), capitalQuoteWei: (60n * E).toString() } } });
-  const settings = v2Settings(input.maxOpenPositions ?? 1, input.cmcNewsEnabled ?? false, input.slippageBps ?? 300);
+  const settings: TradeSettings = { ...v2Settings(input.maxOpenPositions ?? 1, input.cmcNewsEnabled ?? false, input.slippageBps ?? 300), ...input.ownerSettings };
   await settingsStore.put({ agentId: agent.id, ownerAddress: OWNER, params: settings, digest: tradeSettingsDigest(settings) });
   const venue: VenueRow = { dex: "pancakeswap", version: "v3", pool: POOL, quote: USDT_56, quoteSymbol: "USDT",
     feeTier: 100, liquidityUsd: 100_000, volume24hUsd: 1_000, priceUsd: 1, asOf: input.now() };
@@ -129,6 +132,7 @@ async function harness(input: {
   let stockBalance = input.stockBalance ?? 0n;
   const llmState = { exitThrows: false };
   const deps: TradeWorkerDeps = { agentStore: agents, positions, intents, settingsStore, journal, dataPlane, aggregatorGuard: GUARD,
+    ...(input.exitRulesMode === undefined ? {} : { tradfiExitRulesMode: input.exitRulesMode }),
     ...(input.cmcNews === undefined ? {} : { cmcNews: input.cmcNews }),
     provider: { getTokenBalance: async ({ token }) => token.toLowerCase() === USDT_56.toLowerCase() ? 300n * E : stockBalance,
       getTokenMetadata: async () => ({ decimals: 18, symbol: "STOCK" }),
@@ -614,4 +618,346 @@ test("AUDIT M-4: exit — cmcNewsEnabled false with refreshCmcNews WIRED still o
   const promptText2 = promptText(capturedMessages[0]);
   assert.ok(promptText2.length > 0, "the exit LLM must still have been asked");
   assert.equal(promptText2.includes("dataRequests"), false, "the CMC-off exit prompt must not offer dataRequests even though refreshCmcNews is wired");
+});
+
+// TRADFI-ENTRY-TIMING-SPEC §6: the entry timing gate in the tradfi v2 entry lane.
+const OPENING_RANGE_MS = Date.UTC(2026, 5, 5, 13, 45, 0); // Friday 09:45 ET
+const IMPULSE = { stochRsi14: 0.97, bbPosition20: 0.5 };
+const CALM = { stochRsi14: 0.5, bbPosition20: 0.5 };
+
+/** Gives each pool's 15m feature set the rev-2 stochRsi14 / bbPosition20 metrics the gate reads. */
+function timingFeatures(h: { readonly deps: TradeWorkerDeps }, byPool: Readonly<Record<string, { readonly stochRsi14: number; readonly bbPosition20: number }>>): void {
+  const base = h.deps.dataPlane.featuresBatch!.bind(h.deps.dataPlane);
+  const metric = (value: number, requiredBars: number) => ({ value, unit: "ratio", requiredBars, usableBars: requiredBars, available: true, reason: null });
+  h.deps.dataPlane.featuresBatch = async (pools, interval) => {
+    const out = await base(pools, interval) as Record<string, { data: { metrics: Record<string, unknown> } }>;
+    if (interval !== "15m") return out;
+    return Object.fromEntries(Object.entries(out).map(([pool, entry]) => {
+      const values = byPool[pool.toLowerCase()];
+      return [pool, values === undefined ? entry : { ...entry, data: { ...entry.data, parameters: { indicatorRevision: 2 },
+        metrics: { ...entry.data.metrics, stochRsi14: metric(values.stochRsi14, 42), bbPosition20: metric(values.bbPosition20, 20) } } }];
+    }));
+  };
+}
+
+async function timingEvents(h: { readonly positions: MemoryTradePositionStore; readonly agent: { readonly id: string } }) {
+  const runs = await h.positions.listRuns(OWNER, h.agent.id, 1);
+  return (runs[0]?.events ?? []).filter((event) => event.code.startsWith("timing:"));
+}
+
+test("entry timing log: a gated candidate is recorded once and still reaches the LLM and is bought", async (context) => {
+  context.mock.method(Date, "now", () => RTH_MS);
+  const llmCounter = { calls: 0 };
+  const h = await harness({ now: () => RTH_MS, llmCounter });
+  Object.assign(h.deps, { entryTimingMode: "log" });
+  timingFeatures(h, { [POOL.toLowerCase()]: IMPULSE });
+  const result = await runTradeWorkerOnce(h.deps);
+  assert.equal(result.outcomes[0]?.reason, "entered", JSON.stringify(result.outcomes));
+  assert.equal(llmCounter.calls, 1);
+  assert.equal(h.submitted.filter((request) => request.side === "buy").length, 1);
+  const events = await timingEvents(h);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.stage, "score");
+  assert.equal(events[0]?.code, "timing:would-defer:impulse");
+  assert.equal(events[0]?.token?.toLowerCase(), TOKEN.toLowerCase());
+  assert.equal(events[0]?.reason, "stochRsi=0.97 bb=0.50");
+});
+
+test("entry timing log: one event per gated candidate, none for an ungated one", async (context) => {
+  context.mock.method(Date, "now", () => RTH_MS);
+  const h = await harness({ now: () => RTH_MS, secondCandidate: true });
+  Object.assign(h.deps, { entryTimingMode: "log" });
+  timingFeatures(h, { [POOL.toLowerCase()]: IMPULSE, [POOL2.toLowerCase()]: CALM });
+  await runTradeWorkerOnce(h.deps);
+  const events = await timingEvents(h);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.token?.toLowerCase(), TOKEN.toLowerCase());
+});
+
+test("entry timing log: the opening range gates at 09:45 ET and the candidate is still bought", async (context) => {
+  context.mock.method(Date, "now", () => OPENING_RANGE_MS);
+  const h = await harness({ now: () => OPENING_RANGE_MS });
+  Object.assign(h.deps, { entryTimingMode: "log" });
+  const result = await runTradeWorkerOnce(h.deps);
+  assert.equal(result.outcomes[0]?.reason, "entered", JSON.stringify(result.outcomes));
+  const events = await timingEvents(h);
+  assert.deepEqual(events.map((event) => [event.code, event.reason]), [["timing:would-defer:opening-range", "et=09:45"]]);
+});
+
+test("entry timing enforce: the gated candidate is not offered to the LLM nor bought; the ungated one is", async (context) => {
+  context.mock.method(Date, "now", () => RTH_MS);
+  const capturedMessages: { readonly role: string; readonly content: string }[][] = [];
+  const h = await harness({ now: () => RTH_MS, secondCandidate: true, capturedMessages });
+  Object.assign(h.deps, { entryTimingMode: "enforce" });
+  timingFeatures(h, { [POOL.toLowerCase()]: IMPULSE, [POOL2.toLowerCase()]: CALM });
+  const result = await runTradeWorkerOnce(h.deps);
+  assert.equal(result.outcomes[0]?.reason, "entered", JSON.stringify(result.outcomes));
+  const prompt = capturedMessages.flat().map((message) => message.content).join("\n").toLowerCase();
+  assert.equal(prompt.includes(TOKEN.toLowerCase()), false, "the gated candidate must not be in the entry prompt");
+  assert.equal(prompt.includes(TOKEN2.toLowerCase()), true);
+  const buys = h.submitted.filter((request) => request.side === "buy");
+  assert.equal(buys.length, 1);
+  assert.equal(buys[0]?.token.toLowerCase(), TOKEN2.toLowerCase());
+  const events = await timingEvents(h);
+  assert.deepEqual(events.map((event) => [event.code, event.token?.toLowerCase()]), [["timing:deferred:impulse", TOKEN.toLowerCase()]]);
+});
+
+test("entry timing enforce: every candidate gated ends the cycle as timing-defer with no LLM call and no buy", async (context) => {
+  context.mock.method(Date, "now", () => RTH_MS);
+  const llmCounter = { calls: 0 };
+  const h = await harness({ now: () => RTH_MS, llmCounter });
+  Object.assign(h.deps, { entryTimingMode: "enforce" });
+  timingFeatures(h, { [POOL.toLowerCase()]: IMPULSE });
+  const result = await runTradeWorkerOnce(h.deps);
+  assert.equal(result.outcomes[0]?.reason, "timing-defer", JSON.stringify(result.outcomes));
+  assert.equal(llmCounter.calls, 0);
+  assert.equal(h.submitted.filter((request) => request.side === "buy").length, 0);
+  assert.equal((await timingEvents(h))[0]?.code, "timing:deferred:impulse");
+});
+
+test("entry timing enforce: the opening range defers at 09:45 ET", async (context) => {
+  context.mock.method(Date, "now", () => OPENING_RANGE_MS);
+  const h = await harness({ now: () => OPENING_RANGE_MS });
+  Object.assign(h.deps, { entryTimingMode: "enforce" });
+  const result = await runTradeWorkerOnce(h.deps);
+  assert.equal(result.outcomes[0]?.reason, "timing-defer", JSON.stringify(result.outcomes));
+  assert.equal((await timingEvents(h))[0]?.code, "timing:deferred:opening-range");
+});
+
+test("entry timing off or unset: no event and the gated candidate is bought exactly as before", async (context) => {
+  context.mock.method(Date, "now", () => OPENING_RANGE_MS);
+  for (const mode of ["off", undefined] as const) {
+    const h = await harness({ now: () => OPENING_RANGE_MS });
+    if (mode !== undefined) Object.assign(h.deps, { entryTimingMode: mode });
+    timingFeatures(h, { [POOL.toLowerCase()]: IMPULSE });
+    const result = await runTradeWorkerOnce(h.deps);
+    assert.equal(result.outcomes[0]?.reason, "entered", JSON.stringify(result.outcomes));
+    assert.equal((await timingEvents(h)).length, 0);
+  }
+});
+
+test("entry timing log or enforce: an ungated candidate (calm bar, after 10:00 ET) emits nothing and is bought", async (context) => {
+  context.mock.method(Date, "now", () => RTH_MS);
+  for (const mode of ["log", "enforce"] as const) {
+    const h = await harness({ now: () => RTH_MS });
+    Object.assign(h.deps, { entryTimingMode: mode });
+    timingFeatures(h, { [POOL.toLowerCase()]: CALM });
+    const result = await runTradeWorkerOnce(h.deps);
+    assert.equal(result.outcomes[0]?.reason, "entered", JSON.stringify(result.outcomes));
+    assert.equal((await timingEvents(h)).length, 0);
+  }
+});
+
+test("entry timing is wired into the tradfi v2 entry lane only", async () => {
+  const { readFileSync, readdirSync, statSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const worker = readFileSync("src/trade/worker.ts", "utf8");
+  assert.equal(worker.match(/entryTimingGate\(/gu)?.length, 1);
+  const lane = worker.slice(worker.indexOf("async function runTradfiV2Entry("), worker.indexOf("async function processAgent("));
+  assert.equal(lane.includes("entryTimingGate("), true);
+  const importers: string[] = [];
+  const walk = (dir: string): void => { for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) walk(path);
+    else if (path.endsWith(".ts") && /entryTiming\.js/u.test(readFileSync(path, "utf8"))) importers.push(path.replace(/\\/gu, "/"));
+  } };
+  walk("src");
+  assert.deepEqual(importers, ["src/trade/worker.ts"]);
+});
+
+// ---------------------------------------------------------------------------
+// TRADFI-EXIT-RULES §3/§7: the trailing stop and the stale exit in the AI-trade exit lane.
+// The harness quote is 5E for a 5E balance, so an entry of 4.7E reads +638 bps and an entry of 5E reads 0.
+// ---------------------------------------------------------------------------
+
+type RobotHarness = Awaited<ReturnType<typeof harness>>;
+const HOUR_MS = 3_600_000;
+
+async function openRobotPosition(h: RobotHarness, now: number, input: { readonly entryWei: bigint; readonly ageMs: number; readonly peakBps?: bigint }): Promise<void> {
+  await h.positions.open({ positionId: "position", agentId: h.agent.id, ownerAddress: OWNER, token: TOKEN,
+    route: { hops: [], fees: [100] }, venue: "pancake_v3", entryWei: input.entryWei, tokenAmount: 5n * E,
+    fillStatus: "verified", openedAt: now - input.ageMs, settlementAsset: "USDT", requestedEntryAtomic: input.entryWei,
+    verifiedEntryAtomic: input.entryWei, receiptOwnershipKey: `56|${H}|${WALLET.toLowerCase()}|0|${H}` });
+  if (input.peakBps !== undefined) {
+    await h.positions.recordQuote({ ownerAddress: OWNER, agentId: h.agent.id, positionId: "position", quoteOutWei: 5n * E,
+      pnlBps: input.peakBps, atMs: now - 120_000 });
+  }
+}
+
+async function runEvents(h: RobotHarness) {
+  return (await h.positions.listRuns(OWNER, h.agent.id, 1))[0]?.events ?? [];
+}
+
+const HOLD = { decisions: [{ index: 0, exit: false, reason: "hold" }] };
+const ruleEvents = (events: Awaited<ReturnType<typeof runEvents>>) => events.filter(event => event.code.startsWith("rule:"));
+const sells = (h: RobotHarness) => h.submitted.filter(request => request.side === "sell").length;
+
+test("EXIT-RULES log: a trailing stop emits one would-exit event, the position still reaches the exit LLM and nothing is sold", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const llmCounter = { calls: 0 };
+  const h = await harness({ now: () => now, stockBalance: 5n * E, llmCounter, exitDecision: HOLD, exitRulesMode: "log" });
+  await openRobotPosition(h, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 900n });
+  await runTradeWorkerOnce(h.deps);
+  const events = await runEvents(h);
+  assert.deepEqual(ruleEvents(events).map(event => [event.stage, event.code, event.token, event.reason]),
+    [["exit-llm", "rule:would-exit:trailing-stop", TOKEN, "peak=+900 now=+638"]]);
+  assert.equal(llmCounter.calls, 1, "log mode leaves the position with the exit LLM as today");
+  assert.ok(events.some(event => event.code === "trigger:cost-band-breach"));
+  assert.equal(sells(h), 0);
+  assert.equal((await h.positions.listOpen(OWNER, h.agent.id)).length, 1);
+});
+
+test("EXIT-RULES log: a stale exit is logged and the position still goes through the LLM candidate path (no trigger here)", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const h = await harness({ now: () => now, stockBalance: 5n * E, exitRulesMode: "log" });
+  await openRobotPosition(h, now, { entryWei: 5n * E, ageMs: 49 * HOUR_MS });
+  await runTradeWorkerOnce(h.deps);
+  const events = await runEvents(h);
+  assert.deepEqual(ruleEvents(events).map(event => [event.code, event.token, event.reason]),
+    [["rule:would-exit:stale-exit", TOKEN, "held=49.0h pnl=+0"]]);
+  assert.ok(events.some(event => event.stage === "exit-llm" && event.code === "no-trigger" && event.token === TOKEN),
+    "the position was handed to the exit LLM lane, which found no trigger");
+  assert.equal(sells(h), 0);
+});
+
+test("EXIT-RULES off (explicit or the dep left undefined): no rule event and the same LLM behaviour as before", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  for (const mode of [undefined, "off"] as const) {
+    const llmCounter = { calls: 0 };
+    const h = await harness({ now: () => now, stockBalance: 5n * E, llmCounter, exitDecision: HOLD, ...(mode === undefined ? {} : { exitRulesMode: mode }) });
+    await openRobotPosition(h, now, { entryWei: 47n * E / 10n, ageMs: 49 * HOUR_MS, peakBps: 900n });
+    await runTradeWorkerOnce(h.deps);
+    assert.deepEqual(ruleEvents(await runEvents(h)), []);
+    assert.equal(llmCounter.calls, 1);
+    assert.equal(sells(h), 0);
+  }
+});
+
+test("EXIT-RULES enforce: a trailing stop sells through sellPosition with close reason trailing-stop and never asks the LLM", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const llmCounter = { calls: 0 };
+  const h = await harness({ now: () => now, stockBalance: 5n * E, llmCounter, exitRulesMode: "enforce" });
+  await openRobotPosition(h, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 900n });
+  await runTradeWorkerOnce(h.deps);
+  const events = await runEvents(h);
+  assert.deepEqual(ruleEvents(events).map(event => [event.code, event.token, event.reason]),
+    [["rule:exit:trailing-stop", TOKEN, "peak=+900 now=+638"]]);
+  assert.equal(llmCounter.calls, 0, "an enforced rule exit is not sent to the exit LLM");
+  assert.equal(sells(h), 1);
+  assert.ok(events.some(event => event.stage === "sell" && event.reason === "trailing-stop"));
+  const closed = await h.positions.get(OWNER, h.agent.id, "position");
+  assert.equal(closed?.closeReason, "trailing-stop");
+  assert.equal(closed?.closeNote, "peak=+900 now=+638");
+});
+
+test("EXIT-RULES enforce: a stale exit sells with close reason stale-exit and never asks the LLM", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const llmCounter = { calls: 0 };
+  const h = await harness({ now: () => now, stockBalance: 5n * E, llmCounter, exitRulesMode: "enforce" });
+  await openRobotPosition(h, now, { entryWei: 5n * E, ageMs: 49 * HOUR_MS });
+  await runTradeWorkerOnce(h.deps);
+  assert.equal(llmCounter.calls, 0);
+  assert.equal(sells(h), 1);
+  const closed = await h.positions.get(OWNER, h.agent.id, "position");
+  assert.equal(closed?.closeReason, "stale-exit");
+  assert.equal(closed?.closeNote, "held=49.0h pnl=+0");
+});
+
+test("EXIT-RULES enforce: a position the rules do not fire on is untouched (no rule event, the LLM path as today)", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const llmCounter = { calls: 0 };
+  const h = await harness({ now: () => now, stockBalance: 5n * E, llmCounter, exitDecision: HOLD, exitRulesMode: "enforce" });
+  await openRobotPosition(h, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 700n });
+  await runTradeWorkerOnce(h.deps);
+  assert.deepEqual(ruleEvents(await runEvents(h)), [], "638 against a 700 peak is inside the 150 giveback");
+  assert.equal(llmCounter.calls, 1);
+  assert.equal(sells(h), 0);
+});
+
+test("EXIT-RULES enforce: the owner's take profit and max hold win when they fire first", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const tp = await harness({ now: () => now, stockBalance: 5n * E, exitRulesMode: "enforce", ownerSettings: { takeProfitBps: 500 } });
+  await openRobotPosition(tp, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 900n });
+  await runTradeWorkerOnce(tp.deps);
+  assert.equal((await tp.positions.get(OWNER, tp.agent.id, "position"))?.closeReason, "take-profit");
+  assert.deepEqual(ruleEvents(await runEvents(tp)), []);
+  const hold = await harness({ now: () => now, stockBalance: 5n * E, exitRulesMode: "enforce", ownerSettings: { maxHoldSec: 24 * 3_600 } });
+  await openRobotPosition(hold, now, { entryWei: 5n * E, ageMs: 49 * HOUR_MS });
+  await runTradeWorkerOnce(hold.deps);
+  assert.equal((await hold.positions.get(OWNER, hold.agent.id, "position"))?.closeReason, "max-hold");
+  assert.deepEqual(ruleEvents(await runEvents(hold)), []);
+});
+
+test("EXIT-RULES enforce: an owner take profit disables the trailing stop and an owner max hold disables the stale exit", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const tp = await harness({ now: () => now, stockBalance: 5n * E, exitDecision: HOLD, exitRulesMode: "enforce", ownerSettings: { takeProfitBps: 5_000 } });
+  await openRobotPosition(tp, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 900n });
+  await runTradeWorkerOnce(tp.deps);
+  const tpEvents = await runEvents(tp);
+  assert.deepEqual(ruleEvents(tpEvents), []);
+  assert.ok(tpEvents.some(event => event.code === "trigger:cost-band-breach"), "the exit lane ran for this position (not an invalid-settings cycle)");
+  assert.equal(sells(tp), 0);
+  // maxHoldSec is capped at 7 days by the settings parser; a larger value would fail the whole cycle and make this test vacuous.
+  const hold = await harness({ now: () => now, stockBalance: 5n * E, exitDecision: HOLD, exitRulesMode: "enforce", ownerSettings: { maxHoldSec: 6 * 24 * 3_600 } });
+  await openRobotPosition(hold, now, { entryWei: 5n * E, ageMs: 49 * HOUR_MS });
+  await runTradeWorkerOnce(hold.deps);
+  const holdEvents = await runEvents(hold);
+  assert.deepEqual(ruleEvents(holdEvents), []);
+  assert.ok(holdEvents.some(event => event.stage === "exit-llm" && event.code === "no-trigger"), "the exit lane ran for this position");
+  assert.equal(sells(hold), 0);
+});
+
+test("EXIT-RULES review M1: an implausible stored peak (2500) never arms the trailing stop, logs one peak-implausible event and leaves the LLM path alone", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const llmCounter = { calls: 0 };
+  const h = await harness({ now: () => now, stockBalance: 5n * E, llmCounter, exitDecision: HOLD, exitRulesMode: "enforce" });
+  await openRobotPosition(h, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 2_500n });
+  await runTradeWorkerOnce(h.deps);
+  assert.deepEqual(ruleEvents(await runEvents(h)).map(event => [event.stage, event.code, event.token, event.reason]),
+    [["exit-llm", "rule:peak-implausible", TOKEN, "peak=+2500"]]);
+  assert.equal(sells(h), 0, "enforce must not sell on a corrupted peak");
+  assert.equal(llmCounter.calls, 1);
+});
+
+test("EXIT-RULES review M1: a peak of exactly 2000 still arms the trailing stop and logs no implausible event; the stale exit still sells under an implausible peak", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const edge = await harness({ now: () => now, stockBalance: 5n * E, exitRulesMode: "enforce" });
+  await openRobotPosition(edge, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 2_000n });
+  await runTradeWorkerOnce(edge.deps);
+  assert.deepEqual(ruleEvents(await runEvents(edge)).map(event => [event.code, event.reason]), [["rule:exit:trailing-stop", "peak=+2000 now=+638"]]);
+  assert.equal((await edge.positions.get(OWNER, edge.agent.id, "position"))?.closeReason, "trailing-stop");
+  const stale = await harness({ now: () => now, stockBalance: 5n * E, exitRulesMode: "enforce" });
+  await openRobotPosition(stale, now, { entryWei: 5n * E, ageMs: 49 * HOUR_MS, peakBps: 2_500n });
+  await runTradeWorkerOnce(stale.deps);
+  assert.deepEqual(ruleEvents(await runEvents(stale)).map(event => event.code), ["rule:peak-implausible", "rule:exit:stale-exit"]);
+  assert.equal((await stale.positions.get(OWNER, stale.agent.id, "position"))?.closeReason, "stale-exit");
+});
+
+test("EXIT-RULES review L3: a position with no stored peak is evaluated without a peak (no trailing event, no peak-implausible event)", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const h = await harness({ now: () => now, stockBalance: 5n * E, exitDecision: HOLD, exitRulesMode: "enforce" });
+  await openRobotPosition(h, now, { entryWei: 47n * E / 10n, ageMs: 60_000 });
+  await runTradeWorkerOnce(h.deps);
+  assert.deepEqual(ruleEvents(await runEvents(h)), []);
+  assert.equal(sells(h), 0);
+});
+
+test("EXIT-RULES off: an implausible peak logs nothing", async (context) => {
+  const now = RTH_MS;
+  context.mock.method(Date, "now", () => now);
+  const h = await harness({ now: () => now, stockBalance: 5n * E, exitDecision: HOLD });
+  await openRobotPosition(h, now, { entryWei: 47n * E / 10n, ageMs: 60_000, peakBps: 2_500n });
+  await runTradeWorkerOnce(h.deps);
+  assert.deepEqual(ruleEvents(await runEvents(h)), []);
 });

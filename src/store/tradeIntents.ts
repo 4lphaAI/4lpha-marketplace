@@ -528,7 +528,7 @@ function rowToIntent(row: IntentRow): TradeIntentRecord {
   if (row.side !== "buy" && row.side !== "sell") throw new Error("Stored trade intent side is invalid.");
   if (row.state !== "pending" && row.state !== "projected" && row.state !== "rolled-back") throw new Error("Stored trade intent state is invalid.");
   const closeReason = row.close_reason;
-  if (closeReason !== null && !["owner-request", "stop-loss", "take-profit", "max-hold", "llm", "crash-stop", "session-expiring"].includes(closeReason)) {
+  if (closeReason !== null && !["owner-request", "stop-loss", "take-profit", "max-hold", "llm", "crash-stop", "session-expiring", "trailing-stop", "stale-exit"].includes(closeReason)) {
     throw new Error("Stored trade intent close reason is invalid.");
   }
   const venue = intentVenue(row.venue);

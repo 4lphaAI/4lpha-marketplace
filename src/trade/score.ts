@@ -235,6 +235,8 @@ export type ExitTriggerContext = {
 const COST_BAND_BREACH_BPS = TRADFI_COST_BAND_BPS + 150;
 const PEAK_GIVEBACK_FLOOR_BPS = 300;
 const PEAK_GIVEBACK_DROP_BPS = 200;
+/** A slow bleed re-asked on every new low (one position, 38 asks); after a giveback ask, re-ask only on a further drop this large. */
+export const PEAK_GIVEBACK_REASK_BPS = 150;
 
 function sign(value: number): -1 | 0 | 1 { return value > 0 ? 1 : value < 0 ? -1 : 0; }
 
@@ -260,7 +262,7 @@ function costBandBreach(prior: ExitTriggerContext | null, current: ExitTriggerCo
 function peakGiveback(prior: ExitTriggerContext | null, current: ExitTriggerContext): boolean {
   if (current.peakPnlBps === null || current.peakPnlBps < PEAK_GIVEBACK_FLOOR_BPS) return false;
   if (current.pnlBps > current.peakPnlBps - PEAK_GIVEBACK_DROP_BPS) return false;
-  if (prior !== null && prior.trigger === "peak-giveback" && prior.pnlBps <= current.pnlBps) return false;
+  if (prior !== null && prior.trigger === "peak-giveback" && current.pnlBps > prior.pnlBps - PEAK_GIVEBACK_REASK_BPS) return false;
   return true;
 }
 

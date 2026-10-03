@@ -4,7 +4,7 @@ import type { TradeExecutionModel } from "./settings.js";
 import { TRADE_MODEL_PRESETS } from "./sizing.js";
 import { TRADE_DOCTRINE, TRADFI_DOCTRINE } from "./doctrine.js";
 import { FEATURE_PROMPT_GUIDANCE } from "./features.js";
-import { TRADFI_COST_BAND_BPS, TRADFI_LOSS_REVIEW_BPS } from "./score.js";
+import { TRADFI_LOSS_REVIEW_BPS } from "./score.js";
 import { CMC_EVENT_CALENDAR_ENABLED } from "./cmc.js";
 
 // The LLM layer is 0G Compute. The default is Alibaba's qwen3.7-flash on the 0G
@@ -277,7 +277,7 @@ export function buildExitPrompt(input: {
       role: "system",
       content: [
         tradfi
-          ? `You decide only whether each indexed tokenized-stock position with a blank take profit, stop loss or time limit should exit now. Doctrine: ${TRADFI_DOCTRINE}. A round trip costs about ${TRADFI_COST_BAND_BPS} bps, so a PnL inside +/-${TRADFI_COST_BAND_BPS} bps is spread, not a signal. The owner left the exit to you because stocks can need days or weeks; hold is the default answer unless the named trigger, the indicators or the regime give a reason to leave. A single stock moving ${TRADFI_LOSS_REVIEW_BPS / 100}% against the entry is ordinary volatility: a loss smaller than ${TRADFI_LOSS_REVIEW_BPS} bps is never by itself a reason to exit; exit a loss that size only when the 1h trend has broken (EMA12 below EMA26 and a negative MACD histogram) or the regime is risk_off. Protect gains when peakPnlBps is well above pnlBps. pnlBps and peakPnlBps are signed and labelled: "+335 (gain)" is a profit, "-335 (loss)" is a loss; never call a gain a loss.`
+          ? `You decide only whether each indexed tokenized-stock position with a blank take profit, stop loss or time limit should exit now. Doctrine: ${TRADFI_DOCTRINE}. pnlBps is already net of the purchase cost and of the current sell quote, so a positive pnlBps is real profit after costs. The owner left the exit to you because stocks can need days or weeks; hold is the default answer unless the named trigger, the indicators or the regime give a reason to leave. A single stock moving ${TRADFI_LOSS_REVIEW_BPS / 100}% against the entry is ordinary volatility: a loss smaller than ${TRADFI_LOSS_REVIEW_BPS} bps is never by itself a reason to exit; exit a loss that size only when the 1h trend has broken (EMA12 below EMA26 and a negative MACD histogram) or the regime is risk_off. Protect gains when peakPnlBps is well above pnlBps. pnlBps and peakPnlBps are signed and labelled: "+335 (gain)" is a profit, "-335 (loss)" is a loss; never call a gain a loss.`
           : timeLimitAuthority
             ? "Decide only whether each indexed position with a blank take profit, stop loss or time limit should exit now. A blank time limit means the owner gave you the clock: with both price thresholds set, exiting inside them is your call, not a violation."
             : "Decide only whether each indexed position with a blank TP or SL should exit now.",

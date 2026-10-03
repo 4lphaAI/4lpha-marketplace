@@ -108,12 +108,33 @@ test("trade exit doctrine migration, CAS and fence round-trips use disposable lo
   assert.equal((await intents.listUnsettled(OWNER, "trade-agent"))[0]?.closeReason, "crash-stop");
   assert.equal(intent.note, "marker");
 
+  // TRADFI-EXIT-RULES: both rule close reasons pass the CHECK and the read-back on positions and intents.
+  for (const [index, reason] of (["trailing-stop", "stale-exit"] as const).entries()) {
+    await positions.open({ positionId: reason, agentId: "trade-agent", ownerAddress: OWNER, token: TOKEN,
+      route: { hops: [], fees: [] }, entryWei: 100n, tokenAmount: 100n, fillStatus: "verified", openedAt: NOW });
+    assert.equal((await positions.closePosition({ ownerAddress: OWNER, agentId: "trade-agent", positionId: reason,
+      exitWei: 90n, reason, note: "rule detail" }))?.closeReason, reason);
+    assert.equal((await positions.get(OWNER, "trade-agent", reason))?.closeReason, reason);
+    await intents.create({ decisionId: `rule-${reason}`, idempotencyKey: `0x${String(index + 2).repeat(64)}` as Hex, agentId: "trade-agent",
+      ownerAddress: OWNER, side: "sell", token: TOKEN, route: { hops: [], fees: [] }, amountWei: 100n, entryWei: 100n,
+      positionId: reason, closeReason: reason, note: "rule detail" });
+  }
+  assert.deepEqual((await intents.listUnsettled(OWNER, "trade-agent")).map((row) => row.closeReason).sort(),
+    ["crash-stop", "stale-exit", "trailing-stop"]);
+
   const concurrent = await Promise.all([
     PostgresTradePositionStore.create(await createPgSqlClient(cluster.url), () => NOW),
     PostgresTradePositionStore.create(await createPgSqlClient(cluster.url), () => NOW),
   ]);
   const constraint = await sql.query<{ readonly count: string }>(`select count(*)::text as count from pg_constraint c
-    where c.conname = 'trade_positions_close_reason_v3_check' and c.conrelid = 'trade_positions'::regclass`);
+    where c.conname = 'trade_positions_close_reason_v4_check' and c.conrelid = 'trade_positions'::regclass`);
   assert.equal(constraint.rows[0]?.count, "1");
+  // TRADFI-EXIT-RULES: v4 replaces the narrower v3 and admits the two rule close reasons.
+  const retired = await sql.query<{ readonly count: string }>(`select count(*)::text as count from pg_constraint c
+    where c.conname = 'trade_positions_close_reason_v3_check' and c.conrelid = 'trade_positions'::regclass`);
+  assert.equal(retired.rows[0]?.count, "0");
+  const definition = await sql.query<{ readonly def: string }>(`select pg_get_constraintdef(c.oid) as def from pg_constraint c
+    where c.conname = 'trade_positions_close_reason_v4_check' and c.conrelid = 'trade_positions'::regclass`);
+  assert.ok(definition.rows[0]?.def.includes("'trailing-stop'") && definition.rows[0]?.def.includes("'stale-exit'"));
   for (const store of concurrent) await store.close();
 });

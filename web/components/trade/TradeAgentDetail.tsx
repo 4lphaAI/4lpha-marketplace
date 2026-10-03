@@ -243,6 +243,8 @@ export function noLimitNote(draft: Pick<TradeSettings, "takeProfitBps" | "stopLo
 
 /** The wire code as words: "crash-stop" → "crash stop", as the open-position plan already renders reasons (AUDIT A1). */
 export function closeReasonLabel(reason: TradePositionView["closeReason"]): string {
+  if (reason === "trailing-stop") return "Trailing stop";
+  if (reason === "stale-exit") return "Stale position exit";
   return reason === null ? "—" : reason.replace(/-/gu, " ");
 }
 

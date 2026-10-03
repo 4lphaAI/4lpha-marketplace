@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { TradeDcaActionView, TradeDcaView, TradeView } from "@/lib/trade";
-import { DCA_REMOVE_PATIENCE_MS, TradeRunLog, dcaRemoveProgress, tradeCards, dcaRunFailed, dcaRunSucceeded, hasExecutedTrade, hasLlmDecision, routeLine, runFailed, runLabel, runSucceeded, runSummary } from "./TradeRunLog";
+import { DCA_REMOVE_PATIENCE_MS, TradeRunLog, eventLabel, dcaRemoveProgress, tradeCards, dcaRunFailed, dcaRunSucceeded, hasExecutedTrade, hasLlmDecision, routeLine, runFailed, runLabel, runSucceeded, runSummary } from "./TradeRunLog";
 
 // The exact §2.2 reason set (worker.ts's `runTradfiScheduleEntry`), literal
 // here as spec §10 allows, and also asserted against in
@@ -267,6 +267,17 @@ it("labels the session backstop rows", () => {
   ]} />)).toContain("No new entries — session ends soon");
 });
 
+it("labels the entry timing deferral and renders its run-log events", () => {
+  expect(runLabel("timing-defer;candidates=3")).toBe("Entry deferred: waiting for a better entry");
+  const html = renderToStaticMarkup(<TradeRunLog symbols={{ "0x1": "NVDAB" }} runs={[
+    { id: "t", dryRun: false, reason: "timing-defer;candidates=3", candidates: 3, entries: 0, exits: 0, refusals: 0, createdAt: 1,
+      events: [{ stage: "score", code: "timing:deferred:impulse", elapsedMs: 1, token: "0x1", reason: "stochRsi=0.97 bb=1.04" }] },
+  ]} />);
+  expect(html).toContain("Entry deferred: waiting for a better entry");
+  expect(html).toContain("timing:deferred:impulse");
+  expect(html).toContain("stochRsi=0.97 bb=1.04");
+});
+
 describe("run log hotfix (2026-09-24): V3 cycles are readable", () => {
   const quiet = { id: "q", dryRun: false, reason: "score-hold;candidates=12", candidates: 12, entries: 0, exits: 0, refusals: 0, createdAt: 1000,
     events: [
@@ -282,6 +293,30 @@ describe("run log hotfix (2026-09-24): V3 cycles are readable", () => {
     expect(hasLlmDecision({ ...quiet, events: [{ stage: "exit-llm", code: "hold", elapsedMs: 1, reason: "within spread" }] })).toBe(true);
     expect(hasLlmDecision({ ...quiet, events: [{ stage: "entry-llm", code: "enter", elapsedMs: 1, confidence: 78 }] })).toBe(true);
     expect(hasLlmDecision({ ...quiet, events: [{ stage: "exit-llm", code: "hold-guard", elapsedMs: 1 }] })).toBe(true);
+  });
+  it("TRADFI-EXIT-RULES: rule events read as sentences in the run log, other codes keep the generic words", () => {
+    expect(eventLabel("rule:would-exit:trailing-stop")).toBe("Robot exit rule would sell: trailing stop");
+    expect(eventLabel("rule:exit:stale-exit")).toBe("Robot exit rule sells: stale position");
+    expect(eventLabel("rule:peak-implausible")).toBe("Robot exit rule skipped: the recorded peak is implausible");
+    expect(eventLabel("no-trigger")).toBe("no trigger");
+    const html = renderToStaticMarkup(<TradeRunLog symbols={{}} runs={[{ ...quiet, events: [{ stage: "exit-llm", code: "rule:would-exit:trailing-stop", elapsedMs: 1, token: "0x3333333333333333333333333333333333333333", reason: "peak=+312 now=+150" }] }]} />);
+    expect(html).toContain("Robot exit rule would sell: trailing stop");
+    expect(html).toContain("peak=+312 now=+150");
+  });
+  it("TRADFI-EXIT-RULES: a rule event is neither an LLM decision nor a failed sell, and an enforced rule sell has no model reason", () => {
+    const token = "0x3333333333333333333333333333333333333333";
+    const would = { stage: "exit-llm", code: "rule:would-exit:trailing-stop", elapsedMs: 1, token, reason: "peak=+312 now=+150" };
+    const enforced = { stage: "exit-llm", code: "rule:exit:stale-exit", elapsedMs: 1, token, reason: "held=49.2h pnl=+40" };
+    const logged = { ...quiet, events: [would] };
+    expect(hasLlmDecision(logged)).toBe(false);
+    expect(hasLlmDecision({ ...quiet, events: [enforced] })).toBe(false);
+    expect(runFailed(logged)).toBe(false);
+    expect(runFailed({ ...quiet, events: [enforced, { stage: "sell", code: "committed", elapsedMs: 2, token, reason: "stale-exit" }] })).toBe(false);
+    const sold = { ...quiet, exits: 1, events: [enforced, { stage: "sell", code: "committed", elapsedMs: 2, token, reason: "stale-exit" }] };
+    const cards = tradeCards([sold]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.llm).toBeNull();
+    expect(cards[0]?.detail).toBe("stale-exit");
   });
   it("summarises the score instead of the routeable count, and names score-hold", () => {
     expect(runSummary(quiet)).toBe("3 scored · 0 passed · 1 vetoed · 1 no data · 0 bought · 0 closed");
@@ -445,5 +480,16 @@ describe("buy card route line: guard fill vs direct AMM (2026-09-24)", () => {
     const run = { id: "r", dryRun: false, reason: "entered", candidates: 1, entries: 1, exits: 0, refusals: 0, createdAt: 1,
       events: [{ stage: "route", code: "binance-guard", elapsedMs: 1, token: "0xAA" }, { stage: "buy", code: "committed", elapsedMs: 2, token: "0xAA", reason: "5.00 USDT via binance-aggregator" }] };
     expect(routeLine(tradeCards([run])[0]!.routes)).toBe("Route: Binance aggregator through the guard");
+  });
+});
+
+describe("entry timing events (2026-10-03)", () => {
+  it("are not counted as scored candidates in the run summary", () => {
+    const run = { id: "t", dryRun: false, reason: "score-hold", candidates: 1, entries: 0, exits: 0, refusals: 0, createdAt: 1,
+      events: [
+        { stage: "score", code: "shortlisted", elapsedMs: 1, token: "0xAA", reason: "score=15 active=1.00" },
+        { stage: "score", code: "timing:would-defer:impulse", elapsedMs: 2, token: "0xAA", reason: "stochRsi=0.97 bb=1.02" },
+      ] };
+    expect(runSummary(run)).toMatch(/^1 scored · 1 passed/u);
   });
 });
