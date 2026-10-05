@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sessionState, SESSION_PROFILES, SESSION_WEIGHTS } from "../src/trade/session.js";
+import { sessionState, SESSION_EVIDENCE_WEIGHTS, SESSION_PROFILES, SESSION_WEIGHTS } from "../src/trade/session.js";
 
 // America/New_York timestamps, computed relative to known UTC offsets (EDT = UTC-4, EST = UTC-5).
 
@@ -41,4 +41,15 @@ test("session profiles and weights are defined for all three sessions", () => {
   assert.equal(SESSION_PROFILES.close.sizeMult, 0.8);
   assert.equal(SESSION_PROFILES.overnight.sizeMult, 0.55);
   assert.equal(SESSION_PROFILES.overnight.maxOpen, 3);
+});
+
+test("volume score weight is cut to 6 / 4 / 3 and the evidence table keeps the pre-cut weights", () => {
+  assert.equal(SESSION_WEIGHTS.rth.volume, 6);
+  assert.equal(SESSION_WEIGHTS.close.volume, 4);
+  assert.equal(SESSION_WEIGHTS.overnight.volume, 3);
+  assert.deepEqual(SESSION_EVIDENCE_WEIGHTS, {
+    rth: { orb: 18, momentum: 16, volume: 16, ema: 14, macd: 12, regime: 12, vwap: 10, rsi: 8, gap: 6, roc1h: 6, bollinger: 4, stochRsi: 4, atrGuard: 10 },
+    close: { orb: 0, momentum: 14, volume: 12, ema: 16, macd: 14, regime: 12, vwap: 10, rsi: 10, gap: 12, roc1h: 8, bollinger: 6, stochRsi: 6, atrGuard: 10 },
+    overnight: { orb: 0, momentum: 14, volume: 8, ema: 18, macd: 16, regime: 14, vwap: 0, rsi: 10, gap: 14, roc1h: 10, bollinger: 8, stochRsi: 6, atrGuard: 10 },
+  });
 });

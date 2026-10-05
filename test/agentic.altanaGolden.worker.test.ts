@@ -229,6 +229,6 @@ test("Agentic golden Altana: TradFi AI buy and stop-loss sell", async context =>
     runs: await h.positions.listRuns(OWNER, h.agent.id, 50),
   }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
   const hash = crypto.createHash("sha256").update(transcript).digest("hex");
-  assert.equal(hash, "75c53bb886522b9c39e96a3d1799370848636c16316028e72d74f8a14db53c3b");
+  assert.equal(hash, "afb23f6b884c40c31e149ca08c4ab13633ca95e3972ad8b75ca9fdaa4ca197bb");
   }
 });

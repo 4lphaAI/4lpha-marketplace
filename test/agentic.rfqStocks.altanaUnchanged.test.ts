@@ -39,7 +39,7 @@ const RECORDED: Readonly<Record<string, string>> = {
   "sizing": "1cfee734c9adda02f205c7cfce65dc954f84a50c6990ebf20dccbdbc1245c454",
   "prompt": "a88d410f8aabe0359b727c0505080639678f279de04f133e58bbf6cc83ea2e17",
   "corrected-diff": "12144cc6de0580d32b6a0a28283ac438e1f2c5b12341d287219fac3f8359e107",
-  "altana-cycle": "cd3f061dd15f4177f92fa0b828e9b10f5babd86eb85591d06f1a0feecf26487c",
+  "altana-cycle": "6c8a2ef3891df0e4f8887201f9696e08b9f7cf975e79814d9dbc7c43c2cf15c5",
   "agentic-lanes": "30c9144a900fd89977e259ea882ccefc67d3dee5768288da39750a938ab20500",
   "altana-pooled-requote": "ffafd3f567848bc8fb5e99a56c4427df1227e2858721b53ffa058d88a1f58f0f",
 };

@@ -29,10 +29,25 @@ test("worked vector: mildly positive tape must not buy (rth)", () => {
   const f = evidence({ emaSpreadPct: 0.5, histogram: 0.5, macd: 5, signal9: 4, ema26: 1000, rsi14: 55, momentum10: 10, rvol20: 1.2, roc10Pct: 0.1, atrPct: 1 });
   const s = evidence({ emaSpreadPct: 0.3, roc10Pct: 0.4 });
   const result = scoreToken(f, s, "neutral", "rth");
-  assert.equal(result.score, 12.1);
+  assert.equal(result.score, 11.2);
   assert.ok(Math.abs(result.activeWeightShare - 94 / 136) < 1e-9);
   assert.equal(result.buy, false);
   assert.equal(result.veto, null);
+});
+
+test("volume moves the score by its cut weight only and never moves the evidence share (rth)", () => {
+  const score = (rvol20: number) => {
+    const f = evidence({ emaSpreadPct: 0.5, histogram: 0.5, macd: 5, signal9: 4, ema26: 1000, rsi14: 55, momentum10: 10, rvol20, roc10Pct: 0.1, atrPct: 1 });
+    const s = evidence({ emaSpreadPct: 0.3, roc10Pct: 0.4 });
+    return scoreToken(f, s, "neutral", "rth");
+  };
+  const low = score(0.5); // volume component -30
+  const high = score(2.0); // volume component +45
+  assert.equal(low.score, 7.6);
+  assert.equal(high.score, 13);
+  assert.ok(Math.abs(high.score - low.score) <= (6 * 75) / 84 + 0.1);
+  assert.equal(low.activeWeightShare, high.activeWeightShare);
+  assert.ok(Math.abs(low.activeWeightShare - 94 / 136) < 1e-9);
 });
 
 test("insufficient-evidence below 0.35 active weight share", () => {

@@ -1,7 +1,7 @@
 /** Deterministic entry score + veto for the tradfi v2 lane (TRADFI-AI-TRADE-V3 §2). Pure, no I/O. */
 import type { FeatureEvidence } from "./features.js";
 import type { ScoreComponentId, SessionState } from "./session.js";
-import { SESSION_PROFILES, SESSION_WEIGHTS } from "./session.js";
+import { SESSION_EVIDENCE_WEIGHTS, SESSION_PROFILES, SESSION_WEIGHTS } from "./session.js";
 
 /** Measured 100-145 bps round trip from FINDINGS (bp); not an env flag. */
 export const TRADFI_COST_BAND_BPS = 150;
@@ -195,23 +195,26 @@ function vetoFor(f: FeatureEvidence | undefined, regime: Regime, strong: boolean
 /** Score one candidate (§2.1-2.3). */
 export function scoreToken(f: FeatureEvidence | undefined, s: FeatureEvidence | undefined, regime: Regime, session: SessionState): ScoreResult {
   const weights = SESSION_WEIGHTS[session];
+  const evidenceWeights = SESSION_EVIDENCE_WEIGHTS[session];
   const profile = SESSION_PROFILES[session];
   const comps = components(f, s, regime, session);
   let weightedSum = 0;
   let activeWeight = 0;
-  let totalWeight = 0;
+  let evidenceActive = 0;
+  let evidenceTotal = 0;
   const contributions: { readonly id: ScoreComponentId; readonly weighted: number; readonly reason: string }[] = [];
   for (const id of Object.keys(weights) as ScoreComponentId[]) {
     const w = weights[id];
-    totalWeight += w;
+    evidenceTotal += evidenceWeights[id];
     const result = comps[id];
     if (result.score !== null) {
       weightedSum += w * result.score;
       activeWeight += w;
+      evidenceActive += evidenceWeights[id];
       contributions.push({ id, weighted: Math.abs(w * result.score), reason: result.reason });
     }
   }
-  const activeWeightShare = totalWeight > 0 ? activeWeight / totalWeight : 0;
+  const activeWeightShare = evidenceTotal > 0 ? evidenceActive / evidenceTotal : 0;
   const insufficientEvidence = activeWeightShare < 0.35;
   const score = activeWeight > 0 ? Math.round((weightedSum / activeWeight) * 10) / 10 : 0;
   const strong = !insufficientEvidence && score >= profile.strong;
