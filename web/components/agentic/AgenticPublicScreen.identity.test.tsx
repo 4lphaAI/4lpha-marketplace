@@ -34,10 +34,11 @@ async function render(identity: unknown) {
   return result;
 }
 
-it("a registered Agentic identity links its full id to the fixed 8004scan page under the wallet line", async () => {
+it("a registered Agentic identity links its full id to the fixed 8004scan page on the wallet line", async () => {
   const r = await render(registered);
   expect(r.links).toContainEqual(["https://8004scan.io/agents/bsc/364199", "noopener noreferrer", "ERC-8004 #364199"]);
-  expect(r.kicker).toBe(W);
+  // Same line as the wallet address (inside the kicker), after it.
+  expect(r.kicker).toBe(W + "ERC-8004 #364199");
 });
 
 it("a pending mark shows the pending line with no link; no identity shows nothing", async () => {
