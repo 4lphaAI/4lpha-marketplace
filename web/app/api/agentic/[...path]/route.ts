@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { publicOrigin } from "@/lib/exec/public-origin";
 
 const COOKIE = "4lpha_agentic_pairing";
 const requests = new Map<string, { start: number; count: number }>();
@@ -17,7 +18,7 @@ async function proxy(request: NextRequest, segments: readonly string[], method: 
   if (!publicRead && !(method === "POST" && (path === "pairings" || path === "hire" || pairing && /\/(code|finalize)$/.test(path))) && !(method === "GET" && pairing && !/\/(code|finalize)$/.test(path))) return NextResponse.json({ data: null, error: { code: "not_found" } }, { status: 404 });
   const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
   if (publicRead && limited("read:" + ip, 60, 60_000) || method === "POST" && path === "pairings" && limited("start:" + ip, 5, 600_000)) return NextResponse.json({ data: null, error: { code: "rate_limited" } }, { status: 429 });
-  if (method === "POST" && (request.headers.get("content-type")?.split(";")[0]?.trim() !== "application/json" || request.headers.get("origin") !== request.nextUrl.origin)) return NextResponse.json({ data: null, error: { code: "forbidden" } }, { status: 403 });
+  if (method === "POST" && (request.headers.get("content-type")?.split(";")[0]?.trim() !== "application/json" || request.headers.get("origin") !== publicOrigin(request))) return NextResponse.json({ data: null, error: { code: "forbidden" } }, { status: 403 });
   const cookie = request.cookies.get(COOKIE)?.value;
   if (!publicRead && path !== "pairings" && (cookie === undefined || !/^[0-9a-f-]{36}\.[0-9a-f]{64}$/.test(cookie))) return NextResponse.json({ data: null, error: { code: "unauthorized" } }, { status: 401 });
   const key = path.toLowerCase(), saved = cache.get(key);
@@ -28,7 +29,7 @@ async function proxy(request: NextRequest, segments: readonly string[], method: 
     const body = method === "POST" ? await request.text() : undefined;
     if (body !== undefined && Buffer.byteLength(body) > 16_384) return NextResponse.json({ data: null, error: { code: "invalid_body" } }, { status: 413 });
     const upstream = await fetch(url.replace(/\/$/, "") + "/agentic/" + path, { method, cache: "no-store", signal: AbortSignal.timeout(30_000),
-      headers: { accept: "application/json", "x-exec-token": token, ...(body === undefined ? {} : { "content-type": "application/json", origin: request.nextUrl.origin }),
+      headers: { accept: "application/json", "x-exec-token": token, ...(body === undefined ? {} : { "content-type": "application/json", origin: publicOrigin(request) }),
         ...(!publicRead && path !== "pairings" && cookie !== undefined ? { "x-agentic-pairing": cookie } : {}) }, ...(body === undefined ? {} : { body }) });
     const raw = await upstream.text();
     const envelope = JSON.parse(raw) as { data?: Record<string, unknown>; error?: unknown };

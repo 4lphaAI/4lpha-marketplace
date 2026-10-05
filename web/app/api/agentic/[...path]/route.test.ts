@@ -42,6 +42,15 @@ describe("Agentic BFF", () => {
     vi.stubEnv("NEXT_PUBLIC_AGENTIC_WALLET_ENABLED", "false"); expect((await POST(request("pairings", "POST"), params("pairings"))).status).toBe(404);
     expect(fetcher).not.toHaveBeenCalled();
   });
+  it("behind the Railway edge, compares and forwards the public origin from the proxy headers", async () => {
+    const behindEdge = (origin: string) => new NextRequest("http://0.0.0.0:3000/api/agentic/pairings", { method: "POST", body: "{}",
+      headers: { origin, "content-type": "application/json", "x-forwarded-for": "offline-" + ip, "x-forwarded-proto": "https", "x-forwarded-host": "4lpha.tech" } });
+    expect((await POST(behindEdge("https://4lpha.tech"), params("pairings"))).status).toBe(200);
+    expect(fetcher.mock.calls[0][1].headers.origin).toBe("https://4lpha.tech");
+    expect((await POST(behindEdge("https://evil.test"), params("pairings"))).status).toBe(403);
+    expect((await POST(behindEdge("http://0.0.0.0:3000"), params("pairings"))).status).toBe(403);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
   it("limits starts to five per ten minutes and public reads to sixty per minute", async () => {
     for (let i = 0; i < 5; i += 1) expect((await POST(request("pairings", "POST"), params("pairings"))).status).toBe(200);
     expect((await POST(request("pairings", "POST"), params("pairings"))).status).toBe(429);
