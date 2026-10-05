@@ -505,6 +505,11 @@ export const US_EQUITY_TICKER_CLASS: Readonly<Record<string, TickerClass>> = {
   TQQQ: ETF,
   TSLA: stock("Consumer Discretionary"),
   TSM: stock("Information Technology", "Semiconductors"),
+  // AGENTIC-RFQ-STOCKS E11 (OQ-9): the 26 RFQ-only underlyings. No sector is invented (null renders "unknown"); ETFs get no planning call; CBRS and QNT are unmeasured symbols, so no paid call.
+  AAOI: stock(null), AMD: stock(null), ARM: stock(null), AVGO: stock(null), AXTI: stock(null), COHR: stock(null), COIN: stock(null), CRDO: stock(null), CRWV: stock(null),
+  GLW: stock(null), IBM: stock(null), LITE: stock(null), NBIS: stock(null), PLTR: stock(null), PYPL: stock(null), QCOM: stock(null), RKLB: stock(null), WDC: stock(null),
+  DRAM: ETF, EWY: ETF, INTW: ETF, KORU: ETF, MUU: ETF, MVLL: ETF,
+  CBRS: UNRESOLVABLE, QNT: UNRESOLVABLE,
 };
 
 export function tickerClass(ticker: string): TickerClass | null {

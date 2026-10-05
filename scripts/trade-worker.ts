@@ -59,7 +59,16 @@ import { PANCAKE_V2_FACTORY_56 } from "../src/quant/config.js";
 import { PANCAKE_V3_FACTORY_56 } from "../src/lp/readers.js";
 import type { WalletCall } from "../src/core/types.js";
 import type { TradeIntentRecord } from "../src/store/tradeIntents.js";
+import { excludeCustody } from "../src/agentic/domain.js";
 import { resolveTradfiExitRulesMode } from "../src/trade/exitRules.js";
+import { resolveAgenticConfig } from "../src/agentic/config.js";
+import { AgenticStore } from "../src/agentic/store.js";
+import { BawRunner } from "../src/agentic/baw.js";
+import { AgenticInstanceManager } from "../src/agentic/instances.js";
+import { createAgenticChain } from "../src/agentic/resolve.js";
+import { createAgenticCmc } from "../src/agentic/cmc.js";
+import { createAgenticWorkerDeps, startAgenticLane } from "../src/agentic/worker.js";
+import { createPgSqlClient } from "../src/store/sql.js";
 
 const UNISWAP_V3_FACTORY_56: Address = getAddress("0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7");
 
@@ -182,6 +191,7 @@ async function buildTradfiReceiptExpected(input: {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (!enabled(process.env)) {
+    resolveAgenticConfig(process.env, { hireEnabled: false, tradeAgentEnabled: false, rpcUrls: [] });
     console.log("[trade-worker] TRADE_AGENT_ENABLED is off; exiting");
     return;
   }
@@ -208,6 +218,7 @@ async function main(): Promise<void> {
   const readerNetwork = { chain: BNB.chain, chainId: BNB.chainId, publicRpcUrl: BNB.publicRpcUrl };
   // C30: the composition root shares exactly the LP daemon's RPC resolver.
   const rpcUrls = resolveLpRpcUrls(process.env, readerNetwork);
+  const agenticConfig = resolveAgenticConfig(process.env, { hireEnabled: resolveHireEnabled(process.env), tradeAgentEnabled: true, rpcUrls });
   // AUDIT L5: one client owns every quote/receipt read and proves chain 56 before the daemon can sweep.
   const routeReader = createRouteQuoteReader({ rpcUrls,
     ...(trade.venues.uniswapQuoterV3 === undefined ? {} : { uniswapQuoter: trade.venues.uniswapQuoterV3 }) });
@@ -241,8 +252,10 @@ async function main(): Promise<void> {
     dataPlane: createHttpTradeReadinessDataPlane(dataPlaneOptions),
     intervalMs: 60_000,
   });
-  const agentStore = await createAgentStore();
-  const settingsStore = await createTradeSettingsStore(agentStore);
+  const rawAgentStore = await createAgentStore();
+  const agentStore = rawAgentStore;
+  const rawSettingsStore = await createTradeSettingsStore(rawAgentStore);
+  const settingsStore = excludeCustody(rawSettingsStore, rawAgentStore);
   const positions = await createTradePositionStore();
   const intents = await createTradeIntentStore();
   const cmcStore = await createTradeCmcStore();
@@ -599,14 +612,29 @@ async function main(): Promise<void> {
       }
     }
   }
+  let agenticLane: ReturnType<typeof startAgenticLane> | undefined;
+  let agenticStore: AgenticStore | undefined;
+  if (agenticConfig.enabled) {
+    if (cmcMasterKey === null) throw new Error("AGENTIC_BOOT_REQUIREMENTS");
+    const runner = new BawRunner(agenticConfig.cli);
+    await runner.checkBoot();
+    agenticStore = new AgenticStore(await createPgSqlClient(required(process.env, "DATABASE_URL")), { agents: rawAgentStore, journal, intents, cmc: cmcStore, killswitch });
+    await agenticStore.initialize();
+    const instance = await AgenticInstanceManager.start(agenticStore, runner, "trade-worker");
+    const chain = createAgenticChain(rpcUrls);
+    const execution = { store: agenticStore, runner, instance, chain, masterKey: cmcMasterKey, positions };
+    const agenticCmc = createAgenticCmc({ ...execution, agents: rawAgentStore, settings: rawSettingsStore, cmc: cmcStore, journal, killswitch, rpcUrls });
+    const worker = createAgenticWorkerDeps({ shared: deps, agents: rawAgentStore, settings: rawSettingsStore, execution, executorDeps, cmc: agenticCmc, rfq: agenticConfig.rfq });
+    agenticLane = startAgenticLane({ ...execution, execution, agents: rawAgentStore, settings: rawSettingsStore, worker, cmc: agenticCmc, journal }, { dryRun: args.dryRun, once: args.once });
+    console.log("agentic: on, cli 1.10.0, keytar unresolvable");
+  }
   const cmcTickHandle = cmcWorker === undefined ? null : setInterval(() => {
     void cmcWorker.scheduler.tick().then(logCmcObservations).catch(() => undefined);
   }, cmcWorker.scheduler.intervalMs);
-
   console.log(`[trade-worker] chain=56 interval=${args.intervalMs}ms dry-run=${args.dryRun} once=${args.once}`);
   let stopping = false;
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.on(signal, () => { stopping = true; });
+    process.on(signal, () => { stopping = true; agenticLane?.stop(); });
   }
   for (;;) {
     const startedAt = Date.now();
@@ -621,6 +649,8 @@ async function main(): Promise<void> {
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
   readiness.stop();
+  await agenticLane?.close();
+  await agenticStore?.close();
   if (cmcTickHandle !== null) clearInterval(cmcTickHandle);
   await simulations?.shutdown();
   for (const store of [intents, positions, settingsStore, journal, killswitch, agentStore, cmcStore]) {

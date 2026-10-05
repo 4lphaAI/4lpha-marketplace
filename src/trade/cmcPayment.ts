@@ -167,12 +167,14 @@ export function createCmcSdkPaymentSigner(input: {
   };
 }
 
-function readSignedAuthorization(
+export function readSignedAuthorization(
   header: string,
   payload: X402PaymentPayload,
   challenge: CmcChallenge,
   wallet: Address,
   nowSec: number,
+  /** Agentic only: Binance signs validAfter as the signing time, so accept 0 <= validAfter <= validAfterMaxSec and < deadline. Absent: validAfter must be 0. */
+  options?: { readonly validAfterMaxSec?: number },
 ): CmcSignedAuthorization {
   const inner = record(payload.payload) ? payload.payload : null;
   const permit = inner !== null && record(inner["permit2Authorization"]) ? inner["permit2Authorization"] : null;
@@ -195,7 +197,8 @@ function readSignedAuthorization(
   const validAfter = BigInt(witness["validAfter"]);
   if (payer.toLowerCase() !== wallet.toLowerCase() || token.toLowerCase() !== challenge.asset.toLowerCase()
     || amount !== challenge.amountWei || spender.toLowerCase() !== challenge.spender.toLowerCase()
-    || witnessTo.toLowerCase() !== challenge.payTo.toLowerCase() || validAfter !== 0n
+    || witnessTo.toLowerCase() !== challenge.payTo.toLowerCase()
+    || (options?.validAfterMaxSec === undefined ? validAfter !== 0n : validAfter < 0n || validAfter > BigInt(options.validAfterMaxSec) || validAfter >= deadline)
     || deadline <= BigInt(nowSec)) throw new Error("CMC authorization does not match its challenge.");
   return { header, payload, nonce, deadline, validAfter, token, payer, spender, witnessTo };
 }

@@ -49,7 +49,7 @@ function reason(code: string | null | undefined, old = false): string {
 }
 
 export function PortfolioSummary({ portfolio, settings, status, sessionExpiresAt }: {
-  readonly portfolio: Portfolio; readonly settings: TradeSettings; readonly status: string | null; readonly sessionExpiresAt: number | null | undefined;
+  readonly portfolio: Portfolio; readonly settings: Pick<TradeSettings, "portfolioDriftBps">; readonly status: string | null; readonly sessionExpiresAt: number | null | undefined;
 }) {
   const [clock, setClock] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setClock(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
@@ -83,8 +83,9 @@ export function PortfolioSummary({ portfolio, settings, status, sessionExpiresAt
   </div>)}</div>;
 }
 
-export function PortfolioDetail({ portfolio, settings, runs, icons, refresh, simulationLog }: {
-  readonly portfolio: Portfolio; readonly settings: TradeSettings; readonly runs: TradeView["runs"];
+export function PortfolioDetail({ portfolio, settings, runs, icons, refresh, simulationLog, readOnly = false }: {
+  readonly portfolio: Portfolio; readonly settings: Pick<TradeSettings, "portfolioDriftBps">; readonly runs: TradeView["runs"];
+  /** The public Agentic page: the run log words its owner actions away. */ readonly readOnly?: boolean;
   readonly icons: Readonly<Record<string, string | null>>; readonly refresh: () => Promise<unknown>;
   /** The read-only pre-flight simulation log; shown inside the Run log tab (Runs | Simulate toggle) only when supplied. */
   readonly simulationLog?: React.ReactNode;
@@ -142,7 +143,7 @@ export function PortfolioDetail({ portfolio, settings, runs, icons, refresh, sim
       <div className="fl-portfolio-allocation__list">{[...portfolio.tokens, { token: USDT, symbol: "USDT", balanceAtomic: portfolio.portfolioCashWei, valueWei: portfolio.portfolioCashWei }].map((row, index) => <div className="fl-portfolio-allocation__item" key={row.token}>
         <i style={{ background: index === portfolio.tokens.length ? "var(--ink-3)" : COLORS[index] }} /><TokenIcon src={icons[row.token.toLowerCase()] ?? null} symbol={row.symbol} size={24} />
         <span><strong>{index === portfolio.tokens.length ? "Cash" : row.symbol}</strong><small>{index === portfolio.tokens.length ? money(portfolio.portfolioCashWei) : quantity(row.balanceAtomic)}
-          {index === portfolio.tokens.length && BigInt(portfolio.idleUsdtWei) > 0n ? ` · ${money(portfolio.idleUsdtWei)} idle · not managed` : ""}</small></span>
+          {!readOnly && index === portfolio.tokens.length && BigInt(portfolio.idleUsdtWei) > 0n ? ` · ${money(portfolio.idleUsdtWei)} idle · not managed` : ""}</small></span>
         <span>{available && row.valueWei !== null ? percent(BigInt(row.valueWei) * 10000n / total) : "—"}</span>
       </div>)}</div>
       {!available ? <p className="fl-trade-budget__note">{total === null ? "Allocation unavailable: a stock quote is unavailable." : "No managed value yet."}</p> : null}
@@ -183,15 +184,16 @@ export function PortfolioDetail({ portfolio, settings, runs, icons, refresh, sim
     {tab === "Order history" ? <section className="fl-trade-table fl-portfolio-panel"><div className="fl-trade-table__bar"><span>Order history</span><Button variant="ghost" size="sm" icon={<Icon name="refresh" size={13} />} onClick={() => void refresh()}>Refresh</Button></div><div className="fl-portfolio-table" role="region" aria-label="Order history table" tabIndex={0}>
       <div className="fl-row__head" style={{ gridTemplateColumns: OCOLS }}><span title="Recorded order time">Time</span><span>Side</span><span>Asset</span><span>Reason</span><span>Price</span><span>Amount</span><span>Value</span><span>Tx</span></div>
       {[...portfolio.legs].sort((a, b) => b.createdAt - a.createdAt || (b.detail?.id ?? "").localeCompare(a.detail?.id ?? "")).map((leg, index) => <div className="fl-row fl-portfolio-row" style={{ gridTemplateColumns: OCOLS }} key={leg.detail?.id ?? `${leg.slot}:${leg.token}:${index}`}>
-        <time title="Recorded order time">{new Date(leg.createdAt).toLocaleString()}</time><span style={{ color: leg.side === "buy" ? "var(--profit)" : "var(--loss)" }}>{leg.side === "buy" ? "Buy" : "Sell"}</span><span>{leg.symbol}</span>
+        <time title="Recorded order time">{new Date(leg.createdAt).toLocaleString()}</time><span style={{ color: leg.side === "buy" ? "var(--profit)" : "var(--loss)" }}>{leg.side === "buy" ? "Buy" : "Sell"}</span><span className="fl-portfolio-asset"><TokenIcon src={icons[leg.token.toLowerCase()] ?? null} symbol={leg.symbol} size={22} /><span>{leg.symbol}</span></span>
         <span>{leg.slot === 0 ? "Initial allocation" : "Rebalance"}<small>{leg.detail === undefined ? "Needs the updated execution plane." : leg.detail.executionState ?? reason(leg.detail.executionReason)}</small></span>
         <span>{leg.detail?.quantityAtomic && BigInt(leg.detail.quantityAtomic) > 0n && leg.detail.quoteWei !== null
-          ? unitPrice(BigInt(leg.detail.quoteWei) * 10n ** 18n / BigInt(leg.detail.quantityAtomic) + "") : <>—<small>{leg.detail === undefined ? "Needs the updated execution plane." : "Executed quantity not recorded."}</small></>}</span>
+          ? unitPrice(BigInt(leg.detail.quoteWei) * 10n ** 18n / BigInt(leg.detail.quantityAtomic) + "") : <>—<small>{leg.detail === undefined ? "Needs the updated execution plane."
+            : leg.detail.quantityAtomic == null ? "Executed quantity not recorded." : "Executed cost not recorded."}</small></>}</span>
         <span>{quantity(leg.detail?.quantityAtomic ?? null)}{leg.detail?.quantityAtomic == null ? <small>{leg.detail === undefined ? "Needs the updated execution plane." : "Executed quantity not recorded."}</small> : null}</span>
         <span>{money(leg.detail?.quoteWei ?? null)}{leg.detail?.quoteWei == null ? <small>{leg.detail === undefined ? "Needs the updated execution plane." : "Verified value unavailable."}</small> : null}</span>
         <span>{txUrl(leg.txHash) ? <a href={txUrl(leg.txHash)!} target="_blank" rel="noreferrer">Tx ↗</a> : <span>—<small>Transaction hash unavailable.</small></span>}</span>
       </div>)}{portfolio.legs.length === 0 ? <div className="fl-trade-empty">No orders recorded yet.</div> : null}</div></section> : null}
     {tab === "Run log" ? <RunLogPanel simulationLog={simulationLog} runLog={<section className="fl-trade-table fl-portfolio-panel"><div className="fl-trade-table__bar"><span>Run log</span><Button variant="ghost" size="sm" icon={<Icon name="refresh" size={13} />} onClick={() => void refresh()}>Refresh</Button></div>
-      <TradeRunLog runs={runs} symbols={Object.fromEntries(portfolio.tokens.map((row) => [row.token.toLowerCase(), row.symbol]))} portfolio portfolioLegs={portfolio.legs} /></section>} /> : null}
+      <TradeRunLog runs={runs} symbols={Object.fromEntries(portfolio.tokens.map((row) => [row.token.toLowerCase(), row.symbol]))} portfolio portfolioLegs={portfolio.legs} readOnly={readOnly} /></section>} /> : null}
   </>;
 }

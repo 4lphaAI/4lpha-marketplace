@@ -274,6 +274,10 @@ export function HireTradeDeploy(props: {
   readonly go: (route: string) => void;
   readonly blockedReason?: string | null;
   readonly showCrashProtection?: boolean;
+  /** Opens the custody picker before a fresh hire; `proceed` runs the Altana deploy unchanged. */
+  readonly chooseCustody?: (proceed: () => void) => void;
+  /** Reports what currently blocks the Altana hire, so the custody picker can refuse that choice with its reason. */
+  readonly onAltanaBlocked?: (reason: string | null) => void;
 }) {
   const owner = useOwnerActions();
   const hireStorage = React.useMemo(() => accountHireStorage(typeof window === "undefined" ? undefined : window.localStorage, owner.ownerAddress), [owner.ownerAddress]);
@@ -298,6 +302,7 @@ export function HireTradeDeploy(props: {
   const [running, setRunning] = React.useState(false);
   const activeRun = React.useRef<GridDeployRun | null>(null);
   const mounted = React.useRef(true);
+  const deployRef = React.useRef<() => Promise<void>>(async () => undefined);
   const resumed = React.useRef(false);
   const hireSettings = React.useMemo(() => props.settings.crashProtection === undefined
     ? { ...props.settings, crashProtection: true }
@@ -373,6 +378,8 @@ export function HireTradeDeploy(props: {
       : isTradfiV2 ? null : `Total capital is too small. Raise it to at least ${formatMinimumBnb(minimumWei)} BNB.`;
   const nativeCapBlock = isTradfiV2 && !isDca && !isPortfolio && v2NativeCapWei === null ? "Reading the live stock count to set the native relay reserve…" : null;
   const blocked = props.blockedReason ?? previewError ?? sizingMessage ?? nativeCapBlock;
+  const { onAltanaBlocked } = props;
+  React.useEffect(() => { onAltanaBlocked?.(blocked); }, [blocked, onAltanaBlocked]);
 
   React.useEffect(() => {
     mounted.current = true;
@@ -1039,6 +1046,9 @@ export function HireTradeDeploy(props: {
   const v2Funding = shown !== null && isTradfiV2 ? tradfiV2FundingSnapshot({ funding: shown.funding, sizing: shown.sizing, capDayWei: capDayWei.toString(10),
     capitalQuoteWei: hireSettings.capitalQuoteWei ?? "0", ...(hireSettings.cmcTotalBudgetWei === undefined ? {} : { cmcTotalBudgetWei: hireSettings.cmcTotalBudgetWei }) }) : null;
 
+  deployRef.current = deployAll;
+  // The custody picker opens even while the Altana hire is blocked: the Agentic path has its own checks.
+  const custodyPick = record === null && !legacyAmbiguous && props.chooseCustody !== undefined;
   return <div style={{ display: "grid", gap: 14, marginTop: 26, paddingTop: 20, borderTop: "1px solid var(--line-1)" }}>
     <span className="fl-eyebrow">Hire the scoped agent session</span>
     {props.showCrashProtection === false ? null : <p>Crash protection: {hireSettings.crashProtection === true ? "ON" : "OFF"}.</p>}
@@ -1063,9 +1073,10 @@ export function HireTradeDeploy(props: {
           {hireSettings.cmcNewsEnabled === true ? <p>Data budget is included in the USDT target and paid from the agent wallet. Your passkey confirms the data budget once, right after the grant.</p> : null}</>
         : <p>Capital floor: {formatEther(previewMinimumWei(shown))} BNB, including entry fees and exit gas reserves.</p>}
     </div> : null}
-    <button type="button" style={busyBtn(working !== null || blocked !== null, primaryBtn)}
-      onClick={legacyAmbiguous ? restartAmbiguousHire : () => void deployAll()}
-      disabled={working !== null || blocked !== null}>
+    <button type="button" style={busyBtn(working !== null || (!custodyPick && blocked !== null), primaryBtn)}
+      onClick={legacyAmbiguous ? restartAmbiguousHire : custodyPick
+        ? () => props.chooseCustody!(() => void deployRef.current()) : () => void deployAll()}
+      disabled={working !== null || (!custodyPick && blocked !== null)}>
       {legacyAmbiguous ? "Restart hire" : record === null ? "Sign hire and create the session key" : "Continue deploy"}
     </button>
     {blocked ? <p style={{ color: "var(--loss)" }}>{blocked}</p> : null}

@@ -34,6 +34,7 @@ export const PROTOCOL_LOGOS: Record<string, string>;
 // components/badges
 export const FilterChip: DsComponent;
 export const Num: DsComponent;
+export const AgenticWalletBadge: DsComponent;
 export const StatusBadge: DsComponent;
 export const TierBadge: DsComponent;
 

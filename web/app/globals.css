@@ -867,6 +867,10 @@ button { font: inherit; color: inherit; }
 /* The asset is a mark with no wordtype, so the name is set beside it — a bare
    26px glyph reads as a coloured dot, not as an attribution. */
 .fl-powered-by__name{font:var(--weight-semibold) var(--text-base)/1 var(--font-sans);color:var(--ink-1);letter-spacing:-0.01em}
+/* Account footer: the Agentic Wallet lockup and the Altana mark side by side. */
+.fl-powered-by--credits{gap:24px;flex-wrap:wrap}
+.fl-powered-by__brand{display:flex;align-items:center;gap:9px}
+.fl-powered-by img.fl-powered-by__wordmark{height:18px}
 
 /* Agent card ------------------------------------------------------- */
 .fl-card{display:flex;flex-direction:column;border:var(--border-width) solid var(--border-card);border-radius:var(--radius-md);background:var(--surface-card);transition:border-color var(--dur-base) var(--ease-out),background-color var(--dur-base) var(--ease-out)}
@@ -880,6 +884,18 @@ button { font: inherit; color: inherit; }
 .fl-card__headline{display:flex;align-items:baseline;justify-content:space-between;gap:var(--space-5);margin:var(--space-6) var(--card-pad) 0;padding:var(--space-5);border:var(--border-width) solid var(--line-1);border-radius:var(--radius-sm);background:var(--surface-sunken)}
 .fl-card__headline-label{font:var(--type-eyebrow);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-subtle)}
 .fl-card__headline-value{font:var(--weight-semibold) var(--text-xl)/1 var(--font-mono);font-variant-numeric:tabular-nums}
+.fl-card__spec{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:var(--space-5);margin:var(--space-6) var(--card-pad) 0;padding:10px var(--space-5);border:var(--border-width) solid var(--line-1);border-radius:var(--radius-sm);background:var(--surface-sunken)}
+.fl-card__spec-group{display:flex;align-items:center;gap:var(--space-3);min-width:0;flex-wrap:wrap}
+.fl-card__spec-group:last-child{justify-content:flex-end}
+/* Two custody marks (Altana + Agentic Wallet) need more room than half the row,
+   so on those cards the protocol side shrinks to its logos. */
+.fl-card__spec:has(.fl-card__spec-wordmark){grid-template-columns:auto auto minmax(0,1fr)}
+.fl-card__spec-divider{width:1px;height:16px;background:var(--line-1);flex:0 0 auto}
+.fl-card__spec-item{display:inline-flex;align-items:center;gap:6px;font:var(--weight-medium) var(--text-sm)/1 var(--font-sans);color:var(--ink-1);white-space:nowrap}
+.fl-card__spec-logo{width:16px;height:16px;display:block;border-radius:50%;object-fit:contain;flex:0 0 auto}
+.fl-card__spec-logo--square{border-radius:0}
+.fl-card__spec-wordmark{height:16px;width:auto;display:block}
+.fl-walletbadge{display:block;width:auto;flex:0 0 auto}.fl-walletbadge--md{height:16px}.fl-walletbadge--sm{height:12px}
 .fl-card__foot{display:flex;align-items:center;justify-content:space-between;gap:var(--space-5);margin-top:auto;padding:var(--space-6) var(--card-pad) var(--card-pad)}
 .fl-card__price{display:flex;flex-direction:column;gap:2px}
 .fl-card__price-value{font:var(--type-metric-sm);color:var(--ink-1)}

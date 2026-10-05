@@ -1,6 +1,7 @@
 import type { Address } from "viem";
 import type { TradeDataPlaneReads } from "./dataPlaneReads.js";
 import type { TradeExecutionModel } from "./settings.js";
+import { USDT_56 } from "./settlement.js";
 
 export type FeatureInterval = "15m" | "1h";
 export type FeaturePool = { readonly pool: Address; readonly tokenAddress: Address; readonly currency: "usd" | "token" };
@@ -21,6 +22,8 @@ export type FeatureMetric = { readonly value: number | null; readonly unit: stri
 export type SessionState = "rth" | "close" | "overnight";
 export type FeatureEvidence = {
   readonly pool: FeaturePool; readonly interval: FeatureInterval; readonly quoteAddress: Address;
+  /** AGENTIC-RFQ-STOCKS R2.4: set only on evidence decoded from the recorded underlying reference series (then `pool` is the series identity: the token itself, never a pool to route or quote from). Absent on every pool record. */
+  readonly scope?: "underlying";
   readonly snapshotId: string; readonly seriesId: string; readonly observedAt: number;
   readonly calculatedAt: number; readonly evaluationClose: number; readonly expiresAt: number;
   readonly metrics: Readonly<Record<FeatureMetricName, FeatureMetric>>;
@@ -196,6 +199,11 @@ export function featurePrompt(features: TokenFeatures | undefined, now: number, 
   if (!features) return "";
   const rows = Object.values(features).filter(row => freshFeature(row, now));
   if (!rows.length) return "";
+  // R2.4: recorded-underlying evidence says what it is (the US stock's reference price, no volume) and carries no pool and no quote address.
+  if (rows.every(row => row.scope === "underlying")) return JSON.stringify({ scope: "underlying", series: UNDERLYING_SERIES, note: UNDERLYING_NOTE,
+    intervals: rows.map(row => ({ interval: row.interval, base: row.pool.tokenAddress, currency: row.pool.currency, observedAt: row.observedAt, evaluationClose: row.evaluationClose,
+      snapshotId: row.snapshotId, metrics: row.metrics,
+      ...(options.v2 === true && row.indicatorRevision !== undefined ? { indicatorRevision: row.indicatorRevision, additiveMetrics: row.additiveMetrics } : {}) })) });
   return JSON.stringify({ scope: "exact_pool", executionQuote: false, quantitativeAdvisory: assessMomentum(features, now),
     intervals: rows.map(row => ({ interval: row.interval, pool: row.pool.pool, base: row.pool.tokenAddress,
       quote: row.quoteAddress, currency: row.pool.currency, observedAt: row.observedAt, evaluationClose: row.evaluationClose,
@@ -204,6 +212,154 @@ export function featurePrompt(features: TokenFeatures | undefined, now: number, 
 }
 
 /** §3.3: a ≤200-char worded summary of the freshest 1h (then 15m) evidence, for the tradfi exit prompt. Never JSON. */
+/* ------------------------------------------------------------------------------------------------------------------------------------------------ */
+/* AGENTIC-RFQ-STOCKS R2.4 / R3.3 / R5.1: features of a bStock with no pool, read from the underlying reference price the data plane records itself.          */
+/* One scope per token per cycle (never spliced); below 30 changed buckets every metric is unavailable; no volume, ever.                                 */
+/* ------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+export const UNDERLYING_FEATURE_VERSION = "underlying-features-v1";
+export const MAX_UNDERLYING_FEATURES = 64;
+export const UNDERLYING_FEATURE_MIN_REAL_BARS = 30;
+export const UNDERLYING_SERIES = "underlying-reference-usd";
+export const UNDERLYING_NOTE = "underlying reference price, sampled every 60 s, no volume; the underlying US stock, not the bStock's own trades";
+
+/** Index identities only. An index longer than the 64-token ceiling answers nothing (fail closed). */
+export function selectUnderlyingTokens(raw: unknown, tokens: readonly Address[]): readonly Address[] {
+  if (!record(raw) || !Array.isArray(raw.tokens) || raw.tokens.length > MAX_UNDERLYING_FEATURES) return [];
+  const wanted = new Set(tokens.slice(0, MAX_UNDERLYING_FEATURES).map(token => token.toLowerCase()));
+  const found = new Set<string>();
+  for (const row of raw.tokens) if (record(row) && address(row.tokenAddress) && wanted.has(row.tokenAddress.toLowerCase())) found.add(row.tokenAddress.toLowerCase());
+  return [...found].sort() as Address[];
+}
+
+/**
+ * The decoder of one recorded-underlying record. Everything decodeFeature checks, with the underlying identity in place of a pool's, plus:
+ * `coverage.realBars` an integer of at least 30 (a second, local enforcement of the data plane's floor), the per-metric changed-bucket counts of R3.3 recomputed here from
+ * `coverage.changedBuckets` whatever the record claims, and `rvol20` and the VWAP distance forced unavailable (the series has no volume).
+ */
+export function decodeUnderlyingFeature(raw: unknown, token: Address, interval: FeatureInterval, now: number): FeatureEvidence | null {
+  if (!record(raw) || raw.version !== UNDERLYING_FEATURE_VERSION || raw.staleness !== "fresh"
+    || !record(raw.identity) || !record(raw.metrics) || !record(raw.coverage) || !record(raw.lineage)) return null;
+  const id = raw.identity, coverage = raw.coverage;
+  if (id.chainId !== 56 || !address(id.tokenAddress) || id.tokenAddress.toLowerCase() !== token.toLowerCase()
+    || id.interval !== interval || id.priceCurrency !== "usd" || id.priceBasis !== "usd_per_share" || id.source !== "binance-rwa"
+    || raw.lineage.scope !== "underlying"
+    || !timestamp(id.observedAt) || !timestamp(raw.calculatedAt) || !timestamp(raw.evaluationClose)
+    || !timestamp(raw.expiresAt) || !hash(raw.snapshotId) || !hash(raw.seriesId)
+    || coverage.latestClose !== raw.evaluationClose
+    || typeof coverage.contiguousBars !== "number" || !Number.isInteger(coverage.contiguousBars) || coverage.contiguousBars < 0 || coverage.contiguousBars > 120
+    || typeof coverage.realBars !== "number" || !Number.isInteger(coverage.realBars) || coverage.realBars < UNDERLYING_FEATURE_MIN_REAL_BARS || coverage.realBars > 120) return null;
+  const close = raw.evaluationClose, step = STEPS[interval];
+  // R3.3 re-enforcement: the buckets that changed, as the record itself lists them (absent or malformed lists make every gated metric unavailable).
+  const listed = Array.isArray(coverage.changedBuckets) && coverage.changedBuckets.length <= 120 && coverage.changedBuckets.every(timestamp) ? coverage.changedBuckets as number[] : null;
+  const changedIn = (from: number, to: number): number => listed === null ? 0 : listed.filter(t => t >= from && t < to).length;
+  const trailingChanged = (required: number): boolean => required < 2 || changedIn(close - required * step, close) >= Math.ceil(0.6 * required);
+  const session = record(raw.session) ? raw.session : null;
+  const orbChanged = (): boolean => {
+    if (session === null || session.state !== "rth" || !timestamp(session.sessionStart)) return false;
+    return listed !== null && listed.includes(session.sessionStart) && listed.includes(session.sessionStart + step);
+  };
+  const priceUnit = "usd_per_base_token";
+  const metrics = {} as Record<FeatureMetricName, FeatureMetric>;
+  for (const name of Object.keys(REQUIRED) as FeatureMetricName[]) {
+    const unit = name === "rvol20" ? "ratio" : name === "ema12" || name === "ema26" || name === "atr14" ? priceUnit : "percent";
+    const item = raw.metrics[name];
+    const valid = name !== "rvol20" && record(item) && item.available === true && item.reason === null && item.unit === unit
+      && typeof item.value === "number" && Number.isFinite(item.value)
+      && item.requiredBars === REQUIRED[name] && typeof item.usableBars === "number"
+      && Number.isInteger(item.usableBars) && item.usableBars >= REQUIRED[name] && item.usableBars <= 120
+      && coverage.contiguousBars >= REQUIRED[name] && trailingChanged(REQUIRED[name])
+      && (!(name === "atr14" || name === "atrPct") || item.value >= 0)
+      && (!(name === "ema12" || name === "ema26") || item.value > 0);
+    metrics[name] = { value: valid ? item.value as number : null, unit, available: valid };
+  }
+  const parameters = record(raw.parameters) ? raw.parameters : null;
+  const revision = parameters?.indicatorRevision === 3 ? 3 : parameters?.indicatorRevision === 2 ? 2 : parameters?.indicatorRevision === 1 ? 1 : null;
+  const additiveMetrics = {} as Record<AdditiveFeatureMetricName, FeatureMetric>;
+  if (revision !== null) {
+    for (const name of Object.keys(ADDITIVE_REQUIRED) as AdditiveFeatureMetricNameV1[]) {
+      const item = raw.metrics[name];
+      const unit = name === "rsi14" ? "index" : priceUnit;
+      const valid = record(item) && item.available === true && item.reason === null && item.unit === unit
+        && typeof item.value === "number" && Number.isFinite(item.value)
+        && item.requiredBars === ADDITIVE_REQUIRED[name] && typeof item.usableBars === "number"
+        && Number.isInteger(item.usableBars) && item.usableBars >= ADDITIVE_REQUIRED[name] && item.usableBars <= 120
+        && coverage.contiguousBars >= ADDITIVE_REQUIRED[name] && trailingChanged(ADDITIVE_REQUIRED[name])
+        && (name !== "rsi14" || (item.value >= 0 && item.value <= 100));
+      additiveMetrics[name] = { value: valid ? item.value as number : null, unit, available: valid };
+    }
+  }
+  if (revision === 2 || revision === 3) {
+    for (const name of Object.keys(REV2_ADDITIVE_REQUIRED) as AdditiveFeatureMetricNameV2[]) {
+      const required = name === "orbBreakPct" ? orbRequiredBars(interval) : REV2_ADDITIVE_REQUIRED[name];
+      const item = raw.metrics[name];
+      const unit = name === "bbPosition20" || name === "stochRsi14" ? "ratio" : "percent";
+      const valid = name !== "vwapDistancePct" && required > 0 && record(item) && item.available === true && item.reason === null && item.unit === unit
+        && typeof item.value === "number" && Number.isFinite(item.value)
+        && item.requiredBars === required && typeof item.usableBars === "number"
+        && Number.isInteger(item.usableBars) && item.usableBars >= required && item.usableBars <= 120
+        && coverage.contiguousBars >= required
+        && (name === "orbBreakPct" ? orbChanged() : trailingChanged(REV2_ADDITIVE_REQUIRED[name]));
+      additiveMetrics[name] = { value: valid ? item.value as number : null, unit, available: valid };
+    }
+  }
+  const sessionStateRaw = session?.state;
+  const sessionState: SessionState | null = sessionStateRaw === "rth" || sessionStateRaw === "close" || sessionStateRaw === "overnight" ? sessionStateRaw : null;
+  const result: FeatureEvidence = { pool: { pool: token.toLowerCase() as Address, tokenAddress: token.toLowerCase() as Address, currency: "usd" }, scope: "underlying", interval,
+    quoteAddress: USDT_56.toLowerCase() as Address, observedAt: id.observedAt, calculatedAt: raw.calculatedAt, evaluationClose: raw.evaluationClose,
+    expiresAt: raw.expiresAt, snapshotId: raw.snapshotId, seriesId: raw.seriesId, metrics,
+    ...(revision !== null ? { indicatorRevision: revision, additiveMetrics } : {}),
+    ...(revision === 2 || revision === 3 ? { sessionState } : {}) };
+  return freshFeature(result, now) ? result : null;
+}
+
+/** R1 / RI2: per token per cycle the evidence comes from ONE scope. Underlying records are requested only for the tokens with no pool evidence at all, and never replace one. */
+export async function mergeUnderlyingFeatures(dataPlane: Pick<TradeDataPlaneReads, "underlyingFeatureIndex" | "underlyingFeaturesBatch">, pool: ReadonlyMap<string, TokenFeatures>,
+  tokens: readonly Address[], now: number, signal?: AbortSignal): Promise<ReadonlyMap<string, TokenFeatures>> {
+  const wanted = tokens.filter(token => pool.get(token.toLowerCase()) === undefined);
+  if (wanted.length === 0) return pool;
+  const underlying = await enrichUnderlyingFeatures(dataPlane, wanted, now, signal);
+  if (underlying.size === 0) return pool;
+  const merged = new Map(pool);
+  for (const [token, evidence] of underlying) if (!merged.has(token)) merged.set(token, evidence);
+  return merged;
+}
+
+/** The pool path's twin for tokens that have no pool series: index plus 10-token batches per interval, one 12 s aggregate deadline, outages only remove evidence. */
+export async function enrichUnderlyingFeatures(dataPlane: Pick<TradeDataPlaneReads, "underlyingFeatureIndex" | "underlyingFeaturesBatch">, tokens: readonly Address[], now: number, signal?: AbortSignal): Promise<ReadonlyMap<string, TokenFeatures>> {
+  const result = new Map<string, TokenFeatures>();
+  if (!dataPlane.underlyingFeatureIndex || !dataPlane.underlyingFeaturesBatch || tokens.length === 0) return result;
+  const deadline = AbortSignal.any([AbortSignal.timeout(12_000), ...(signal ? [signal] : [])]);
+  const bounded = async <T>(operation: () => Promise<T>): Promise<T> => {
+    deadline.throwIfAborted();
+    return new Promise<T>((resolve, reject) => {
+      const abort = () => reject(new Error("feature-read-aborted"));
+      deadline.addEventListener("abort", abort, { once: true });
+      Promise.resolve().then(operation).then(resolve, reject).finally(() => deadline.removeEventListener("abort", abort)).catch(() => undefined);
+    });
+  };
+  try {
+    const found = selectUnderlyingTokens(await bounded(() => dataPlane.underlyingFeatureIndex!(deadline)), tokens);
+    signal?.throwIfAborted();
+    if (!found.length) return result;
+    const chunks: Address[][] = [];
+    for (let index = 0; index < found.length; index += FEATURE_BATCH_SIZE) chunks.push(found.slice(index, index + FEATURE_BATCH_SIZE));
+    await Promise.all((["15m", "1h"] as const).flatMap(interval => chunks.map(async chunk => {
+      try {
+        const batch = await bounded(() => dataPlane.underlyingFeaturesBatch!(chunk, interval, deadline));
+        if (!record(batch) || Object.keys(batch).length > FEATURE_BATCH_SIZE) return;
+        for (const token of chunk) {
+          const row = batch[token];
+          const evidence = decodeUnderlyingFeature(record(row) ? row.data : null, token, interval, now);
+          if (evidence) result.set(token, { ...result.get(token), [interval]: evidence });
+        }
+      } catch { /* A missing batch does not discard the others. */ }
+    })));
+  } catch { /* No underlying evidence: the candidate stays unscored. */ }
+  if (signal?.aborted) signal.throwIfAborted();
+  return result;
+}
+
 export function describeFeatures(features: TokenFeatures | undefined): string {
   if (!features) return "no fresh indicators";
   const row = features["1h"] ?? features["15m"];

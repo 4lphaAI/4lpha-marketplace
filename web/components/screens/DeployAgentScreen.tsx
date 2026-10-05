@@ -20,6 +20,8 @@ import { DEFAULT_RELAY_FEE_PER_SUBMIT_WEI, gridCapitalFloorBnb, gridCapitalFloor
 import { HireGridDeploy } from "@/components/deploy/HireGridDeploy";
 import { HireLpDeploy } from "@/components/deploy/HireLpDeploy";
 import { HireTradeDeploy } from "@/components/deploy/HireTradeDeploy";
+import { AgenticDeployModal } from "@/components/deploy/HireAgenticTradeDeploy";
+import { agenticDcaEnabled, agenticEnabled } from "@/lib/agentic";
 import { DemoTradeDeploy } from "@/components/deploy/DemoTradeDeploy";
 import { DemoAgentPanel } from "@/components/demo/DemoAgentPanel";
 import { HireLendingDeploy } from "@/components/deploy/HireLendingDeploy";
@@ -105,7 +107,7 @@ const PRESETS = {
       set: { takeProfit: "25", stopLoss: "25" } },
   ],
   trading: [
-    { id: "tradfi", label: "TradFi", executionModel: "tradfi", note: "Tokenized US stocks only (bStocks, Ondo).",
+    { id: "tradfi", label: "TradFi", executionModel: "tradfi", agenticWallet: agenticEnabled, note: "Tokenized US stocks only (bStocks, Ondo).",
       set: { confidence: "80", minMcap: "", maxMcap: "", minEntry: weiToBnb(DEFAULT_TRADFI_V2_MIN_ENTRY_WEI), perTrade: weiToBnb(DEFAULT_TRADFI_V2_MAX_ENTRY_WEI), capital: "63", maxPositions: "3" } },
     { id: "degen", label: "Degen", executionModel: "degen", note: "Runners under $1M selected from Four.meme and Flap.sh",
       set: { confidence: "75", minMcap: "", maxMcap: "1,000,000", perTrade: "0.01", capital: "0.02", tp1: "60", stopLoss: "35", holdTime: "480", maxPositions: "4" } },
@@ -311,10 +313,11 @@ const CONFIG = {
    Only "AI Trade" reaches the plane today; the other three are ported UI and
    their Deploy stays locked until a backend exists for them. */
 const TRADFI_MODES = [
-  { id: "ai", label: "AI Trade", icon: RESOURCES.modeAi, note: "The model screens tokenized equities and manages entries and exits." },
-  { id: "sched", label: "Schedule buy", icon: RESOURCES.modeSched, note: "Buys a fixed amount of one tokenized stock on a set frequency." },
-  { id: "dca", label: "Auto DCA", icon: RESOURCES.modeDca, note: "Opens with a base order, then adds a DCA order each time price drops one step." },
-  { id: "smart", label: "Smart Portfolio", icon: RESOURCES.modeSmart, note: "Holds a weighted basket and rebalances back to target." },
+  { id: "ai", label: "AI Trade", icon: RESOURCES.modeAi, agenticWallet: agenticEnabled, note: "The model screens tokenized equities and manages entries and exits." },
+  { id: "sched", label: "Schedule buy", icon: RESOURCES.modeSched, agenticWallet: agenticEnabled, note: "Buys a fixed amount of one tokenized stock on a set frequency." },
+  { id: "dca", label: "Auto DCA", icon: RESOURCES.modeDca,
+    agenticWallet: agenticEnabled && agenticDcaEnabled, note: "Opens with a base order, then adds a DCA order each time price drops one step." },
+  { id: "smart", label: "Smart Portfolio", icon: RESOURCES.modeSmart, agenticWallet: agenticEnabled, note: "Holds a weighted basket and rebalances back to target." },
 ];
 
 function TradFiModes({ value, onChange }) {
@@ -331,10 +334,21 @@ function TradFiModes({ value, onChange }) {
               <span aria-hidden="true" style={{ width: 32, height: 32, flex: "0 0 auto", display: "block", background: on ? "var(--cat-yield)" : "var(--ink-1)", opacity: on ? 1 : 0.65, WebkitMaskImage: `url("${m.icon}")`, maskImage: `url("${m.icon}")`, WebkitMaskSize: "contain", maskSize: "contain", WebkitMaskRepeat: "no-repeat", maskRepeat: "no-repeat", WebkitMaskPosition: "center", maskPosition: "center" }} />
               <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: on ? "var(--cat-yield)" : "var(--ink-1)" }}>{m.label}</span>
             </button>
+            {m.agenticWallet ? (
+              <span aria-label="Supports Agentic Wallet" title="Supports Agentic Wallet"
+                style={{ position: "absolute", top: -8, right: 10, display: "flex", alignItems: "center", height: 18, padding: "0 7px", borderRadius: 999, background: "var(--surface-card)", border: "1px solid rgb(240 185 11 / 0.45)", pointerEvents: "none", width: 69 }}>
+                <img src="/design/protocols/binance-agentic-wallet.png" alt="" style={{ height: 7, width: "auto", display: "block" }} />
+              </span>
+            ) : null}
             {tip ? (
               <span role="tooltip"
                 style={{ position: "absolute", left: 0, right: 0, bottom: "calc(100% + 8px)", zIndex: 20, padding: "8px 10px", borderRadius: "var(--radius-sm)", background: "var(--surface-raised, #1a1d21)", border: "1px solid var(--line-2, var(--line-1))", boxShadow: "0 8px 24px rgba(0,0,0,.45)", font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--ink-1)", display: "block" }}>
                 {m.note}
+                {m.agenticWallet ? (
+                  <span style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, padding: "6px 9px", borderRadius: "var(--radius-xs, 4px)", border: "1px solid rgb(240 185 11 / 0.55)", background: "rgb(240 185 11 / 0.06)", color: "#F0B90B", font: "var(--weight-medium) var(--text-xs)/1.3 var(--font-sans)" }}>
+                    {m.label} supports Agentic Wallet.
+                  </span>
+                ) : null}
               </span>
             ) : null}
           </div>
@@ -1515,6 +1529,7 @@ function UnitStepper({ label, value, onChange, unit, onUnitChange, options, step
 
 function Field({ f, value, onChange, values, set, preset }) {
   const [fieldError, setFieldError] = React.useState("");
+  if (values.agenticCustody && (values.tradfiMode ?? "ai") === "ai" && (f.k === "cmcHub" || f.cmcOnly)) return null;
   const tradfiV2 = preset === "tradfi" && values.tradfiV2 !== false;
   if (f.tradfiOnly && !tradfiV2) return null;
   if (f.cmcOnly && (!tradfiV2 || values.cmcHub !== true)) return null;
@@ -1747,7 +1762,10 @@ function DeployAgentSection({ go }) {
               <span style={{ color: k.color, display: "grid", placeItems: "center" }}><Icon name="chevron-right" size={14} /></span>
             </div>
             <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-muted)" }}>{k.blurb}</p>
-            <span style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: k.color, marginTop: "auto" }}>Customise</span>
+            <span style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginTop: "auto" }}>
+              <span style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: k.color }}>Customise</span>
+              {agenticEnabled && k.id === "trading" ? <img src="/design/protocols/binance-agentic-wallet.png" alt="Agentic Wallet" style={{ height: 11, width: "auto", display: "block" }} /> : null}
+            </span>
           </button>
         ))}
       </div>
@@ -1761,6 +1779,10 @@ function DeployAgentScreen({ kind, go }) {
   const presets = PRESETS[id];
   const owner = useOwnerActions();
   const [selectedMode, setMode] = React.useState("Live");
+  const [agenticCustody, setAgenticCustody] = React.useState(false);
+  const [walletPick, setWalletPick] = React.useState(false);
+  const altanaProceed = React.useRef<(() => void) | null>(null);
+  const [altanaBlocked, setAltanaBlocked] = React.useState<string | null>(null);
   const mode = id === "lp" || id === "health" ? "Live" : selectedMode;
   const [preset, setPreset] = React.useState(DEFAULT_PRESET[id]);
   const [values, setValues] = React.useState(() => defaults(id, DEFAULT_PRESET[id]));
@@ -2257,6 +2279,8 @@ function DeployAgentScreen({ kind, go }) {
     return null;
   })();
 
+  const formValues = agenticEnabled && agenticCustody && id === "trading" && preset === "tradfi" && !tradeSettings?.tradeMode && mode === "Live"
+    ? { ...values, agenticCustody: true } : values;
   return (
     <div className={`fl-shell fl-deploy-page fl-deploy-polished${id === "grid" ? " fl-grid-deploy" : ""}`} style={{ maxWidth: 1080 }} data-testid={`deploy-${id}-screen`}>
       <Button variant="ghost" size="sm" icon={<span style={{ display: "grid", placeItems: "center", transform: "rotate(180deg)" }}><Icon name="arrow-right" size={13} /></span>} onClick={() => go("/")}>Back to marketplace</Button>
@@ -2322,10 +2346,16 @@ function DeployAgentScreen({ kind, go }) {
               const on = p.id === preset;
               return (
                 <button key={p.id} onClick={() => applyPreset(p)}
-                  style={{ textAlign: "left", cursor: "pointer", display: "grid", gap: 6, padding: "12px 14px", borderRadius: "var(--radius-sm)", background: on ? active.tint : "var(--surface-sunken)", border: `1px solid ${on ? active.color : "var(--line-1)"}` }}>
+                  style={{ position: "relative", textAlign: "left", cursor: "pointer", display: "grid", gap: 6, padding: "12px 14px", borderRadius: "var(--radius-sm)", background: on ? active.tint : "var(--surface-sunken)", border: `1px solid ${on ? active.color : "var(--line-1)"}` }}>
                   <span style={{ font: "var(--weight-medium) var(--text-sm)/1 var(--font-sans)", color: on ? active.color : "var(--ink-1)" }}>{p.label}</span>
                   {p.gap ? <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: on ? active.color : "var(--text-muted)" }}>{p.gap}</span> : null}
                   <span style={{ font: "var(--weight-regular) var(--text-xs)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)" }}>{p.note}</span>
+                  {p.agenticWallet ? (
+                    <span aria-label="Supports Agentic Wallet" title="Supports Agentic Wallet"
+                      style={{ position: "absolute", top: -8, right: 10, display: "flex", alignItems: "center", height: 18, padding: "0 7px", borderRadius: 999, background: "var(--surface-card)", border: "1px solid rgb(240 185 11 / 0.45)", pointerEvents: "none", width: 69 }}>
+                      <img src="/design/protocols/binance-agentic-wallet.png" alt="" style={{ height: 7, width: "auto", display: "block" }} />
+                    </span>
+                  ) : null}
                 </button>
               );
             })}
@@ -2345,7 +2375,7 @@ function DeployAgentScreen({ kind, go }) {
               // for its section exactly as the live pool picker is for "Pool".
               : id === "health" && s.title === "Guarded account"
                 ? <GuardedAccountSection key="guarded-account" value={values.guarded} onChange={(next) => set("guarded", next)} />
-                : <Group key={s.title} section={s} values={values} set={set} preset={preset} overrides={fieldOverrides} />)}
+                : <Group key={s.title} section={s} values={formValues} set={set} preset={preset} overrides={fieldOverrides} />)}
         </div>
         {id === "lp" && preset === "wide" ? (
           <div style={{ marginTop: 16, padding: "12px 14px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)", color: "var(--text-subtle)", font: "var(--weight-regular) var(--text-sm)/1.4 var(--font-sans)" }}>
@@ -2364,7 +2394,7 @@ function DeployAgentScreen({ kind, go }) {
             </button>
             {showAdv ? (
               <div style={{ display: "grid", gap: 24, marginTop: 20 }}>
-                {advanced.map((s) => <Group key={s.title} section={s} values={values} set={set} preset={preset} overrides={fieldOverrides} />)}
+                {advanced.map((s) => <Group key={s.title} section={s} values={formValues} set={set} preset={preset} overrides={fieldOverrides} />)}
               </div>
             ) : null}
           </div>
@@ -2447,6 +2477,17 @@ function DeployAgentScreen({ kind, go }) {
               takeProfitBps={tradeSettings.takeProfitBps}
               maxHoldSec={tradeSettings.maxHoldSec}
               maxOpenPositions={tradeSettings.maxOpenPositions} />
+          ) : agenticEnabled && agenticDcaEnabled && preset === "tradfi" && tradeSettings.tradeMode === "dca" || agenticEnabled && preset === "tradfi" && (!tradeSettings.tradeMode || tradeSettings.tradeMode === "schedule" || tradeSettings.tradeMode === "portfolio") ? (
+          // Live TradFi AI Trade, Schedule buy and Smart Portfolio: the deploy button opens the custody pop-up (Altana or
+          // Binance Agentic Wallet); choosing Altana runs the passkey hire below unchanged.
+          <><HireTradeDeploy agentName={tradeSettings.name} executionModel={tradeSettings.executionModel}
+              capitalBnb={tradfiV2 ? "" : String(values.capital ?? "0")} settings={tradeSettings} go={go}
+              blockedReason={tradeBlockedReason} showCrashProtection={!tradfiSmart}
+              chooseCustody={(proceed) => { altanaProceed.current = proceed; setWalletPick(true); }} onAltanaBlocked={setAltanaBlocked} />
+            {walletPick ? <AgenticDeployModal settings={tradeSettings} portfolioSymbols={tradfiSmart ? smartRows.map((row) => row.sym) : undefined} go={go} blockedReason={tradeBlockedReason} altanaBlockedReason={altanaBlocked} label={active.label} color={active.color}
+              onCustody={(custody) => setAgenticCustody(custody === "agentic")}
+              onClose={() => { setWalletPick(false); setAgenticCustody(false); }}
+              onAltana={() => { setWalletPick(false); setAgenticCustody(false); altanaProceed.current?.(); }} /> : null}</>
           ) : (
           <HireTradeDeploy agentName={tradeSettings.name} executionModel={tradeSettings.executionModel}
             capitalBnb={tradfiV2 ? "" : String(values.capital ?? "0")} settings={tradeSettings} go={go}

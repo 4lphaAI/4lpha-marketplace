@@ -100,13 +100,17 @@ export function runOutcome(run: Run): RunOutcome {
  * `hasExecutedTrade`/`runSucceeded`/`runFailed` classify every DCA run as
  * "quiet". These two predicates classify by the reason CODE instead.
  */
-const DCA_SUCCEEDED = new Set(["dca-placed", "dca-level-filled", "dca-round-closed", "dca-removed", "dca-stopped"]);
+const DCA_SUCCEEDED = new Set(["dca-placed", "dca-level-filled", "dca-round-closed", "dca-removed", "dca-stopped",
+  // AGENTIC-DCA 4.6
+  "dca-base-bought", "dca-orders-cancelled"]);
 const DCA_QUIET = new Set([
   "dca-disabled", "dca-action-in-flight", "dca-waiting", "dca-resumed", "dca-retry-backoff", "dca-uneconomic",
   "dca-trigger-not-reached", "dca-below-range", "dca-above-range", "dca-cash-low", "dca-cap-exhausted",
   "dca-native-cap-exhausted", "dca-removing:sale-backoff", "dca-removing:waiting-for-an-unknown-mint", "dca_round_changed", "dry-run", "session-expired", "session-expiring",
   // mirror of src/trade/dcaExecute.ts:339-341 DCA_HOLD_CODES (a denial that is a hold, not a failure)
   "NATIVE_RESERVE", "QUOTE_DAILY_CAP", "GUARD_QUOTE_EXPIRED", "dca_key_conflict", "halted", "paused", "not_executable",
+  // AGENTIC-DCA 4.6 and R22.2: waits and a held take profit, not failures (the held-order codes stay failed)
+  "dca-watching", "dca-quote-short", "dca-cooldown", "dca-cancelling", "dca-stopping", "dca-winding-down", "dca-low-bnb", "dca-quota-low", "dca-settings-hold", "dca-binance-throttled", "dca-agentic-off", "dca-tp-stale",
 ]);
 export function dcaRunSucceeded(run: Run): boolean {
   if (run.dryRun) return false;
@@ -165,6 +169,7 @@ export function routeLine(routes: readonly RunEvent[]): string | null {
   const refused = routes.filter((event) => event.code === "binance-refused").map((event) => event.reason ?? "refused");
   const via = selected === null ? "no route selected"
     : selected.code === "binance-guard" ? "Binance aggregator through the guard"
+    : selected.code === "binance-rfq" ? "Binance aggregator (RFQ)"
     : `direct AMM (${selected.code.replace(/_/gu, " ")})`;
   return `Route: ${via}${refused.length === 0 ? "" : ` · aggregator refused: ${[...new Set(refused)].join(", ")}`}`;
 }
@@ -210,7 +215,7 @@ function scoreLine(event: RunEvent): string {
   return `Score ${score ?? "?"}${event.code === "strong" ? " (strong)" : ""}${parts === "" ? "" : ` · ${parts}`}`;
 }
 
-export function runLabel(reason: string): string {
+export function runLabel(reason: string, readOnly = false): string {
   const code = reason.split(";")[0] ?? reason;
   const labels: Record<string, string> = {
     "score-hold": "No candidate passed the score",
@@ -249,7 +254,8 @@ export function runLabel(reason: string): string {
     "portfolio-disabled": "Smart Portfolio is off",
     "portfolio-token-not-granted": "A selected stock is not granted",
     "portfolio-pending-intent": "Waiting for a rebalance trade",
-    "portfolio-submission-unknown": "A trade's outcome is unknown; the agent waits. Pause and Remove stay available and your funds stay in this wallet.",
+    "portfolio-submission-unknown": readOnly ? "A trade's outcome is unknown; the agent waits."
+      : "A trade's outcome is unknown; the agent waits. Pause and Remove stay available and your funds stay in this wallet.",
     "portfolio-held": "Already checked this interval — no rebalance",
     "portfolio-done": "Rebalance check complete",
     "portfolio-hold": "Checked — drift stayed below the threshold",
@@ -260,6 +266,8 @@ export function runLabel(reason: string): string {
     "portfolio-sold": "Rebalancing — sold a stock",
     "portfolio-bought": "Rebalancing — bought a stock",
     "portfolio-no-route": "No usable rebalance route",
+    "AGENTIC_QUOTE_REFUSED": "Binance refused the quote (the trade may be below its minimum size)",
+    "binance-rejected": "Binance rejected the order",
     "portfolio-refused": "Stock rebalance route or budget refused",
     "portfolio-capital-used": "Total capital is already invested",
     "portfolio-cap-exhausted": "USDT day cap is exhausted",
@@ -321,6 +329,27 @@ export function runLabel(reason: string): string {
     "dca-removing:cost-unavailable": "Removing: the sale cannot be priced yet",
     "dca-removed": "Removed — every order is back in the wallet",
     "dca-receipt-mismatch": "Held: a batch receipt did not match its plan",
+    // AGENTIC-DCA 4.6 and R22.2: the Agentic lane's codes. The lane never emits dca-disabled, dca-retry-exhausted, dca-stop-loss or dca-removing*.
+    "dca-base-bought": "Base order bought",
+    "dca-orders-cancelled": "Term ended: nothing is left to fill",
+    "dca-watching": "Watching the price",
+    "dca-quote-short": "Price reached; the Binance quote is not good enough yet",
+    "dca-cooldown": "Cooling down after the round",
+    "dca-cancelling": "Cancelling orders",
+    "dca-stopping": "Stop loss: waiting for the order in flight",
+    "dca-winding-down": "Term ending: waiting for the order in flight",
+    "dca-low-bnb": "Waiting: BNB for gas is low",
+    "dca-quota-low": "Waiting: Binance daily quota is low",
+    "dca-settings-hold": "Waiting: Binance settings changed",
+    "dca-binance-throttled": "Waiting: Binance is rate limiting",
+    "dca-agentic-off": "Agentic Auto DCA is off: only cancels run",
+    "dca-order-held": "Held: an order needs review",
+    "dca-unattributed-strategy": "Held: an order this agent did not place is open",
+    "dca-list-incomplete": "Held: the order list could not be read completely",
+    "dca-fill-above-level": "A buy filled above its level price",
+    "dca-tp-stale": "Take profit left as placed while the agent is held",
+    "dca-stop-cancel-unconfirmed": "Stop loss: a cancel is not confirmed yet; retrying every minute",
+    "dca-no-tp": "Held: the round has no take profit order right now",
   };
   // A DCA reason may carry a detail after ":" (`dca-plan-refused:<why>`); its label is the code's.
   return labels[code] ?? (code.startsWith("dca-") ? labels[code.split(":")[0] ?? ""] : undefined) ?? code.replace(/[-_]/gu, " ");
@@ -407,8 +436,8 @@ const DCA_ACTION_TITLE: Readonly<Record<TradeDcaActionView["kind"], (roundNo: nu
   remove: () => "Remove: orders pulled",
 };
 
-export function TradeRunLog({ runs, symbols, schedule = false, portfolio = false, portfolioLegs, dca }: { readonly runs: readonly Run[]; readonly symbols: Readonly<Record<string, string>>; readonly schedule?: boolean; readonly portfolio?: boolean;
-  readonly portfolioLegs?: NonNullable<TradeView["portfolio"]>["legs"];
+export function TradeRunLog({ runs, symbols, schedule = false, portfolio = false, portfolioLegs, dca, readOnly = false }: { readonly runs: readonly Run[]; readonly symbols: Readonly<Record<string, string>>; readonly schedule?: boolean; readonly portfolio?: boolean;
+  readonly portfolioLegs?: NonNullable<TradeView["portfolio"]>["legs"]; readonly readOnly?: boolean;
   readonly dca?: { readonly actions: readonly TradeDcaActionView[] | undefined } }) {
   const [filter, setFilter] = useState("all");
   const shown = runs.filter((run) => filter === "all"
@@ -456,7 +485,7 @@ export function TradeRunLog({ runs, symbols, schedule = false, portfolio = false
           </div>
         </div>);
     })() : shown.map((run) => <details className="fl-run-card" key={run.id}>
-      <summary><span className={`fl-run-dot ${(dca !== undefined ? dcaRunSucceeded(run) : run.entries > 0 || run.exits > 0) ? "is-active" : ""}`} /><div><strong>{runLabel(run.reason)}</strong><p>{runSummary(run)}{run.dryRun ? " · simulation" : ""}</p></div><time title={new Date(run.createdAt).toISOString()}>{relativeTime(run.createdAt, Date.now()).text}</time><span aria-hidden="true">⌄</span></summary>
+      <summary><span className={`fl-run-dot ${(dca !== undefined ? dcaRunSucceeded(run) : run.entries > 0 || run.exits > 0) ? "is-active" : ""}`} /><div><strong>{runLabel(run.reason, readOnly)}</strong><p>{runSummary(run)}{run.dryRun ? " · simulation" : ""}</p></div><time title={new Date(run.createdAt).toISOString()}>{relativeTime(run.createdAt, Date.now()).text}</time><span aria-hidden="true">⌄</span></summary>
       <div className="fl-run-detail"><div className="fl-run-meta">{new Date(run.createdAt).toLocaleString()} · Run {run.id}</div>
         {(run.events?.length ?? 0) > 0 ? <><ol>{run.events!.filter((event) => !NOISE_CODES.has(event.code)).map((event, i) => <li key={i}>
           <span className="fl-run-stage">{event.stage.replace(/-/gu, " ")} <small>+{(event.elapsedMs / 1000).toFixed(1)}s</small></span>

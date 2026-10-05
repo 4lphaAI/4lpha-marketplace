@@ -70,6 +70,9 @@ import { isFeeCollectionStep, sequenceAffectsPosition } from "./lp/feeRecorder.j
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { createDemoRoutes, type DemoServerDeps } from "./demo/routes.js";
+import { registerAgenticRoutes, type AgenticPairings } from "./agentic/routes.js";
+import { type AgenticRfqPin, mapWithConcurrency, orderRfqOnly, rfqCostBps, validRankingOut } from "./agentic/rfq.js";
+import { RFQ_RANKING_NOTIONAL_WEI } from "./trade/rfq.js";
 import type { Context } from "hono";
 import { bytesToHex, concat, encodeAbiParameters, encodeFunctionData, formatEther, getAddress, getCreate2Address, isAddress, keccak256, stringToBytes, toBytes, zeroAddress } from "viem";
 import { publicKeyToAddress } from "viem/utils";
@@ -991,6 +994,7 @@ export type TradeAgentServerDeps = {
 
 /** Collaborators the HTTP layer reads from. Injected so the app stays testable. */
 export interface ServerDeps {
+  readonly agentic?: AgenticPairings;
   readonly agentStore: AgentStore;
   readonly journal: ExecutionJournal;
   readonly nonceStore: NonceStore;
@@ -1594,6 +1598,56 @@ export function createServer(deps: ServerDeps): Hono {
       ...(requestSignal === undefined ? {} : { signal: requestSignal }),
     }), signal);
   };
+  // AGENTIC-RFQ-STOCKS E3 (flag on only): the Agentic AI pin variant with its OWN cache and in-flight map. cachedPin, cachedPinCandidates, aiTradfiProbe and their keys are not
+  // touched, so an Altana AI or Schedule pin can never see a pool-less row from it (RI1). Every open and TRADING bStock is admitted, nothing is cut, pooled first by deepest admitted
+  // liquidity, then the RFQ-only stocks by the cost of one validated Flash proxy buy quote at 20 USDT (ordering only: the binding price check of every trade is the Agentic quote).
+  const agenticRfqPinCache = new Map<string, { readonly at: number; readonly pin: AgenticRfqPin }>();
+  let agenticRfqPinFlight: Promise<AgenticRfqPin> | null = null;
+  const cachedAgenticRfqPin = async (): Promise<AgenticRfqPin> => {
+    const tradeAgent = deps.tradeAgent;
+    if (tradeAgent === undefined || !tradeAgent.readiness.ready) throw new TradeNotReadyError();
+    const cached = agenticRfqPinCache.get("tradfi:agentic-ai");
+    if (cached !== undefined && nowMs() - cached.at < 30_000) return cached.pin;
+    // A concurrent caller (a hire the browser retried) awaits the running sweep instead of starting a second 26-quote one.
+    if (agenticRfqPinFlight !== null) return agenticRfqPinFlight;
+    const work = (async (): Promise<AgenticRfqPin> => {
+      const candidates = await pinUniverse("tradfi", { dataPlane: tradeAgent.dataPlane, tradfiV2CapabilityProbe: async () => true }, { lanes: ["bstocks"], probeAll: true });
+      const rows = await tradeAgent.dataPlane.universe("bstocks") ?? [];
+      const byAddress = new Map(rows.map((row) => [row.address.toLowerCase(), row] as const));
+      // R3.12(b): the pin keeps one row per underlying ticker; say so when two lane rows share one.
+      const tickers = new Map<string, string>();
+      for (const row of rows) {
+        const ticker = row.rwa?.underlyingTicker?.trim().toUpperCase();
+        if (ticker === undefined || ticker === "") continue;
+        const other = tickers.get(ticker);
+        if (other === undefined) tickers.set(ticker, row.symbol);
+        else console.warn(`[agentic-rfq-pin] two bStocks share the underlying ${ticker}: ${other} and ${row.symbol}; the pin keeps the deeper one`);
+      }
+      const pooled = candidates.filter((candidate) => admittedVenueRows(candidate.venues).length > 0).map((candidate) => candidate.address);
+      const rfqOnly = candidates.filter((candidate) => admittedVenueRows(candidate.venues).length === 0).map((candidate) => candidate.address);
+      const guard = trade.aggregatorGuard;
+      const ranked = guard !== undefined && tradeAgent.dataPlane.binanceQuoteAndSwap !== undefined && tradeAgent.guardVerified !== undefined && await tradeAgent.guardVerified(guard);
+      const costs = await mapWithConcurrency(rfqOnly, 4, async (token) => {
+        if (!ranked) return { token, costBps: null };
+        try {
+          const request = { tokenIn: USDT_56, tokenOut: token, amountAtomic: RFQ_RANKING_NOTIONAL_WEI.toString(10) };
+          // A method call on its instance, never a detached reference (commit 1fc6f20).
+          const quote = await tradeAgent.dataPlane.binanceQuoteAndSwap!(flashRequest({ ...request, slippageBps: 100 }));
+          const out = validRankingOut(quote, request, guard!, nowMs());
+          const fact = byAddress.get(token.toLowerCase())?.rwa;
+          return { token, costBps: out === null ? null : rfqCostBps({ outAtomic: out, referencePriceUsd: fact?.referencePriceUsd, tokenToShareRatio: fact?.tokenToShareRatio }) };
+        } catch { return { token, costBps: null }; }
+      });
+      const ordered = orderRfqOnly(costs);
+      return { pooled, rfqOnly: ordered.map((row) => row.token), costs: ordered };
+    })();
+    agenticRfqPinFlight = work;
+    try {
+      const pin = await work;
+      agenticRfqPinCache.set("tradfi:agentic-ai", { at: nowMs(), pin });
+      return pin;
+    } finally { agenticRfqPinFlight = null; }
+  };
   const cachedSchedulable = async (amountWei: bigint, slippageBps: number, signal?: AbortSignal): Promise<Awaited<ReturnType<typeof schedulableTokens>>> => {
     const tradeAgent = deps.tradeAgent;
     if (tradeAgent === undefined || !tradeAgent.readiness.ready || tradeAgent.scheduleQuotes === undefined) throw new TradeNotReadyError();
@@ -1800,6 +1854,20 @@ export function createServer(deps: ServerDeps): Hono {
     }
     return next();
   });
+
+  if (deps.agentic !== undefined) registerAgenticRoutes(app, deps.agentic, async (W, minEntryAtomic, slippageBps, mode = "ai") =>
+    (await cachedPin("tradfi", mode, W, undefined, { minEntryAtomic, slippageBps })).map(candidate => candidate.address),
+    async (amountWei, slippageBps) => (await cachedSchedulable(amountWei, slippageBps)).map(token => token.address),
+    (token, minEntryAtomic) => lastScheduleCapability.get(`${token.toLowerCase()}:${minEntryAtomic.toString(10)}`) ?? null,
+    // Smart Portfolio on the Agentic Wallet: the hire's per-stock direct buy quote (the Altana provision's check), present only when PORTFOLIO_ENABLED.
+    deps.tradeAgent?.portfolio?.enabled !== true ? undefined : async (token, amountInAtomic, slippageBps) => {
+      const quotes = deps.tradeAgent!.scheduleQuotes;
+      if (quotes === undefined) throw new Error("trade_not_ready");
+      const row = (await deps.tradeAgent!.dataPlane.universe("bstocks"))?.find(candidate => candidate.address.toLowerCase() === token.toLowerCase());
+      await quotes.buy({ token, amountInAtomic, slippageBps, ...(row?.venues === undefined ? {} : { venues: row.venues }) });
+    },
+    // AGENTIC-RFQ-STOCKS: the Agentic AI pin variant, registered only when AGENTIC_RFQ_STOCKS_ENABLED is on for this process.
+    deps.agentic.deps.rfqEnabled === true ? () => cachedAgenticRfqPin() : undefined);
 
   /* ---- Health and status ------------------------------------------------ */
 

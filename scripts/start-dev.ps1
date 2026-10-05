@@ -1,10 +1,28 @@
 param(
     [ValidateSet('all', 'api', 'web', 'lp', 'trade')]
-    [string]$Service = 'all'
+    [string]$Service = 'all',
+    # Local testing default: the Binance Agentic Wallet custody is on. Pass -NoAgentic to start without it.
+    [switch]$NoAgentic
 )
 
 $ErrorActionPreference = 'Stop'
 $repoPath = Split-Path -Parent $PSScriptRoot
+
+# Agentic Wallet flags for this local stack. Process variables win over .env files (node --env-file and Next.js),
+# and every console started below inherits them. A value already set in this shell is kept.
+if (-not $NoAgentic) {
+    $bawCli = 'D:\4lpha-baw-probe\pinned\node_modules\@binance\agentic-wallet\dist\index.js'
+    foreach ($pair in @(
+        @('AGENTIC_WALLET_ENABLED', 'true'), @('HIRE_ENABLED', 'true'), @('TRADE_AGENT_ENABLED', 'true'),
+        @('NEXT_PUBLIC_AGENTIC_WALLET_ENABLED', 'true'), @('AGENTIC_BAW_CLI', $bawCli))) {
+        if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($pair[0]))) { Set-Item -Path ("Env:" + $pair[0]) -Value $pair[1] }
+    }
+    if (-not (Test-Path -LiteralPath $env:AGENTIC_BAW_CLI)) {
+        Write-Host "Agentic CLI not found at $env:AGENTIC_BAW_CLI; Agentic stays off. Set AGENTIC_BAW_CLI or pass -NoAgentic." -ForegroundColor Yellow
+        Remove-Item Env:AGENTIC_WALLET_ENABLED, Env:NEXT_PUBLIC_AGENTIC_WALLET_ENABLED -ErrorAction SilentlyContinue
+    }
+}
+$agenticArgument = if ($NoAgentic) { ' -NoAgentic' } else { '' }
 $webPath = Join-Path $repoPath 'web'
 $services = @{
     api = @{ Title = '4lpha - API'; Directory = $repoPath; Arguments = @('run', 'dev-plane') }
@@ -29,10 +47,11 @@ try {
 
     if ($Service -eq 'all') {
         Write-Host 'Opening API, web, LP/Grid and Trading worker consoles.'
+        Write-Host ('Agentic Wallet: ' + $(if ($env:AGENTIC_WALLET_ENABLED -eq 'true') { 'ON (trade-worker runs Agentic agents LIVE)' } else { 'off' }))
         Write-Host 'Workers run LIVE when enabled in your existing configuration.'
         Write-Host 'Stop any manually started workers first. Use Ctrl+C in each console to stop.'
         foreach ($serviceName in @('api', 'web', 'lp', 'trade')) {
-            $shellArguments = '-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}" -Service {1}' -f $PSCommandPath, $serviceName
+            $shellArguments = '-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}" -Service {1}{2}' -f $PSCommandPath, $serviceName, $agenticArgument
             Start-Process -FilePath "$PSHOME\powershell.exe" -ArgumentList $shellArguments -WorkingDirectory $repoPath -WindowStyle Normal | Out-Null
         }
         Write-Host 'App: http://localhost:3000 (wait for Ready in the Web console).'

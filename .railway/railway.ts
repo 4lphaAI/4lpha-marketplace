@@ -127,10 +127,23 @@ export default defineRailway(() => {
     LENDING_RPC_URL: "https://bsc-dataseed.bnbchain.org",
   };
 
-  // TradFi Binance aggregator guard. Read by execution-api (hire/renewal grant +
-  // verification) AND trade-worker (no guard ⇒ no aggregator call).
+  // TradFi Binance aggregator guard (FINDINGS (bt)). Read by execution-api
+  // (hire/renewal grant + verification) AND trade-worker (no guard ⇒ no
+  // aggregator call), so it is spread into both services, not the lending venue.
   const tradfiGuard = {
     TRADFI_BINANCE_GUARD_ADDRESS: "0x16B24723aCE1Adc87243338d0A32C50BeC259650",
+  };
+
+  // Binance Agentic Wallet custody (AI Trade, Schedule, Smart Portfolio, Auto DCA,
+  // RFQ-only bStocks). Read by execution-api (pairing + hire routes, public view)
+  // AND trade-worker (the Agentic lanes); flip both together. The CLI is the
+  // pinned 1.10.0 copy Dockerfile.services installs at /opt/baw. Production since
+  // 2026-10-05 by operator go (G1-G4 and RG-pre-2 not yet run, risk accepted).
+  const agentic = {
+    AGENTIC_WALLET_ENABLED: "true",
+    AGENTIC_BAW_CLI: "/opt/baw/node_modules/@binance/agentic-wallet/dist/index.js",
+    AGENTIC_DCA_ENABLED: "true",
+    AGENTIC_RFQ_STOCKS_ENABLED: "true",
   };
 
   const api = service("execution-api", {
@@ -159,12 +172,16 @@ export default defineRailway(() => {
       // stored the literal `$(openssl …)` string here before). Absent ⇒ S1 is
       // fail-closed and mints no receipt.
       LENDING_PREVIEW_SECRET: preserve(),
-      // Auto DCA. DEPLOYMENT ORDER: every service that calls `reconcile` must run
-      // the commit that knows the `dcaRange` journal kind before this is "true".
+      // Auto DCA (AUTO-DCA §0.2), ON by operator ruling 2026-09-25. Read by
+      // execution-api (hire routes) and trade-worker (rounds). DEPLOYMENT ORDER
+      // (§11.2): every service that calls `reconcile` must run the commit that
+      // knows the `dcaRange` journal kind before this is "true" anywhere —
+      // deploy that code first, then this flag, on both services together.
       DCA_ENABLED: "true",
       // Smart Portfolio. Flip only once execution-api and trade-worker both run the portfolio-aware code.
       PORTFOLIO_ENABLED: "true",
       ...tradfiGuard,
+      ...agentic,
       // Staged TradFi submit: a relay pre-submission refusal becomes ROLLED_BACK
       // instead of a stuck UNKNOWN. Production since 2026-10-02 06:36Z (operator go).
       TRADE_STAGED_SUBMIT: "true",
@@ -188,11 +205,15 @@ export default defineRailway(() => {
       ...fromApi,
       ...llm,
       TRADE_LLM_API_KEY: preserve(),
-      // Flip together with execution-api's.
+      // Off ⇒ the exit subset only for an agent hired while on (D17). Flip it
+      // together with execution-api's.
       DCA_ENABLED: "true",
+      // Deploy both services with portfolio code before the second step enables hires and cycles.
       PORTFOLIO_ENABLED: "true",
       ...tradfiGuard,
+      ...agentic,
       // Binance pre-flight simulation of every TradFi submission (worker-only).
+      // Production since 2026-10-02 (operator go after the local sell evidence).
       TRADFI_PREFLIGHT_SIMULATE: "true",
       TRADE_STAGED_SUBMIT: "true",
       // Entry timing gate for the TradFi AI-trade lane: off | log | enforce. Log records would-defer events and changes no buy.
@@ -399,6 +420,7 @@ export default defineRailway(() => {
     deploy: {
       healthcheckPath: "/api/pools",
       healthcheckTimeout: 120,
+      restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 5,
     },
     env: {
@@ -422,6 +444,10 @@ export default defineRailway(() => {
       // switched to dot notation — at which point loading the wrong host fails
       // at the ceremony instead of at the plane, which is the better failure.
       NEXT_PUBLIC_PASSKEY_RP_ID: "4lpha.tech",
+      // Agentic Wallet UI and BFF proxy. Baked at build time (ARG in web/Dockerfile),
+      // so a change needs a rebuild, not a restart.
+      NEXT_PUBLIC_AGENTIC_WALLET_ENABLED: "true",
+      NEXT_PUBLIC_AGENTIC_DCA_ENABLED: "true",
       NEXT_TELEMETRY_DISABLED: "1",
       NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: preserve(),
     },

@@ -207,6 +207,7 @@ export type CmcRuntimeOwnerWiring = {
 };
 
 export type CmcRuntimeWorkerWiring = {
+  readonly refreshCapability?: (input: { target: CmcRuntimeTarget; nowMs: number }) => Promise<{ ok: true } | { ok: false; reason: string }>;
   readonly masterKey: Buffer;
   /**
    * This callback must reread current v2 settings, pause/global-kill state,
@@ -366,6 +367,7 @@ export type CmcRuntimeOwner = {
 };
 
 export type CmcRuntimeWorker = {
+  readonly takeQueued: (agentId: string) => CmcRuntimeTarget | null;
   readonly news: CmcNewsService;
   /** Awaited trade hook: records the current target and returns without I/O. */
   readonly enqueue: (target: CmcRuntimeTarget) => void;
@@ -784,11 +786,11 @@ function createWorkerRuntime(input: {
         }
         return { ticker: null, state: "skipped", context: null, operationId: null, reason: "reconciliation-required" };
       }
-      if (capability === null) return { ticker: null, state: "skipped", context: null, operationId: null, reason: "cmc-capability-reader-unavailable" };
-      const capabilityReady = await refreshRuntimeCapability({ gate: capability, store: input.store,
+      if (capability === null && worker.refreshCapability === undefined) return { ticker: null, state: "skipped", context: null, operationId: null, reason: "cmc-capability-reader-unavailable" };
+      const capabilityReady = worker.refreshCapability === undefined ? await refreshRuntimeCapability({ gate: capability!, store: input.store,
         agentId: target.agentId, ownerAddress: target.ownerAddress, wallet: target.wallet,
         generation: target.budgetGeneration, sessionPublicKey: target.sessionPublicKey,
-        sessionExpiry: target.sessionExpiry, nowMs: nowMs ?? input.now() });
+        sessionExpiry: target.sessionExpiry, nowMs: nowMs ?? input.now() }) : await worker.refreshCapability({ target, nowMs: nowMs ?? input.now() });
       if (!capabilityReady.ok) return { ticker: null, state: "skipped", context: null, operationId: null, reason: capabilityReady.reason };
       const effectiveNowMs = nowMs ?? input.now();
       // R2.1.3/R2.1.5: drop any pending request whose 16:30-ET window has
@@ -996,7 +998,8 @@ function createWorkerRuntime(input: {
       intervalHandle = null;
     },
   };
-  return { news, enqueue, refresh, getFreshContext, reconcileAttempt, reconcilePending, scheduler };
+  return { news, enqueue, refresh, getFreshContext, reconcileAttempt, reconcilePending, scheduler,
+    takeQueued(agentId) { const target = queuedTargets.get(agentId) ?? null; queuedTargets.delete(agentId); return target; } };
 }
 
 export function createCmcRuntime(input: {

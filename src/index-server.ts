@@ -91,13 +91,23 @@ import { NFPM_56 } from "./ops/nfpm.js";
 import { HttpTradeDataPlaneReads } from "./trade/dataPlaneReads.js";
 import { createHttpTradeReadinessDataPlane, createTradeReadiness } from "./trade/readiness.js";
 import { createTradeDetailObserver } from "./trade/detail.js";
+import { altanaAgentStore } from "./agentic/domain.js";
+import { resolveAgenticConfig } from "./agentic/config.js";
+import { AgenticStore } from "./agentic/store.js";
+import { BawRunner } from "./agentic/baw.js";
+import { AgenticInstanceManager } from "./agentic/instances.js";
+import { AgenticPairings } from "./agentic/routes.js";
+import { createAgenticChain } from "./agentic/resolve.js";
+import { createAgenticPublicView } from "./agentic/publicView.js";
+import { resumeAgenticEnding } from "./agentic/worker.js";
+import { loadMasterKey } from "./store/crypto.js";
 import { createRouteQuoteReader, quoteBestTradfiBuy, quoteBestTradfiSell } from "./trade/route.js";
 import { portfolioStockValue } from "./trade/portfolio.js";
 import { createPortfolioFillCache, verifyPortfolioFill } from "./trade/portfolioReceipt.js";
 import { createTradfiV2ReceiptReader } from "./trade/receipt.js";
 import { assertTradfiGuardRuntimeExact, cachedGuardVerification, classifyTradfiFlashError, createTradfiCapabilityProbeCache, flashRequest, TRADFI_BINANCE_FLASH_ROUTER_56, TRADFI_BINANCE_FLASH_SPENDER_56, TRADFI_SWAP_GUARD_ABI, type TradfiCapabilityProbeResult } from "./trade/guard.js";
 import { USDT_56 } from "./trade/settlement.js";
-import { admittedVenueRows } from "./trade/rwa.js";
+import { admittedVenueRows, rwaPremiumBps } from "./trade/rwa.js";
 import { uniswapV3Venue } from "./ops/venues.js";
 import { createCmcRuntime } from "./trade/cmcRuntime.js";
 
@@ -205,7 +215,8 @@ const serverConfig: ServerConfig = {
   ...(envSalt === "" ? {} : { envSalt }),
 };
 
-const agentStore = await createAgentStore({ chainId: network.chainId, keyStoreAddress: keyStore });
+const rawAgentStore = await createAgentStore({ chainId: network.chainId, keyStoreAddress: keyStore });
+const agentStore = altanaAgentStore(rawAgentStore);
 const journal = await createJournal();
 const nonceStore = await createNonceStore();
 const runtimeReplayStore = await createRuntimeReplayStore();
@@ -265,6 +276,44 @@ const lpReaderNetwork = {
   publicRpcUrl: network.publicRpcUrl,
 };
 const tradeRpcUrls = tradeAgentEnabled ? resolveLpRpcUrls(process.env, lpReaderNetwork) : undefined;
+const agenticConfig = resolveAgenticConfig(process.env, { hireEnabled, tradeAgentEnabled, rpcUrls: tradeRpcUrls ?? [] });
+// The Schedule quote composition below (Flash fallback and mark cache included) is assigned here once, so the Agentic public view marks a holding exactly as the owner view does.
+let agenticScheduleQuotes: { buy(input: { token: Address; amountInAtomic: bigint; slippageBps: number; venues?: readonly import("./trade/dataPlaneReads.js").VenueRow[]; signal?: AbortSignal }): Promise<{ quotedOutAtomic: bigint }>;
+  sell(input: { token: Address; amountInAtomic: bigint; slippageBps: number; signal?: AbortSignal }): Promise<{ quotedOutAtomic: bigint }> } | undefined;
+let agenticPairings: AgenticPairings | undefined;
+let agenticStore: AgenticStore | undefined;
+let agenticInstance: AgenticInstanceManager | undefined;
+if (agenticConfig.enabled) {
+  const runner = new BawRunner(agenticConfig.cli);
+  await runner.checkBoot();
+  const masterKey = loadMasterKey();
+  if (masterKey === null || tradeSettingsStore === undefined || tradePositions === undefined || tradeIntents === undefined || tradeCmc === undefined) throw new Error("AGENTIC_BOOT_REQUIREMENTS");
+  agenticStore = new AgenticStore(await createPgSqlClient(readEnv("DATABASE_URL")), { agents: rawAgentStore, journal, intents: tradeIntents, cmc: tradeCmc, killswitch });
+  await agenticStore.initialize();
+  agenticInstance = await AgenticInstanceManager.start(agenticStore, runner, "execution-api");
+  const chain = createAgenticChain(agenticConfig.rpcUrls);
+  const provider = { getTokenBalance: (request: import("./core/types.js").GetTokenBalanceParams) => chain.balance(request.wallet.address, request.token),
+    getTokenMetadata: (request: import("./core/types.js").GetTokenMetadataParams) => chain.metadata(request.token) };
+  const lifecycle = { store: agenticStore, agents: rawAgentStore, settings: tradeSettingsStore, positions: tradePositions, runner, masterKey, instance: agenticInstance };
+  agenticPairings = new AgenticPairings({ ...lifecycle, cmc: tradeCmc, chain, ready: () => tradeReadiness?.ready === true, dcaEnabled: agenticConfig.dca, rfqEnabled: agenticConfig.rfq,
+    origins: passkeyConfig.enabled ? passkeyConfig.origins : [],
+    publicView: createAgenticPublicView({ ...lifecycle, intents: tradeIntents, cmc: tradeCmc, killswitch, symbols: () => tradeReadiness?.bstocksSymbols,
+      observer: createTradeDetailObserver({ provider, rpcUrls: agenticConfig.rpcUrls }), chain, scheduleSellQuote: () => agenticScheduleQuotes?.sell,
+      // The reference premium exactly as the Altana owner view reads it (the lane row, then the deepest fresh admitted venue); any failure is null.
+      schedulePremiumBps: () => tradeDataPlane === undefined ? undefined : async token => {
+        const row = (await tradeDataPlane.universe("bstocks"))?.find(candidate => candidate.address.toLowerCase() === token.toLowerCase());
+        const fact = row?.rwa;
+        if (fact === undefined) return null;
+        return rwaPremiumBps(fact.venues === undefined && row?.venues !== undefined
+          ? { ...fact, venues: row.venues, onchainPriceUsd: admittedVenueRows(row.venues)[0]?.priceUsd ?? null } : fact, Date.now());
+      },
+      // Smart Portfolio public detail: journal evidence, display names and the pinned-pool valuation, each resolved at call time (tradeRouteReader is declared below).
+      journal, portfolioNames: () => tradeDataPlane === undefined ? undefined : async () => new Map(((await tradeDataPlane.universe("bstocks")) ?? []).flatMap(row =>
+        typeof row.name === "string" && row.name.trim() !== "" ? [[row.address.toLowerCase(), row.name.trim()] as const] : [])),
+      portfolioValue: () => tradeRouteReader === undefined ? undefined : input => portfolioStockValue(tradeRouteReader, input.token, input.amountInAtomic) }),
+    resumeEnding: row => resumeAgenticEnding(lifecycle, row) });
+  console.log("agentic: on, cli 1.10.0, keytar unresolvable");
+}
 const portfolioReceiptReader = tradeRpcUrls === undefined || tradeRpcUrls.length < 2
   ? undefined : createTradfiV2ReceiptReader({ rpcUrls: tradeRpcUrls.slice(0, 2) });
 const portfolioFillCache = createPortfolioFillCache();
@@ -703,6 +752,7 @@ const scheduleUniswapV3 = uniswapV3Venue(tradeConfig.venues);
 
 const app = createServer({
   agentStore,
+  ...(agenticPairings === undefined ? {} : { agentic: agenticPairings }),
   journal,
   nonceStore,
   runtimeReplayStore,
@@ -756,7 +806,7 @@ const app = createServer({
       ...(tradeSimulations === undefined ? {} : { simulations: tradeSimulations }),
       ...(tradeRouteReader === undefined ? {} : { portfolioValue: (input: { readonly token: Address; readonly amountInAtomic: bigint }) =>
         portfolioStockValue(tradeRouteReader, input.token, input.amountInAtomic) }),
-      ...(tradeRpcUrls === undefined || tradeRouteReader === undefined ? {} : { scheduleQuotes: {
+      ...(tradeRpcUrls === undefined || tradeRouteReader === undefined ? {} : { scheduleQuotes: (agenticScheduleQuotes = {
         buy: (input: { readonly token: Address; readonly amountInAtomic: bigint; readonly slippageBps: number; readonly venues?: readonly import("./trade/dataPlaneReads.js").VenueRow[]; readonly signal?: AbortSignal }) => quoteBestTradfiBuy({
           token: input.token, amountInAtomic: input.amountInAtomic, slippageBps: input.slippageBps, rpcUrls: tradeRpcUrls, reader: tradeRouteReader,
           ...(input.venues === undefined ? {} : { venues: input.venues }), ...(scheduleUniswapV3 === null || tradeConfig.venues.uniswapQuoterV3 === undefined ? {} : { uniswapRouter: scheduleUniswapV3.router }), ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -779,7 +829,7 @@ const app = createServer({
             return { quotedOutAtomic };
           }
         },
-      } }),
+      }) }),
     } }),
   ...(hireEnabled && lpBuilt !== undefined && hireEvidence !== undefined
     && hireRelayFeePerSubmitWei !== undefined && hireGrantGasHeadroomWei !== undefined
@@ -887,6 +937,7 @@ const billingInternalServer = billingBuilt === undefined || enabledBillingConfig
   host: enabledBillingConfig.internalHost,
   port: enabledBillingConfig.internalPort,
 });
+await agenticPairings?.start();
 const server = serve({ fetch: app.fetch, port });
 
 console.log(
@@ -922,6 +973,9 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   // The lending stores, on the same terms and for the same reason.
   await closeLendingServerDeps(lendingBuilt);
   await cmcRuntime?.close();
+  await agenticPairings?.close();
+  await agenticInstance?.finish();
+  await agenticStore?.close();
   // Closed in dependency order; each `close` is independent, so one failure must
   // not strand the others.
   for (const closeable of [

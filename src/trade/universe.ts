@@ -413,6 +413,11 @@ export type SelectEntryCandidatesInput = {
   readonly signal?: AbortSignal;
   readonly nowMs: number;
   readonly verdictCache?: TradeVerdictCache;
+  /**
+   * AGENTIC-RFQ-STOCKS E5 (lowercase addresses): the pool-less stocks of an RFQ-active Agentic AI agent. Absent, this function is byte-identical to before.
+   * Present: their verdict ignores the dust-pool premium, the shortlist is the first 12 pooled plus every RFQ-only token, and the read budget grows by the RFQ-only tokens shortlisted.
+   */
+  readonly rfqOnly?: ReadonlySet<string>;
 };
 
 /**
@@ -521,8 +526,9 @@ export async function selectEntryCandidates(
 ): Promise<SelectEntryCandidatesResult> {
   const refusals: CandidateRefusal[] = [];
   let reads = 0;
+  let budget = TRADE_READ_BUDGET;
   const consume = (): boolean => {
-    if (reads >= TRADE_READ_BUDGET) return false;
+    if (reads >= budget) return false;
     reads += 1;
     return true;
   };
@@ -537,7 +543,11 @@ export async function selectEntryCandidates(
       classified.push(candidate);
       continue;
     }
-    const verdict = rwaEntryVerdict(rwaFacts.get(key), input.nowMs,
+    const rfqFact = rwaFacts.get(key);
+    // E5: an RFQ-only token never reads the dust-pool premium of its row; the executed-quote premium decides, so a row with a reference and a ratio is allowed as premium:deferred.
+    const verdict = input.rfqOnly?.has(key) === true
+      ? rwaEntryVerdict(rfqFact === undefined ? undefined : { ...rfqFact, premiumBps: null }, input.nowMs, { allowVenueMissing: true, deferUnknownPremium: true })
+      : rwaEntryVerdict(rwaFacts.get(key), input.nowMs,
       input.model === "tradfi" && input.settings.settlementAsset === "USDT" ? { allowVenueMissing: true } : {});
     if (verdict.kind === "refuse") {
       refusals.push({ address: candidate.address, reason: verdict.reason });
@@ -609,7 +619,11 @@ export async function selectEntryCandidates(
       scanReasons: [],
     });
   }
-  const shortlist = (input.model === "tradfi" ? ranked : rankDiversified(input.model, ranked)).slice(0, TRADE_SHORTLIST_MAX);
+  const ordered = input.model === "tradfi" ? ranked : rankDiversified(input.model, ranked);
+  const rfqOnly = input.rfqOnly;
+  const shortlist = rfqOnly === undefined ? ordered.slice(0, TRADE_SHORTLIST_MAX)
+    : [...ordered.filter((candidate) => !rfqOnly.has(candidate.address.toLowerCase())).slice(0, TRADE_SHORTLIST_MAX), ...ordered.filter((candidate) => rfqOnly.has(candidate.address.toLowerCase()))];
+  if (rfqOnly !== undefined) budget = TRADE_READ_BUDGET + shortlist.filter((candidate) => rfqOnly.has(candidate.address.toLowerCase())).length;
   const cache = input.verdictCache ?? PROCESS_VERDICT_CACHE;
   const selected: EntryCandidate[] = [];
   for (const candidate of shortlist) {

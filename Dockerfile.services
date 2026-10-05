@@ -28,6 +28,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --include=dev --no-audit --no-fund
 
 COPY src ./src
+RUN mkdir -p /opt/baw && cp src/agentic/cli/package.json src/agentic/cli/package-lock.json /opt/baw/ && cd /opt/baw && npm ci --ignore-scripts --omit=dev --no-audit --no-fund && rm -rf node_modules/@github/keytar && test "$(node node_modules/@binance/agentic-wallet/dist/index.js --version)" = "1.10.0"
 COPY scripts ./scripts
 
 ENV NODE_ENV=production

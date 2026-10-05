@@ -1,5 +1,6 @@
 /* Ported verbatim from the Claude Design export (ui_kits/marketplace/data.js).
    Only the trailing `Object.assign(window, ...)` was replaced by ES exports. */
+import { agenticDcaEnabled, agenticEnabled } from "./agentic";
 
 export interface AgentMetric { label: string; value: string; tone?: string; note?: string }
 export interface AgentActivity { title: string; detail: string; time: string; txHash?: string; icon?: string; tone?: string }
@@ -19,6 +20,8 @@ export interface Agent {
   /** Extra venue logos rendered beside the protocol logo on the card meta row. */
   relatedProtocols?: string[];
   venues?: string[];
+  /** Custody options shown on the card spec row; absent means Altana only. */
+  custody?: string[];
   metricValue: string;
   metricTone?: string;
   metricLabel?: string;
@@ -82,7 +85,7 @@ export const AGENTS: Agent[] = [
     tagline: "Collects fees earns and adds them back into the same position.",
     metricValue: "+$180 vs -$40 IL", metricTone: "profit", hiredCount: 64, price: "1.0%", priceUnit: "performance fee" },
   { id: "yield-router", name: "AI Stocks Trader", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks", "ondo"],
-    tier: "verified", status: "live", explainer: "trade",
+    tier: "verified", status: "live", explainer: "trade", ...(agenticEnabled ? { custody: ["altana", "agentic-wallet"] } : {}),
     tagline: "Screens tokenized US stocks and manages entries.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 289, price: "10%", priceUnit: "of profit",
     pair: "NVDAB / USDT", dailyCap: "500 USDT",
@@ -93,16 +96,16 @@ export const AGENTS: Agent[] = [
       { label: "Fee", value: "10%", note: "of profit" },
     ],
     statusLine: "2 of 3 positions open · last entry 41m ago" },
-  { id: "vector-trader", name: "Tradfi Recurring Buy", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks"],
-    tier: "verified", status: "live", explainer: "schedule",
+  { id: "vector-trader", name: "Tradfi Recurring Buy", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks", "ondo"],
+    tier: "verified", status: "live", explainer: "schedule", ...(agenticEnabled ? { custody: ["altana", "agentic-wallet"] } : {}),
     tagline: "Buys a fixed amount of one tokenized stock on a set frequency.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 156, price: "0 Fees", priceUnit: "this month" },
-  { id: "atlas-trader", name: "Auto DCA Agent", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks"],
-    tier: "verified", status: "live", explainer: "dca",
+  { id: "atlas-trader", name: "Auto DCA Agent", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks", "ondo"],
+    tier: "verified", status: "live", explainer: "dca", ...(agenticEnabled && agenticDcaEnabled ? { custody: ["altana", "agentic-wallet"] } : {}),
     tagline: "Buys a fixed amount on a schedule, or on every dip.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 203, price: "0 Fees", priceUnit: "this month" },
-  { id: "smart-portfolio", name: "Smart Portfolio Agent", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks"],
-    tier: "verified", status: "live", explainer: "smart",
+  { id: "smart-portfolio", name: "Smart Portfolio Agent", categoryId: "trading", protocol: "PancakeSwap v3", relatedProtocols: ["bstocks", "ondo"],
+    tier: "verified", status: "live", explainer: "smart", ...(agenticEnabled ? { custody: ["altana", "agentic-wallet"] } : {}),
     tagline: "Holds a weighted basket and rebalances back to target.",
     metricValue: "14.2%", metricTone: "profit", hiredCount: 74, price: "0 Fees", priceUnit: "this month" },
   // MARKETPLACE-LENDING-AGENT §2.3: the mock's "37 positions saved", 1204

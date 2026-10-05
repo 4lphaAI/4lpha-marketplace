@@ -19,6 +19,8 @@ import { RunLogPanel } from "./TradeSimulationLog";
 import type { TradePositionView, TradeSettings, TradeView } from "@/lib/trade";
 
 type Schedule = NonNullable<TradeView["schedule"]>;
+/** The three settings the schedule body reads, so the Agentic public page can render it without a full settings object. */
+type ScheduleSettings = Pick<TradeSettings, "capitalQuoteWei" | "entryWei" | "scheduleMarketHoursOnly">;
 
 const MONO: React.CSSProperties = { font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.04em" };
 const KICKER: React.CSSProperties = { font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)", letterSpacing: "0.08em", textTransform: "uppercase" };
@@ -170,7 +172,7 @@ function ScheduleSegmentBar({ fills, planned }: { readonly fills: number; readon
   </div>;
 }
 
-function ScheduleProgressCard({ schedule, settings, nowMs }: { readonly schedule: Schedule; readonly settings: TradeSettings; readonly nowMs: number }) {
+function ScheduleProgressCard({ schedule, settings, nowMs, label }: { readonly schedule: Schedule; readonly settings: ScheduleSettings; readonly nowMs: number; readonly label?: string }) {
   const totalWei = (BigInt(schedule.spentWei) + BigInt(schedule.remainingWei)).toString(10);
   const nextBuy = schedule.finished !== null ? { value: scheduleFinishedLabel(schedule.finished), note: "idle · no worker calls" } : scheduleCountdown(schedule, nowMs);
   return (
@@ -188,6 +190,7 @@ function ScheduleProgressCard({ schedule, settings, nowMs }: { readonly schedule
           </div>
         </div>
         <div style={{ display: "flex", gap: 20, flexWrap: "wrap", paddingTop: 14, borderTop: "1px solid var(--line-1)" }}>
+          {label === undefined ? null : <span style={MONO} data-testid="schedule-progress-label">{label.toUpperCase()}</span>}
           <span style={{ ...MONO, marginLeft: "auto" }}>REMAINING {usdt2(schedule.remainingWei)}</span>
         </div>
       </div>
@@ -217,7 +220,7 @@ function ScheduleMetric({ label, value, note, tone = "normal", skeleton = false 
 }
 
 function ScheduleMetricRow({ schedule, settings, open, nowMs }: {
-  readonly schedule: Schedule; readonly settings: TradeSettings; readonly open: readonly TradePositionView[]; readonly nowMs: number;
+  readonly schedule: Schedule; readonly settings: ScheduleSettings; readonly open: readonly TradePositionView[]; readonly nowMs: number;
 }) {
   const holding = schedule.holding;
   const basisState = scheduleBasisState(open, holding, nowMs);
@@ -260,7 +263,7 @@ function ScheduleMetricRow({ schedule, settings, open, nowMs }: {
 }
 
 function SchedulePricePanel({ schedule, settings, open, averagePriceValue }: {
-  readonly schedule: Schedule; readonly settings: TradeSettings; readonly open: readonly TradePositionView[]; readonly averagePriceValue: string;
+  readonly schedule: Schedule; readonly settings: ScheduleSettings; readonly open: readonly TradePositionView[]; readonly averagePriceValue: string;
 }) {
   const markers: readonly MarketChartMarker[] = open.map((position) => ({ timestamp: position.openedAt, side: "buy" as const, text: "B" }));
   const premiumText = schedule.premiumBps === undefined || schedule.premiumBps === null ? "premium unavailable" : bpsPercent(schedule.premiumBps, true);
@@ -338,14 +341,16 @@ function ScheduleBuysTable({ schedule, open, icon, nowMs, refresh }: {
  * ceiling is accepted by the settings route, then every buy is refused
  * (`USDT_ENTRY_BOUNDS`). Say so here instead of letting the schedule stall silently.
  */
-function scheduleAmountAboveGrant(settings: TradeSettings, hiredEntryWei: string | undefined): bigint | null {
+function scheduleAmountAboveGrant(settings: ScheduleSettings, hiredEntryWei: string | undefined): bigint | null {
   if (hiredEntryWei === undefined || !/^\d+$/u.test(hiredEntryWei) || !/^\d+$/u.test(settings.entryWei)) return null;
   const granted = BigInt(hiredEntryWei);
   return granted > 0n && BigInt(settings.entryWei) > granted ? granted : null;
 }
 
 /** What the owner can do once the schedule is finished; the worker makes no calls for it until an edit reopens it. */
-function scheduleFinishedNextSteps(schedule: Schedule): string {
+function scheduleFinishedNextSteps(schedule: Schedule, readOnly: boolean): string {
+  // An Agentic Wallet hire has no owner action: the stock and any leftover USDT are already the owner's, in the Binance App.
+  if (readOnly) return `The agent is idle and makes no calls. Your ${schedule.symbol} and any leftover USDT stay in your Agentic Wallet; sell them in the Binance App.`;
   const holdings = `Your ${schedule.symbol} and any leftover USDT stay in the agent wallet; withdraw them from Account with your passkey. Remove revokes the session key and sells nothing.`;
   if (schedule.finished === "budget") {
     return `The agent is idle and makes no calls. The total budget is fixed at hire, so buying more needs a new Schedule hire. ${holdings}`;
@@ -354,30 +359,34 @@ function scheduleFinishedNextSteps(schedule: Schedule): string {
   return `The agent is idle and makes no calls. ${reopen} to resume buying on the next cycle while budget remains. ${holdings}`;
 }
 
-function ScheduleNotices({ schedule, settings, hiredEntryWei }: { readonly schedule: Schedule; readonly settings: TradeSettings; readonly hiredEntryWei?: string }) {
-  const granted = schedule.finished === null ? scheduleAmountAboveGrant(settings, hiredEntryWei) : null;
+function ScheduleNotices({ schedule, settings, hiredEntryWei, readOnly }: { readonly schedule: Schedule; readonly settings: ScheduleSettings; readonly hiredEntryWei?: string; readonly readOnly: boolean }) {
+  const granted = schedule.finished === null && !readOnly ? scheduleAmountAboveGrant(settings, hiredEntryWei) : null;
   return <>
     {granted === null ? null : <div className="fl-trade-message fl-trade-message--warning" role="alert" style={{ margin: "0 0 16px" }} data-testid="schedule-amount-above-grant">
       <span>Amount per buy {usdt2(settings.entryWei)} is above the {usdt2(granted.toString(10))} this hire's session allows, so every buy is refused. Set it back to {usdt2(granted.toString(10))} or less, or renew / re-hire for a larger amount.</span>
     </div>}
     {schedule.finished === null ? null : <div className="fl-trade-message" role="status" style={{ margin: "0 0 16px" }} data-testid="schedule-finished-next">
-      <span>{scheduleFinishedNextSteps(schedule)}</span>
+      <span>{scheduleFinishedNextSteps(schedule, readOnly)}</span>
     </div>}
   </>;
 }
 
 /** Always-visible top of the schedule page: the progress card and the five-tile metric row. Rendered whether or not the owner is editing, mirroring the mock-up. */
-export function ScheduleSummary({ schedule, settings, open, hiredEntryWei }: {
+export function ScheduleSummary({ schedule, settings, open, hiredEntryWei, readOnly = false, label }: {
+  /** Optional footer text on the progress card's left; the Agentic page names the mode there. */
+  readonly label?: string;
   readonly schedule: Schedule;
-  readonly settings: TradeSettings;
+  readonly settings: ScheduleSettings;
   readonly open: readonly TradePositionView[];
   readonly hiredEntryWei?: string;
+  /** The Agentic public page: no owner action exists, so the notices that point at one are not shown. */
+  readonly readOnly?: boolean;
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNowMs(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
   return <>
-    <ScheduleNotices schedule={schedule} settings={settings} {...(hiredEntryWei === undefined ? {} : { hiredEntryWei })} />
-    <ScheduleProgressCard schedule={schedule} settings={settings} nowMs={nowMs} />
+    <ScheduleNotices schedule={schedule} settings={settings} readOnly={readOnly} {...(hiredEntryWei === undefined ? {} : { hiredEntryWei })} />
+    <ScheduleProgressCard schedule={schedule} settings={settings} nowMs={nowMs} {...(label === undefined ? {} : { label })} />
     <ScheduleMetricRow schedule={schedule} settings={settings} open={open} nowMs={nowMs} />
   </>;
 }
@@ -385,11 +394,13 @@ export function ScheduleSummary({ schedule, settings, open, hiredEntryWei }: {
 /** The Buys / Run log toggle and its panel, shown only while the owner is not editing. */
 export function ScheduleTabs({ schedule, settings, trade, refresh, simulationLog }: {
   readonly schedule: Schedule;
-  readonly settings: TradeSettings;
-  readonly trade: TradeView;
+  readonly settings: ScheduleSettings;
+  readonly trade: Pick<TradeView, "open" | "runs">;
   readonly refresh: () => Promise<unknown>;
   /** The read-only pre-flight simulation log; shown inside the Run log tab (Runs | Simulate toggle) only when supplied. */
   readonly simulationLog?: React.ReactNode;
+  /** The Agentic public page. Nothing in the tabs is an owner action, so this changes no output; it keeps one contract with ScheduleSummary. */
+  readonly readOnly?: boolean;
 }) {
   const [tab, setTab] = useState<"Buys" | "Run log">("Buys");
   const [showChart, setShowChart] = useState(false);

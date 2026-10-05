@@ -136,7 +136,7 @@ export type AgentAuthority = KeyAuthority;
  *   - `hd-derived`  the wallet is derived from a service-held seed. Reserved for
  *                   the hard-isolation option (FINDINGS.md (g)); not used yet.
  */
-export type CustodyModel = "self-eoa" | "passkey" | "hd-derived";
+export type CustodyModel = "self-eoa" | "passkey" | "hd-derived" | "binance-agentic";
 
 /** A wallet the execution plane can act on. */
 export type AgentWalletRef = {

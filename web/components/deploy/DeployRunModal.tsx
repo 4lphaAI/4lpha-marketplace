@@ -58,7 +58,7 @@ function StepMark({ state, index, color }: { readonly state: DeployStepState; re
  * value eases toward the goal every frame, so it never jumps or stalls. The
  * frame loop writes the DOM directly — no React render per frame.
  */
-function LinearProgress({ base, span, color, running, failed }: {
+export function LinearProgress({ base, span, color, running, failed }: {
   readonly base: number; readonly span: number; readonly color: string; readonly running: boolean; readonly failed: boolean;
 }) {
   const bar = React.useRef<HTMLDivElement | null>(null);

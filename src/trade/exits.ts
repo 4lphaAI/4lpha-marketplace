@@ -77,6 +77,11 @@ export type ExitDecisionInput = {
   readonly autoExitNote?: string | null;
   /** The worker grants the model the time limit only for live trade settings. */
   readonly timeLimitAuthority?: boolean;
+  /**
+   * AGENTIC-RFQ-STOCKS R3.4: present only for an RFQ-only position of an RFQ-active agent. The owner stop-loss then fires only if the previous reading ALSO sits at or below the line
+   * (`null` = no usable previous reading, so it holds). Absent, this function is what it always was.
+   */
+  readonly previousMarkPnlBps?: bigint | null;
 };
 
 export type ExitDecision =
@@ -237,7 +242,8 @@ export function decideExit(input: ExitDecisionInput): ExitDecision {
     const note = markerNote(input);
     return { exit: true, reason: "session-expiring", pnlBps: currentPnlBps, ...(note === null ? {} : { note }) };
   }
-  if (currentPnlBps !== null && input.stopLossBps !== null && currentPnlBps <= -BigInt(input.stopLossBps)) {
+  if (currentPnlBps !== null && input.stopLossBps !== null && currentPnlBps <= -BigInt(input.stopLossBps)
+    && (input.previousMarkPnlBps === undefined || input.previousMarkPnlBps !== null && input.previousMarkPnlBps <= -BigInt(input.stopLossBps))) {
     return { exit: true, reason: "stop-loss", pnlBps: currentPnlBps };
   }
   if (currentPnlBps !== null && input.takeProfitBps !== null && currentPnlBps >= BigInt(input.takeProfitBps)) {

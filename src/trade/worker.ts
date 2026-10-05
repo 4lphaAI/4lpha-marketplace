@@ -35,6 +35,7 @@ import {
   type BestBuyRoute,
   type RouteQuoteReader,
   type TradeVenueId,
+  type TradfiQuote,
 } from "./route.js";
 import type { TradeRoute, V3FeeTier } from "../ops/route.js";
 import { isTradfiV2Settings, isTradfiAiSettings, isTradeDcaSettings, isTradeScheduleSettings, isTradePortfolioSettings, parseTradeSettings, type EffectiveTradeSettings } from "./settings.js";
@@ -116,12 +117,13 @@ import { normalizeTradeRunEvents, type TradeRunEvent } from "../store/tradeRunTr
 import { sizeTradeBuy, tradfiV2BuyFeeWei, tradfiV2EntryReservation } from "./sizing.js";
 import { rwaMarketClosed } from "./universe.js";
 import { currentSlot, scheduleAnchorMs, scheduleLedger, type ScheduleIntervalSec, type ScheduleLedger } from "./schedule.js";
-import { enrichFeatures, featurePrompt, assessMomentum, featureModel, describeFeatures } from "./features.js";
+import { enrichFeatures, featurePrompt, assessMomentum, featureModel, describeFeatures, mergeUnderlyingFeatures } from "./features.js";
 import { sessionState, SESSION_PROFILES } from "./session.js";
 import { evaluateExitTrigger, blendRegime, scoreToken, tradfiExitAllowed, type Regime, type ExitTriggerContext } from "./score.js";
 import { entryTimingGate, type EntryTimingMode } from "./entryTiming.js";
 import { tradfiPeakImplausible, tradfiRobotExit, type TradfiExitRulesMode } from "./exitRules.js";
 import { TRADFI_BINANCE_FLASH_ROUTER_56, TRADFI_BINANCE_FLASH_SPENDER_56, TRADFI_GUARD_MAX_DEADLINE_WINDOW_SEC, TRADFI_GUARD_MIN_REMAINING_MS, flashRequest } from "./guard.js";
+import { RFQ_CONFIRM_DELAY_MS, confirmationGates, isRfqOnlyRow, priorFromStored, rfqAsk, rfqPeak, rfqPeakArgument, rfqQuoteRecord, skipsConfirmation, usablePreviousReading, type RfqReading, type RfqStocksDeps } from "./rfq.js";
 import { buildTradfiGuardSwapCall } from "./guard.js";
 import { buildTradfiApprove, buildTradfiPancakeV2Swap, buildTradfiPancakeV3Swap, buildTradfiUniswapV3Swap, buildTradfiPlatformFee } from "../ops/tradfi.js";
 import type { CmcNewsService } from "./cmcNews.js";
@@ -309,6 +311,8 @@ export type TradeWorkerDeps = {
   readonly intervalMs?: number;
   /** Minimum process-local interval for time-limit-only exit-model calls. */
   readonly exitLlmIntervalMs?: number;
+  /** AGENTIC-RFQ-STOCKS E7: the Agentic-only Binance quote source. Only `createAgenticWorkerDeps` sets it (flag on or off); an Altana worker never has it, so no Altana path can reach it (RI1). */
+  readonly rfqStocks?: RfqStocksDeps;
   readonly log?: (message: string) => void;
 };
 
@@ -342,6 +346,11 @@ const exitLlmAttemptAt = new Map<string, number>();
  * back to direct; the entry is cleared the moment it is read.
  */
 const directSellEscape = new Set<string>();
+/**
+ * AGENTIC-RFQ-STOCKS R5.1.1 (P1): an asked-mark hold of an RFQ-only model-approved sale, keyed `agent:position`, valued with the cycle time of the hold. The next model-approved sale of that
+ * position within 900 000 ms skips the check once and clears the entry only when the sale is actually dispatched; older entries are swept at the start of each RFQ exit pass.
+ */
+const rfqAskedMarkEscape = new Map<string, number>();
 /**
  * AUTO-DCA R2.4 (audit H-1): a merged close + start the executor DENIED writes
  * no action, so no rollback streak can unmerge it. The agent's next strategy
@@ -655,6 +664,18 @@ async function readRwaLaneSnapshot(
       : row.rwa);
   }
   return { available: true, rowsByAddress, facts, addresses };
+}
+
+/** AGENTIC-RFQ-STOCKS E8: null for every Altana agent and every hire without the marker (the dep exists only on Agentic workers, and the agent must be an Agentic AI one). */
+async function rfqOf(deps: TradeWorkerDeps, agent: AgentRecord, settings: EffectiveTradeSettings): Promise<{ readonly entries: boolean; readonly rfqOnlyAtHire: ReadonlySet<string> } | null> {
+  if (deps.rfqStocks === undefined || agent.custodyModel !== "binance-agentic" || !isTradfiAiSettings(settings)) return null;
+  return deps.rfqStocks.active(agent);
+}
+
+/** E2: RFQ-only now when the lane snapshot is readable and shows no admitted venue; the hire-time set when it is not. */
+function isRfqOnlyToken(snapshot: RwaLaneSnapshot, rfq: { readonly rfqOnlyAtHire: ReadonlySet<string> }, token: string): boolean {
+  const key = token.toLowerCase();
+  return snapshot.available ? isRfqOnlyRow(snapshot.rowsByAddress.get(key)) : rfq.rfqOnlyAtHire.has(key);
 }
 
 async function repairSellRoute(
@@ -2057,7 +2078,15 @@ async function priceTradfiV2Sell(
   sale: { readonly token: Address; readonly amount: bigint; readonly positionId: string },
   counts: MutableCounts,
   signal?: AbortSignal,
+  rfq?: boolean,
 ): Promise<{ readonly quote: Awaited<ReturnType<typeof quoteBestTradfiSell>>; readonly guardQuote?: TradeRequest["guardQuote"] } | { readonly refusal: "cost-unavailable" }> {
+  // AGENTIC-RFQ-STOCKS E10: an RFQ-only position is priced only by the Agentic sell quote of its balance; no direct or Flash call is ever made for it.
+  if (rfq === true && deps.rfqStocks !== undefined) {
+    const q = await deps.rfqStocks.quote({ agent, side: "sell", token: sale.token, amountAtomic: sale.amount, ...(signal === undefined ? {} : { signal }) });
+    if (!q.ok) { observe(counts, { stage: "route", code: "binance-refused", token: sale.token, reason: q.code }); return { refusal: "cost-unavailable" }; }
+    observe(counts, { stage: "route", code: "binance-rfq", token: sale.token });
+    return { quote: rfqQuoteRecord({ token: sale.token, amountInAtomic: sale.amount, quotedOutAtomic: q.outAtomic, minOutAtomic: applySlippageFloorWei(q.outAtomic, settings.slippageBps), nowMs: deps.now?.() ?? Date.now() }) };
+  }
   const uniswapAllowed = sessionAllowsUniswap(agent, deps.uniswapRouter);
   let quote: Awaited<ReturnType<typeof quoteBestTradfiSell>>;
   let guardQuote: TradeRequest["guardQuote"] | undefined;
@@ -2138,6 +2167,50 @@ async function priceTradfiV2Sell(
   return { quote, ...(guardQuote === undefined ? {} : { guardQuote }) };
 }
 
+function rfqPause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted === true) { reject(signal.reason); return; }
+    const onAbort = (): void => { clearTimeout(timer); reject(signal!.reason); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** The (current, previous) readings of one RFQ-only position this cycle, carried from the pricing site to the robot site and the trigger site; nothing re-reads the row (R4.8). */
+type RfqPair = { readonly quote: TradfiQuote; readonly current: RfqReading | null; readonly prev: RfqReading | null; readonly confirmFailed: string | null };
+
+/**
+ * AGENTIC-RFQ-STOCKS R3.4 / R4.2 / R5.4 / R5.5: the previous reading is the one on the position row loaded at the start of the cycle (usable only from an earlier cycle, same route and
+ * balance, within 900 000 ms). When a mark gate is breached by the first reading and no usable previous reading agrees, ONE confirming sell quote is taken after a 5 s pause (no wallet fence
+ * held); on success it is the cycle's current reading and the first reading its previous one, on failure the first reading stays current. A sale that is not a mark decision never waits.
+ */
+async function rfqPair(input: { deps: TradeWorkerDeps; agent: AgentRecord; settings: EffectiveTradeSettings; position: TradePositionRecord; balance: bigint; first: TradfiQuote;
+  nowMs: number; draining: boolean; counts: MutableCounts; signal?: AbortSignal }): Promise<RfqPair> {
+  const { deps, agent, settings, position, balance, first, nowMs, counts, signal } = input;
+  const basis = position.verifiedEntryAtomic;
+  const firstPnl = basis === null || basis === undefined ? null : pnlBps(first.quotedOutAtomic, basis);
+  if (basis === null || basis === undefined || firstPnl === null) return { quote: first, current: null, prev: null, confirmFailed: null };
+  const firstReading: RfqReading = { quoteWei: first.quotedOutAtomic, pnlBps: firstPnl };
+  const prev = usablePreviousReading({ position, routeKey: routeKey(first.venue, first.route), balance, nowMs });
+  const exitRequestedAt = input.draining ? (position.exitRequestedAt ?? nowMs) : position.exitRequestedAt;
+  const autoExitReason = position.autoExitReason === "session-expiring" ? null : position.autoExitReason;
+  if (skipsConfirmation({ draining: input.draining, exitRequestedAt, autoExitReason, crashProtection: settings.crashProtection })) return { quote: first, current: firstReading, prev, confirmFailed: null };
+  const gates = confirmationGates({ stopLossBps: settings.stopLossBps, takeProfitBps: settings.takeProfitBps, maxHoldSec: settings.maxHoldSec,
+    mode: isTradfiAiSettings(settings) ? deps.tradfiExitRulesMode ?? "off" : "off", openedAtMs: position.openedAt, nowMs, storedPeak: position.peakPnlBps,
+    prior: priorFromStored(position.exitLlmContext, sessionState(nowMs)), first: firstReading, prev,
+    hasBlankThreshold: hasBlankThreshold({ takeProfitBps: settings.takeProfitBps, stopLossBps: settings.stopLossBps, timeLimitAuthority: settings.maxHoldSec === null }) });
+  if (gates.length === 0) return { quote: first, current: firstReading, prev, confirmFailed: null };
+  await rfqPause(RFQ_CONFIRM_DELAY_MS, signal);
+  const confirm = await deps.rfqStocks!.quote({ agent, side: "sell", token: position.token, amountAtomic: balance, ...(signal === undefined ? {} : { signal }) });
+  if (!confirm.ok) {
+    observe(counts, { stage: "sell", code: "rfq-confirm", token: position.token, reason: `${gates.join("+")};failed:${confirm.code}` });
+    return { quote: first, current: firstReading, prev, confirmFailed: confirm.code };
+  }
+  observe(counts, { stage: "sell", code: "rfq-confirm", token: position.token, reason: `${gates.join("+")};ok` });
+  return { quote: rfqQuoteRecord({ token: position.token, amountInAtomic: balance, quotedOutAtomic: confirm.outAtomic, minOutAtomic: applySlippageFloorWei(confirm.outAtomic, settings.slippageBps), nowMs: deps.now?.() ?? Date.now() }),
+    current: { quoteWei: confirm.outAtomic, pnlBps: pnlBps(confirm.outAtomic, basis)! }, prev: firstReading, confirmFailed: null };
+}
+
 /** USDT v2 exits keep the sell quote and basis in the same settlement asset. */
 async function runTradfiV2Exits(
   deps: TradeWorkerDeps,
@@ -2151,6 +2224,9 @@ async function runTradfiV2Exits(
 ): Promise<void> {
   const open = await deps.positions.listOpen(agent.ownerAddress, agent.id);
   const uniswapAllowed = sessionAllowsUniswap(agent, deps.uniswapRouter);
+  // AGENTIC-RFQ-STOCKS E10: null for every Altana agent and every hire without the marker (exits and marks keep working with the flag off: a holder must be able to sell).
+  const rfq = await rfqOf(deps, agent, settings);
+  if (rfq !== null) for (const [key, heldAt] of rfqAskedMarkEscape) if (nowMs - heldAt > RUG_QUOTE_WINDOW_MS) rfqAskedMarkEscape.delete(key);
   // TRADFI-EXPIRY-KEEP-REMOVE R2: nothing is sold at session expiry for this
   // model. A stored `session-expiring` marker is UI hygiene now: cleared once
   // per cycle under the entry fence, and masked below in case one is retained.
@@ -2167,7 +2243,7 @@ async function runTradfiV2Exits(
   if (dataRequestsEnabled) {
     void deps.refreshCmcNews!({ agent, heldTickers: exitHeldTickers, shortlistedTickers: [], nowMs, ...(signal === undefined ? {} : { signal }) }).catch(() => undefined);
   }
-  const llmCandidates: Array<{ readonly priced: PricedPosition; readonly pnlBps: bigint; readonly ticker: string }> = [];
+  const llmCandidates: Array<{ readonly priced: PricedPosition; readonly pnlBps: bigint; readonly ticker: string; readonly rfq?: { readonly prev: RfqReading | null; readonly confirmFailed: string | null } }> = [];
   for (const position of open) {
     signal?.throwIfAborted();
     const balance = await deps.provider.getTokenBalance({ wallet: { address: agent.walletAddress, ownerAddress: agent.ownerAddress, custodyModel: agent.custodyModel, chainId: 56 }, token: position.token,
@@ -2176,11 +2252,15 @@ async function runTradfiV2Exits(
       await deps.positions.closePosition({ ownerAddress: agent.ownerAddress, agentId: agent.id, positionId: position.positionId, exitWei: 0n, reason: "balance-gone" });
       continue;
     }
-    const sellPriced = await priceTradfiV2Sell(deps, agent, settings, { token: position.token, amount: balance, positionId: position.positionId }, counts, signal);
+    const rfqPosition = rfq !== null && isRfqOnlyToken(snapshot, rfq, position.token);
+    const sellPriced = await priceTradfiV2Sell(deps, agent, settings, { token: position.token, amount: balance, positionId: position.positionId }, counts, signal, rfqPosition);
     if ("refusal" in sellPriced) {
       await deps.positions.recordSellRefusal({ ownerAddress: agent.ownerAddress, agentId: agent.id, positionId: position.positionId, refusal: sellPriced.refusal }); continue;
     }
-    const { quote, guardQuote } = sellPriced;
+    const { quote: firstQuote, guardQuote } = sellPriced;
+    // R3.4 / R4.2: an RFQ-only mark is a pair of readings; the confirming quote, when one is taken, is the cycle's current reading (and prices a resulting sale).
+    const rfqMark = rfqPosition ? await rfqPair({ deps, agent, settings, position, balance, first: firstQuote, nowMs, draining, counts, ...(signal === undefined ? {} : { signal }) }) : null;
+    const quote = rfqMark?.quote ?? firstQuote;
     const priced: PricedPosition = { position, balance, quoteOutWei: quote.quotedOutAtomic, venue: quote.venue, route: quote.route,
       routeKey: routeKey(quote.venue, quote.route), ...(guardQuote === undefined ? {} : { guardQuote }) };
     const basis = position.verifiedEntryAtomic;
@@ -2194,10 +2274,12 @@ async function runTradfiV2Exits(
       crashRefAtMs: position.crashRefAtMs, crashRefRoute: position.crashRefRoute, crashBasisVerified: position.crashBasisVerified,
       tokenAmount: position.tokenAmount, fillStatus: position.fillStatus,
       autoExitReason: position.autoExitReason === "session-expiring" ? null : position.autoExitReason,
-      autoExitNote: position.autoExitNote, rugQuoteWindowMs: RUG_QUOTE_WINDOW_MS, timeLimitAuthority: settings.maxHoldSec === null });
+      autoExitNote: position.autoExitNote, rugQuoteWindowMs: RUG_QUOTE_WINDOW_MS, timeLimitAuthority: settings.maxHoldSec === null,
+      ...(rfqMark === null ? {} : { previousMarkPnlBps: rfqMark.prev?.pnlBps ?? null }) });
     const evidenceOkay = decision.evidence === undefined ? true : await persistExitEvidence(deps, agent, position, decision.evidence);
     const decisionPnlBps = decision.exit ? decision.pnlBps : pnlBps(quote.quotedOutAtomic, basis ?? 0n);
-    await persistQuoteTelemetry(deps, agent, priced, decisionPnlBps, nowMs, counts, signal);
+    // R3.4: an RFQ-only position feeds the stored peak the LOWER of the pair (nothing without a usable previous reading); the stored quote is the current reading either way.
+    await persistQuoteTelemetry(deps, agent, priced, rfqMark === null ? decisionPnlBps : rfqPeakArgument(decisionPnlBps, rfqMark.prev), nowMs, counts, signal);
     if (decision.exit && evidenceOkay) {
       await sellPosition(deps, agent, settings, priced, decision.reason === "llm" ? "llm" : decision.reason, counts, signal, decision.note ?? null);
     } else if (!decision.exit && basis !== undefined && basis !== null && basis > 0n && decisionPnlBps !== null && hasBlankThreshold({
@@ -2206,17 +2288,23 @@ async function runTradfiV2Exits(
       // TRADFI-EXIT-RULES §3/§4: the owner's own exits and `decideExit` ran first. The peak is the stored one
       // (loaded before this cycle's telemetry write) raised to the current reading.
       const mode = isTradfiAiSettings(settings) ? deps.tradfiExitRulesMode ?? "off" : "off";
-      const peak = Math.max(Number(decisionPnlBps), position.peakPnlBps === null ? Number.NEGATIVE_INFINITY : Number(position.peakPnlBps));
+      const peak = rfqMark === null ? Math.max(Number(decisionPnlBps), position.peakPnlBps === null ? Number.NEGATIVE_INFINITY : Number(position.peakPnlBps)) : rfqPeak(position.peakPnlBps, decisionPnlBps, rfqMark.prev);
       // Review M1: a peak above TRADFI_TRAIL_MAX_PEAK_BPS never arms T (tradfiRobotExit); say so once per cycle.
       if (mode !== "off" && tradfiPeakImplausible(peak)) observe(counts, { stage: "exit-llm", code: "rule:peak-implausible", token: position.token, reason: `peak=+${Math.trunc(peak)}` });
       const robot = mode === "off" ? null : tradfiRobotExit({ pnlBps: Number(decisionPnlBps), peakPnlBps: peak,
         openedAtMs: position.openedAt, nowMs, takeProfitBlank: settings.takeProfitBps === null, maxHoldBlank: settings.maxHoldSec === null });
-      if (robot !== null) observe(counts, { stage: "exit-llm", code: `rule:${mode === "enforce" ? "exit" : "would-exit"}:${robot.rule}`, token: position.token, reason: robot.detail });
-      if (robot !== null && mode === "enforce") {
-        await sellPosition(deps, agent, settings, priced, robot.rule, counts, signal, robot.detail);
+      // R3.15: for an RFQ-only position the same rule must fire on the previous reading too (same peak); otherwise the worker logs rule:hold-confirm and sells nothing.
+      const confirmedRobot = rfqMark === null || robot === null ? robot : rfqMark.prev !== null && tradfiRobotExit({ pnlBps: Number(rfqMark.prev.pnlBps), peakPnlBps: peak,
+        openedAtMs: position.openedAt, nowMs, takeProfitBlank: settings.takeProfitBps === null, maxHoldBlank: settings.maxHoldSec === null })?.rule === robot.rule ? robot : null;
+      if (robot !== null && confirmedRobot === null) observe(counts, { stage: "exit-llm", code: "rule:hold-confirm", token: position.token, reason: robot.detail });
+      else if (robot !== null) observe(counts, { stage: "exit-llm", code: `rule:${mode === "enforce" ? "exit" : "would-exit"}:${robot.rule}`, token: position.token, reason: robot.detail });
+      if (confirmedRobot !== null && mode === "enforce") {
+        await sellPosition(deps, agent, settings, priced, confirmedRobot.rule, counts, signal, confirmedRobot.detail);
+      } else if (rfqMark !== null && settings.stopLossBps !== null && decisionPnlBps <= -BigInt(settings.stopLossBps)) {
+        // R3.4: a stop-loss awaiting its second reading is not offered to the exit model this cycle; it is decided next cycle by the readings.
       } else {
         const ticker = snapshot.rowsByAddress.get(position.token.toLowerCase())?.rwa?.underlyingTicker ?? "";
-        llmCandidates.push({ priced, pnlBps: decisionPnlBps, ticker });
+        llmCandidates.push({ priced, pnlBps: decisionPnlBps, ticker, ...(rfqMark === null ? {} : { rfq: { prev: rfqMark.prev, confirmFailed: rfqMark.confirmFailed } }) });
       }
     }
   }
@@ -2235,6 +2323,9 @@ async function runTradfiV2Exits(
     const isRegimeValue = (value: string): value is Regime => value === "risk_on" || value === "risk_off" || value === "neutral" || value === "unavailable";
     const triggered: typeof llmCandidates = [];
     const triggerById = new Map<string, string>();
+    // AGENTIC-RFQ-STOCKS R5.1.4/R5.2: the pnl shown to the model (and braked on) and the quote behind it, per RFQ-only position; per-cycle maps, never fields of the stored context (a bigint cannot be JSON).
+    const askedById = new Map<string, bigint>();
+    const decisionMarkById = new Map<string, bigint>();
     const contextByPosition = new Map<string, { askedAtMs: number; pnlBps: number; peakPnlBps: number | null;
       macdHistSign: -1 | 0 | 1 | null; emaSpreadSign: -1 | 0 | 1 | null; regime: Regime; session: typeof session; trigger: string }>();
     for (const item of llmCandidates) {
@@ -2253,12 +2344,19 @@ async function runTradfiV2Exits(
       };
       const trigger = evaluateExitTrigger(prior, current);
       if (trigger === null) { observe(counts, { stage: "exit-llm", code: "no-trigger", token: item.priced.position.token }); continue; }
+      if (item.rfq !== undefined) {
+        // R3.15 / R4.1: a loss or non-price trigger of an RFQ-only position needs a confirmed pair; a gain trigger stays single-reading.
+        const verdict = rfqAsk({ trigger, pnlBps: item.pnlBps, quoteWei: item.priced.quoteOutWei, prev: item.rfq.prev, confirmFailed: item.rfq.confirmFailed, storedPeak: item.priced.position.peakPnlBps });
+        if (verdict.kind === "hold") { observe(counts, { stage: "exit-llm", code: "trigger:hold-confirm", token: item.priced.position.token, reason: verdict.reason }); continue; }
+        askedById.set(item.priced.position.positionId, verdict.askedPnl);
+        decisionMarkById.set(item.priced.position.positionId, verdict.markQuote);
+      }
       observe(counts, { stage: "exit-llm", code: `trigger:${trigger}`, token: item.priced.position.token });
       triggerById.set(item.priced.position.positionId, trigger);
       // Written only after a validated answer below: an LLM outage or off-schema
       // response must not consume the trigger, or it silently never re-asks.
       contextByPosition.set(item.priced.position.positionId, {
-        askedAtMs: nowMs, pnlBps: current.pnlBps, peakPnlBps: current.peakPnlBps, macdHistSign, emaSpreadSign, regime, session, trigger,
+        askedAtMs: nowMs, pnlBps: askedById.has(item.priced.position.positionId) ? Number(askedById.get(item.priced.position.positionId)) : current.pnlBps, peakPnlBps: current.peakPnlBps, macdHistSign, emaSpreadSign, regime, session, trigger,
       });
       triggered.push(item);
     }
@@ -2273,7 +2371,7 @@ async function runTradfiV2Exits(
     const answer = await completeWithFallback(deps, settings, buildExitPrompt({
       tradfi: true,
       positions: triggered.map((item) => ({ tokenAddress: item.priced.position.token, symbol: snapshot.rowsByAddress.get(item.priced.position.token.toLowerCase())?.symbol ?? item.priced.position.token.slice(0, 8),
-        pnlBps: item.pnlBps, ageSec: Math.max(0, Math.floor((nowMs - item.priced.position.openedAt) / 1_000)), takeProfitBps: settings.takeProfitBps, stopLossBps: settings.stopLossBps,
+        pnlBps: askedById.get(item.priced.position.positionId) ?? item.pnlBps, ageSec: Math.max(0, Math.floor((nowMs - item.priced.position.openedAt) / 1_000)), takeProfitBps: settings.takeProfitBps, stopLossBps: settings.stopLossBps,
         peakPnlBps: item.priced.position.peakPnlBps, trigger: triggerById.get(item.priced.position.positionId) ?? "-", session, regime,
         indicators: describeFeatures(features.get(item.priced.position.token.toLowerCase())),
         ...(settings.maxHoldSec === null ? { maxHoldSec: null } : {}) })),
@@ -2311,7 +2409,7 @@ async function runTradfiV2Exits(
         // Operator ruling 2026-09-23 (implicit −8 %): a loss inside the review
         // band is sold only on a broken 1h trend or a risk_off regime.
         const guardContext = contextByPosition.get(item.priced.position.positionId);
-        const guard = tradfiExitAllowed({ pnlBps: Number(item.pnlBps), regime,
+        const guard = tradfiExitAllowed({ pnlBps: Number(askedById.get(item.priced.position.positionId) ?? item.pnlBps), regime,
           emaSpreadSign: guardContext?.emaSpreadSign ?? null, macdHistSign: guardContext?.macdHistSign ?? null });
         if (!guard.allowed) {
           observe(counts, { stage: "exit-llm", code: "hold-guard", model: answer.model, token: item.priced.position.token, reason: guard.reason });
@@ -2323,7 +2421,19 @@ async function runTradfiV2Exits(
         let refreshed: PricedPosition | null = null;
         const exitFacts = agent.sessionFacts;
         const exitFlashGranted = deps.dataPlane.binanceQuoteAndSwap !== undefined && exitFacts !== null && flashGuardGranted(deps, exitFacts);
-        try {
+        // E10: the post-model re-quote of an RFQ-only position is the Agentic sell quote, never a direct or Flash one.
+        if (item.rfq !== undefined && deps.rfqStocks !== undefined) {
+          const fresh = await deps.rfqStocks.quote({ agent, side: "sell", token: item.priced.position.token, amountAtomic: item.priced.balance, ...(signal === undefined ? {} : { signal }) });
+          if (!fresh.ok) observe(counts, { stage: "route", code: "binance-refused", token: item.priced.position.token, reason: fresh.code });
+          else {
+            const record = rfqQuoteRecord({ token: item.priced.position.token, amountInAtomic: item.priced.balance, quotedOutAtomic: fresh.outAtomic,
+              minOutAtomic: applySlippageFloorWei(fresh.outAtomic, settings.slippageBps), nowMs: deps.now?.() ?? Date.now() });
+            const { guardQuote: droppedGuard, ...withoutGuard } = item.priced;
+            void droppedGuard;
+            refreshed = { ...withoutGuard, quoteOutWei: record.quotedOutAtomic, venue: record.venue, route: record.route, routeKey: routeKey(record.venue, record.route) };
+            observe(counts, { stage: "route", code: "binance-rfq", token: item.priced.position.token });
+          }
+        } else try {
           const direct = await quoteBestTradfiSell({ token: item.priced.position.token, amountInAtomic: item.priced.balance,
             slippageBps: settings.slippageBps, rpcUrls: deps.rpcUrls, ...(uniswapAllowed && deps.uniswapRouter !== undefined ? { uniswapRouter: deps.uniswapRouter } : {}),
             ...(deps.routeReader === undefined ? {} : { reader: deps.routeReader }), ...(signal === undefined ? {} : { signal }) });
@@ -2389,7 +2499,20 @@ async function runTradfiV2Exits(
             } catch (error) { observe(counts, { stage: "route", code: "binance-refused", token: item.priced.position.token, reason: flashProxyReason(error) }); }
           }
         }
-        if (refreshed !== null) await sellPosition(deps, agent, settings, refreshed, "llm", counts, signal, decision.reason);
+        if (refreshed !== null) {
+          if (item.rfq !== undefined) {
+            // R5.1 / R5.1.1: the sale quote must not sit below the owner's own slippage floor of the quote behind the asked pnl; a hold lasts to the next model-approved sale within 900 s and is cleared only by a dispatch.
+            const key = `${agent.id}:${item.priced.position.positionId}`, heldAt = rfqAskedMarkEscape.get(key), mark = decisionMarkById.get(item.priced.position.positionId);
+            const honoured = heldAt !== undefined && nowMs - heldAt <= RUG_QUOTE_WINDOW_MS;
+            if (!honoured && mark !== undefined && refreshed.quoteOutWei < applySlippageFloorWei(mark, settings.slippageBps)) {
+              rfqAskedMarkEscape.set(key, nowMs);
+              observe(counts, { stage: "route", code: "binance-refused", token: item.priced.position.token, reason: "asked-mark" });
+              continue;
+            }
+            rfqAskedMarkEscape.delete(key);
+          }
+          await sellPosition(deps, agent, settings, refreshed, "llm", counts, signal, decision.reason);
+        }
       }
     }
   } catch {
@@ -2462,7 +2585,7 @@ function maxTradfiV2DebitAmount(cashWei: bigint, feeBps: number): bigint {
   return low;
 }
 
-async function tradfiActualPremiumAllowed(input: {
+export async function tradfiActualPremiumAllowed(input: {
   readonly deps: TradeWorkerDeps;
   readonly fact: RwaFact | undefined;
   readonly token: Address;
@@ -2499,6 +2622,8 @@ type SubmitTradfiV2BuyInput = {
   readonly scheduleSlot?: number;
   readonly portfolioSlot?: number;
   readonly fenceGuard?: (sql: SqlClient | undefined) => Promise<boolean | string>;
+  /** AGENTIC-RFQ-STOCKS E8: set only for an RFQ-only candidate of an RFQ-active agent; priced by the Agentic quote (E9). */
+  readonly rfq?: boolean;
 };
 
 async function portfolioFence(
@@ -2536,7 +2661,28 @@ async function portfolioFence(
   return null;
 }
 
-type PriceTradfiV2BuyInput = Pick<SubmitTradfiV2BuyInput, "candidate" | "amount" | "snapshot" | "settlementUsd" | "uniswapAllowed" | "maxPremiumBps">;
+type PriceTradfiV2BuyInput = Pick<SubmitTradfiV2BuyInput, "candidate" | "amount" | "snapshot" | "settlementUsd" | "uniswapAllowed" | "maxPremiumBps" | "rfq">;
+
+/**
+ * AGENTIC-RFQ-STOCKS E9: an RFQ-only buy is priced by the Agentic `market-order quote` (the source the executor re-checks), never by a direct, cost or Flash step:
+ * the buy quote, the executed-quote premium (cap 150 bps), an exit quote for what the buy would return (no bound on the round trip, D2), and `minOut = Q x (1 - slippage)`.
+ */
+async function priceRfqBuy(deps: TradeWorkerDeps, agent: AgentRecord, settings: EffectiveTradeSettings, input: PriceTradfiV2BuyInput, counts: MutableCounts,
+  signal?: AbortSignal): Promise<{ readonly quote: Awaited<ReturnType<typeof quoteBestTradfiBuy>>; readonly rfq: true } | "no-route"> {
+  const { candidate, amount, snapshot, settlementUsd } = input;
+  const refuse = (reason: string): "no-route" => { observe(counts, { stage: "route", code: "binance-refused", token: candidate.address, reason }); counts.refusals += 1; return "no-route"; };
+  const bought = await deps.rfqStocks!.quote({ agent, side: "buy", token: candidate.address, amountAtomic: amount, ...(signal === undefined ? {} : { signal }) });
+  if (!bought.ok) return refuse(bought.code);
+  if (!await tradfiActualPremiumAllowed({ deps, fact: snapshot.facts.get(candidate.address.toLowerCase()), token: candidate.address, amountInAtomic: amount, amountOutAtomic: bought.outAtomic,
+    settlementUsd, ...(input.maxPremiumBps === undefined ? {} : { maxPremiumBps: input.maxPremiumBps }), ...(signal === undefined ? {} : { signal }) })) return refuse("premium");
+  const exit = await deps.rfqStocks!.quote({ agent, side: "sell", token: candidate.address, amountAtomic: bought.outAtomic, ...(signal === undefined ? {} : { signal }) });
+  if (!exit.ok || exit.outAtomic <= 0n) return refuse(`no-exit:${exit.ok ? "zero" : exit.code}`);
+  const minOut = bought.outAtomic * BigInt(10_000 - settings.slippageBps) / 10_000n;
+  if (minOut <= 0n) { counts.refusals += 1; return "no-route"; }
+  const nowMs = deps.now?.() ?? Date.now();
+  observe(counts, { stage: "route", code: "binance-rfq", token: candidate.address, reason: `premium-ok;exit=${exit.outAtomic}` });
+  return { quote: rfqQuoteRecord({ token: candidate.address, amountInAtomic: amount, quotedOutAtomic: bought.outAtomic, minOutAtomic: minOut, nowMs }), rfq: true };
+}
 
 /**
  * The v2 buy pricing block of {@link submitTradfiV2Buy}, extracted verbatim
@@ -2555,7 +2701,8 @@ async function priceTradfiV2Buy(
   counts: MutableCounts,
   signal?: AbortSignal,
   extraCallsFor?: (quote: V2CostQuote) => readonly WalletCall[],
-): Promise<{ readonly quote: Awaited<ReturnType<typeof quoteBestTradfiBuy>>; readonly guardQuote?: TradeRequest["guardQuote"]; readonly nativeCostWei?: bigint } | "no-route"> {
+): Promise<{ readonly quote: Awaited<ReturnType<typeof quoteBestTradfiBuy>>; readonly guardQuote?: TradeRequest["guardQuote"]; readonly nativeCostWei?: bigint; readonly rfq?: true } | "no-route"> {
+  if (input.rfq === true && deps.rfqStocks !== undefined) return priceRfqBuy(deps, agent, settings, input, counts, signal);
   const { candidate, amount, snapshot, settlementUsd, uniswapAllowed } = input;
   const extra = extraCallsFor === undefined ? {} : { extraCallsFor };
   // A DCA start (the one caller with `extraCallsFor`) carries no platform fee.
@@ -2743,7 +2890,7 @@ async function submitTradfiV2Buy(
     // Run log (2026-09-24): the committed buy itself, with size and venue, so the Trades view can show it.
     const usdtText = (Number(amount / 10n ** 14n) / 10_000).toFixed(2);
     observe(counts, { stage: "buy", code: "committed", token: candidate.address,
-      reason: `${usdtText} USDT via ${guardQuote === undefined ? quote.venue : "binance-aggregator"}` });
+      reason: `${usdtText} USDT via ${guardQuote === undefined && priced.rfq !== true ? quote.venue : "binance-aggregator"}` });
     return "entered";
   }
   return resultCode(fenced.value);
@@ -2798,7 +2945,12 @@ async function runTradfiV2Entry(
   if (spendableUsdt < minEntry || budget < minEntry) return "entry-budget-too-small";
   if (!snapshot.available) return "data-plane-unavailable";
   const uniswapAllowed = sessionAllowsUniswap(agent, deps.uniswapRouter);
-  const candidates = pinnedTokens(facts, true).slice(0, 28).map((address) => {
+  // AGENTIC-RFQ-STOCKS E8: an RFQ-active Agentic AI agent sees every pinned stock (at most 64) when its worker has the flag on; with the flag off it sees the pooled ones only, cut at 28 as today.
+  const rfq = await rfqOf(deps, agent, settings);
+  const rfqOnlySet = rfq === null ? undefined : new Set(pinnedTokens(facts, true).filter((address) => isRfqOnlyToken(snapshot, rfq, address)).map((address) => address.toLowerCase()));
+  const rfqEntries = rfq !== null && rfq.entries;
+  const candidates = (rfq === null ? pinnedTokens(facts, true).slice(0, 28) : rfqEntries ? pinnedTokens(facts, true)
+    : pinnedTokens(facts, true).filter((address) => !rfqOnlySet!.has(address.toLowerCase())).slice(0, 28)).map((address) => {
     const row = snapshot.rowsByAddress.get(address.toLowerCase());
     return { address, symbol: row?.symbol ?? address.slice(0, 8), lane: row?.lane ?? "bstocks" as const,
       marketCapUsd: null, priceUsd: null, volume24hUsd: null, priceChange24hPct: null, holders: null,
@@ -2813,10 +2965,13 @@ async function runTradfiV2Entry(
     previouslyEnteredAddresses: new Set(all.map((row) => row.token.toLowerCase())),
     openPositionAddresses: new Set([...open.map((row) => row.token.toLowerCase()), ...unsettled.filter((row) => row.side === "buy").map((row) => row.token.toLowerCase())]),
     forbiddenAddresses: deps.forbiddenAddresses(agent), rwaAddresses: snapshot.addresses, rwaFacts: snapshot.facts, dataPlane: deps.dataPlane,
-    ...(signal === undefined ? {} : { signal }), nowMs, ...(deps.verdictCache === undefined ? {} : { verdictCache: deps.verdictCache }) });
+    ...(signal === undefined ? {} : { signal }), nowMs, ...(deps.verdictCache === undefined ? {} : { verdictCache: deps.verdictCache }),
+    ...(rfqEntries ? { rfqOnly: rfqOnlySet! } : {}) });
   if (selected.kind === "aborted") return selected.reason;
   const routeable: EntryCandidate[] = [];
   for (const candidate of selected.candidates) {
+    // E8: an RFQ-only candidate is routeable unquoted (scored first, quoted only when the model enters it): no direct, cost or Flash call is ever made for it.
+    if (rfqEntries && rfqOnlySet!.has(candidate.address.toLowerCase())) { routeable.push(candidate); continue; }
     let directAvailable = false;
     try {
       const minQuote = await quoteBestTradfiBuy({ token: candidate.address, amountInAtomic: minEntry, slippageBps: settings.slippageBps,
@@ -2848,7 +3003,9 @@ async function runTradfiV2Entry(
   }
   counts.candidates = routeable.length;
   if (routeable.length === 0) return "no-route";
-  const features = await enrichFeatures(deps.dataPlane, settings.executionModel, routeable.map((item) => item.address), nowMs, signal);
+  const poolFeatures = await enrichFeatures(deps.dataPlane, settings.executionModel, routeable.map((item) => item.address), nowMs, signal);
+  // E6 / RI2: the recorded-underlying series only for the RFQ-only tokens that got no pool evidence at all.
+  const features = !rfqEntries ? poolFeatures : await mergeUnderlyingFeatures(deps.dataPlane, poolFeatures, routeable.filter((item) => rfqOnlySet!.has(item.address.toLowerCase())).map((item) => item.address), nowMs, signal);
   const session = sessionState(nowMs);
   let entryRegime: Regime = "unavailable";
   try {
@@ -2886,7 +3043,9 @@ async function runTradfiV2Entry(
   // `dataRequests` line AND the entry validator's `allowDataRequests` option.
   const dataRequestsEnabled = settings.cmcNewsEnabled === true && deps.refreshCmcNews !== undefined;
   const entryHeldTickers = open.flatMap((position) => { const heldTicker = snapshot.rowsByAddress.get(position.token.toLowerCase())?.rwa?.underlyingTicker; return heldTicker === undefined || heldTicker === null ? [] : [heldTicker]; });
-  const entryShortlistedTickers = shortlist.map(({ candidate }) => candidate.underlyingTicker ?? "");
+  // E11: the RFQ-only part of the score shortlist replaces the list when it is non-empty (held tickers stay first in the planning pick); caps and budget are the existing ones.
+  const rfqShortlistedTickers = !rfqEntries ? [] : shortlist.filter(({ candidate }) => rfqOnlySet!.has(candidate.address.toLowerCase())).map(({ candidate }) => candidate.underlyingTicker ?? "");
+  const entryShortlistedTickers = rfqShortlistedTickers.length > 0 ? rfqShortlistedTickers : shortlist.map(({ candidate }) => candidate.underlyingTicker ?? "");
   if (dataRequestsEnabled) {
     void deps.refreshCmcNews!({ agent, heldTickers: entryHeldTickers, shortlistedTickers: entryShortlistedTickers, nowMs, ...(signal === undefined ? {} : { signal }) }).catch(() => undefined);
   }
@@ -2944,7 +3103,7 @@ async function runTradfiV2Entry(
     if (amount < minEntry) amount = minEntry;
     if (amount > maxEntry) amount = maxEntry;
     const extractedResult = await submitTradfiV2Buy(deps, agent, settings, {
-      candidate, amount, snapshot, settlementUsd, uniswapAllowed, budget, spendableUsdt,
+      candidate, amount, snapshot, settlementUsd, uniswapAllowed, budget, spendableUsdt, ...(rfqEntries && rfqOnlySet!.has(candidate.address.toLowerCase()) ? { rfq: true } : {}),
     }, counts, dryRun, signal);
     if (extractedResult === "entry-budget-too-small" || extractedResult === "no-route") continue;
     return extractedResult;
@@ -2992,6 +3151,69 @@ async function processAgent(
     exits: counts.exits,
   });
   return { agentId: agent.id, dryRun, reason, ...counts };
+}
+
+/**
+ * AGENTIC-RFQ-STOCKS E13 (gate only: scripts/agentic-gate.ts is its only importer, a source test pins it): one RFQ buy of an RFQ-only stock at the settings' minimum entry, for the live gate RG2.
+ * It runs the entry lane's budget and snapshot preamble (copied, so the entry lane stays untouched) and then the ordinary buy submission with the RFQ marker: no score, no model, no timing gate,
+ * no pacing. Without `live` it prices only (quote, executed premium, exit check, minOut), prints the numbers and writes nothing.
+ */
+export async function submitTradfiV2GateBuy(
+  deps: TradeWorkerDeps,
+  agent: AgentRecord,
+  settingsRow: TradeSettingsRecord,
+  token: Address,
+  options: { readonly live: boolean; readonly signal?: AbortSignal },
+): Promise<{ readonly result: string; readonly numbers: { readonly amountAtomic: string; readonly quotedOutAtomic: string; readonly minOutAtomic: string } | null; readonly events: readonly TradeRunEvent[] }> {
+  const counts: MutableCounts = { events: [], startedAt: Date.now(), candidates: 0, refusals: 0, entries: 0, exits: 0, heldNoPrice: 0 };
+  const signal = options.signal;
+  const done = async (result: string, numbers: { readonly amountAtomic: string; readonly quotedOutAtomic: string; readonly minOutAtomic: string } | null = null) => {
+    observe(counts, { stage: "cycle", code: result });
+    if (options.live) await deps.positions.insertRun({ agentId: agent.id, ownerAddress: agent.ownerAddress, dryRun: false, reason: runReason(result, counts),
+      events: counts.events ?? [], candidates: counts.candidates, refusals: counts.refusals, entries: counts.entries, exits: counts.exits });
+    return { result, numbers, events: counts.events ?? [] };
+  };
+  const settings = settingsFrom(settingsRow.params);
+  const facts = agent.sessionFacts;
+  const rfq = await rfqOf(deps, agent, settings);
+  if (rfq === null || !rfq.entries) return done("rfq-not-active");
+  if (facts === null || settings.minEntryWei === undefined || settings.capitalQuoteWei === undefined) return done("settings-invalid");
+  const minEntry = BigInt(settings.minEntryWei);
+  const open = await deps.positions.listOpen(agent.ownerAddress, agent.id);
+  if (open.length >= settings.maxOpenPositions) return done("at-capacity");
+  const dataReservedBefore = deps.v2DataBudgetReservedWei === undefined ? 0n : await deps.v2DataBudgetReservedWei(agent);
+  if (dataReservedBefore === null || dataReservedBefore < 0n) return done("data-budget-unavailable");
+  const pendingQuoteBefore = deps.journal.sumPendingQuoteSpendSince === undefined ? 0n : await deps.journal.sumPendingQuoteSpendSince(agent.id, 0);
+  const usdtBalance = await deps.provider.getTokenBalance({ wallet: { address: agent.walletAddress, ownerAddress: agent.ownerAddress, custodyModel: agent.custodyModel, chainId: 56 }, token: USDT_56,
+    ...(signal === undefined ? {} : { signal }) });
+  const settlementUsd = freshTokenUsdFact((await deps.dataPlane.tokensBatch([USDT_56], signal)).find((row) => row.address.toLowerCase() === USDT_56.toLowerCase()), Date.now());
+  if (settlementUsd === null) return done("settlement-price-unavailable");
+  const dataReservedAfter = deps.v2DataBudgetReservedWei === undefined ? 0n : await deps.v2DataBudgetReservedWei(agent);
+  if (dataReservedAfter === null || dataReservedAfter < 0n) return done("data-budget-unavailable");
+  const pendingQuoteAfter = deps.journal.sumPendingQuoteSpendSince === undefined ? 0n : await deps.journal.sumPendingQuoteSpendSince(agent.id, 0);
+  const pendingQuote = pendingQuoteBefore > pendingQuoteAfter ? pendingQuoteBefore : pendingQuoteAfter;
+  const chainQuoteRemaining = await readTradfiV2QuoteRemaining(deps, agent, facts, signal);
+  if (chainQuoteRemaining === null) return done("quote-meter-unavailable");
+  const quoteRemaining = chainQuoteRemaining > pendingQuote ? chainQuoteRemaining - pendingQuote : 0n;
+  const cashProtected = (dataReservedBefore > dataReservedAfter ? dataReservedBefore : dataReservedAfter) + pendingQuote;
+  const spendableUsdt = usdtBalance > cashProtected ? usdtBalance - cashProtected : 0n;
+  const budget = [BigInt(settings.capitalQuoteWei), quoteRemaining, spendableUsdt].reduce((left, right) => left < right ? left : right, 1n << 256n);
+  if (deps.tradfiNativeCostUsdtAtomic === undefined) return done("cost-unavailable");
+  if (spendableUsdt < minEntry || budget < minEntry) return done("entry-budget-too-small");
+  const snapshot = await readRwaLaneSnapshot(deps, agent, settings.executionModel, signal);
+  if (!snapshot.available) return done("data-plane-unavailable");
+  if (!isRfqOnlyToken(snapshot, rfq, token)) return done("not-rfq-only");
+  const row = snapshot.rowsByAddress.get(token.toLowerCase());
+  const candidate: EntryCandidate = { address: token, symbol: row?.symbol ?? token.slice(0, 8), lane: row?.lane ?? "bstocks" as const, marketCapUsd: null, priceUsd: null, volume24hUsd: null,
+    priceChange24hPct: null, holders: null, ...(row?.rwa?.underlyingTicker === undefined || row.rwa.underlyingTicker === null ? {} : { underlyingTicker: row.rwa.underlyingTicker }),
+    ...(row?.rwa?.platform === undefined ? {} : { platform: row.rwa.platform }), underlyingMarketClosed: false, rwaNote: null, eligibilitySource: "binance-rwa", eligibilityVenue: null,
+    routeKind: "pancake-discovery", scanReasons: [] };
+  const input: SubmitTradfiV2BuyInput = { candidate, amount: minEntry, snapshot, settlementUsd, uniswapAllowed: false, budget, spendableUsdt, rfq: true };
+  if (!options.live) {
+    const priced = await priceRfqBuy(deps, agent, settings, input, counts, signal);
+    return done(priced === "no-route" ? "no-route" : "priced", priced === "no-route" ? null : { amountAtomic: minEntry.toString(10), quotedOutAtomic: priced.quote.quotedOutAtomic.toString(10), minOutAtomic: priced.quote.minOutAtomic.toString(10) });
+  }
+  return done(await submitTradfiV2Buy(deps, agent, settings, input, counts, false, signal));
 }
 
 /** Sweep every stable 32-row page; one agent failure never stops the page or sweep. */

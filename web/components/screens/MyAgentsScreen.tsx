@@ -16,8 +16,11 @@ import { readSessionStorage, rememberReadExpiry, subscribeReadExpiry } from "@/l
 import { RESOURCES } from "@/lib/design-resources";
 import { SessionExpiryChip } from "@/components/agent/SessionExpiry";
 import { SessionRenew } from "@/components/agent/SessionRenew";
+import { agenticDeployedWallets, agenticEnabled } from "@/lib/agentic";
+import { ObserveAgenticWallet } from "@/components/agentic/ObserveAgenticWallet";
 
 const RECOVERY_READ_HEADERS: Readonly<Record<string, string>> = {};
+const AGENTIC_ENABLED = process.env.NEXT_PUBLIC_AGENTIC_WALLET_ENABLED === "true";
 
 type Props = { readonly go: (route: string) => void };
 type Unit = "USD" | "BNB";
@@ -57,15 +60,17 @@ function money(value: number | null, unit: Unit, bnbUsd: number | null, signed =
  * native to leave the gas reserve behind. At most ONE reason sentence renders,
  * under the tiles.
  */
-/** "Powered by Altana", the footer strip shared by the portfolio card and its
-    skeleton. Altana supplies the EIP-7702 wallet, the passkey owner binding and
-    the session every agent executes under, so the credit belongs on this panel
-    rather than in the page chrome. */
-function PoweredByAltana() {
-  return <div className="fl-powered-by fl-powered-by--page">
-    <span className="fl-powered-by__label">Powered by</span>
-    <img src={RESOURCES.altana} alt="" />
-    <span className="fl-powered-by__name">Altana</span>
+/** The custody credit at the foot of the account page: the Agentic Wallet
+    lockup (when that lane is built in) beside Altana, which supplies the
+    EIP-7702 wallet, the passkey owner binding and the session every Altana
+    agent executes under. */
+function CustodyCredits() {
+  return <div className="fl-powered-by fl-powered-by--page fl-powered-by--credits">
+    {agenticEnabled ? <img className="fl-powered-by__wordmark" src="/design/protocols/binance-agentic-wallet.png" alt="Agentic Wallet" /> : null}
+    <span className="fl-powered-by__brand">
+      <img src={RESOURCES.altana} alt="" />
+      <span className="fl-powered-by__name">Altana</span>
+    </span>
   </div>;
 }
 
@@ -333,6 +338,8 @@ export function AccountScreenContent(props: {
   /** Whether wallet B has code on chain; `null` ⇒ the larger reserve. */
   readonly walletRegistered?: boolean | null;
   readonly accountManagement?: boolean;
+  /** The read-only Agentic Wallet panel; sits under the portfolio panel, or below the account state when no portfolio is loaded. */
+  readonly agenticPanel?: React.ReactNode;
 }) {
   // Owner effects run after paint; never paint the prior account during that gap.
   if (props.portfolio && props.ownerAddress && props.portfolio.ownerAddress.toLowerCase() !== props.ownerAddress.toLowerCase()) {
@@ -397,6 +404,7 @@ export function AccountScreenContent(props: {
           {...(props.ownerAddress ? { ownerAddress: props.ownerAddress } : {})} withdrawReason={withdrawReason}
           onDeposit={(entry) => setFunding({ wallet: entry, tab: "deposit" })} onWithdraw={(entry) => setFunding({ wallet: entry, tab: "withdraw" })}
           unit={props.unit} setUnit={props.setUnit} refresh={props.refresh} loading={props.loading} />
+        {props.agenticPanel}
         {props.portfolio.venus && <p style={{ color: "var(--text-muted)", marginBottom: 14 }}>Venus stored value: supply {money(micros(props.portfolio.venus.supplyUsdMicros), "USD", null)}, debt {money(micros(props.portfolio.venus.borrowUsdMicros), "USD", null)}, net {money(micros(props.portfolio.venus.netUsdMicros), "USD", null, true)}.</p>}
         {props.portfolio.coverage.total.state === "partial" && <p style={{ color: "var(--warning)", marginBottom: 14 }}>Some values are incomplete: {props.portfolio.coverage.total.reasons.join(", ")}.</p>}
         {pendingRows.length > 0 && <section aria-label="Incomplete agent setups" style={{ ...CARD, marginBottom: 20 }}>
@@ -416,11 +424,14 @@ export function AccountScreenContent(props: {
           {rows.map((row) => { const design = AGENTS.find((agent) => agent.id === row.id); const pnl = micros(displayablePnlUsdMicros(row)); const live = row.status === "armed"; const expiredSession = row.session?.expiresAt !== null && row.session?.expiresAt !== undefined && Math.floor(Date.now() / 1_000) >= row.session.expiresAt; const attention = row.attention === "gas-blocked" || row.attention === "gas-low"; const renewalKind = row.httpRuntimeProfile === "trade-v1" ? "trade" : design?.categoryId === "grid" ? "grid" : "lp"; return <div key={row.id} role="button" tabIndex={0} style={{ cursor: "pointer" }} title={`Open ${row.id}`} onClick={() => props.go(`/account/${row.id}`)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); props.go(`/account/${row.id}`); } }}><DenseRow name={design?.name ?? row.id} categoryId={design?.categoryId ?? "defi"} status={live ? "live" : "paused"} warning={attention || expiredSession} statusLabel={attention ? "Attention" : expiredSession ? "Expired" : live ? "Live" : "Pause"} statusLine={attention ? (row.attention === "gas-blocked" ? "needs BNB for relay gas — standing by" : "low on BNB for relay gas") : `${row.httpRuntimeProfile} · ${row.holdings.state}`} value={money(pnl, "USD", null, true)} valueTone={pnl !== null && pnl > 0 ? "profit" : pnl !== null && pnl < 0 ? "loss" : undefined} valueSub={row.pnl.coverage === "full" ? "gross LP mark-to-basis" : row.pnl.reason} />{row.session?.renewable ? <div onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}><SessionRenew agentId={row.id} walletAddress={row.walletAddress} sessionExpiresAt={row.session.expiresAt} kind={renewalKind} /></div> : row.session ? <SessionExpiryChip expiresAt={row.session.expiresAt} nowMs={Date.now()} /> : null}</div>; })}
         </div>}
       </> : <PortfolioSkeleton />}
-    <PoweredByAltana />
+    {props.portfolio && hasOwner ? null : props.agenticPanel}
+    <CustodyCredits />
   </div>;
 }
 
 export function MyAgentsScreen({ go }: Props) {
+  const [agenticWallets, setAgenticWallets] = React.useState<readonly string[]>([]);
+  React.useEffect(() => { if (AGENTIC_ENABLED) setAgenticWallets(agenticDeployedWallets()); }, []);
   const { address, isConnected } = useAccount();
   // THE identity for every owner-scoped check on this screen. Under passkey
   // custody the connected wallet is a funding source and nothing else, so the
@@ -553,8 +564,9 @@ export function MyAgentsScreen({ go }: Props) {
   }, [createPasskey]);
 
   return (
-    <AccountScreenContent isConnected={isConnected} portfolio={portfolio} loading={loading} error={error} needsSignature={needsSignature} narrow={narrow} unit={unit} setUnit={setUnit} refresh={() => void load()} authorize={() => void authorize()} go={go} connectedAddress={address}
+    <><AccountScreenContent isConnected={isConnected} portfolio={portfolio} loading={loading} error={error} needsSignature={needsSignature} narrow={narrow} unit={unit} setUnit={setUnit} refresh={() => void load()} authorize={() => void authorize()} go={go} connectedAddress={address}
         ownerKind={ownerKind} ownerAddress={ownerAddress} passkey={passkey} signIn={onSignIn} createWallet={onCreateWallet} offerCreateWallet={offerCreateWallet}
-      walletBusy={walletBusy} walletNotice={walletNotice} walletRegistered={walletRegistered} accountManagement />
+      walletBusy={walletBusy} walletNotice={walletNotice} walletRegistered={walletRegistered} accountManagement
+      {...(AGENTIC_ENABLED ? { agenticPanel: <ObserveAgenticWallet wallets={agenticWallets} go={go} /> } : {})} /></>
   );
 }

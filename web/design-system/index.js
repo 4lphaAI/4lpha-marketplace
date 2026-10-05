@@ -7,6 +7,23 @@ import React from "react";
 const __ds_ns = { __errors: [] };
 const __ds_scope = {};
 
+// components/badges/AgenticWalletBadge.jsx
+try { (() => {
+function _extends() { return _extends = Object.assign ? Object.assign.bind() : function (n) { for (var e = 1; e < arguments.length; e++) { var t = arguments[e]; for (var r in t) ({}).hasOwnProperty.call(t, r) && (n[r] = t[r]); } return n; }, _extends.apply(null, arguments); }
+/** Binance Agentic Wallet logo lockup, used as supplied (public/design/protocols/binance-agentic-wallet.png). */
+function AgenticWalletBadge({
+  size = "md",
+  ...rest
+}) {
+  return /*#__PURE__*/React.createElement("img", _extends({
+    src: "/design/protocols/binance-agentic-wallet.png",
+    alt: "Agentic Wallet",
+    className: `fl-walletbadge fl-walletbadge--${size}`
+  }, rest));
+}
+Object.assign(__ds_scope, { AgenticWalletBadge });
+})(); } catch (e) { __ds_ns.__errors.push({ path: "components/badges/AgenticWalletBadge.jsx", error: String((e && e.message) || e) }); }
+
 // components/badges/Num.jsx
 try { (() => {
 function _extends() { return _extends = Object.assign ? Object.assign.bind() : function (n) { for (var e = 1; e < arguments.length; e++) { var t = arguments[e]; for (var r in t) ({}).hasOwnProperty.call(t, r) && (n[r] = t[r]); } return n; }, _extends.apply(null, arguments); }
@@ -391,6 +408,7 @@ const PATHS = {
   "refresh": `<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4.2V9h-4.8"/>`,
   "clock": `<circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3.3 2"/>`,
   "copy": `<rect x="8.5" y="8.5" width="11" height="11" rx="2.2"/><path d="M5.5 15.5A1.5 1.5 0 0 1 4 14V6a1.5 1.5 0 0 1 1.5-1.5H14A1.5 1.5 0 0 1 15.5 6"/>`,
+  "eye": `<path d="M2.8 12S6.2 5.8 12 5.8 21.2 12 21.2 12 17.8 18.2 12 18.2 2.8 12 2.8 12z"/><circle cx="12" cy="12" r="2.8"/>`,
   "chevron-right": `<path d="M10 7l5 5-5 5"/>`,
   "chevron-down": `<path d="M7 10l5 5 5-5"/>`,
   "close": `<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>`,
@@ -764,6 +782,9 @@ try { (() => {
 // The export read these off `window.__resources`; the same bytes ship from
 // `public/design/protocols/`, so the src is a plain URL (as in lib/logo.ts).
 const PROTOCOL_LOGOS = {
+  "Uniswap": "/design/protocols/uniswap.png",
+  "Ondo": "/design/protocols/ondo.png",
+  "uniswap": "/design/protocols/uniswap.png",
   "PancakeSwap v3": "/design/protocols/pancakeswap.png",
   "PancakeSwap": "/design/protocols/pancakeswap.png",
   "Venus": "/design/protocols/venus.png",
@@ -781,6 +802,15 @@ Object.assign(__ds_scope, { PROTOCOL_LOGOS });
 // components/agents/AgentCard.jsx
 try { (() => {
 function _extends() { return _extends = Object.assign ? Object.assign.bind() : function (n) { for (var e = 1; e < arguments.length; e++) { var t = arguments[e]; for (var r in t) ({}).hasOwnProperty.call(t, r) && (n[r] = t[r]); } return n; }, _extends.apply(null, arguments); }
+const PROTOCOL_NAMES = {
+  "PancakeSwap v3": "PancakeSwap",
+  bstocks: "bStocks",
+  ondo: "Ondo",
+  uniswap: "Uniswap",
+  fourmeme: "Four.meme",
+  flapsh: "Flap.sh"
+};
+
 /**
  * The marketplace hero component. Answers three questions in one glance:
  * what is this agent, is it good, what does it cost.
@@ -803,6 +833,7 @@ function AgentCard({
   onHire,
   onOpen,
   disabled,
+  custody,
   id,
   pair,
   dailyCap,
@@ -862,25 +893,37 @@ function AgentCard({
   }))), /*#__PURE__*/React.createElement("p", {
     className: "fl-card__tagline"
   }, tagline), /*#__PURE__*/React.createElement("div", {
-    className: "fl-card__meta"
+    className: "fl-card__spec"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "fl-card__spec-group"
   }, [protocol, ...(venues || []), ...(relatedProtocols || [])].filter(Boolean).map(v => __ds_scope.PROTOCOL_LOGOS[v] ? /*#__PURE__*/React.createElement("img", {
     key: v,
     src: __ds_scope.PROTOCOL_LOGOS[v],
-    alt: v,
-    title: v,
-    className: "fl-card__protocol-logo"
+    alt: PROTOCOL_NAMES[v] || v,
+    title: PROTOCOL_NAMES[v] || v,
+    className: "fl-card__spec-logo"
   }) : /*#__PURE__*/React.createElement("span", {
-    key: v
-  }, v))), /*#__PURE__*/React.createElement("div", {
-    className: "fl-card__headline"
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "fl-card__headline-label"
-  }, metricLabel || cat.metricLabel), /*#__PURE__*/React.createElement("span", {
-    className: "fl-card__headline-value"
-  }, /*#__PURE__*/React.createElement(__ds_scope.Num, {
-    value: metricValue,
-    tone: metricTone
-  }))), /*#__PURE__*/React.createElement("div", {
+    key: v,
+    className: "fl-card__spec-item"
+  }, v))), /*#__PURE__*/React.createElement("span", {
+    className: "fl-card__spec-divider",
+    "aria-hidden": "true"
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "fl-card__spec-group"
+  }, (custody ? [].concat(custody) : ["altana"]).map(c => c === "agentic-wallet" ? /*#__PURE__*/React.createElement("img", {
+    key: c,
+    src: "/design/protocols/binance-agentic-wallet.png",
+    alt: "Agentic Wallet",
+    title: "Agentic Wallet",
+    className: "fl-card__spec-wordmark"
+  }) : /*#__PURE__*/React.createElement("span", {
+    key: c,
+    className: "fl-card__spec-item"
+  }, /*#__PURE__*/React.createElement("img", {
+    src: "/design/altana.png",
+    alt: "",
+    className: "fl-card__spec-logo fl-card__spec-logo--square"
+  }), "Altana")))), /*#__PURE__*/React.createElement("div", {
     className: "fl-card__foot"
   }, /*#__PURE__*/React.createElement("div", {
     className: "fl-card__price"
@@ -1146,6 +1189,7 @@ export const PermissionItem = __ds_scope.PermissionItem;
 export const StepIndicator = __ds_scope.StepIndicator;
 export const FilterChip = __ds_scope.FilterChip;
 export const Num = __ds_scope.Num;
+export const AgenticWalletBadge = __ds_scope.AgenticWalletBadge;
 export const StatusBadge = __ds_scope.StatusBadge;
 export const TierBadge = __ds_scope.TierBadge;
 export const CATEGORIES = __ds_scope.CATEGORIES;

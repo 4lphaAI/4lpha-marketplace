@@ -524,7 +524,7 @@ export type TradeDcaOrderView = {
   readonly tokenId: string | null;
   readonly tickLower: number;
   readonly tickUpper: number;
-  readonly closedBy: "plane" | "owner" | "elsewhere" | null;
+  readonly closedBy: "plane" | "owner" | "elsewhere" | "binance" | "external" | null;
   readonly usdtWei: string;
   readonly stockWei: string;
   readonly txHash: string | null;
@@ -570,7 +570,7 @@ export type TradeDcaView = {
   };
   readonly round: null | {
     readonly roundNo: number;
-    readonly phase: "starting" | "active" | "closing" | "settled" | "stopped";
+    readonly phase: "starting" | "active" | "closing" | "settled" | "stopped" | "stopping" | "winding-down" | "ended" | "interrupted";
     readonly closeCause: string | null;
     readonly openedAt: number;
     readonly unreliable: boolean;
@@ -583,7 +583,7 @@ export type TradeDcaView = {
     readonly levels: readonly (TradeDcaOrderView & {
       readonly levelNo: number;
       readonly levelPriceE8: string | null;
-      readonly state: "pending" | "resting" | "filled" | "collected" | "skipped" | "below-range";
+      readonly state: "pending" | "resting" | "filled" | "collected" | "skipped" | "below-range" | "cancelled" | "held";
     })[];
     readonly tp: null | (TradeDcaOrderView & { readonly state: string; readonly rangeLowE8: string; readonly rangeHighE8: string });
     /** DCA-DETAIL §3: the round's base fill (price = round's p0). `null` before p0 is known, or on an older plane. */
@@ -610,6 +610,9 @@ export type TradeDcaView = {
   readonly history?: { readonly fills: readonly TradeDcaFillView[] };
   /** DCA-DETAIL §3.1: actions with a tx, newest first, at most 50. Optional: absent on an older plane. */
   readonly actions?: readonly TradeDcaActionView[];
+  /** AGENTIC-DCA (public page only): orders held for review and the shared keep-alive clock. Absent on the Altana view. */
+  readonly heldOrders?: number;
+  readonly keepAlive?: { readonly lastActivityAtMs: number | null; readonly dueAtMs: number | null; readonly lastPaidAtMs: number | null };
 };
 
 export type TradeCmcBudget = {
@@ -645,6 +648,46 @@ function isCmcBudget(value: unknown): value is TradeCmcBudget {
   } catch { return false; }
 }
 
+/** The Smart Portfolio block's shape check: the owner view parser and the public Agentic page share it (AGENTIC-PORTFOLIO-SPEC 4.6). */
+export function isTradePortfolioBlock(p: unknown): boolean {
+  const integer = (value: unknown, min = 0): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= min;
+  const nullableDecimal = (value: unknown): boolean => value === null || isDecimalWei(value);
+  const signedDecimal = (value: unknown): boolean => typeof value === "string" && /^-?\d+$/u.test(value);
+  const address = (value: unknown): value is string => typeof value === "string" && /^0x[0-9a-fA-F]{40}$/u.test(value);
+  const hash = (value: unknown): boolean => value === null || typeof value === "string" && /^0x[0-9a-fA-F]{64}$/u.test(value);
+  const reasons = ["no-buy", "not-recorded", "not-verified", "unavailable"];
+  const evidence = (amount: unknown, reason: unknown): boolean => nullableDecimal(amount)
+    && (reason === null || typeof reason === "string" && reasons.includes(reason))
+    && (amount === null ? reason !== null : reason === null);
+  return isRecord(p) && Array.isArray(p.tokens) && p.tokens.length >= 2 && p.tokens.length <= 5
+    && Array.isArray(p.legs) && p.legs.length <= 50
+    && [p.capitalQuoteWei, p.cashCapWei, p.walletUsdtWei, p.portfolioCashWei, p.idleUsdtWei].every(isDecimalWei)
+    && [p.stockValueWei, p.totalValueWei, p.pnlWei].every((value, index) => index === 2 ? value === null || signedDecimal(value) : nullableDecimal(value))
+    && signedDecimal(p.netInvestedWei) && (p.driftBps === null || integer(p.driftBps))
+    && [14400, 28800, 43200, 86400].includes(p.intervalSec as number)
+    && integer(p.anchorMs) && (p.currentSlot === null || integer(p.currentSlot)) && integer(p.nextCheckAtMs)
+    && (p.check === null || isRecord(p.check) && integer(p.check.slot) && ["held", "rebalancing", "done"].includes(p.check.state as string)
+      && integer(p.check.maxDriftBps) && isDecimalWei(p.check.valueWei) && integer(p.check.checkedAt))
+    && p.tokens.every((token: unknown) => isRecord(token) && address(token.token) && typeof token.symbol === "string" && token.symbol.length > 0
+      && integer(token.targetBps, 1000) && isDecimalWei(token.balanceAtomic) && nullableDecimal(token.valueWei)
+      && (token.valueWei === null ? token.valueReason === "quote-unavailable" : token.valueReason === null)
+      && (token.weightBps === null || integer(token.weightBps)) && (token.driftBps === null || integer(token.driftBps))
+      && (token.displayName === undefined || token.displayName === null || typeof token.displayName === "string")
+      && (token.initial === undefined || isRecord(token.initial) && evidence(token.initial.quantityAtomic, token.initial.quantityReason)
+        && evidence(token.initial.quoteWei, token.initial.quoteReason)))
+    && new Set((p.tokens as readonly { readonly token: string }[]).map((token) => token.token.toLowerCase())).size === p.tokens.length
+    && (p.tokens as readonly { readonly targetBps: number }[]).reduce((sum, token) => sum + token.targetBps, 0) === 10000
+    && p.legs.every((leg: unknown) => isRecord(leg) && integer(leg.slot) && ["buy", "sell"].includes(leg.side as string)
+      && address(leg.token) && typeof leg.symbol === "string" && leg.symbol.length > 0 && isDecimalWei(leg.amountWei)
+      && nullableDecimal(leg.quotedOutAtomic) && nullableDecimal(leg.minOutAtomic) && nullableDecimal(leg.proceedsAtomic)
+      && ["pending", "projected", "rolled-back"].includes(leg.state as string) && hash(leg.txHash) && integer(leg.createdAt)
+      && (leg.detail === undefined || isRecord(leg.detail) && typeof leg.detail.id === "string" && leg.detail.id.length > 0
+        && (leg.detail.executionState === null || ["PENDING", "IN_PROGRESS", "COMMITTED", "ROLLED_BACK", "UNKNOWN"].includes(leg.detail.executionState as string))
+        && (leg.detail.executionReason === null || ["not-recorded", "unavailable"].includes(leg.detail.executionReason as string))
+        && (leg.detail.executionState === null ? leg.detail.executionReason !== null : leg.detail.executionReason === null)
+        && evidence(leg.detail.quantityAtomic, leg.detail.quantityReason) && evidence(leg.detail.quoteWei, leg.detail.quoteReason)));
+}
+
 export function parseTradeViewEnvelope(payload: unknown): TradeView {
   if (typeof payload !== "object" || payload === null) throw new Error("Trade view returned an unexpected response.");
   const data = (payload as { readonly data?: unknown }).data;
@@ -661,46 +704,7 @@ export function parseTradeViewEnvelope(payload: unknown): TradeView {
     throw new Error("Trade view returned an invalid kept-positions count.");
   }
   if (view.cmcBudget !== undefined && !isCmcBudget(view.cmcBudget)) throw new Error("Trade view returned an invalid CMC budget.");
-  if (view.portfolio !== undefined) {
-    const p = view.portfolio;
-    const integer = (value: unknown, min = 0): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= min;
-    const nullableDecimal = (value: unknown): boolean => value === null || isDecimalWei(value);
-    const signedDecimal = (value: unknown): boolean => typeof value === "string" && /^-?\d+$/u.test(value);
-    const address = (value: unknown): value is string => typeof value === "string" && /^0x[0-9a-fA-F]{40}$/u.test(value);
-    const hash = (value: unknown): boolean => value === null || typeof value === "string" && /^0x[0-9a-fA-F]{64}$/u.test(value);
-    const reasons = ["no-buy", "not-recorded", "not-verified", "unavailable"];
-    const evidence = (amount: unknown, reason: unknown): boolean => nullableDecimal(amount)
-      && (reason === null || typeof reason === "string" && reasons.includes(reason))
-      && (amount === null ? reason !== null : reason === null);
-    const valid = isRecord(p) && Array.isArray(p.tokens) && p.tokens.length >= 2 && p.tokens.length <= 5
-      && Array.isArray(p.legs) && p.legs.length <= 50
-      && [p.capitalQuoteWei, p.cashCapWei, p.walletUsdtWei, p.portfolioCashWei, p.idleUsdtWei].every(isDecimalWei)
-      && [p.stockValueWei, p.totalValueWei, p.pnlWei].every((value, index) => index === 2 ? value === null || signedDecimal(value) : nullableDecimal(value))
-      && signedDecimal(p.netInvestedWei) && (p.driftBps === null || integer(p.driftBps))
-      && [14400, 28800, 43200, 86400].includes(p.intervalSec as number)
-      && integer(p.anchorMs) && (p.currentSlot === null || integer(p.currentSlot)) && integer(p.nextCheckAtMs)
-      && (p.check === null || isRecord(p.check) && integer(p.check.slot) && ["held", "rebalancing", "done"].includes(p.check.state as string)
-        && integer(p.check.maxDriftBps) && isDecimalWei(p.check.valueWei) && integer(p.check.checkedAt))
-      && p.tokens.every((token: unknown) => isRecord(token) && address(token.token) && typeof token.symbol === "string" && token.symbol.length > 0
-        && integer(token.targetBps, 1000) && isDecimalWei(token.balanceAtomic) && nullableDecimal(token.valueWei)
-        && (token.valueWei === null ? token.valueReason === "quote-unavailable" : token.valueReason === null)
-        && (token.weightBps === null || integer(token.weightBps)) && (token.driftBps === null || integer(token.driftBps))
-        && (token.displayName === undefined || token.displayName === null || typeof token.displayName === "string")
-        && (token.initial === undefined || isRecord(token.initial) && evidence(token.initial.quantityAtomic, token.initial.quantityReason)
-          && evidence(token.initial.quoteWei, token.initial.quoteReason)))
-      && new Set((p.tokens as readonly { readonly token: string }[]).map((token) => token.token.toLowerCase())).size === p.tokens.length
-      && (p.tokens as readonly { readonly targetBps: number }[]).reduce((sum, token) => sum + token.targetBps, 0) === 10000
-      && p.legs.every((leg: unknown) => isRecord(leg) && integer(leg.slot) && ["buy", "sell"].includes(leg.side as string)
-        && address(leg.token) && typeof leg.symbol === "string" && leg.symbol.length > 0 && isDecimalWei(leg.amountWei)
-        && nullableDecimal(leg.quotedOutAtomic) && nullableDecimal(leg.minOutAtomic) && nullableDecimal(leg.proceedsAtomic)
-        && ["pending", "projected", "rolled-back"].includes(leg.state as string) && hash(leg.txHash) && integer(leg.createdAt)
-        && (leg.detail === undefined || isRecord(leg.detail) && typeof leg.detail.id === "string" && leg.detail.id.length > 0
-          && (leg.detail.executionState === null || ["PENDING", "IN_PROGRESS", "COMMITTED", "ROLLED_BACK", "UNKNOWN"].includes(leg.detail.executionState as string))
-          && (leg.detail.executionReason === null || ["not-recorded", "unavailable"].includes(leg.detail.executionReason as string))
-          && (leg.detail.executionState === null ? leg.detail.executionReason !== null : leg.detail.executionReason === null)
-          && evidence(leg.detail.quantityAtomic, leg.detail.quantityReason) && evidence(leg.detail.quoteWei, leg.detail.quoteReason)));
-    if (!valid) throw new Error("Trade view returned an invalid portfolio block.");
-  }
+  if (view.portfolio !== undefined && !isTradePortfolioBlock(view.portfolio)) throw new Error("Trade view returned an invalid portfolio block.");
   if (view.schedule !== undefined) {
     const scheduleRow = view.schedule as unknown as Record<string, unknown>;
     const premiumBps = scheduleRow.premiumBps;

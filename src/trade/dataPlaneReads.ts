@@ -89,6 +89,9 @@ export interface TradeDataPlaneReads extends Pick<DataPlaneClient, "security"> {
   binanceSimulate?(input: { readonly from: Address; readonly to: Address; readonly data: Hex; readonly signal: AbortSignal }): Promise<TradfiSimulateResult>;
   featurePools?(signal?: AbortSignal): Promise<unknown>;
   featuresBatch?(pools: readonly Address[], interval: "15m" | "1h", signal?: AbortSignal): Promise<unknown>;
+  /** AGENTIC-RFQ-STOCKS R2.4: the recorded-underlying feature index and 1..10-token batch (store-only on the data plane; a missing method is no evidence). */
+  underlyingFeatureIndex?(signal?: AbortSignal): Promise<unknown>;
+  underlyingFeaturesBatch?(tokens: readonly Address[], interval: "15m" | "1h", signal?: AbortSignal): Promise<unknown>;
   /** `null` is reserved for the legacy 400 `invalid_lane` allowlist response. */
   universe(lane: UniverseLane, signal?: AbortSignal): Promise<readonly UniverseRow[] | null>;
   tokensBatch(addresses: readonly Address[], signal?: AbortSignal): Promise<readonly TokenBatchRow[]>;
@@ -534,6 +537,16 @@ export class HttpTradeDataPlaneReads implements TradeDataPlaneReads {
     if (pools.length < 1 || pools.length > 10) throw new InfrastructureError("Feature batches require 1..10 pools.");
     const query = pools.map(pool => pool.toLowerCase()).join(",");
     return this.#requireOk(await this.#send(`trading/features/v2?pools=${encodeURIComponent(query)}&interval=${interval}`, signal), "features").data;
+  }
+
+  async underlyingFeatureIndex(signal?: AbortSignal): Promise<unknown> {
+    return this.#requireOk(await this.#send("trading/underlying-features/v1/tokens", signal), "underlying feature index").data;
+  }
+
+  async underlyingFeaturesBatch(tokens: readonly Address[], interval: "15m" | "1h", signal?: AbortSignal): Promise<unknown> {
+    if (tokens.length < 1 || tokens.length > 10) throw new InfrastructureError("Underlying feature batches require 1..10 tokens.");
+    const query = tokens.map(token => token.toLowerCase()).join(",");
+    return this.#requireOk(await this.#send(`trading/underlying-features/v1?tokens=${encodeURIComponent(query)}&interval=${interval}`, signal), "underlying features").data;
   }
 
   async usEquityRegime(signal?: AbortSignal): Promise<UsEquityRegime> {

@@ -17,7 +17,8 @@ import type { OwnerActionEnvelope } from "@/lib/exec/owner-action";
 import type { StoredPasskey } from "@/lib/exec/passkey";
 import { executeCmcBudgetCalls, validateCmcBudgetCallPlan } from "@/lib/altana/cmc-budget";
 import { cmcPendingStorageKey, readCmcPending, writeCmcPending, clearCmcPending, type CmcPendingOperation } from "@/lib/altana/cmc-pending";
-import { TRADE_LLM_MODELS, dcaOrderPriceE8, dcaPullDoor, stopLossBpsFromPercent, stopLossPercentFromBps, tradeModelLabel, txUrl, type TradeDcaView, type TradePositionView, type TradeSettings, type TradeView } from "@/lib/trade";
+import { AGENTIC_DCA_COPY, agenticDcaResting } from "@/lib/agentic";
+import { TRADE_LLM_MODELS, dcaOrderPriceE8, dcaPullDoor, stopLossBpsFromPercent, stopLossPercentFromBps, tradeModelLabel, txUrl, type TradeDcaOrderView, type TradeDcaView, type TradePositionView, type TradeSettings, type TradeView } from "@/lib/trade";
 import { pancakePositionUrl } from "@/lib/pancake";
 
 type TradeTab = "Open Positions" | "Closed Positions" | "Run log" | "CMC x402";
@@ -57,11 +58,11 @@ type Props = {
   };
 };
 
-function compactAddress(value: string): string {
+export function compactAddress(value: string): string {
   return value.length <= 13 ? value : `${value.slice(0, 6)}…${value.slice(-4)}`;
 }
 
-function bps(value: number | string | null, signed = false): string {
+export function bps(value: number | string | null, signed = false): string {
   if (value === null) return "—";
   const numeric = Number(value) / 100;
   if (!Number.isFinite(numeric)) return "—";
@@ -94,7 +95,7 @@ function usdt(wei: string | null, signed = false): string {
 }
 
 /** Display-only USDT: at most two decimals, rounded half-up on the atomic value (operator ruling 2026-09-20). Edit inputs keep the exact `usdt()`. */
-function usdt2(wei: string | null, signed = false): string {
+export function usdt2(wei: string | null, signed = false): string {
   if (wei === null || !/^-?\d+$/u.test(wei)) return "—";
   try {
     const amount = BigInt(wei);
@@ -189,7 +190,7 @@ function positionPnlWei(position: TradePositionView): string | null {
   catch { return null; }
 }
 
-function positionSettlementAsset(position: TradePositionView, settings: TradeSettings | null): "USDT" | "BNB" {
+function positionSettlementAsset(position: TradePositionView, settings: Pick<TradeSettings, "settlementAsset"> | null): "USDT" | "BNB" {
   return position.settlementAsset === "USDT" || settings?.settlementAsset === "USDT" ? "USDT" : "BNB";
 }
 
@@ -201,7 +202,7 @@ function settlementAmount(wei: string | null, asset: "USDT" | "BNB", signed = fa
   return asset === "USDT" ? usdt2(wei, signed) : bnb(wei, signed);
 }
 
-function Metric({ label, value, note, tone = "normal", credit, noteTone = false }: { readonly label: string; readonly value: string; readonly note?: string; readonly tone?: "normal" | "profit" | "loss"; readonly credit?: React.ReactNode; readonly noteTone?: boolean }) {
+export function Metric({ label, value, note, tone = "normal", credit, noteTone = false }: { readonly label: string; readonly value: string; readonly note?: string; readonly tone?: "normal" | "profit" | "loss"; readonly credit?: React.ReactNode; readonly noteTone?: boolean }) {
   return <div className="fl-trade-metric">
     <span className="fl-trade-kicker">{label}</span>
     <strong className={`fl-trade-metric__value fl-trade-metric__value--${tone}`}>{value}</strong>
@@ -294,7 +295,7 @@ function friendlyCmcError(error: string): string {
 }
 
 /** Owner-readable CMC log (2026-09-20): every paid attempt and every cached context, newest first. */
-function CmcLog({ log }: { readonly log: TradeView["cmcLog"] | undefined }) {
+export function CmcLog({ log }: { readonly log: TradeView["cmcLog"] | undefined }) {
   // Operator 2026-09-21: charges (what was paid, with the settle tx) and data
   // (what came back) are two different questions — two lists, one switch.
   const [kind, setKind] = useState<"charges" | "data">("charges");
@@ -648,17 +649,22 @@ function verifiedRealised(position: TradePositionView): boolean {
     && position.exitFillStatus === "verified" && position.exitWei !== null;
 }
 
-function PositionRow({ position, open, icon, expanded, onExpand, onSell, busy, settings, usdRate, schedule = false }: {
+/** What a position row reads from the agent settings; the read-only Agentic page supplies it from its public settings. */
+export type PositionRowSettings = Pick<TradeSettings, "settlementAsset" | "takeProfitBps" | "stopLossBps" | "maxHoldSec">;
+
+/** `onSell` absent hides the Sell button and `plan` replaces the Exit plan cell (the read-only Agentic page, for kept holdings). */
+export function PositionRow({ position, open, icon, expanded, onExpand, onSell, busy, settings, usdRate, schedule = false, plan }: {
   readonly position: TradePositionView;
   readonly open: boolean;
   readonly icon: string | null;
   readonly expanded: boolean;
   readonly onExpand: () => void;
-  readonly onSell: () => void;
+  readonly onSell?: () => void;
   readonly busy: boolean;
-  readonly settings: TradeSettings | null;
+  readonly settings: PositionRowSettings | null;
   readonly usdRate?: number | null;
   readonly schedule?: boolean;
+  readonly plan?: React.ReactNode;
 }) {
   const symbol = positionSymbol(position);
   const asset = positionSettlementAsset(position, settings);
@@ -674,14 +680,14 @@ function PositionRow({ position, open, icon, expanded, onExpand, onSell, busy, s
       <div className="fl-trade-position__age">{positionAge(position)}</div>
       <div className="fl-trade-position__size"><strong>{tokenAmount(position)} <small>{symbol}</small></strong><span>{settlementAmount(entryAtomic, asset)} total</span><span>@ {entryPricePerToken(position, asset)} / {symbol}</span></div>
       <div className="fl-trade-position__plan">
-        {open ? (settings?.takeProfitBps === null || settings?.takeProfitBps === undefined) && (settings?.stopLossBps === null || settings?.stopLossBps === undefined)
+        {plan !== undefined ? plan : open ? (settings?.takeProfitBps === null || settings?.takeProfitBps === undefined) && (settings?.stopLossBps === null || settings?.stopLossBps === undefined)
           ? <strong><i className="is-tp" />LLM decides</strong>
           : <><strong><i className="is-tp" />TP {settings?.takeProfitBps === null || settings?.takeProfitBps === undefined ? "LLM decides" : `${bps(settings.takeProfitBps)} pending`}</strong><span><i />Stop {settings?.stopLossBps === null || settings?.stopLossBps === undefined ? "LLM decides" : bps(-settings.stopLossBps)}</span></> : <><strong>{position.closeReason?.replace(/-/gu, " ") ?? "closed"}</strong><span>{position.exitFillStatus === "verified" ? "verified fill" : "unverified fill"}</span></>}
       </div>
       <button type="button" className={`fl-trade-chart-button ${expanded ? "is-active" : ""}`} aria-label={`${expanded ? "Hide" : "Show"} ${symbol} chart`} onClick={onExpand}><Icon name="yield" size={18} /></button>
       <div className={`fl-trade-position__pnl is-${tone}`}><strong>{asset === "USDT" ? usdt2(pnlWei, true) : fiat(pnlWei, usdRate ?? null, true)}</strong><span>{bps(pnl, true)}</span></div>
       <div className="fl-trade-position__actions">
-        {open && !schedule ? <Button variant="danger" size="sm" disabled={busy || position.exitRequestedAt !== null} onClick={onSell}>{position.exitRequestedAt === null ? "Sell" : "Selling"}</Button> : null}
+        {open && !schedule && onSell !== undefined ? <Button variant="danger" size="sm" disabled={busy || position.exitRequestedAt !== null} onClick={onSell}>{position.exitRequestedAt === null ? "Sell" : "Selling"}</Button> : null}
         {txUrl(open ? position.entryTxHash : position.exitTxHash) ? <a href={txUrl(open ? position.entryTxHash : position.exitTxHash)!} target="_blank" rel="noreferrer">Tx <Icon name="external" size={11} /></a> : <span>—</span>}
       </div>
     </div>
@@ -693,11 +699,11 @@ function PositionRow({ position, open, icon, expanded, onExpand, onSell, busy, s
   </>;
 }
 
-function ClosedPositionRow({ position, icon, usdRate, settings }: {
+export function ClosedPositionRow({ position, icon, usdRate, settings }: {
   readonly position: TradePositionView;
   readonly icon: string | null;
   readonly usdRate: number | null;
-  readonly settings: TradeSettings | null;
+  readonly settings: PositionRowSettings | null;
 }) {
   const symbol = positionSymbol(position);
   const asset = positionSettlementAsset(position, settings);
@@ -721,6 +727,7 @@ function ClosedPositionRow({ position, icon, usdRate, settings }: {
 const DCA_LEVEL_STATE: Readonly<Record<string, string>> = {
   pending: "pending", resting: "resting", filled: "filled", collected: "collected",
   skipped: "skipped (price moved past it)", "below-range": "skipped (below your price range)",
+  cancelled: "cancelled", held: "held",
 };
 
 const DCA_READ_REASON: Readonly<Record<string, string>> = {
@@ -785,15 +792,26 @@ function dcaPnlSinceHire(dca: TradeDcaView, capitalQuoteWei: string | undefined)
   return { value: usdt2(pnlWei.toString(10), true), note, tone: pnlWei > 0n ? "profit" : pnlWei < 0n ? "loss" : "normal" };
 }
 
-/** DCA-DETAIL §2: the five tiles. */
-function DcaTiles({ dca, settings, live }: { readonly dca: TradeDcaView; readonly settings: TradeSettings | null; readonly live: boolean }) {
+/**
+ * The holding an ended Agentic DCA agent still has (AGENTIC-DCA-SPEC R31.3): the stock in the wallet, worth its value at the mark when the mark is readable,
+ * or the chain-unreadable reason when the wallet read failed. No number appears without its source.
+ */
+function dcaEndedHoldingNote(dca: TradeDcaView, avgCostE8: string | null): string {
+  const base = dca.wallet == null ? DCA_READ_REASON["chain-unreadable"]! : `Holding ${dcaStockAmount(dca.wallet.stockWei, dca.symbol)}${dca.mark == null ? "" : `, worth ${dcaVolumeApprox(dca.wallet.stockWei, dca.mark.e8)} at the market price`}`;
+  return avgCostE8 === null ? `${base}; no stock was bought in the last round` : base;
+}
+
+/** DCA-DETAIL §2: the five tiles. `ended` (the Agentic public page, after a stop, a term end or an owner end) keeps the Average-price tile on the holding. */
+export function DcaTiles({ dca, settings, live, ended }: { readonly dca: TradeDcaView; readonly settings: Pick<TradeSettings, "capitalQuoteWei"> | null; readonly live: boolean; readonly ended?: { readonly avgCostE8: string | null } }) {
   const pnl = dcaPnlSinceHire(dca, settings?.capitalQuoteWei);
   const marketReason = dcaMarketReason(dca);
   return <div className="fl-trade-metrics">
     <Metric label="Total Delegated" value={settings?.capitalQuoteWei === undefined ? "—" : usdt2(settings.capitalQuoteWei)} note={settings?.capitalQuoteWei === undefined ? "Capital is not recorded for this agent." : undefined} />
     <Metric label="Execution model" value="TradFi - Auto DCA" />
     <Metric label="PnL since hire" value={pnl.value} tone={pnl.tone} note={pnl.note} noteTone />
-    <Metric label="Average price" value={dcaPrice(dca.round?.avgCostE8)} note={dca.round === null ? (live ? "Setting up…" : "No round is open.") : `Holding ${dcaStockAmount(dca.round.stockHeldWei, dca.symbol)}`} />
+    {ended === undefined
+      ? <Metric label="Average price" value={dcaPrice(dca.round?.avgCostE8)} note={dca.round === null ? (live ? "Setting up…" : "No round is open.") : `Holding ${dcaStockAmount(dca.round.stockHeldWei, dca.symbol)}`} />
+      : <Metric label="Average price" value={dcaPrice(ended.avgCostE8)} note={dcaEndedHoldingNote(dca, ended.avgCostE8)} />}
     <Metric label="Market price" value={dca.mark === null || dca.mark === undefined ? "—" : dcaPrice(dca.mark.e8)} note={marketReason} />
   </div>;
 }
@@ -930,7 +948,7 @@ type DcaOrderRowModel = {
 function dcaOrderRows(dca: TradeDcaView, door: "show" | "removing" | "pause-first"): readonly DcaOrderRowModel[] {
   const round = dca.round;
   if (round === null) return [];
-  const closedSuffix = (closedBy: "plane" | "owner" | "elsewhere" | null) => closedBy === "owner" ? " · closed by you" : closedBy === "elsewhere" ? " · collected elsewhere" : "";
+  const closedSuffix = (closedBy: TradeDcaOrderView["closedBy"]) => closedBy === "owner" ? " · closed by you" : closedBy === "elsewhere" ? " · collected elsewhere" : "";
   const rows: DcaOrderRowModel[] = [];
   if (round.tp !== null) {
     const priceE8 = dcaOrderPriceE8(round.tp, "tp");
@@ -962,9 +980,9 @@ function dcaOrderRows(dca: TradeDcaView, door: "show" | "removing" | "pause-firs
 /** Operator 2026-09-25: even columns, no spacer column. */
 const DCA_ORDER_COLUMNS = "minmax(140px,1.2fr) minmax(90px,.8fr) minmax(110px,1fr) minmax(90px,.8fr) minmax(120px,1fr) minmax(110px,.9fr)";
 
-function DcaOrdersTable({ dca, door, busy, pull, refresh }: {
+function DcaOrdersTable({ dca, door, busy, pull, refresh, readOnly }: {
   readonly dca: TradeDcaView; readonly door: "show" | "removing" | "pause-first"; readonly busy: boolean;
-  readonly pull?: (tokenId?: string) => void; readonly refresh: () => Promise<unknown>;
+  readonly pull?: (tokenId?: string) => void; readonly refresh: () => Promise<unknown>; readonly readOnly: boolean;
 }) {
   const rows = dcaOrderRows(dca, door);
   return <section className="fl-trade-table">
@@ -977,13 +995,14 @@ function DcaOrdersTable({ dca, door, busy, pull, refresh }: {
     <div className="fl-trade-position fl-trade-position--head fl-trade-position--closed" style={{ gridTemplateColumns: DCA_ORDER_COLUMNS }}><span>Order</span><span>State</span><span>Price</span><span>USDT</span><span>{dca.symbol}</span><span className="fl-trade-heading-end">Actions</span></div>
     {rows.map((row) => <div className="fl-trade-position fl-trade-position--closed" style={{ gridTemplateColumns: DCA_ORDER_COLUMNS }} key={row.key} data-testid="dca-order">
       <div><strong>{row.label}</strong>
-        {row.showNft ? <div>{row.tokenId === null ? <span style={{ color: "var(--text-subtle)" }}>—</span>
+        {row.showNft && !readOnly ? <div>{row.tokenId === null ? <span style={{ color: "var(--text-subtle)" }}>—</span>
           : <a className="fl-lp-nft-link" href={pancakePositionUrl(row.tokenId)} target="_blank" rel="noreferrer" title="Open this position on PancakeSwap">#{row.tokenId}</a>}</div> : null}
       </div>
       <div style={row.stateText.startsWith("filled") ? { color: "var(--gain, #2cd391)", fontWeight: 500 } : undefined}>{row.stateText}</div>
       <div>{row.priceText}{row.priceReason ? <small style={{ display: "block", color: "var(--text-subtle)" }}>{row.priceReason}</small> : null}</div>
-      <div>{row.usdtWei === null ? "—" : usdt2(row.usdtWei)}</div>
-      <div>{row.stockWei === null ? "—" : dcaStockAmount(row.stockWei, dca.symbol)}</div>
+      {/* Agentic public page (operator 2026-10-04): an amount is a number or a dash, never a 0 placeholder for a side the order has not moved. */}
+      <div>{row.usdtWei === null || readOnly && /^0+$/u.test(row.usdtWei) ? "—" : usdt2(row.usdtWei)}</div>
+      <div>{row.stockWei === null || readOnly && /^0+$/u.test(row.stockWei) ? "—" : dcaStockAmount(row.stockWei, dca.symbol)}</div>
       <div className="fl-trade-position__actions">
         {row.canClose ? <Button variant="ghost" size="sm" disabled={busy || pull === undefined} onClick={() => pull?.(row.tokenId!)}>Close on chain</Button> : null}
         {txUrl(row.txHash) ? <a href={txUrl(row.txHash)!} target="_blank" rel="noreferrer">Tx <Icon name="external" size={11} /></a> : <span>—</span>}
@@ -1195,8 +1214,8 @@ function DcaOrderHistory({ dca, refresh }: { readonly dca: TradeDcaView; readonl
   </section>;
 }
 
-/** DCA-DETAIL §6: entry, TP and every resting level's own tick-edge price. */
-function dcaChartPriceLines(dca: TradeDcaView): readonly { readonly price: number; readonly color: string; readonly title: string }[] {
+/** DCA-DETAIL §6: entry, TP and every resting level's own tick-edge price. The read-only Agentic page has no NFT: an armed (resting) order is drawn at its trigger price. */
+function dcaChartPriceLines(dca: TradeDcaView, readOnly = false): readonly { readonly price: number; readonly color: string; readonly title: string }[] {
   const round = dca.round;
   if (round === null) return [];
   const lines: { readonly price: number; readonly color: string; readonly title: string }[] = [];
@@ -1206,9 +1225,9 @@ function dcaChartPriceLines(dca: TradeDcaView): readonly { readonly price: numbe
     if (Number.isFinite(price) && price > 0) lines.push({ price, color, title });
   };
   pushLine(round.avgCostE8, "#2fd48c", "ENTRY");
-  if (round.tp !== null && round.tp.state === "resting" && round.tp.tokenId !== null) pushLine(round.tp.edgePriceE8, "#2fd48c", "TP");
+  if (round.tp !== null && round.tp.state === "resting" && (round.tp.tokenId !== null || readOnly)) pushLine(round.tp.edgePriceE8, "#2fd48c", "TP");
   for (const level of round.levels) {
-    if (level.state === "resting" && level.tokenId !== null) pushLine(level.edgePriceE8, "#2fd48c", `DCA #${level.levelNo}`);
+    if (level.state === "resting" && (level.tokenId !== null || readOnly)) pushLine(level.edgePriceE8, "#2fd48c", `DCA #${level.levelNo}`);
   }
   return lines;
 }
@@ -1223,6 +1242,21 @@ function dcaChartMarkers(dca: TradeDcaView): readonly MarketChartMarker[] {
   }));
 }
 
+/**
+ * AGENTIC-DCA 4.5, R2.10, R22.2: what the public page says in place of the Altana status notes, in plain words. Each note shows under its own
+ * condition; `status` is "armed" while the agent is live (so a hire with no round yet is "setting up", not "no round is open").
+ */
+function dcaReadOnlyNotes(dca: TradeDcaView, status: string | null, endReason: string | null): readonly (readonly [string, string])[] {
+  const round = dca.round;
+  return [
+    ...(endReason === "stop-loss" ? [["stop-loss", AGENTIC_DCA_COPY.stopLoss] as const] : []),
+    ...(endReason === "term-ended" ? [["term-end", AGENTIC_DCA_COPY.termEnd] as const] : []),
+    ...(endReason === "owner-signed-out" ? [["owner-end", AGENTIC_DCA_COPY.ownerEnd] as const] : []),
+    ...(round === null && status === "armed" ? [["setting-up", AGENTIC_DCA_COPY.settingUp(agenticDcaResting(dca.settings.maxOrders))] as const] : []),
+    ...((dca.heldOrders ?? 0) > 0 ? [["held", AGENTIC_DCA_COPY.held(dca.heldOrders!)] as const] : []),
+  ];
+}
+
 type DcaTab = "Orders" | "Ongoing" | "Rounds" | "Order history" | "Holdings" | "Run log";
 const DCA_TABS: readonly DcaTab[] = ["Orders", "Ongoing", "Rounds", "Order history", "Holdings", "Run log"];
 
@@ -1232,7 +1266,7 @@ const DCA_TABS: readonly DcaTab[] = ["Orders", "Ongoing", "Rounds", "Order histo
  * notes, the "Current round" card, the tab bar with the chart toggle, and
  * the five tabs (Orders, Ongoing, Rounds, Order history, Run log).
  */
-export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull, refresh, icon, runs, symbols, simulationLog }: {
+export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull, refresh, icon, runs, symbols, simulationLog, readOnly = false, endReason = null, holdingsExtra }: {
   readonly dca: TradeDcaView;
   readonly status: string | null;
   readonly draining: boolean;
@@ -1245,11 +1279,19 @@ export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull,
   readonly symbols: Readonly<Record<string, string>>;
   /** The read-only pre-flight simulation log; shown inside the Run log tab (Runs | Simulate toggle) only when supplied. */
   readonly simulationLog?: React.ReactNode;
+  /**
+   * The public Agentic page (AGENTIC-DCA 4.5, 4.6): no owner door (no pull, no Close on chain, no NFT link), the plane's own order id as text,
+   * and the Agentic notes in place of the Altana status ones. `status` reads "armed" while the agent is live; `endReason` is the agent's own end reason.
+   */
+  readonly readOnly?: boolean;
+  readonly endReason?: string | null;
+  /** Extra content under the Holdings tab (the public page's keep-alive panel). */
+  readonly holdingsExtra?: React.ReactNode;
 }) {
   const [tab, setTab] = useState<DcaTab>("Orders");
   const [showChart, setShowChart] = useState(false);
   const round = dca.round;
-  const door = dcaPullDoor({ status, draining, planeUnreachable });
+  const door = readOnly ? "pause-first" : dcaPullDoor({ status, draining, planeUnreachable });
   const elsewhere = round !== null && [round.tp, ...round.levels].some((order) => order?.closedBy === "elsewhere");
   // AUTO-DCA R4.7: a Remove with no open round left nothing to sweep — nothing was sold.
   const statusLine = draining && round === null
@@ -1258,6 +1300,7 @@ export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull,
     : round === null ? (status === "armed" ? "Setting up: buying the base order, then placing the orders." : "No round is open.") : null; // Operator 2026-09-25: the round/phase line duplicated the Current round card.
   const note = (text: string, testId: string) => <div className="fl-trade-message" role="note" data-testid={testId}>{text}</div>;
   return <>
+    {readOnly ? dcaReadOnlyNotes(dca, status, endReason).map(([key, text]) => <React.Fragment key={key}>{note(text, `dca-ro-${key}`)}</React.Fragment>) : <>
     {statusLine === null ? null : <div className="fl-trade-message" role="status" data-testid="dca-status">{statusLine}</div>}
     {status === "paused" ? note("Paused. Your resting orders keep trading on chain: a DCA level can still buy and the take profit can still sell. The stop loss does not run while paused. To stop everything, pull the resting orders.", "dca-paused") : null}
     {dca.unknownAction !== null ? note(draining
@@ -1265,6 +1308,7 @@ export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull,
       : "A batch's outcome is unknown, so the plane places nothing new until it is resolved. Your doors: pause and pull the resting orders with your passkey, or Remove.", "dca-unknown") : null}
     {round?.unreliable === true ? note("This round's orders could not all be verified from chain, so its PnL is not measurable and the plane holds. Your doors: Remove, or pause, pull the resting orders and withdraw.", "dca-unreliable") : null}
     {elsewhere ? note("An order was collected to another address. Revoke this agent's session.", "dca-elsewhere") : null}
+    </>}
     <DcaCurrentRoundCard dca={dca} icon={icon} onOpenOngoing={() => setTab("Ongoing")} />
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       <div className="fl-trade-tabs">{DCA_TABS.map((item) => <button key={item} type="button" className={tab === item ? "is-active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
@@ -1272,16 +1316,16 @@ export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull,
     </div>
     {showChart && tab !== "Run log" ? <section className="fl-trade-table" style={{ marginBottom: 16 }}>
       <div style={{ padding: "14px 16px 12px" }}>
-        <MarketChart kind="token" address={dca.token} title={`${dca.symbol} / USDT`} embedded height={230} defaultInterval="15m" priceLines={dcaChartPriceLines(dca)} markers={dcaChartMarkers(dca)} />
+        <MarketChart kind="token" address={dca.token} title={`${dca.symbol} / USDT`} embedded height={230} defaultInterval="15m" priceLines={dcaChartPriceLines(dca, readOnly)} markers={dcaChartMarkers(dca)} />
       </div>
     </section> : null}
-    {tab === "Orders" ? <DcaOrdersTable dca={dca} door={door} busy={busy} pull={pull} refresh={refresh} /> : null}
+    {tab === "Orders" ? <DcaOrdersTable dca={dca} door={door} busy={busy} pull={pull} refresh={refresh} readOnly={readOnly} /> : null}
     {tab === "Ongoing" ? <DcaOngoing dca={dca} live={status === "armed"} /> : null}
     {tab === "Rounds" ? <DcaRoundsHistory dca={dca} /> : null}
     {tab === "Order history" ? <DcaOrderHistory dca={dca} refresh={refresh} /> : null}
-    {tab === "Holdings" ? <DcaWalletPanel dca={dca} /> : null}
+    {tab === "Holdings" ? <><DcaWalletPanel dca={dca} />{holdingsExtra}</> : null}
     {tab === "Run log" ? <RunLogPanel simulationLog={simulationLog} runLog={<section className="fl-trade-table"><div className="fl-trade-table__bar"><span>Run log</span><Button variant="ghost" size="sm" icon={<Icon name="refresh" size={13} />} onClick={() => void refresh()}>Refresh</Button></div>
-      <TradeRunLog runs={runs} symbols={symbols} dca={{ actions: dca.actions }} /></section>} /> : null}
+      <TradeRunLog runs={runs} symbols={symbols} dca={{ actions: dca.actions }} readOnly={readOnly} /></section>} /> : null}
   </>;
 }
 

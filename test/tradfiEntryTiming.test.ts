@@ -82,3 +82,9 @@ test("the timing run-log events survive normalizeTradeRunEvents", () => {
     ["score", "timing:deferred:opening-range", token, "et=09:41"],
   ]);
 });
+
+test("review M1: the hosted-custody deps builder forwards the entry timing mode to the shared entry lane", async () => {
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync("src/agentic/worker.ts", "utf8");
+  assert.match(source, /entryTimingMode: shared\.entryTimingMode/u);
+});

@@ -220,6 +220,13 @@ export type CmcMemorySnapshot = {
 const PINNED_CMC_CHARGE_WEI = 10_000_000_000_000_000n;
 
 export type CmcBudgetStore = {
+  rebindAgenticPaymentNonce?(input: { agentId: string; ownerAddress: Address; operationId: string; budgetGeneration: number;
+    preparedNonce: bigint; signedNonce: bigint; signedDeadline: bigint; signedValidAfter: bigint; sessionExpiry: number; nowMs: number }): Promise<CmcAttemptRecord | null>;
+  /**
+   * Agentic G0 test aid only (never called by Altana): forget the unpaid failed news rows and the hourly-slot stamp so the daily calls are due again.
+   * Removes failed news rows with no payment, a released attempt or no attempt record (never reserved). Refuses (null, nothing changed) while anything is pending or any attempt is neither released nor settled.
+   */
+  rewindFailedNewsForAgenticGate?(input: { agentId: string; ownerAddress: Address; nowMs: number }): Promise<{ removedNews: number } | null>;
   get(agentId: string, ownerAddress: Address): Promise<CmcBudgetRecord | null>;
   putInitial(input: {
     readonly agentId: string;
@@ -1299,6 +1306,44 @@ export class MemoryTradeCmcStore implements CmcBudgetStore {
     this.#leases.clear();
   }
 
+  async rebindAgenticPaymentNonce(input: { agentId: string; ownerAddress: Address; operationId: string; budgetGeneration: number;
+    preparedNonce: bigint; signedNonce: bigint; signedDeadline: bigint; signedValidAfter: bigint; sessionExpiry: number; nowMs: number }): Promise<CmcAttemptRecord | null> {
+    return this.#fence(input.agentId, async () => {
+      const budget = this.#ownedBudget(input.agentId, input.ownerAddress);
+      const attempt = this.#attempts.get(input.operationId);
+      const lease = this.#leases.get(input.agentId);
+      const now = this.#now();
+      if (budget === null || attempt === undefined || attempt.agentId !== input.agentId || attempt.ownerAddress !== ownerKey(input.ownerAddress)
+        || attempt.generation !== input.budgetGeneration || budget.generation !== input.budgetGeneration || budget.pendingOperationId !== input.operationId
+        || lease === undefined || lease.inFlightOperationId !== input.operationId || lease.leaseExpiresAtMs === null || lease.leaseExpiresAtMs <= now
+        || attempt.state !== "prepared" || attempt.encryptedAuthorization !== null || attempt.nonce !== input.preparedNonce || attempt.deadline === null
+        || BigInt(Math.floor(now / 1000) + 5) >= input.signedDeadline || input.signedDeadline > (attempt.deadline + 60n > BigInt(Math.floor(now / 1000) + 180) ? attempt.deadline + 60n : BigInt(Math.floor(now / 1000) + 180))
+        || input.signedDeadline > BigInt(input.sessionExpiry)
+        || input.signedValidAfter < 0n || input.signedValidAfter >= input.signedDeadline || input.signedValidAfter > BigInt(Math.floor(now / 1000) + 60)) return null;
+      const next = { ...attempt, nonce: input.signedNonce, deadline: input.signedDeadline, validAfter: input.signedValidAfter, updatedAt: now };
+      this.#attempts.set(input.operationId, next); return clone(next);
+    });
+  }
+
+  async rewindFailedNewsForAgenticGate(input: { agentId: string; ownerAddress: Address; nowMs: number }): Promise<{ removedNews: number } | null> {
+    return this.#fence(input.agentId, async () => {
+      const budget = this.#ownedBudget(input.agentId, input.ownerAddress), lease = this.#leases.get(input.agentId);
+      const attempts = [...this.#attempts.values()].filter((row) => row.agentId === input.agentId);
+      if (budget === null || budget.pendingOperationId !== null || (lease?.inFlightOperationId ?? null) !== null
+        || attempts.some((row) => row.state !== "released" && row.state !== "settled")) return null;
+      const released = new Set(attempts.filter((row) => row.state === "released").map((row) => row.operationId)), known = new Set(attempts.map((row) => row.operationId));
+      let removedNews = 0;
+      for (const [key, row] of [...this.#news]) {
+        if (row.agentId !== input.agentId || row.status === "available") continue;
+        // Linked to an existing settled or open attempt: kept. A released attempt, or no attempt record at all (never reserved), means unpaid.
+        if (row.paymentOperationId !== null && !released.has(row.paymentOperationId) && known.has(row.paymentOperationId)) continue;
+        this.#news.delete(key); removedNews += 1;
+      }
+      if (lease !== undefined) this.#leases.set(input.agentId, { ...lease, lastAttemptAtMs: null });
+      return { removedNews };
+    });
+  }
+
   #ownedBudget(agentId: string, ownerAddress: Address): CmcBudgetRecord | null {
     const row = this.#budgets.get(agentId);
     return row === undefined || row.ownerAddress !== ownerKey(ownerAddress) ? null : row;
@@ -1458,6 +1503,21 @@ export class PostgresTradeCmcStore implements CmcBudgetStore {
   async claimNewsSlot(input: { agentId: string; ownerAddress: Address; operationId: string; nowMs: number; llmRequest?: { readonly windowStartMs: number; readonly cap: number } }): Promise<boolean> { return this.#mutate(input.agentId, (memory) => memory.claimNewsSlot(input)); }
   async finishNewsSlot(input: { agentId: string; ownerAddress: Address; operationId: string; nowMs: number }): Promise<boolean> { return this.#mutate(input.agentId, (memory) => memory.finishNewsSlot(input)); }
   async getNewsLease(agentId: string, ownerAddress: Address): Promise<CmcNewsLease | null> { return this.#read(agentId, (memory) => memory.getNewsLease(agentId, ownerAddress)); }
+  async rebindAgenticPaymentNonce(input: Parameters<NonNullable<CmcBudgetStore["rebindAgenticPaymentNonce"]>>[0]): Promise<CmcAttemptRecord | null> {
+    return this.#sql.transaction(async tx => {
+      await lock(tx, input.agentId);
+      const loaded = await this.#load(tx, input.agentId);
+      const time = await tx.query<{ ms: string }>("select (extract(epoch from clock_timestamp()) * 1000)::bigint as ms");
+      const memory = new MemoryTradeCmcStore(() => Number(time.rows[0]!.ms));
+      memory.restore(loaded.snapshot(input.agentId), new Map());
+      const result = await memory.rebindAgenticPaymentNonce(input);
+      if (result !== null) await this.#save(tx, input.agentId, memory.snapshot(input.agentId));
+      return result;
+    });
+  }
+  async rewindFailedNewsForAgenticGate(input: { agentId: string; ownerAddress: Address; nowMs: number }): Promise<{ removedNews: number } | null> {
+    return this.#mutate(input.agentId, (memory) => memory.rewindFailedNewsForAgenticGate(input));
+  }
   async close(): Promise<void> { await this.#sql.close(); }
 
   async #read<T>(agentId: string, work: (memory: MemoryTradeCmcStore) => Promise<T>): Promise<T> {
