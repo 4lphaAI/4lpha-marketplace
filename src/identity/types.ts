@@ -4,7 +4,7 @@ import type { Address, Hex } from "viem";
 
 export const CHAIN_ID = 56 as const;
 export const REGISTRY = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432" as const;
-export type IdentityCategory = "grid" | "trading" | "lp" | "lending" | "tradfi-trade" | "tradfi-schedule" | "tradfi-dca" | "tradfi-portfolio";
+export type IdentityCategory = "grid" | "trading" | "lp" | "lending" | "tradfi-trade" | "tradfi-schedule" | "tradfi-dca" | "tradfi-portfolio" | "agentic-trade" | "agentic-schedule" | "agentic-dca" | "agentic-portfolio";
 export const ERROR_CODES = ["invalid_identity", "invalid_config", "schema_missing", "not_found", "ineligible", "not_enrolled", "conflict", "lock_lost", "lock_busy", "nonce_conflict", "fee_limit", "insufficient_balance", "rpc_unavailable", "invalid_receipt", "reverted", "verification_failed", "intent_mismatch", "exclusive_required", "arguments_invalid", "other_job_pending"] as const;
 export type IdentityErrorCode = typeof ERROR_CODES[number];
 export class IdentityError extends Error {
@@ -26,13 +26,18 @@ export function isObject(value: unknown): value is Record<string, unknown> { ret
 export function validRef(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value); }
 export function validId(value: unknown): value is string { return typeof value === "string" && /^(0|[1-9][0-9]{0,77})$/.test(value) && BigInt(value) < 2n ** 256n; }
 export function validHash(value: unknown): value is Hex { return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value); }
-export function validCategory(value: unknown): value is IdentityCategory { return value === "grid" || value === "trading" || value === "lp" || value === "lending" || value === "tradfi-trade" || value === "tradfi-schedule" || value === "tradfi-dca" || value === "tradfi-portfolio"; }
+export function validCategory(value: unknown): value is IdentityCategory { return value === "grid" || value === "trading" || value === "lp" || value === "lending" || value === "tradfi-trade" || value === "tradfi-schedule" || value === "tradfi-dca" || value === "tradfi-portfolio" || value === "agentic-trade" || value === "agentic-schedule" || value === "agentic-dca" || value === "agentic-portfolio"; }
 export function categoryForPreset(value: unknown): IdentityCategory | null {
   return value === "grid-v1" || value === "grid-shift-v1" ? "grid" : value === "trade-v1" ? "trading" : value === "lp-v1" ? "lp" : value === "lending-v1" ? "lending" : null;
 }
 export function categoryForHire(preset: unknown, tradeSettingsParams: unknown): IdentityCategory | null {
   if (preset !== "trade-v1" || !isObject(tradeSettingsParams) || tradeSettingsParams.executionModel !== "tradfi") return categoryForPreset(preset);
   return tradeSettingsParams.tradeMode === "schedule" ? "tradfi-schedule" : tradeSettingsParams.tradeMode === "dca" ? "tradfi-dca" : tradeSettingsParams.tradeMode === "portfolio" ? "tradfi-portfolio" : "tradfi-trade";
+}
+export function categoryForAgenticHire(tradeSettingsParams: unknown): IdentityCategory | null {
+  if (!isObject(tradeSettingsParams) || tradeSettingsParams.executionModel !== "tradfi" || tradeSettingsParams.settlementAsset !== "USDT") return null;
+  const mode = tradeSettingsParams.tradeMode;
+  return mode === undefined ? "agentic-trade" : mode === "schedule" ? "agentic-schedule" : mode === "dca" ? "agentic-dca" : mode === "portfolio" ? "agentic-portfolio" : null;
 }
 /** Nonthrowing, including JSON literal null. SQL absence is a separate fact. */
 export function decodeIdentity(value: unknown, sqlAbsent = value === undefined): StoredIdentity {

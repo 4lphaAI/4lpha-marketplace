@@ -1,15 +1,23 @@
 import { fail, REGISTRY, validCategory, validId, validRef, type IdentityCategory, type MetadataVersion } from "./types.js";
 
 const LABELS = { grid: "Grid", trading: "Trading", lp: "LP", lending: "Health Guard",
-  "tradfi-trade": "TradFi Trade", "tradfi-schedule": "TradFi Schedule", "tradfi-dca": "TradFi DCA", "tradfi-portfolio": "TradFi Portfolio" } as const;
+  "tradfi-trade": "TradFi Trade", "tradfi-schedule": "TradFi Schedule", "tradfi-dca": "TradFi DCA", "tradfi-portfolio": "TradFi Portfolio",
+  "agentic-trade": "Agentic Trade", "agentic-schedule": "Agentic Schedule", "agentic-dca": "Agentic DCA", "agentic-portfolio": "Agentic Portfolio" } as const;
 const TRADFI_DESCRIPTIONS = {
   "tradfi-trade": "An AI trading agent for tokenized US stocks on BNB Chain. It screens the listed stocks and opens positions when its model picks an entry. It sells on the owner's exit rules, and when the owner leaves take-profit, stop-loss or hold time open, the model can also decide to exit.",
   "tradfi-schedule": "Buys one tokenized US stock with a fixed USDT amount on a recurring schedule on BNB Chain, and skips a buy when the on-chain price trades too far above the stock's reference price.",
   "tradfi-dca": "Auto DCA for one tokenized US stock on BNB Chain. It buys with USDT at set price steps below the start price and keeps a resting take-profit order above the average cost. Stock left unsold carries over, and a new round can start after the take-profit fills.",
   "tradfi-portfolio": "Holds a weighted basket of tokenized US stocks on BNB Chain. On the chosen interval it rebalances with USDT toward the owner's target weights when the drift reaches the owner's threshold.",
 } as const;
+const AGENTIC_DESCRIPTIONS = {
+  "agentic-trade": "An AI trading agent for tokenized US stocks that trades with USDT from the owner's Binance Agentic Wallet on BNB Chain and pays for CoinMarketCap data with x402 from the same wallet. It buys when its rule scores and model agree. It sells on the owner's exit rules, and when the owner leaves take-profit, stop-loss or hold time open, it can also decide to exit on its own.",
+  "agentic-schedule": "Buys one tokenized US stock with a fixed USDT amount on a recurring schedule from the owner's Binance Agentic Wallet on BNB Chain, and skips a buy when the on-chain price trades too far above the stock's reference price. It only buys, and the stock stays in the wallet.",
+  "agentic-dca": "Auto DCA for one tokenized US stock from the owner's Binance Agentic Wallet on BNB Chain. It opens each round with a USDT market buy, buys more at set price steps below that entry, and sells the round's stock at market when the price reaches the take-profit above its average cost. A stop-loss or the end of the term ends it without selling.",
+  "agentic-portfolio": "Holds a weighted basket of tokenized US stocks in the owner's Binance Agentic Wallet on BNB Chain. On the chosen interval it rebalances with USDT toward the owner's target weights when the drift reaches the owner's threshold, and at the end of the term it keeps the stocks.",
+} as const;
 const DESCRIPTIONS = {
   ...TRADFI_DESCRIPTIONS,
+  ...AGENTIC_DESCRIPTIONS,
   grid: "A 4lpha grid trading deployment. Its ERC-8004 identity is owned and managed by the platform minter; trading funds retain their separate wallet custody.",
   trading: "A 4lpha trading deployment. Its ERC-8004 identity is owned and managed by the platform minter; trading funds retain their separate wallet custody.",
   lp: "A 4lpha liquidity provision deployment. Its ERC-8004 identity is owned and managed by the platform minter; trading funds retain their separate wallet custody.",
@@ -17,6 +25,7 @@ const DESCRIPTIONS = {
 } as const;
 const V2_DESCRIPTIONS = {
   ...TRADFI_DESCRIPTIONS,
+  ...AGENTIC_DESCRIPTIONS,
   grid: "Automated grid market making that buys low and sells high as market prices move using PancakeSwap V3 on BNB Chain.",
   trading: "Screens eligible markets, sizes entries, and automatically manages buys and exits using Four.Meme, Flap.sh, and PancakeSwap V3 on BNB Chain.",
   lp: "Routes liquidity to the best APR or fee opportunities with auto-rebalancing, compounding, and risk exits using PancakeSwap V3 on BNB Chain.",
@@ -65,7 +74,7 @@ function sorted(value: unknown): unknown {
   return value;
 }
 export function metadataUri(category: IdentityCategory, publicRef: string, agentId: string | null = null): string {
-  if (!validCategory(category) || category.startsWith("tradfi-") || !validRef(publicRef) || agentId !== null && !validId(agentId)) fail("invalid_identity");
+  if (!validCategory(category) || category.startsWith("tradfi-") || category.startsWith("agentic-") || !validRef(publicRef) || agentId !== null && !validId(agentId)) fail("invalid_identity");
   const template = metadataTemplate(category);
   const value = { ...template, name: `${template.name} ${publicRef.slice(0, 8)}`, registrations: agentId === null ? [] : [{ agentId, agentRegistry: `eip155:56:${REGISTRY}` }],
     x4lpha: { instanceRef: publicRef, category, identityCustody: "platform-minter" } };
@@ -81,7 +90,7 @@ export function metadataUri(category: IdentityCategory, publicRef: string, agent
  */
 function numberedUri(services: readonly { readonly name: string; readonly endpoint: string }[], category: IdentityCategory, displayNumber: number, publicRef: string, agentId: string | null, image: string): string {
   if (!validCategory(category) || !Number.isSafeInteger(displayNumber) || displayNumber < 1 || !validRef(publicRef) || agentId !== null && !validId(agentId)) fail("invalid_identity");
-  const label = category.startsWith("tradfi-") ? LABELS[category] : category === "lp" ? "LP" : category[0]!.toUpperCase() + category.slice(1);
+  const label = category.startsWith("tradfi-") || category.startsWith("agentic-") ? LABELS[category] : category === "lp" ? "LP" : category[0]!.toUpperCase() + category.slice(1);
   const value = { type: "https://eips.ethereum.org/EIPS/eip-8004#registration-v1", name: `${label} Agent ${displayNumber} by 4LPHA`, description: V2_DESCRIPTIONS[category], image,
     services: copy(services), website: "https://4lpha.tech", socials: { x: "https://x.com/4lpha_agent" }, x402Support: false,
     registrations: agentId === null ? [] : [{ agentId, agentRegistry: `eip155:56:${REGISTRY}` }], x4lpha: { instanceRef: publicRef, category, displayNumber, identityCustody: "platform-minter" } };
@@ -91,7 +100,7 @@ function numberedUri(services: readonly { readonly name: string; readonly endpoi
 }
 
 export function metadataUriV2(category: IdentityCategory, displayNumber: number, publicRef: string, agentId: string | null = null, image = "https://4lpha.tech/4lpha_logo_180.png"): string {
-  if (!validCategory(category) || category.startsWith("tradfi-")) fail("invalid_identity");
+  if (!validCategory(category) || category.startsWith("tradfi-") || category.startsWith("agentic-")) fail("invalid_identity");
   return numberedUri(LEGACY_SERVICES, category, displayNumber, publicRef, agentId, image);
 }
 

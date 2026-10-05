@@ -643,6 +643,12 @@ export class FakeSqlClient implements SqlClient {
         if (!row || row["owner_address"] !== params[1] || row["erc8004_identity"] != null || row["identity_absent"] === false || row["erc8004_agent_id"] !== null || !["armed", "paused"].includes(String(row["status"]))) return [];
         row["erc8004_identity"] = jsonbParam(params[2]); row["identity_absent"] = false; return [{ id: row["id"] }];
       }
+      case "agents.enrollAgenticIdentity": {
+        const row = this.#agents.get(String(params[0]));
+        if (!row || row["owner_address"] !== params[1] || row["custody_model"] !== "binance-agentic" || row["erc8004_identity"] != null || row["identity_absent"] === false
+          || row["erc8004_agent_id"] !== null || !["armed", "paused"].includes(String(row["status"]))) return [];
+        row["erc8004_identity"] = jsonbParam(params[2]); row["identity_absent"] = false; return [{ id: row["id"] }];
+      }
       case "erc8004.project": {
         const row = this.#agents.get(String(params[0]));
         const identity = row?.["erc8004_identity"] as Row | null | undefined;

@@ -667,6 +667,16 @@ export interface AgentStore {
     id: string,
     erc8004AgentId: string | null,
   ): Promise<AgentRecord | null>;
+  /**
+   * Write a pending `agentic-*` ERC-8004 identity on a Binance Agentic Wallet agent
+   * row. One CAS, never overwrites an existing identity or id, never touches a
+   * non-Agentic row, and does not bump the authority row version. True when written.
+   */
+  enrollAgenticIdentity(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly category: IdentityCategory;
+  }): Promise<boolean>;
   /** One-way owner-scoped CAS from unbound to an ordinary runtime profile. */
   bindHttpRuntimeProfile(
     ownerAddress: Address,
@@ -1737,6 +1747,19 @@ export class MemoryAgentStore implements AgentStore {
       ...record,
       erc8004AgentId,
     }));
+  }
+
+  async enrollAgenticIdentity(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly category: IdentityCategory;
+  }): Promise<boolean> {
+    if (!input.category.startsWith("agentic-")) identityFail("invalid_identity");
+    const entry = this.#owned(input.ownerAddress, input.agentId);
+    if (entry === undefined || entry.record.custodyModel !== "binance-agentic" || !["armed", "paused"].includes(entry.record.status)
+      || entry.record.erc8004Identity != null || entry.record.erc8004AgentId !== null) return false;
+    entry.record = { ...entry.record, erc8004Identity: newIdentity(input.category) };
+    return true;
   }
 
   async bindHttpRuntimeProfile(
@@ -2984,6 +3007,22 @@ export class PostgresAgentStore implements AgentStore {
     );
     const row = result.rows[0];
     return row === undefined ? null : rowToRecord(row);
+  }
+
+  async enrollAgenticIdentity(input: {
+    readonly ownerAddress: Address;
+    readonly agentId: string;
+    readonly category: IdentityCategory;
+  }): Promise<boolean> {
+    if (!input.category.startsWith("agentic-")) identityFail("invalid_identity");
+    const result = await this.#sql.query<{ id: string }>(
+      `/* agents.enrollAgenticIdentity */ update agents set erc8004_identity = $3::jsonb
+       where id = $1 and owner_address = $2 and custody_model = 'binance-agentic' and status in ('armed','paused')
+         and erc8004_identity is null and erc8004_agent_id is null
+       returning id`,
+      [input.agentId, ownerKey(input.ownerAddress), JSON.stringify(newIdentity(input.category))],
+    );
+    return result.rows[0] !== undefined;
   }
 
   async updateAgentErc8004Id(

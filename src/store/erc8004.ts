@@ -81,7 +81,7 @@ export function validateLedger(state: LedgerState, binding: IdentityBinding): vo
       || job.chainId !== 56 || job.registry.toLowerCase() !== REGISTRY.toLowerCase() || job.registry.toLowerCase() !== binding.registry.toLowerCase() || job.minter.toLowerCase() !== binding.minter.toLowerCase()
       || job.displayNumber !== undefined && (!Number.isSafeInteger(job.displayNumber) || job.displayNumber < 1)
       || job.metadataVersion !== undefined && ![1, 2, 3].includes(job.metadataVersion)
-      || job.category.startsWith("tradfi-") && job.metadataVersion !== 3
+      || (job.category.startsWith("tradfi-") || job.category.startsWith("agentic-")) && job.metadataVersion !== 3
       || job.initialUri !== metadataUriFor(job.metadataVersion, job.category, job.displayNumber, job.publicRef)
       || job.mintedId !== null && !validId(job.mintedId)
       || job.finalUri !== (job.mintedId === null ? null : metadataUriFor(job.metadataVersion, job.category, job.displayNumber, job.publicRef, job.mintedId))
