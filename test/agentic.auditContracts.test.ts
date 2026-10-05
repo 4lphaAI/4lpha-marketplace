@@ -141,6 +141,8 @@ test("bStock companion event: a sell receipt with the companion on the sold toke
 
 test("production public DTO has exactly the recursive Revision 7.3 key sets", async () => {
   const f = await fixture();
+  // An enrolled identity, so the conditional erc8004Identity key and its own key set are pinned too.
+  assert.equal(await f.agents.enrollAgenticIdentity({ ownerAddress: W, agentId: f.agentId, category: "agentic-trade" }), true);
   await f.store.patchWallet(f.row, { state: "ended", endReason: "term-ended" });
   await f.positions.open({ positionId: "private-position", agentId: f.agentId, ownerAddress: W, token: TOKEN,
     route: { hops: [], fees: [] }, entryWei: 1n, tokenAmount: 2n, fillStatus: "verified", openedAt: NOW });
@@ -151,7 +153,8 @@ test("production public DTO has exactly the recursive Revision 7.3 key sets", as
   const result = await view(W), a = result.agent;
   const keys = (value: object | null, expected: string) => { assert.ok(value); assert.deepEqual(Object.keys(value).sort(), expected.split(" ").sort()); };
   keys(result, "wallet custody agent"); assert.ok(a);
-  keys(a, "name status holdCode endReason termDays termEndAction hireStartedAtMs entryCutoffAtMs hireEndsAtMs connection lastProbeAtMs heldOrders logoutPending settings limits cmc summary positions events runs pinned cmcLog");
+  keys(a, "name status holdCode endReason termDays termEndAction hireStartedAtMs entryCutoffAtMs hireEndsAtMs connection lastProbeAtMs heldOrders logoutPending settings limits cmc summary positions events runs pinned cmcLog erc8004Identity");
+  keys(a.erc8004Identity, "version publicRef revision category status agentId registrationTxHash uriUpdateTxHash errorCode");
   keys(a.settings, "executionModel primaryModel capitalQuoteWei entryWei minEntryWei maxOpenPositions slippageBps stopLossBps takeProfitBps maxHoldSec");
   keys(a.limits, "readAtMs dailyLimit quotaLeft x402DailyLimit x402QuotaLeft tradeAllTokens abnormalTxnHandling signInMaxTimeMs");
   keys(a.cmc, "authorizedTotalWei settledWei remainingWei status");

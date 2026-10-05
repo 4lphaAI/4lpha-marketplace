@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { createAgenticPublicView } from "../src/agentic/publicView.js";
 import { MemoryIdentityFence } from "../src/identity/fence.js";
+import { INVALID_IDENTITY } from "../src/identity/types.js";
 import { NOW, W, fixture } from "./support/agenticSchedule.js";
 
 const HASH_A = `0x${"a1".repeat(32)}` as const, HASH_B = `0x${"b2".repeat(32)}` as const;
@@ -40,4 +41,11 @@ test("a registered identity is shown with its agent id and both transaction hash
   const next = { ...source.identity, revision: source.identity.revision + 1, status: "registered" as const, agentId: "364199", registrationTxHash: HASH_A, uriUpdateTxHash: HASH_B };
   assert.equal(await w.f.agents.projectIdentity(source, next, new MemoryIdentityFence()), true);
   assert.deepEqual((await w.agent()).erc8004Identity, next);
+});
+
+test("a corrupt stored identity reaches the page only as the blocked invalid_identity projection, never raw", async (t) => {
+  const w = await world(t);
+  const real = w.f.agents.getAgentById.bind(w.f.agents);
+  t.mock.method(w.f.agents, "getAgentById", async (id: string) => { const agent = await real(id); return agent === null ? null : { ...agent, erc8004Identity: INVALID_IDENTITY }; });
+  assert.deepEqual((await w.agent()).erc8004Identity, { status: "blocked", errorCode: "invalid_identity" });
 });
