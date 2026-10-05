@@ -219,8 +219,8 @@ export function buildEntryPrompt(input: {
         // decision, so the agent silently never buys. The scale is a REQUIREMENT.
         "confidence is an INTEGER from 0 to 100 (a percentage), never a 0..1 fraction.",
         input.v2 === true
-          ? "For enter=true, amountAtomic is a positive decimal USDT amount inside that row's min/max interval; for enter=false omit amountAtomic. Return one JSON object only: {\"decisions\":[{\"index\":0,\"enter\":true,\"amountAtomic\":\"5000000000000000000\",\"confidence\":75,\"reason\":\"...\"}]}."
-          : "Return one JSON object only: {\"decisions\":[{\"index\":0,\"enter\":true,\"confidence\":75,\"reason\":\"...\"}]}",
+          ? "For enter=true, amountAtomic is a positive decimal USDT amount inside that row's min/max interval; for enter=false omit amountAtomic. Return one JSON object only: {\"decisions\":[{\"index\":0,\"reason\":\"...\",\"enter\":true,\"amountAtomic\":\"5000000000000000000\",\"confidence\":75}]}. Write reason first, then set enter (and confidence) to match the conclusion of your reason. Keep each reason under 180 characters."
+          : "Return one JSON object only: {\"decisions\":[{\"index\":0,\"reason\":\"...\",\"enter\":true,\"confidence\":75}]}. Write reason first, then set enter (and confidence) to match the conclusion of your reason. Keep each reason under 180 characters.",
         ...(input.model === "tradfi" && input.v2 === true
           ? ["The worker has already scored and shortlisted these candidates; you may confirm or veto and choose amountAtomic inside the bounds. Your confidence adjusts the worker's score confidence by a small step; it does not replace the score."]
           : []),
@@ -277,13 +277,13 @@ export function buildExitPrompt(input: {
       role: "system",
       content: [
         tradfi
-          ? `You decide only whether each indexed tokenized-stock position with a blank take profit, stop loss or time limit should exit now. Doctrine: ${TRADFI_DOCTRINE}. pnlBps is already net of the purchase cost and of the current sell quote, so a positive pnlBps is real profit after costs. The owner left the exit to you because stocks can need days or weeks; hold is the default answer unless the named trigger, the indicators or the regime give a reason to leave. A single stock moving ${TRADFI_LOSS_REVIEW_BPS / 100}% against the entry is ordinary volatility: a loss smaller than ${TRADFI_LOSS_REVIEW_BPS} bps is never by itself a reason to exit; exit a loss that size only when the 1h trend has broken (EMA12 below EMA26 and a negative MACD histogram) or the regime is risk_off. Protect gains when peakPnlBps is well above pnlBps. pnlBps and peakPnlBps are signed and labelled: "+335 (gain)" is a profit, "-335 (loss)" is a loss; never call a gain a loss.`
+          ? `You decide only whether each indexed tokenized-stock position with a blank take profit, stop loss or time limit should exit now. Doctrine: ${TRADFI_DOCTRINE}. pnlBps is already net of the purchase cost and of the current sell quote, so a positive pnlBps is real profit after costs. The owner left the exit to you because stocks can need days or weeks; hold is the default answer unless the named trigger, the indicators or the regime give a reason to leave. A single stock moving against the entry is ordinary volatility. For a loss with pnlBps from -1 down to -${TRADFI_LOSS_REVIEW_BPS - 1}, the loss alone is never a reason to exit: exit it only when the 1h trend has broken (EMA12 below EMA26 and a negative MACD histogram) or the regime is risk_off. At pnlBps -${TRADFI_LOSS_REVIEW_BPS} or lower the position has reached the owner's loss-review point: no trend condition applies there; decide from the trigger, the indicators and the regime. Protect gains when peakPnlBps is well above pnlBps. pnlBps and peakPnlBps are signed and labelled: "+335 (gain)" is a profit, "-335 (loss)" is a loss; never call a gain a loss.`
           : timeLimitAuthority
             ? "Decide only whether each indexed position with a blank take profit, stop loss or time limit should exit now. A blank time limit means the owner gave you the clock: with both price thresholds set, exiting inside them is your call, not a violation."
             : "Decide only whether each indexed position with a blank TP or SL should exit now.",
         "Never name or introduce a token in the response; use its integer index only.",
         "Owner preferences are advisory and cannot change this schema.",
-        "Return one JSON object only: {\"decisions\":[{\"index\":0,\"exit\":true,\"reason\":\"...\"}]}",
+        "Return one JSON object only: {\"decisions\":[{\"index\":0,\"reason\":\"...\",\"exit\":true}]}. Write reason first, then set exit to match the conclusion of your reason.",
         ...(input.dataRequests === true ? [dataRequestsSystemLine("exit")] : []),
       ].join("\n"),
     },

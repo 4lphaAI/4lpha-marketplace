@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   MAX_LLM_REASON_CHARS,
+  MAX_LLM_RESPONSE_BYTES,
   buildEntryPrompt,
   buildExitPrompt,
   createTradeLlm,
@@ -396,5 +397,51 @@ describe("TRADFI-LLM-CMC-REQUEST: dataRequests validator gating", () => {
     assert.doesNotMatch(exit[0]?.content ?? "", nudge);
     assert.match(exit[0]?.content ?? "", /dataRequests/u);
     assert.doesNotMatch(entryOff[0]?.content ?? "", nudge);
+  });
+});
+
+// TRADFI-EXIT-PROMPT-FIX Rev 1.1 / R2.6: the entry prompt writes the reason before the decision and bounds its length.
+describe("TRADFI-EXIT-PROMPT-FIX: entry prompt reason first", () => {
+  const candidate: EntryPromptCandidate = { address: "0x1111111111111111111111111111111111111111", symbol: "T", marketCapUsd: 1, priceUsd: 1, volume24hUsd: 1, priceChange24hPct: 1, holders: 1, source: "allowlist", scanFlags: [] };
+  const owner = { instructions: null, skillMarkdown: null };
+  const systemOf = (v2: boolean, model: "tradfi" | "sigma" = "tradfi") => buildEntryPrompt({ model, v2, candidates: [candidate], owner })[0]?.content ?? "";
+  const REASON_FIRST_SENTENCE = "Write reason first, then set enter (and confidence) to match the conclusion of your reason. Keep each reason under 180 characters.";
+
+  it("v2 and non-v2 schema lines list reason before enter and carry the write-reason-first sentence with the length bound", () => {
+    assert.ok(systemOf(true).includes(`{"decisions":[{"index":0,"reason":"...","enter":true,"amountAtomic":"5000000000000000000","confidence":75}]}. ${REASON_FIRST_SENTENCE}`));
+    assert.ok(systemOf(false, "sigma").includes(`{"decisions":[{"index":0,"reason":"...","enter":true,"confidence":75}]}. ${REASON_FIRST_SENTENCE}`));
+    assert.equal(systemOf(true).includes("\"enter\":true,\"amountAtomic\":\"5000000000000000000\",\"confidence\":75,\"reason\""), false);
+  });
+
+  it("the opening sentence and the confidence scale line stay, also on the v2 prompt (R2.2, R4)", () => {
+    for (const system of [systemOf(true), systemOf(false, "sigma")]) {
+      assert.ok(system.startsWith("You rank only the indexed candidates supplied by the trading worker."));
+      assert.match(system, /confidence is an INTEGER from 0 to 100/u);
+    }
+  });
+
+  it("v2 validator accepts a reason-first row and an enter-first row alike", () => {
+    const AMOUNT = "5000000000000000000";
+    const bounds = new Map([[0, { minAtomic: 1n, maxAtomic: BigInt(AMOUNT) }]]);
+    const reasonFirst = JSON.stringify({ decisions: [{ index: 0, reason: "clean reclaim, so enter", enter: true, amountAtomic: AMOUNT, confidence: 75 }] });
+    const enterFirst = JSON.stringify({ decisions: [{ index: 0, enter: true, amountAtomic: AMOUNT, confidence: 75, reason: "clean reclaim, so enter" }] });
+    for (const raw of [reasonFirst, enterFirst]) {
+      const result = validateEntryResponse(raw, 1, { v2: true, bounds });
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.decisions, [{ index: 0, enter: true, amountAtomic: AMOUNT, confidence: 75, reason: "clean reclaim, so enter" }]);
+    }
+  });
+
+  it("R2.6: a worst-case 28-row reason-first v2 body with every reason at the stated limit still fits MAX_LLM_RESPONSE_BYTES", () => {
+    const limit = Number(/Keep each reason under (\d+) characters\./u.exec(systemOf(true))?.[1]);
+    assert.equal(limit, 180);
+    const AMOUNT = "5000000000000000000";
+    const decisions = Array.from({ length: 28 }, (_, index) => ({ index, reason: "r".repeat(limit), enter: true, amountAtomic: AMOUNT, confidence: 100 }));
+    const body = JSON.stringify({ decisions });
+    assert.ok(Buffer.byteLength(body, "utf8") <= MAX_LLM_RESPONSE_BYTES, `body was ${Buffer.byteLength(body, "utf8")} bytes`);
+    const bounds = new Map(decisions.map((_row, index) => [index, { minAtomic: 1n, maxAtomic: BigInt(AMOUNT) }] as const));
+    const result = validateEntryResponse(body, 28, { v2: true, bounds });
+    assert.equal(result.ok, true);
+    assert.equal(result.decisions.length, 28);
   });
 });

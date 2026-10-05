@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { resolveTradfiExitRulesMode, tradfiPeakImplausible, tradfiRobotExit, TRADFI_TRAIL_MAX_PEAK_BPS } from "../src/trade/exitRules.js";
-import { buildExitPrompt } from "../src/trade/llm.js";
-import { TRADFI_COST_BAND_BPS } from "../src/trade/score.js";
+import { buildExitPrompt, validateExitResponse } from "../src/trade/llm.js";
+import { TRADFI_COST_BAND_BPS, TRADFI_LOSS_REVIEW_BPS } from "../src/trade/score.js";
 import { normalizeTradeRunEvents } from "../src/store/tradeRunTrace.js";
 
 const HOUR = 3_600_000;
@@ -89,11 +89,11 @@ test("the TradFi exit prompt carries the net-of-cost sentence and not the spread
   assert.equal(system.includes("is spread, not a signal"), false);
 });
 
-test("non-TradFi exit prompts are byte-identical to the pre-change prompts (hashes captured from master d214424)", () => {
+test("non-TradFi exit prompts are byte-identical to the pinned prompts (hashes re-captured for the reason-first schema change)", () => {
   assert.equal(digest(buildExitPrompt({ owner: OWNER, positions: [position] })),
-    "98cc1898bbecffe2ff438bfbb6829a39bbd9f0270da84ffe984e24423b66d349");
+    "13f32a68c2b4ddcd2aa3e88878fed0423bb51ea255d03ce18e90bee171bd5f2e");
   assert.equal(digest(buildExitPrompt({ owner: OWNER, positions: [position], timeLimitAuthority: true })),
-    "118e5059566ce679718967443789a5138ba77671acb4b65e172ff479eefd1d2d");
+    "2865e67e9277c8a3fb5e8ecfe5267e058c011f0ee61d303da5dfb22eb6b02f4e");
 });
 
 test("the rule run-log events survive normalizeTradeRunEvents", () => {
@@ -106,4 +106,51 @@ test("the rule run-log events survive normalizeTradeRunEvents", () => {
     ["exit-llm", "rule:would-exit:trailing-stop", token, "peak=+312 now=+150"],
     ["exit-llm", "rule:exit:stale-exit", token, "held=49.2h pnl=+40"],
   ]);
+});
+
+// TRADFI-EXIT-PROMPT-FIX (Rev 2): reason before decision on every exit prompt, and a doctrine sentence that matches tradfiExitAllowed.
+const exitSystem = (extra: Partial<Parameters<typeof buildExitPrompt>[0]> = {}) =>
+  buildExitPrompt({ owner: OWNER, positions: [position], ...extra })[0]!.content;
+
+test("PROMPT-FIX: every exit system message shows reason before exit and tells the model to write the reason first", () => {
+  const line = "Return one JSON object only: {\"decisions\":[{\"index\":0,\"reason\":\"...\",\"exit\":true}]}. Write reason first, then set exit to match the conclusion of your reason.";
+  for (const system of [exitSystem({ tradfi: true }), exitSystem(), exitSystem({ timeLimitAuthority: true })]) {
+    assert.ok(system.includes(line));
+    assert.equal(system.includes("\"exit\":true,\"reason\""), false);
+  }
+});
+
+test("PROMPT-FIX R2.2: the opening clause of each exit system message stays frozen (the fake LLMs of the worker suites classify on it)", () => {
+  assert.ok(exitSystem({ tradfi: true }).startsWith("You decide only whether each indexed"));
+  assert.ok(exitSystem({ timeLimitAuthority: true }).startsWith("Decide only whether each indexed"));
+  assert.ok(exitSystem().startsWith("Decide only whether each indexed"));
+});
+
+test("PROMPT-FIX R2.1: the TradFi doctrine states today's brake rule on both branches, signed, with the boundaries from TRADFI_LOSS_REVIEW_BPS", () => {
+  assert.equal(TRADFI_LOSS_REVIEW_BPS, 800);
+  const system = exitSystem({ tradfi: true });
+  const sentence = `A single stock moving against the entry is ordinary volatility. For a loss with pnlBps from -1 down to -${TRADFI_LOSS_REVIEW_BPS - 1}, the loss alone is never a reason to exit: exit it only when the 1h trend has broken (EMA12 below EMA26 and a negative MACD histogram) or the regime is risk_off. At pnlBps -${TRADFI_LOSS_REVIEW_BPS} or lower the position has reached the owner's loss-review point: no trend condition applies there; decide from the trigger, the indicators and the regime.`;
+  assert.ok(system.includes(sentence));
+  // The interpolated numbers, spelled out so a constant change shows up here.
+  assert.ok(system.includes("pnlBps from -1 down to -799,"));
+  assert.ok(system.includes("At pnlBps -800 or lower"));
+  assert.equal(system.includes("a loss that size"), false);
+  assert.equal(system.includes("otherwise hold"), false);
+  // The sentences around the replaced span are untouched.
+  assert.ok(system.includes("hold is the default answer unless the named trigger, the indicators or the regime give a reason to leave. A single stock moving against"));
+  assert.ok(system.includes("decide from the trigger, the indicators and the regime. Protect gains when peakPnlBps is well above pnlBps. pnlBps and peakPnlBps are signed and labelled:"));
+  assert.ok(system.includes("never call a gain a loss."));
+  // The doctrine sentence is the TradFi lane only.
+  assert.equal(exitSystem().includes("loss-review point"), false);
+  assert.equal(exitSystem({ timeLimitAuthority: true }).includes("loss-review point"), false);
+});
+
+test("PROMPT-FIX: validateExitResponse accepts both key orders", () => {
+  const reasonFirst = JSON.stringify({ decisions: [{ index: 0, reason: "trend broke, so exit", exit: true }] });
+  const exitFirst = JSON.stringify({ decisions: [{ index: 0, exit: true, reason: "trend broke, so exit" }] });
+  for (const raw of [reasonFirst, exitFirst]) {
+    const result = validateExitResponse(raw, 1);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.decisions, [{ index: 0, exit: true, reason: "trend broke, so exit" }]);
+  }
 });
