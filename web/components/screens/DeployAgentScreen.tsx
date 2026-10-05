@@ -109,8 +109,6 @@ const PRESETS = {
       set: { confidence: "80", minMcap: "", maxMcap: "", minEntry: weiToBnb(DEFAULT_TRADFI_V2_MIN_ENTRY_WEI), perTrade: weiToBnb(DEFAULT_TRADFI_V2_MAX_ENTRY_WEI), capital: "63", maxPositions: "3" } },
     { id: "degen", label: "Degen", executionModel: "degen", note: "Runners under $1M selected from Four.meme and Flap.sh",
       set: { confidence: "75", minMcap: "", maxMcap: "1,000,000", perTrade: "0.01", capital: "0.02", tp1: "60", stopLoss: "35", holdTime: "480", maxPositions: "4" } },
-    { id: "sigma", label: "Sigma", executionModel: "sigma", note: "Machine learning to spot daily runners by 4lpha",
-      set: { confidence: "72", minMcap: "", maxMcap: "", perTrade: "0.005", capital: "0.02", tp1: "100", stopLoss: "50", holdTime: "120", maxPositions: "5" } },
   ],
   lp: [
     { id: "wide", label: "Sigma", note: "Machine learning to route liquidity for the highest available Fee & APR.",
@@ -1924,7 +1922,7 @@ function DeployAgentScreen({ kind, go }) {
     try {
       const saved = JSON.parse(raw);
       const settings = saved.settings ?? saved;
-      // A saved legacy `blue-chip` or `mid-cap` redeploy has no panel any more; it falls through the `some` check below and is ignored.
+      // A saved legacy `blue-chip`, `mid-cap` or `sigma` redeploy has no panel any more; it falls through the `some` check below and is ignored.
       const presetId = settings.executionModel;
       if (!PRESETS.trading.some((entry) => entry.id === presetId)) return;
       setPreset(presetId);
@@ -2159,7 +2157,7 @@ function DeployAgentScreen({ kind, go }) {
   const dcaOrderWei = parseBnbToWei(String(values.dcaOrder ?? "0"));
   const dcaCapitalWei = Number.isInteger(dcaMaxOrders) && dcaMaxOrders > 0 ? dcaBaseWei + dcaOrderWei * BigInt(dcaMaxOrders) : 0n;
   const tradeSettings = id === "trading" ? ({
-    name: String(values.agentName ?? "Trading Agent 01"), executionModel: tradePreset?.executionModel ?? "sigma",
+    name: String(values.agentName ?? "Trading Agent 01"), executionModel: tradePreset?.executionModel ?? "tradfi",
     entryWei: tradfiDca ? dcaBaseWei.toString(10) : tradfiSmart ? smartCapitalWei.toString(10) : parseBnbToWei(String(tradfiSchedule ? values.schedAmount ?? "0" : values.perTrade ?? "0")).toString(10), maxOpenPositions: tradfiSchedule || tradfiDca || tradfiSmart ? 1 : Number(values.maxPositions),
     minMarketCapUsd: tradfiDca || tradfiSmart ? null : decimalOrNull(values.minMcap), maxMarketCapUsd: tradfiDca || tradfiSmart ? null : decimalOrNull(values.maxMcap), noReentry: !tradfiDca && !tradfiSmart && !!values.noReentry,
     takeProfitBps: tradfiSchedule || tradfiDca || tradfiSmart ? null : values.tp1On ? Math.round(Number(values.tp1) * 100) : null, stopLossBps: tradfiSchedule || tradfiDca || tradfiSmart ? null : stopLossBpsWhenEnabled(!!values.stopLossOn, Number(values.stopLoss)),
