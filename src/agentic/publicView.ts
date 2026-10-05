@@ -21,6 +21,7 @@ import { dcaLevelAt, dcaP0, dcaPriceE8 } from "./dca.js";
 import type { AgenticStore } from "./store.js";
 import { agenticExecutedQuantity, type AgenticChain } from "./resolve.js";
 import { isCurrentCmcSkill } from "../trade/cmcUsEquity.js";
+import { identityOwnerView } from "../identity/types.js";
 
 /** An opaque public id: the first 16 hex of sha256 of the raw id, never the raw id. */
 const opaque = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 16);
@@ -384,6 +385,8 @@ export function createAgenticPublicView(input: { store: AgenticStore; agents: Ag
           live: live === undefined ? null : { liveWalletBalance: live.liveWalletBalance, currentQuoteWei: live.currentQuoteWei, quoteStatus: live.quoteStatus } };
       }), events, runs, ...(cmcLog === null ? {} as { cmcLog: NonNullable<typeof cmcLog> } : { cmcLog }),
       pinned: (row.hireFacts!.pinned ?? []).map(address => ({ address, symbol: input.symbols?.()?.get(address.toLowerCase()) ?? null })),
+      // The ERC-8004 summary the owner routes already show; every field is also public on chain (registry event and token URI).
+      ...(identityOwnerView(agent.erc8004Identity) === undefined ? {} : { erc8004Identity: identityOwnerView(agent.erc8004Identity) }),
       ...(scheduleView === undefined ? {} : { schedule: scheduleView }),
       ...(portfolioView === undefined ? {} : { portfolio: portfolioView }),
       ...(dcaView === undefined ? {} : { dca: dcaView }),

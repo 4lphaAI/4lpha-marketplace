@@ -15,6 +15,16 @@ describe("ERC-8004 owner summary", () => {
     expect(parseErc8004Identity(invalid)).toEqual(invalid);
   });
 
+  it("accepts every server category, including the four Agentic Wallet ones, and refuses an unknown one", () => {
+    for (const category of ["grid", "trading", "lp", "lending", "tradfi-trade", "tradfi-schedule", "tradfi-dca", "tradfi-portfolio",
+      "agentic-trade", "agentic-schedule", "agentic-dca", "agentic-portfolio"]) {
+      const parsed = parseErc8004Identity({ ...registered, category, agentId: "364199" });
+      expect(parsed).toEqual({ ...registered, category, agentId: "364199" });
+      expect(erc8004TokenUrl(parsed!)).toBe("https://8004scan.io/agents/bsc/364199");
+    }
+    expect(parseErc8004Identity({ ...registered, category: "agentic-lp" })).toEqual(invalid);
+  });
+
   it("keeps zero and the full uint256 ID exact in its fixed registry link", () => {
     for (const agentId of ["0", "9007199254740993", maxId]) {
       const parsed = parseErc8004Identity({ ...registered, agentId });

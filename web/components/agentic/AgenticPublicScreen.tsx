@@ -4,9 +4,11 @@ import { Button, Icon, StatusBadge } from "@/design-system";
 import { SessionExpiryChip, useSessionClock } from "@/components/agent/SessionExpiry";
 import { useTokenIcons } from "@/components/TokenIcon";
 import { ZeroGCredit } from "@/components/ZeroGCredit";
+import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
 import { ClosedPositionRow, CmcLog, DcaDetail, DcaTiles, Metric, PositionRow, bps, closedNewestFirst, compactAddress, usdt2, type PositionRowSettings } from "@/components/trade/TradeAgentDetail";
 import { AGENTIC_DCA_COPY, agenticDcaView, agenticRequest, isAgenticDcaDto } from "@/lib/agentic";
 import { relativeTime } from "@/lib/exec/agent-detail";
+import { parseErc8004Identity } from "@/lib/exec/erc8004-identity";
 import { TradeRunLog } from "@/components/trade/TradeRunLog";
 import { ScheduleSummary, ScheduleTabs } from "@/components/trade/ScheduleDetail";
 import { PortfolioDetail, PortfolioSummary } from "@/components/trade/PortfolioDetail";
@@ -38,6 +40,8 @@ type PublicWallet = { wallet: string; custody: "binance-agentic"; agent: null | 
   portfolio?: TradeView["portfolio"] | null;
   /** Present only for an Agentic Auto DCA hire; read through isAgenticDcaDto, never cast. */
   dca?: unknown;
+  /** The ERC-8004 summary (absent before the identity is enrolled or on a plane without the field); read through parseErc8004Identity, never cast. */
+  erc8004Identity?: unknown;
 } };
 type Tab = "Open Positions" | "Closed Positions" | "Kept Positions" | "Run log" | "CMC x402";
 
@@ -137,6 +141,7 @@ export function AgenticPublicScreen({ wallet }: { wallet: string }) {
           {agent === null ? null : <StatusBadge status={state} pill {...(stateLabel === undefined ? {} : { label: stateLabel })} />}
           {live && agent !== null ? <SessionExpiryChip expiresAt={Math.floor(agent.hireEndsAtMs / 1_000)} nowMs={nowMs} /> : null}</div>
         <span className="fl-trade-kicker fl-trade-agent-id" style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}><img src="/design/protocols/agentic-wallet.png" alt="Agentic Wallet" style={{ height: 14, width: "auto", verticalAlign: "middle", marginRight: 8 }} /><a href={`https://bscscan.com/address/${wallet}`} target="_blank" rel="noopener noreferrer" style={{ color: "inherit", textDecoration: "underline", textTransform: "none", letterSpacing: "normal" }}>{wallet}</a>{dcaView === null ? null : <span style={{ marginLeft: 12, textTransform: "none", letterSpacing: "normal" }}>Auto DCA · {dcaView.symbol}</span>}</span>
+        <Erc8004IdentityStatus identity={parseErc8004Identity(agent?.erc8004Identity)} />
       </div>
       <div className="fl-hired-actions">
         {/* Looks like a disabled secondary button (design), but is not a control: this page has no owner actions. */}

@@ -13,7 +13,8 @@ export type Erc8004Identity = {
   readonly version: 1;
   readonly publicRef: string;
   readonly revision: number;
-  readonly category: "grid" | "trading" | "lp" | "lending" | "tradfi-trade" | "tradfi-schedule" | "tradfi-dca" | "tradfi-portfolio";
+  readonly category: "grid" | "trading" | "lp" | "lending" | "tradfi-trade" | "tradfi-schedule" | "tradfi-dca" | "tradfi-portfolio"
+    | "agentic-trade" | "agentic-schedule" | "agentic-dca" | "agentic-portfolio";
   readonly status: "pending" | "registering" | "updating" | "registered" | "blocked";
   readonly agentId: string | null;
   readonly registrationTxHash: string | null;
@@ -43,7 +44,9 @@ export function parseErc8004Identity(value: unknown): Erc8004Identity | undefine
     || typeof raw["revision"] !== "number" || !Number.isSafeInteger(raw["revision"]) || raw["revision"] < 1
     || (raw["category"] !== "grid" && raw["category"] !== "trading" && raw["category"] !== "lp"
       && raw["category"] !== "lending" && raw["category"] !== "tradfi-trade" && raw["category"] !== "tradfi-schedule"
-      && raw["category"] !== "tradfi-dca" && raw["category"] !== "tradfi-portfolio")
+      && raw["category"] !== "tradfi-dca" && raw["category"] !== "tradfi-portfolio"
+      && raw["category"] !== "agentic-trade" && raw["category"] !== "agentic-schedule"
+      && raw["category"] !== "agentic-dca" && raw["category"] !== "agentic-portfolio")
     || (raw["status"] !== "pending" && raw["status"] !== "registering" && raw["status"] !== "updating"
       && raw["status"] !== "registered" && raw["status"] !== "blocked")
     || (raw["agentId"] !== null && !uint256(raw["agentId"]))
