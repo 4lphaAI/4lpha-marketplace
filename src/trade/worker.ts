@@ -113,7 +113,7 @@ import { freshTokenUsdFact, type TradeDataPlaneReads, type TradfiFlashQuote, typ
 import type { TradeReadiness } from "./readiness.js";
 import { pinnedTokens } from "./view.js";
 import { AGENT_GAS_MAX_BACKOFF_MS, agentGasFloor, agentGasReason, classifyAgentGas } from "../ops/gasFloor.js";
-import { normalizeTradeRunEvents, type TradeRunEvent } from "../store/tradeRunTrace.js";
+import { appendTradeRunEvent, normalizeTradeRunEvents, type TradeRunEvent } from "../store/tradeRunTrace.js";
 import { sizeTradeBuy, tradfiV2BuyFeeWei, tradfiV2EntryReservation } from "./sizing.js";
 import { rwaMarketClosed } from "./universe.js";
 import { currentSlot, scheduleAnchorMs, scheduleLedger, type ScheduleIntervalSec, type ScheduleLedger } from "./schedule.js";
@@ -372,8 +372,8 @@ function exitLlmIntervalMs(deps: TradeWorkerDeps): number {
 }
 
 function observe(counts: MutableCounts, event: Omit<TradeRunEvent, "elapsedMs">): void {
-  if (counts.events === undefined || counts.events.length >= 100) return;
-  counts.events.push(...normalizeTradeRunEvents([{ ...event, elapsedMs: Date.now() - (counts.startedAt ?? Date.now()) }]));
+  if (counts.events === undefined) return;
+  appendTradeRunEvent(counts.events, normalizeTradeRunEvents([{ ...event, elapsedMs: Date.now() - (counts.startedAt ?? Date.now()) }]));
 }
 
 type LlmDataRequestForward = { readonly ticker: string; readonly skill: "planning" | "events"; readonly reason: string; readonly source: "entry" | "exit"; readonly model: string };
@@ -2885,14 +2885,16 @@ async function submitTradfiV2Buy(
     return result;
   });
   if (fenced.kind === "draining") return "draining";
+  // Run log (2026-09-24): the buy itself, with size and venue, so the Trades view can show it.
+  const usdtText = (Number(amount / 10n ** 14n) / 10_000).toFixed(2);
+  const via = guardQuote === undefined && priced.rfq !== true ? quote.venue : "binance-aggregator";
   if (fenced.value.kind === "committed") {
     counts.entries += 1;
-    // Run log (2026-09-24): the committed buy itself, with size and venue, so the Trades view can show it.
-    const usdtText = (Number(amount / 10n ** 14n) / 10_000).toFixed(2);
-    observe(counts, { stage: "buy", code: "committed", token: candidate.address,
-      reason: `${usdtText} USDT via ${guardQuote === undefined && priced.rfq !== true ? quote.venue : "binance-aggregator"}` });
+    observe(counts, { stage: "buy", code: "committed", token: candidate.address, reason: `${usdtText} USDT via ${via}` });
     return "entered";
   }
+  // AGENTIC-RECEIPT-WAIT F2: an unknown submission may have landed; the marker keeps this run through the 200-run prune.
+  if (fenced.value.kind === "unknown") observe(counts, { stage: "buy", code: "unknown", token: candidate.address, reason: `${usdtText} USDT via ${via}` });
   return resultCode(fenced.value);
 }
 

@@ -1307,3 +1307,175 @@ test("Agentic gate repair-fill: the sell analogue applies the verified exit to a
   const p = (await f.positions.get(W, f.agent.id, "p-sell"))!;
   assert.equal((printed[0] as { outcome: string }).outcome, "repaired"); assert.equal(p.exitWei, 5n * E); assert.equal(p.exitFillStatus, "verified");
 });
+
+/** AGENTIC-RECEIPT-WAIT F1: an open swap row bound to a listed row (default FINISHED + HASH), its journal UNKNOWN, a fence, and one resolver pass. */
+async function receiptWait(t: TestContext, patch: Partial<AgenticOrder> = {}, list: Record<string, unknown> = { orderId: "new", status: "FINISHED", txHash: HASH }, wallet: Partial<AgenticWallet> = {}) {
+  const f = await fixture(t, wallet), order = f.order({ dispatch: "spawned", response: "accepted", claimant: f.instance.row.instanceId, claimedAt: NOW, ...patch });
+  await f.store.createOrder(order); await f.journal.begin({ idempotencyKey: HASH, agentId: f.agent.id, ownerAddress: W, kind: "trade" }); await f.journal.markUnknown(HASH, "offline");
+  f.runner.replies.set("market-order list", { kind: "ok", sessionPresent: true, rwaTokens: null, data: { total: 1, page: 1, pageSize: 100, list: [list] } });
+  const fence = (await f.store.acquireFence(W, f.instance.row.instanceId))!;
+  const pass = async () => resolveAgenticOrder({ ...f.execution, journal: f.journal, order: (await f.store.getOrder(HASH))!, fence });
+  return { f, pass, fence };
+}
+const sellOrder = () => ({ side: "sell" as const, fromToken: TOKEN, toToken: agenticAddress(USDT_56), intendedRaw: (5n * E).toString() });
+
+test("AGENTIC-RECEIPT-WAIT F1: an unreadable receipt leaves a FINISHED row open, unheld and an obligation; the next pass commits it", async t => {
+  const { f, pass } = await receiptWait(t);
+  const spies = (["markCommitted", "markRolledBack", "advanceUnknown", "resolveUnknown"] as const).map(name => t.mock.method(f.journal, name));
+  f.chain.receipt = async () => null;
+  await pass();
+  const waiting = (await f.store.getOrder(HASH))!;
+  assert.equal(waiting.outcome, "open"); assert.equal(waiting.holdReason, null); assert.equal(await f.store.walletObligations(W), true);
+  assert.equal((await f.journal.get(HASH))?.state, "UNKNOWN");
+  for (const spy of spies) assert.equal(spy.mock.callCount(), 0);
+  f.chain.receipt = async () => receipt();
+  await pass();
+  assert.equal((await f.store.getOrder(HASH))?.outcome, "committed");
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: the executor keeps polling through an unreadable receipt and returns committed", async t => {
+  const f = await fixture(t); let dispatched = false, reads = 0;
+  f.runner.replies.set("market-order list", async () => ({ kind: "ok", sessionPresent: true, rwaTokens: null, data: { total: dispatched ? 1 : 0, page: 1, pageSize: 100,
+    list: dispatched ? [{ orderId: "listed-offset-id", status: "FINISHED", txHash: HASH }] : [] } }));
+  f.runner.replies.set("market-order swap", async () => { dispatched = true; return { kind: "ok", data: { orderId: "json-offset-id" }, sessionPresent: true, rwaTokens: null }; });
+  f.chain.receipt = async () => { reads += 1; return reads === 1 ? null : receipt(); };
+  const held: unknown[] = [], patchOrder = f.store.patchOrder.bind(f.store);
+  t.mock.method(f.store, "patchOrder", async (...args: Parameters<AgenticStore["patchOrder"]>) => { if (args[1].holdReason !== undefined && args[1].holdReason !== null) held.push(args[1].holdReason); return patchOrder(...args); });
+  const result = await executeAgenticTrade(f.input, f.execution), order = await f.store.getOrder(HASH);
+  assert.equal(result.kind, "committed"); assert.equal(order?.outcome, "committed"); assert.equal(order?.txHash, HASH);
+  assert.equal(reads, 2); assert.deepEqual(held, []);
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: receipt-missing only at 30 min from createdAt", async t => {
+  for (const [age, expected] of [[1_799_999, null], [1_800_000, "receipt-missing"]] as const) {
+    const { f, pass } = await receiptWait(t, { createdAt: NOW - age });
+    f.chain.receipt = async () => null;
+    await pass();
+    const row = (await f.store.getOrder(HASH))!;
+    assert.equal(row.holdReason, expected, `age ${age}`); assert.equal(row.outcome, "open");
+  }
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: a receipt-missing row is re-examined and commits once the receipt reads", async t => {
+  const { f, pass } = await receiptWait(t, { holdReason: "receipt-missing" });
+  f.chain.receipt = async () => receipt();
+  await pass();
+  const row = (await f.store.getOrder(HASH))!;
+  assert.equal(row.outcome, "committed"); assert.equal(row.holdReason, null);
+  // a second unbound new row relabels the held row (fail closed, terminal)
+  const crowded = await receiptWait(t, { holdReason: "receipt-missing" });
+  crowded.f.runner.replies.set("market-order list", { kind: "ok", sessionPresent: true, rwaTokens: null, data: { total: 2, page: 1, pageSize: 100,
+    list: [{ orderId: "new", status: "FINISHED", txHash: HASH }, { orderId: "second", status: "FINISHED", txHash: HASH }] } });
+  crowded.f.chain.receipt = async () => receipt();
+  await crowded.pass();
+  const relabelled = (await crowded.f.store.getOrder(HASH))!;
+  assert.equal(relabelled.holdReason, "multiple-new-rows"); assert.equal(relabelled.outcome, "open");
+});
+
+for (const mutation of ["sender", "revert", "third-token", "inexact"] as const)
+  test(`AGENTIC-RECEIPT-WAIT F1: a read receipt that does not match holds chain-verification at once (${mutation})`, async t => {
+    const { f, pass } = await receiptWait(t);
+    let proof = receipt("buy", mutation === "inexact" ? 4n * E : 5n * E);
+    if (mutation === "sender") proof = { ...proof, from: TOKEN };
+    if (mutation === "revert") proof = { ...proof, observation: { ...proof.observation, receipt: { ...proof.observation.receipt, status: 0n } } };
+    if (mutation === "third-token") proof = { ...proof, observation: { ...proof.observation, receipt: { ...proof.observation.receipt, logs: [...proof.observation.receipt.logs, { ...proof.observation.receipt.logs[0]!, address: W }] } } };
+    f.chain.receipt = async () => proof;
+    await pass();
+    const row = (await f.store.getOrder(HASH))!;
+    assert.equal(row.holdReason, "chain-verification"); assert.equal(row.outcome, "open");
+  });
+
+test("AGENTIC-RECEIPT-WAIT F1: a landed partial sell still holds partial-sell", async t => {
+  const { f, pass } = await receiptWait(t, sellOrder());
+  f.chain.receipt = async () => receipt("sell", 4n * E, 4n * E);
+  await pass();
+  assert.equal((await f.store.getOrder(HASH))?.holdReason, "partial-sell");
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: one receipt read per pass", async t => {
+  for (const [patch, proof] of [[{}, receipt("buy", 4n * E)], [sellOrder(), receipt("sell", 4n * E, 4n * E)]] as const) {
+    const { f, pass } = await receiptWait(t, patch); let reads = 0;
+    f.chain.receipt = async () => { reads += 1; return proof; };
+    await pass();
+    assert.equal(reads, 1); assert.notEqual((await f.store.getOrder(HASH))?.holdReason, null);
+  }
+  const { f, pass } = await receiptWait(t); let reads = 0;
+  f.chain.receipt = async () => { reads += 1; return reads === 1 ? receipt() : null; };
+  await pass();
+  const row = (await f.store.getOrder(HASH))!;
+  assert.equal(row.outcome, "committed"); assert.equal(row.holdReason, null); assert.equal(reads, 1);
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: FAILED with a hash waits on an unreadable receipt, then decides on the read one", async t => {
+  const failed = { orderId: "new", status: "FAILED", txHash: HASH };
+  const state = async (f: Awaited<ReturnType<typeof receiptWait>>["f"]) => { const row = (await f.store.getOrder(HASH))!; return [row.outcome, row.holdReason]; };
+  const waiting = await receiptWait(t, {}, failed);
+  waiting.f.chain.receipt = async () => null;
+  await waiting.pass();
+  assert.deepEqual(await state(waiting.f), ["open", null]);
+  const reverted = await receiptWait(t, {}, failed);
+  reverted.f.chain.receipt = async () => { const proof = receipt(); return { ...proof, observation: { ...proof.observation, receipt: { ...proof.observation.receipt, status: 0n } } }; };
+  await reverted.pass();
+  assert.deepEqual(await state(reverted.f), ["rolled-back", null]);
+  const landed = await receiptWait(t, {}, failed);
+  landed.f.chain.receipt = async () => receipt();
+  await landed.pass();
+  assert.deepEqual(await state(landed.f), ["open", "accepted-then-failed"]);
+  const missing = await receiptWait(t, { createdAt: NOW - 1_800_000 }, failed);
+  missing.f.chain.receipt = async () => null;
+  await missing.pass();
+  assert.deepEqual(await state(missing.f), ["open", "receipt-missing"]);
+});
+
+for (const reason of ["chain-verification", "partial-sell", "accepted-then-failed", "multiple-new-rows", "tx-already-bound"])
+  test(`AGENTIC-RECEIPT-WAIT F1: an existing hold is never re-examined (${reason})`, async t => {
+    const { f, pass } = await receiptWait(t, { holdReason: reason });
+    f.chain.receipt = async () => receipt();
+    await pass();
+    const row = (await f.store.getOrder(HASH))!;
+    assert.equal(row.holdReason, reason); assert.equal(row.outcome, "open");
+    assert.equal(f.runner.calls.some(a => a[1] === "list"), false);
+  });
+
+test("AGENTIC-RECEIPT-WAIT F1: dispose --commit-tx still refuses an unreadable or mismatching hash", async t => {
+  for (const proof of [null, { ...receipt(), from: TOKEN }]) {
+    const { f, fence } = await receiptWait(t); await f.store.releaseFence(fence);
+    f.chain.receipt = async () => proof;
+    const context = { ...f.execution, agents: f.agents, journal: f.journal, positions: f.positions, killswitch: f.killswitch, wallets: new Set([W]), print: () => undefined, cycle: async () => undefined };
+    await assert.rejects(() => runAgenticGate(parseAgenticGateArgs(["dispose", "--order", HASH, "--commit-tx", HASH, "--attest", "offline reviewed evidence", "--yes-live"]), context), /AGENTIC_SWAP_UNVERIFIED/);
+    const row = (await f.store.getOrder(HASH))!;
+    assert.deepEqual([row.outcome, row.holdReason, (await f.journal.get(HASH))?.state], ["open", null, "UNKNOWN"]);
+  }
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: the per-cycle reconcile retries an unheld unresolved row", async t => {
+  const { f, fence } = await receiptWait(t); await f.store.releaseFence(fence);
+  t.mock.method(f.cmc, "refresh", async () => undefined);
+  f.chain.receipt = async () => null;
+  await runAgenticCycle(f.lifecycle, { reconciliationOnly: true });
+  assert.deepEqual([(await f.store.getOrder(HASH))?.outcome, (await f.store.getOrder(HASH))?.holdReason], ["open", null]);
+  f.chain.receipt = async () => receipt();
+  await runAgenticCycle(f.lifecycle, { reconciliationOnly: true });
+  assert.equal((await f.store.getOrder(HASH))?.outcome, "committed");
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: after the owner signed out nothing is released and nothing is re-examined", async t => {
+  const { f, pass, fence } = await receiptWait(t, { createdAt: NOW - 1_800_000 }, undefined, { state: "ended" });
+  await f.store.createOrder(f.order({ idempotencyKey: "held-missing", dispatch: "spawned", response: "accepted", claimant: f.instance.row.instanceId, holdReason: "receipt-missing" }));
+  f.chain.receipt = async () => receipt();
+  await pass();
+  await resolveAgenticOrder({ ...f.execution, journal: f.journal, order: (await f.store.getOrder("held-missing"))!, fence });
+  assert.deepEqual([(await f.store.getOrder(HASH))?.outcome, (await f.store.getOrder(HASH))?.holdReason], ["open", null]);
+  assert.deepEqual([(await f.store.getOrder("held-missing"))?.outcome, (await f.store.getOrder("held-missing"))?.holdReason], ["open", "receipt-missing"]);
+  assert.equal(f.runner.calls.some(a => a[1] === "list"), false);
+});
+
+test("AGENTIC-RECEIPT-WAIT F1: an unheld waiting order delays the logout only to hireEndMs + 30 min", async t => {
+  const hireEnd = NOW + 1_000, f = await fixture(t, { state: "ending", hireEndMs: hireEnd });
+  await f.store.createOrder(f.order({ dispatch: "spawned", response: "accepted", claimant: f.instance.row.instanceId }));
+  const signouts = () => f.runner.calls.filter(a => a[0] === "auth" && a[1] === "signout").length;
+  f.setTime(hireEnd + 1_799_999); await resumeAgenticEnding(f.lifecycle, (await f.store.byAgent(f.agent.id))!);
+  assert.equal(signouts(), 0);
+  f.setTime(hireEnd + 1_800_000); await resumeAgenticEnding(f.lifecycle, (await f.store.byAgent(f.agent.id))!);
+  assert.equal(signouts(), 1);
+});

@@ -9,7 +9,7 @@ import { decodeJsonb, encodeJsonbParam } from "./codec.js";
 import { createPgSqlClient, type SqlClient } from "./sql.js";
 import { MAX_UINT256 } from "../trade/settlement.js";
 
-import { normalizeTradeRunEvents, type TradeRunEvent } from "./tradeRunTrace.js";
+import { isUnknownSubmissionEvent, normalizeTradeRunEvents, type TradeRunEvent } from "./tradeRunTrace.js";
 
 export type Clock = () => number;
 export type TradePositionStatus = "open" | "closed" | "orphaned";
@@ -211,7 +211,7 @@ export interface TradePositionStore {
   resetNoPrice(ownerAddress: Address, agentId: string, positionId: string): Promise<TradePositionRecord | null>;
   insertRun(input: TradeRunInput): Promise<TradeRunRecord>;
   listRuns(ownerAddress: Address, agentId: string, limit?: number): Promise<readonly TradeRunRecord[]>;
-  /** Every retained run that committed a buy or a sell, newest first: these survive the 200-row prune. */
+  /** Every retained run that committed a buy or a sell, or submitted one whose outcome is unknown, newest first: these survive the 200-row prune. */
   listExecutedRuns(ownerAddress: Address, agentId: string): Promise<readonly TradeRunRecord[]>;
   close(): Promise<void>;
 }
@@ -224,8 +224,11 @@ function ownerKey(ownerAddress: Address): Address {
 const EXECUTED_RUN_LIMIT = 1_000;
 
 function runExecuted(run: TradeRunRecord): boolean {
-  return run.entries > 0 || run.exits > 0;
+  return run.entries > 0 || run.exits > 0 || (run.events ?? []).some(isUnknownSubmissionEvent);
 }
+
+/** AGENTIC-RECEIPT-WAIT F2: a run holding an unknown buy or sell submission, in SQL; the same predicate as the memory store's runExecuted. */
+const UNKNOWN_SUBMISSION_SQL = `(events @> '[{"stage":"buy","code":"unknown"}]'::jsonb or events @> '[{"stage":"sell","code":"unknown"}]'::jsonb)`;
 
 function assertRunLimit(limit: number): void {
   if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
@@ -1168,7 +1171,7 @@ export class PostgresTradePositionStore implements TradePositionStore {
       );
       await tx.query(
         `/* tradeRuns.prune */ delete from trade_runs where agent_id = $1
-         and entries = 0 and exits = 0
+         and entries = 0 and exits = 0 and not ${UNKNOWN_SUBMISSION_SQL}
          and id not in (select id from trade_runs where agent_id = $1
                         order by created_at desc, id desc limit 200)`,
         [row.agentId],
@@ -1190,7 +1193,7 @@ export class PostgresTradePositionStore implements TradePositionStore {
   async listExecutedRuns(ownerAddress: Address, agentId: string): Promise<readonly TradeRunRecord[]> {
     const result = await this.#sql.query<RunRow>(
       `/* tradeRuns.listExecuted */ select ${RUN_COLUMNS} from trade_runs
-       where owner_address = $1 and agent_id = $2 and (entries > 0 or exits > 0)
+       where owner_address = $1 and agent_id = $2 and (entries > 0 or exits > 0 or ${UNKNOWN_SUBMISSION_SQL})
        order by created_at desc, id desc limit $3`,
       [ownerKey(ownerAddress), agentId, EXECUTED_RUN_LIMIT],
     );

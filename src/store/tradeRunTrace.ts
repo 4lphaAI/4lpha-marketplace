@@ -43,3 +43,20 @@ export function normalizeTradeRunEvents(value: unknown): readonly TradeRunEvent[
     }];
   });
 }
+
+/** A buy or sell whose executor answer was `unknown`: the order may have landed, so its run is the only record of the decision. */
+export function isUnknownSubmissionEvent(event: Pick<TradeRunEvent, "stage" | "code">): boolean {
+  return (event.stage === "buy" || event.stage === "sell") && event.code === "unknown";
+}
+
+/** Appends below 100 events. At 100 a plain event is dropped; an unknown submission replaces the last event whose stage is neither
+ *  buy nor sell (a committed or refused buy/sell event is never overwritten), and is dropped when no such slot exists. */
+export function appendTradeRunEvent(events: TradeRunEvent[], next: readonly TradeRunEvent[]): void {
+  for (const event of next) {
+    if (events.length < 100) { events.push(event); continue; }
+    if (!isUnknownSubmissionEvent(event)) continue;
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      if (events[i]!.stage !== "buy" && events[i]!.stage !== "sell") { events[i] = event; break; }
+    }
+  }
+}

@@ -263,3 +263,50 @@ test("G17 an owner end books a fill whose swap committed before the sign-out, th
   assert.equal(round!.phase, "interrupted");
   assert.ok(BigInt(round!.soldStockRaw) > 0n, "the committed sale is booked before the round is recorded");
 });
+
+test("AGENTIC-RECEIPT-WAIT F1: a DCA fire with an unreadable receipt stays placing, holds receipt-missing at 30 min, and is booked when the receipt reads", async t => {
+  const w = await dcaLane(t);
+  await run(w, 2);
+  const chain = w.f.chain, real = chain.receipt;
+  let unreadable = true, skew = 0n;
+  const hrtime = process.hrtime.bigint.bind(process.hrtime);
+  // the executor's 20 s poll loop ends after its first unreadable pass (one real 2 s sleep), so the test does not wait 20 s
+  t.mock.method(process.hrtime, "bigint", () => hrtime() + skew);
+  chain.receipt = async hash => { if (!unreadable) return real(hash); skew += 25_000_000_000n; return null; };
+  w.setPrice(725);
+  await w.tick();
+  const tp = async () => (await w.orders()).find(o => o.role === "tp")!;
+  assert.equal((await tp()).state, "placing");
+  assert.equal(await w.code(), "dca-waiting");
+  await w.advance(30 * MINUTE); await w.tick();
+  assert.deepEqual([(await tp()).state, (await tp()).holdReason], ["held", "receipt-missing"]);
+  assert.equal(await w.code(), "dca-order-held");
+  unreadable = false;
+  await w.advance(MINUTE); await w.tick();
+  assert.equal((await tp()).state, "filled");
+  assert.equal((await w.rounds())[0]!.phase, "settled");
+});
+
+test("AGENTIC-RECEIPT-WAIT F2: a DCA base buy or fire of unknown outcome writes the marker and its run survives the prune", async t => {
+  const marker = async (w: DcaWorld, stage: string) => (await w.runs()).find(r => (r.events ?? []).some(e => e.stage === stage && e.code === "unknown"));
+  const base = await dcaLane(t);
+  const executor = base.input.worker.executor, real = executor.execute.bind(executor);
+  executor.execute = async input => { await real(input); return { kind: "unknown" } as never; };
+  await base.tick();
+  const baseRun = await marker(base, "buy");
+  assert.ok(baseRun, "the base buy of unknown outcome writes buy/unknown");
+  assert.equal(baseRun!.reason.split(";")[0], "dca-waiting");
+  for (let i = 0; i < 210; i += 1) await base.f.positions.insertRun({ agentId: base.f.agent.id, ownerAddress: W, dryRun: false, reason: "plain", events: [] });
+  assert.ok((await base.f.positions.listExecutedRuns(W, base.f.agent.id)).some(r => r.id === baseRun!.id));
+  const fire = await dcaLane(t);
+  await run(fire, 2);
+  const fireExecutor = fire.input.worker.executor, fireReal = fireExecutor.execute.bind(fireExecutor);
+  fireExecutor.execute = async input => { await fireReal(input); return { kind: "unknown" } as never; };
+  fire.setPrice(725);
+  await fire.tick();
+  const fireRun = await marker(fire, "sell");
+  assert.ok(fireRun, "the take-profit fire of unknown outcome writes sell/unknown");
+  assert.equal(fireRun!.reason.split(";")[0], "dca-waiting");
+  for (let i = 0; i < 210; i += 1) await fire.f.positions.insertRun({ agentId: fire.f.agent.id, ownerAddress: W, dryRun: false, reason: "plain", events: [] });
+  assert.ok((await fire.f.positions.listExecutedRuns(W, fire.f.agent.id)).some(r => r.id === fireRun!.id));
+});

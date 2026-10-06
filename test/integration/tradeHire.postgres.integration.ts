@@ -122,6 +122,20 @@ test("Trading R9.3: Postgres holds the nonce lock across separate AgentStore mat
         assert.equal((await positions.listOpen(owner, "pg-trader")).length, 0);
       } finally { await positions.close(); }
     });
+    await t.test("AGENTIC-RECEIPT-WAIT F2: real Postgres keeps an unknown-submission run through the prune and lists it", async () => {
+      const sql = await createPgSqlClient(url), positions = await PostgresTradePositionStore.create(sql);
+      try {
+        const owner = getAddress("0x1111111111111111111111111111111111111111");
+        const unknown = (stage: "buy" | "cycle") => [{ stage, code: "unknown", elapsedMs: 5, reason: "5.00 USDT via binance-aggregator" }];
+        const cycle = await positions.insertRun({ ownerAddress: owner, agentId: "pg-unknown", dryRun: false, reason: "unknown", events: unknown("cycle") });
+        const marker = await positions.insertRun({ ownerAddress: owner, agentId: "pg-unknown", dryRun: false, reason: "unknown", events: unknown("buy") });
+        for (let index = 0; index < 201; index += 1) await positions.insertRun({ ownerAddress: owner, agentId: "pg-unknown", dryRun: false, reason: `plain-${index}` });
+        const stored = (await sql.query<{ id: string }>("select id from trade_runs where agent_id = $1", ["pg-unknown"])).rows.map((row) => row.id);
+        assert.equal(stored.includes(marker.id), true); assert.equal(stored.includes(cycle.id), false); assert.equal(stored.length, 201);
+        assert.deepEqual((await positions.listExecutedRuns(owner, "pg-unknown")).map((run) => run.id), [marker.id]);
+        assert.equal((await positions.listExecutedRuns(owner, "pg-unknown"))[0]?.events?.[0]?.code, "unknown");
+      } finally { await positions.close(); }
+    });
     await t.test("worker trade intents survive JSONB route ordering and reject conflicting retries", async () => {
       const intents = await PostgresTradeIntentStore.create(await createPgSqlClient(url));
       try {

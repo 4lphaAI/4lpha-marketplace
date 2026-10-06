@@ -208,3 +208,15 @@ test("E8 audit F1: an LLM enter on a POOLED stock of an RFQ-active agent with en
   const bought = (await ofStage(w.world, "buy", nvda)).find((event) => event.code === "committed");
   assert.equal(bought?.reason, "5.00 USDT via pancake_v2");
 });
+
+test("AGENTIC-RECEIPT-WAIT F2: an Agentic buy of unknown outcome logs buy/unknown with its size and leaves entries at 0", async (t) => {
+  const w = await entryWorld(t, { quote: (call) => call.side === "buy" ? { ok: true, outAtomic: 376_000_000_000_000_000n } : { ok: true, outAtomic: 2_300_000_000_000_000_000n },
+    extraDeps: { executor: { execute: async () => ({ kind: "unknown", meta: {} }) } } });
+  const amd = w.bySymbol("AMDB").address;
+  await w.run();
+  const runs = await w.world.positions.listRuns(w.world.owner, w.world.agent.id, 50);
+  const run = runs.find((candidate) => (candidate.events ?? []).some((event) => event.stage === "buy"))!;
+  const buy = (run.events ?? []).filter((event) => event.stage === "buy");
+  assert.deepEqual(buy.map((e) => [e.code, e.token?.toLowerCase(), e.reason]), [["unknown", amd.toLowerCase(), "5.00 USDT via binance-aggregator"]]);
+  assert.equal(run.entries, 0); assert.match(run.reason, /^unknown;/u);
+});

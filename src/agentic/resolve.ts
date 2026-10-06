@@ -260,7 +260,8 @@ export async function resolveAgenticOrder(input: { store: AgenticStore; journal:
     return recovered.fill;
   }
   if (row.response === null || row.response === "no-response") { await store.patchOrder(row, { holdReason: "no-response" }); return null; }
-  if (row.holdReason !== null && row.holdReason !== "no-list-row") return null;
+  // AGENTIC-RECEIPT-WAIT F1: receipt-missing is re-examined every pass like no-list-row (a hold from an unreadable receipt, not a verdict).
+  if (row.holdReason !== null && row.holdReason !== "no-list-row" && row.holdReason !== "receipt-missing") return null;
   if (row.listSnapshot === null) return null;
   const listed = await agenticList(runner, store, masterKey, row.agentId, fence, ["--startTime", String(row.listSnapshot.startTimeMs), "--fromToken", row.fromToken!, "--toToken", row.toToken!]);
   if (listed === null) return null;
@@ -275,9 +276,14 @@ export async function resolveAgenticOrder(input: { store: AgenticStore; journal:
   const hash = typeof match["txHash"] === "string" && /^0x[0-9a-f]{64}$/i.test(match["txHash"]) ? match["txHash"].toLowerCase() as Hex : null;
   if (match["status"] === "FINISHED" && hash !== null) {
     if ((await store.orders()).some(o => o.idempotencyKey !== row!.idempotencyKey && o.txHash === hash)) { await store.patchOrder(row, { holdReason: "tx-already-bound" }); return null; }
-    const fill = await verifyAgenticSwap(chain, row, hash);
+    // AGENTIC-RECEIPT-WAIT F1: an unreadable receipt (null read, any cause) waits 30 min from created_at before a hold; a read receipt is judged
+    // once, the full and the partial check on that one object, so a second flaky read cannot turn a valid receipt into a hold.
+    const unread = await chain.receipt(hash);
+    if (unread === null) { if (await store.now() - row.createdAt >= 1_800_000) await store.patchOrder(row, { holdReason: "receipt-missing" }); return null; }
+    const read: AgenticChain = { ...chain, receipt: async () => unread };
+    const fill = await verifyAgenticSwap(read, row, hash);
     if (fill === null) {
-      const partial = row.side === "sell" ? await verifyAgenticSwap(chain, row, hash, true) : null;
+      const partial = row.side === "sell" ? await verifyAgenticSwap(read, row, hash, true) : null;
       await store.patchOrder(row, { holdReason: partial !== null && partial.input < BigInt(row.intendedRaw!) ? "partial-sell" : "chain-verification" }); return null;
     }
     const entry = await journal.get(row.idempotencyKey);
@@ -292,6 +298,8 @@ export async function resolveAgenticOrder(input: { store: AgenticStore; journal:
   }
   if (match["status"] === "FAILED") {
     const proof = hash === null ? null : await chain.receipt(hash);
+    // AGENTIC-RECEIPT-WAIT F1: FAILED with a hash and an unreadable receipt waits like the FINISHED branch; a read receipt decides.
+    if (hash !== null && proof === null) { if (await store.now() - row.createdAt >= 1_800_000) await store.patchOrder(row, { holdReason: "receipt-missing" }); return null; }
     const rollback = hash === null && row.response === "rejected" || proof !== null && proof.from === row.walletAddress && proof.observation.receipt.status === 0n;
     if (!rollback) { await store.patchOrder(row, { holdReason: "accepted-then-failed" }); return null; }
     const entry = await journal.get(row.idempotencyKey);

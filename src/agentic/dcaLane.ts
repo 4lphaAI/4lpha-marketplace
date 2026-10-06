@@ -364,6 +364,8 @@ async function phaseStarting(ctx: Ctx, round: AgenticDcaRound, h: Holds): Promis
     if (committed !== null && committed.outcome === "committed" && committed.txHash !== null) { await bookBase(ctx, round, committed); return; }
     setCode(ctx, "dca-waiting"); return;
   }
+  // AGENTIC-RECEIPT-WAIT F2: an unknown submission may have landed; the marker keeps this run through the 200-run prune.
+  if (result.kind === "unknown") note(ctx, "unknown", "buy");
   ctx.refusals += 1;
   const code = result.kind === "denied" || result.kind === "rolled-back" ? result.code : "unknown";
   setCode(ctx, DENIAL_CODES[code] ?? "dca-waiting");
@@ -474,7 +476,7 @@ async function fire(ctx: Ctx, round: AgenticDcaRound, order: AgenticDcaOrder, h:
     if (swap !== null && swap.outcome === "committed" && swap.txHash !== null && await bookSwapFill(ctx, placing, swap)) return "committed";
     setCode(ctx, "dca-waiting"); return "not-fired";
   }
-  if (result.kind === "unknown") { setCode(ctx, "dca-waiting"); return "not-fired"; }
+  if (result.kind === "unknown") { note(ctx, "unknown", buy ? "buy" : "sell"); setCode(ctx, "dca-waiting"); return "not-fired"; }
   ctx.refusals += 1;
   // A refusal or a rollback re-arms the row. Only a Binance rejection counts toward the back-off; a seal (quote below minOut, claim refused) or a denial does not.
   await setOrder(ctx, ctx.orders.find(o => o.orderKey === placing.orderKey)!, { state: "resting", holdReason: null });

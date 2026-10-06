@@ -26,6 +26,9 @@ const NOW = 1_900_000_000_000;
 
 type Row = Record<string, unknown>;
 
+/** The containment fragment of the prune and listExecuted statements (AGENTIC-RECEIPT-WAIT F2): events @> a buy or a sell unknown event. */
+const unknownSubmission = (row: Row): boolean => (row["events"] as { stage?: string; code?: string }[] | undefined ?? []).some((e) => (e.stage === "buy" || e.stage === "sell") && e.code === "unknown");
+
 class TradeFakeSql implements SqlClient {
   readonly settings = new Map<string, Row>();
   readonly positions = new Map<string, Row>();
@@ -143,18 +146,18 @@ class TradeFakeSql implements SqlClient {
       return [row];
     }
     if (tag === "tradeRuns.insert") {
-      this.runs.set(String(p[0]), { id: p[0], agent_id: p[1], owner_address: p[2], dry_run: p[3], reason: p[4], created_at: p[5], entries: p[8], exits: p[9] });
+      this.runs.set(String(p[0]), { id: p[0], agent_id: p[1], owner_address: p[2], dry_run: p[3], reason: p[4], created_at: p[5], entries: p[8], exits: p[9], events: JSON.parse(String(p[10])) as unknown[] });
       return [];
     }
     if (tag === "tradeRuns.prune") {
       const rows = [...this.runs.values()].filter((row) => row["agent_id"] === p[0])
         .sort((a, b) => Number(b["created_at"]) - Number(a["created_at"]) || String(b["id"]).localeCompare(String(a["id"])));
-      for (const row of rows.slice(200)) if (Number(row["entries"]) === 0 && Number(row["exits"]) === 0) this.runs.delete(String(row["id"]));
+      for (const row of rows.slice(200)) if (Number(row["entries"]) === 0 && Number(row["exits"]) === 0 && !unknownSubmission(row)) this.runs.delete(String(row["id"]));
       return [];
     }
     if (tag === "tradeRuns.listExecuted") {
       return [...this.runs.values()]
-        .filter((row) => row["owner_address"] === p[0] && row["agent_id"] === p[1] && (Number(row["entries"]) > 0 || Number(row["exits"]) > 0))
+        .filter((row) => row["owner_address"] === p[0] && row["agent_id"] === p[1] && (Number(row["entries"]) > 0 || Number(row["exits"]) > 0 || unknownSubmission(row)))
         .sort((a, b) => Number(b["created_at"]) - Number(a["created_at"]) || String(b["id"]).localeCompare(String(a["id"])))
         .slice(0, Number(p[2]));
     }
@@ -443,5 +446,37 @@ describe("trade position and run stores", () => {
       assert.deepEqual(kept.map((run) => run.id), [executed.id]);
       assert.equal((await store.listExecutedRuns(OWNER_B, "a1")).length, 0);
     }
+  });
+
+  it("AGENTIC-RECEIPT-WAIT F2: a run with an unknown buy or sell survives the 200-row prune and is listed by listExecutedRuns, in both stores", async () => {
+    const sql = new TradeFakeSql();
+    let tick = 1_000;
+    const clock = (): number => (tick += 1);
+    const stores: readonly TradePositionStore[] = [
+      new MemoryTradePositionStore(clock),
+      await PostgresTradePositionStore.create(sql, clock),
+    ];
+    for (const store of stores) {
+      const events = (stage: "buy" | "sell" | "cycle", code: string) => [{ stage, code, elapsedMs: 3, reason: "5.00 USDT via binance-aggregator" }];
+      const buy = await store.insertRun({ agentId: "a1", ownerAddress: OWNER_A, dryRun: false, reason: "unknown", events: events("buy", "unknown") });
+      const sell = await store.insertRun({ agentId: "a1", ownerAddress: OWNER_A, dryRun: false, reason: "unknown", events: events("sell", "unknown") });
+      const cycle = await store.insertRun({ agentId: "a1", ownerAddress: OWNER_A, dryRun: false, reason: "unknown", events: events("cycle", "unknown") });
+      const refused = await store.insertRun({ agentId: "a1", ownerAddress: OWNER_A, dryRun: false, reason: "refused", events: events("buy", "AGENTIC_WALLET_OBLIGATION") });
+      for (let index = 0; index < 250; index += 1) {
+        await store.insertRun({ agentId: "a1", ownerAddress: OWNER_A, dryRun: false, reason: `refused-${index}` });
+      }
+      const kept = await store.listExecutedRuns(OWNER_A, "a1");
+      assert.deepEqual(kept.map((run) => run.id).sort(), [buy.id, sell.id].sort());
+      assert.deepEqual(kept.map((run) => [run.entries, run.exits]), [[0, 0], [0, 0]]);
+      assert.equal((await store.listRuns(OWNER_A, "a1", 200)).some((run) => [cycle.id, refused.id].includes(run.id)), false);
+      assert.equal((await store.listExecutedRuns(OWNER_B, "a1")).length, 0);
+    }
+    const prune = sql.texts.find((text) => text.includes("/* tradeRuns.prune */")) ?? "";
+    const listed = sql.texts.find((text) => text.includes("/* tradeRuns.listExecuted */")) ?? "";
+    for (const text of [prune, listed]) {
+      assert.ok(text.includes(`events @> '[{"stage":"buy","code":"unknown"}]'::jsonb`));
+      assert.ok(text.includes(`events @> '[{"stage":"sell","code":"unknown"}]'::jsonb`));
+    }
+    assert.match(prune, /entries = 0 and exits = 0/u);
   });
 });
