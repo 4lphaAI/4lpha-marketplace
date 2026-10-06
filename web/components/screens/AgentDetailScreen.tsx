@@ -123,13 +123,42 @@ function AgentDetailScreen({ agent, go, onHire }) {
               </>
             ) : agent.explainer === "trade" ? (
               <>
-                <PermissionItem>Enter only pairs that match the selected model.</PermissionItem>
-                <PermissionItem>Size each entry within your delegated capital and position limits.</PermissionItem>
-                <PermissionItem>Buy and sell on {agent.protocol} inside your slippage cap.</PermissionItem>
-                <PermissionItem>Take profit in stages and exit on stop loss.</PermissionItem>
-                <PermissionItem>Close on your stop loss or max holding time, whichever comes first.</PermissionItem>
+                <PermissionItem>Trade only tokenized US stocks, with USDT.</PermissionItem>
+                <PermissionItem>Size entries within your capital and max open positions.</PermissionItem>
+                <PermissionItem>Swap via Binance first, a direct pool as fallback.</PermissionItem>
+                <PermissionItem>Exit at your take profit, stop loss or max hold time.</PermissionItem>
+                <PermissionItem>Let the LLM decide any exit you leave blank.</PermissionItem>
                 <PermissionItem kind="deny">Withdraw funds to any wallet but yours.</PermissionItem>
-                <PermissionItem kind="deny">Spend past the total capital you delegate, or raise its own limits.</PermissionItem>
+                <PermissionItem kind="deny">Spend past the capital you set, or raise its own limits.</PermissionItem>
+              </>
+            ) : agent.explainer === "schedule" ? (
+              <>
+                <PermissionItem>Buy one tokenized stock with USDT on your schedule.</PermissionItem>
+                <PermissionItem>Spend the same amount on every buy.</PermissionItem>
+                <PermissionItem>Swap via Binance first, a direct pool as fallback.</PermissionItem>
+                <PermissionItem>Hold what it buys; it never sells on its own.</PermissionItem>
+                <PermissionItem kind="deny">Withdraw funds to any wallet but yours.</PermissionItem>
+                <PermissionItem kind="deny">Spend past the total budget you set.</PermissionItem>
+              </>
+            ) : agent.explainer === "dca" ? (
+              <>
+                <PermissionItem>Open each round with a base buy of one stock.</PermissionItem>
+                <PermissionItem>Buy more at each price-drop step, up to your max.</PermissionItem>
+                <PermissionItem>Sell the round at your take profit over average cost.</PermissionItem>
+                <PermissionItem>Start a new round after each take profit.</PermissionItem>
+                <PermissionItem>On stop loss, stop the agent without selling.</PermissionItem>
+                <PermissionItem kind="deny">Withdraw funds to any wallet but yours.</PermissionItem>
+                <PermissionItem kind="deny">Spend past the capital you set.</PermissionItem>
+              </>
+            ) : agent.explainer === "smart" ? (
+              <>
+                <PermissionItem>Hold 2 to 5 tokenized stocks at your target weights.</PermissionItem>
+                <PermissionItem>Check the basket at your interval (4h to daily).</PermissionItem>
+                <PermissionItem>Rebalance only when a stock drifts past your threshold.</PermissionItem>
+                <PermissionItem>Swap via Binance first, a direct pool as fallback.</PermissionItem>
+                <PermissionItem>Keep the stocks when you stop it; no sell-off.</PermissionItem>
+                <PermissionItem kind="deny">Withdraw funds to any wallet but yours.</PermissionItem>
+                <PermissionItem kind="deny">Invest more than the total capital you set.</PermissionItem>
               </>
             ) : agent.explainer === "compound" ? (
               <>
@@ -162,7 +191,7 @@ function AgentDetailScreen({ agent, go, onHire }) {
                 <PermissionItem kind="deny">Touch anything outside the capital you delegate.</PermissionItem>
               </>
             )}
-            <PermissionItem kind="info" note="Takes effect immediately, on-chain.">You can revoke this at any time.</PermissionItem>
+            <PermissionItem kind="info" note={(agent.custody || []).includes("agentic-wallet") ? "Altana: on-chain revoke. Agentic Wallet: sign out in Binance." : "Takes effect immediately, on-chain."}>You can revoke this at any time.</PermissionItem>
           </Panel>
 
           <Panel title="Pricing">
