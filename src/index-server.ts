@@ -294,8 +294,8 @@ if (agenticConfig.enabled) {
   const chain = createAgenticChain(agenticConfig.rpcUrls);
   const provider = { getTokenBalance: (request: import("./core/types.js").GetTokenBalanceParams) => chain.balance(request.wallet.address, request.token),
     getTokenMetadata: (request: import("./core/types.js").GetTokenMetadataParams) => chain.metadata(request.token) };
-  const lifecycle = { store: agenticStore, agents: rawAgentStore, settings: tradeSettingsStore, positions: tradePositions, runner, masterKey, instance: agenticInstance };
-  agenticPairings = new AgenticPairings({ ...lifecycle, cmc: tradeCmc, chain, ready: () => tradeReadiness?.ready === true, dcaEnabled: agenticConfig.dca, rfqEnabled: agenticConfig.rfq,
+  const lifecycle = { store: agenticStore, agents: rawAgentStore, settings: tradeSettingsStore, positions: tradePositions, runner, masterKey, instance: agenticInstance, chain };
+  agenticPairings = new AgenticPairings({ ...lifecycle, cmc: tradeCmc, chain, ready: () => tradeReadiness?.ready === true, dcaEnabled: agenticConfig.dca, rfqEnabled: agenticConfig.rfq, memeEnabled: agenticConfig.meme, earnEnabled: agenticConfig.earn,
     origins: passkeyConfig.enabled ? passkeyConfig.origins : [],
     publicView: createAgenticPublicView({ ...lifecycle, intents: tradeIntents, cmc: tradeCmc, killswitch, symbols: () => tradeReadiness?.bstocksSymbols,
       observer: createTradeDetailObserver({ provider, rpcUrls: agenticConfig.rpcUrls }), chain, scheduleSellQuote: () => agenticScheduleQuotes?.sell,

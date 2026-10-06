@@ -119,8 +119,9 @@ test("PIN1 (DI3, L5-5) no limit-order write remains: no limit-order buy, sell or
   assert.ok(read("src/trade/worker.ts").includes("export async function tradfiActualPremiumAllowed"));
 });
 
-test("PIN2 (DI2) baw.ts, obligations.ts, cmc.ts and the claim and pay-check SQL and methods equal their pre-DCA text (b1e6aad)", () => {
-  assert.equal(sha(read("src/agentic/baw.ts")), "31885634d1f44da105358ef07885850b6461d12941cf33d6bbe96eb68125ea40");
+test("PIN2 (DI2) obligations.ts, cmc.ts and the claim and pay-check SQL and methods equal their pre-DCA text (b1e6aad); baw.ts equals its AGENTIC-EARN text (rule 39)", () => {
+  // AGENTIC-EARN-SPEC 3.13: the six defi commands. Re-pinned once; the four other assertions are unchanged.
+  assert.equal(sha(read("src/agentic/baw.ts")), "b664ee2217d0f2edffc7e67725195da003feba1a8e90a37b837318ba5db19247");
   assert.equal(sha(read("src/agentic/obligations.ts")), "346859081c990b1a9c15ab6ccb8b86489f37e33ac34cfb2df6a5797a31c7d6bf");
   assert.equal(sha(read("src/agentic/cmc.ts")), "af453b39dc05f48825532aae5bbe728b792359c642d6b480f44c02cf761cef01");
   const store = read("src/agentic/store.ts");

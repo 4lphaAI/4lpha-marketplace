@@ -29,7 +29,12 @@ const TIMEOUTS: Readonly<Record<string, number>> = {
   "wallet status": 10_000, "wallet settings": 10_000, "wallet address": 10_000, "wallet balance": 10_000,
   "market-order quote": 10_000, "market-order list": 10_000, "limit-order list": 10_000,
   "market-order swap": 20_000, "x402-payment preview": 30_000, "x402-payment sign": 60_000,
+  // AGENTIC-EARN-SPEC 3.13: the six defi commands of Agentic Earn (timeouts unmeasured, morning patch P6); every other defi subcommand stays refused.
+  "defi investment-list": 15_000, "defi investment-info": 15_000, "defi position": 15_000, "defi preview": 30_000, "defi deposit": 60_000, "defi redeem": 60_000,
 };
+/** The DeFi domain names (server codes 351761 to 351768) and the three client-side validation names; accepted as a `cli-error` only for a `defi ` command. */
+const DEFI_ERROR_NAMES = new Set(["INVESTMENT_NOT_FOUND", "INVESTMENT_NOT_INVESTABLE", "DEFI_TX_SIMULATION_FAILED", "DEFI_SECURITY_RISK_BLOCKED", "COMPLIANCE_FAILED",
+  "INVESTMENT_NO_POSITION", "POSITION_QUERY_FAILED", "INVALID_PARAMS", "INVALID_AMOUNT", "INVALID_ADDRESS"]);
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -41,6 +46,8 @@ export function bawOrderId(value: unknown): string | null {
 }
 
 export function bawOutputValid(command: string, value: unknown): boolean {
+  // Every shape rule of the six defi commands lives in earnAdapter.ts, so a format change is a one-file patch.
+  if (command.startsWith("defi ")) return record(value);
   if (command === "wallet balance") return Array.isArray(value) && value.every(r => record(r)
     && ["symbol", "address", "binanceChainId", "balance", "price", "value"].every(k => typeof r[k] === "string"));
   if (!record(value)) return false;
@@ -201,7 +208,7 @@ export class BawRunner {
                 }
                 const failure = record(parsed) && record(parsed["error"]) ? parsed["error"] : null;
                 if (parsed !== null && record(parsed) && parsed["success"] === false && failure !== null
-                  && Number.isSafeInteger(failure["code"]) && typeof failure["name"] === "string" && ERROR_NAMES.has(failure["name"])) {
+                  && Number.isSafeInteger(failure["code"]) && typeof failure["name"] === "string" && (ERROR_NAMES.has(failure["name"]) || command.startsWith("defi ") && DEFI_ERROR_NAMES.has(failure["name"]))) {
                   resolve({ kind: "cli-error", code: Number(failure["code"]), name: failure["name"],
                     orderId: record(failure["data"]) ? bawOrderId(failure["data"]["orderId"]) : null, sessionPresent }); return;
                 }

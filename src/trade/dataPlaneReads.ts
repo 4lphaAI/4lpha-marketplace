@@ -92,6 +92,11 @@ export interface TradeDataPlaneReads extends Pick<DataPlaneClient, "security"> {
   /** AGENTIC-RFQ-STOCKS R2.4: the recorded-underlying feature index and 1..10-token batch (store-only on the data plane; a missing method is no evidence). */
   underlyingFeatureIndex?(signal?: AbortSignal): Promise<unknown>;
   underlyingFeaturesBatch?(tokens: readonly Address[], interval: "15m" | "1h", signal?: AbortSignal): Promise<unknown>;
+  /** AGENTIC-MEME-STOCKS-SPEC 5: the raw envelopes (data and meta) of the four meme reads, parsed by the Agentic meme lane; a missing method is "unavailable". */
+  memeShortlist?(signal?: AbortSignal): Promise<unknown>;
+  memeToken?(address: Address, signal?: AbortSignal): Promise<unknown>;
+  memeBars?(addresses: readonly Address[], signal?: AbortSignal): Promise<unknown>;
+  memeEligibility?(addresses: readonly Address[], signal?: AbortSignal): Promise<unknown>;
   /** `null` is reserved for the legacy 400 `invalid_lane` allowlist response. */
   universe(lane: UniverseLane, signal?: AbortSignal): Promise<readonly UniverseRow[] | null>;
   tokensBatch(addresses: readonly Address[], signal?: AbortSignal): Promise<readonly TokenBatchRow[]>;
@@ -547,6 +552,26 @@ export class HttpTradeDataPlaneReads implements TradeDataPlaneReads {
     if (tokens.length < 1 || tokens.length > 10) throw new InfrastructureError("Underlying feature batches require 1..10 tokens.");
     const query = tokens.map(token => token.toLowerCase()).join(",");
     return this.#requireOk(await this.#send(`trading/underlying-features/v1?tokens=${encodeURIComponent(query)}&interval=${interval}`, signal), "underlying features").data;
+  }
+
+  async memeShortlist(signal?: AbortSignal): Promise<unknown> {
+    return this.#requireOk(await this.#send("memes/shortlist?segment=memestock", signal), "meme shortlist");
+  }
+
+  async memeToken(address: Address, signal?: AbortSignal): Promise<unknown> {
+    return this.#requireOk(await this.#send(`memes/${encodeURIComponent(address.toLowerCase())}`, signal), "meme board row");
+  }
+
+  async memeBars(addresses: readonly Address[], signal?: AbortSignal): Promise<unknown> {
+    if (addresses.length < 1 || addresses.length > 30) throw new InfrastructureError("Meme bars batches require 1..30 addresses.");
+    const query = addresses.map((address) => address.toLowerCase()).join(",");
+    return this.#requireOk(await this.#send(`memes/bars?addresses=${encodeURIComponent(query)}&limit=60`, signal), "meme bars");
+  }
+
+  async memeEligibility(addresses: readonly Address[], signal?: AbortSignal): Promise<unknown> {
+    requireBatch(addresses);
+    const query = addresses.map((address) => address.toLowerCase()).join(",");
+    return this.#requireOk(await this.#send(`eligibility?addresses=${encodeURIComponent(query)}`, signal), "meme eligibility");
   }
 
   async usEquityRegime(signal?: AbortSignal): Promise<UsEquityRegime> {

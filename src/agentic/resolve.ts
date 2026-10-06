@@ -9,6 +9,8 @@ import { CMC_PERMIT2 } from "../trade/cmcCapability.js";
 import { AGENTIC_RECEIPT_TAG, agenticAddress, type AgenticOrder, type AgenticFence } from "./domain.js";
 import { type BawRunner, bawOrderId } from "./baw.js";
 import { decryptAgenticSession, type AgenticStore } from "./store.js";
+import { EARN_PRODUCTS, EARN_USDT, type EarnProtocol } from "./earnAdapter.js";
+import { venusWei } from "./earn.js";
 
 const ERC20 = parseAbi(["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)",
   "function symbol() view returns (string)", "function uiMultiplier() view returns (uint256)", "function approve(address,uint256) returns (bool)"]);
@@ -18,7 +20,20 @@ const APPROVAL = keccak256(stringToBytes("Approval(address,address,uint256)"));
 const BSTOCK_COMPANION_EVENT = "0x0226a2f5c1ae0e071aeec3d4ebafcefdc5c549be11f40ed27e76e802acccf374";
 const V3_POOL = parseAbi(["function token0() view returns (address)", "function token1() view returns (address)", "function fee() view returns (uint24)",
   "function tickSpacing() view returns (int24)", "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint32 feeProtocol, bool unlocked)"]);
+/** AGENTIC-EARN-SPEC 3.2: the supply-side reads of the two Earn products (vUSDT: balance x stored exchange rate; Aave aToken: balance), and the pin reads that name each receipt token's underlying and pool. */
+const EARN_ABI = parseAbi(["function underlying() view returns (address)", "function UNDERLYING_ASSET_ADDRESS() view returns (address)", "function POOL() view returns (address)",
+  "function exchangeRateStored() view returns (uint256)"]);
+/** The Aave v3 `getReserveData` return struct; `aTokenAddress` is word 8 of the return data counted from zero (word 9 is the stable debt token). */
+const AAVE_POOL = [{ type: "function", name: "getReserveData", stateMutability: "view", inputs: [{ name: "asset", type: "address" }],
+  outputs: [{ type: "tuple", components: [{ name: "configuration", type: "uint256" }, { name: "liquidityIndex", type: "uint128" }, { name: "currentLiquidityRate", type: "uint128" },
+    { name: "variableBorrowIndex", type: "uint128" }, { name: "currentVariableBorrowRate", type: "uint128" }, { name: "currentStableBorrowRate", type: "uint128" },
+    { name: "lastUpdateTimestamp", type: "uint40" }, { name: "id", type: "uint16" }, { name: "aTokenAddress", type: "address" }, { name: "stableDebtTokenAddress", type: "address" },
+    { name: "variableDebtTokenAddress", type: "address" }, { name: "interestRateStrategyAddress", type: "address" }, { name: "accruedToTreasury", type: "uint128" },
+    { name: "unbacked", type: "uint128" }, { name: "isolationModeTotalDebt", type: "uint128" }] }] }] as const;
 export type AgenticReceipt = { observation: TradfiReceiptObservation; from: Address; to: Address; input: Hex };
+/** Both RPCs agreed on every value at one common finalized block (rule 8). */
+export type AgenticEarnBalances = { block: bigint; usdt: bigint; vBalance: bigint; vRate: bigint; venusWei: bigint; aaveWei: bigint };
+export type AgenticEarnPins = Readonly<Record<EarnProtocol, boolean>>;
 /** A pinned Pancake V3 pool read on the two RPCs at their common finalized block (Agentic DCA, AGENTIC-DCA-SPEC 3.1). */
 export type AgenticPoolState = { token0: Address; token1: Address; fee: number; tickSpacing: number; sqrtPriceX96: bigint; tick: number; block: bigint };
 export type AgenticChain = {
@@ -30,6 +45,9 @@ export type AgenticChain = {
   receipt(hash: Hex): Promise<AgenticReceipt | null>;
   /** Optional so the Agentic AI and Schedule fixtures stay valid; a missing method is a failed pool read for the DCA lane (fail closed). */
   poolState?(pool: Address): Promise<AgenticPoolState>;
+  /** Optional for the same reason; a missing or throwing method is a failed read for Earn (no action, the sign-out waits). */
+  earnBalances?(W: Address): Promise<AgenticEarnBalances>;
+  earnPins?(): Promise<AgenticEarnPins>;
 };
 
 export function createAgenticChain(rpcUrls: readonly string[]): AgenticChain {
@@ -69,6 +87,27 @@ export function createAgenticChain(rpcUrls: readonly string[]): AgenticChain {
         fee: await read(c => c.readContract({ address: pool, abi: V3_POOL, functionName: "fee", blockNumber: n })),
         tickSpacing: await read(c => c.readContract({ address: pool, abi: V3_POOL, functionName: "tickSpacing", blockNumber: n })),
         sqrtPriceX96, tick, block: n };
+    },
+    async earnBalances(W) {
+      const n = await block();
+      const venus = EARN_PRODUCTS.find(p => p.protocol === "venus")!.receiptToken, aave = EARN_PRODUCTS.find(p => p.protocol === "aave-v3")!.receiptToken;
+      const read = async (address: Address, functionName: "balanceOf", args: [Address]): Promise<bigint> => agree(await Promise.all(clients.map(c =>
+        c.readContract({ address, abi: ERC20, functionName, args, blockNumber: n }))));
+      const usdt = await read(EARN_USDT, "balanceOf", [W]), vBalance = await read(venus, "balanceOf", [W]), aaveWei = await read(aave, "balanceOf", [W]);
+      const vRate = agree(await Promise.all(clients.map(c => c.readContract({ address: venus, abi: EARN_ABI, functionName: "exchangeRateStored", blockNumber: n }))));
+      return { block: n, usdt, vBalance, vRate, venusWei: venusWei(vBalance, vRate), aaveWei };
+    },
+    async earnPins() {
+      const n = await block();
+      const venus = EARN_PRODUCTS.find(p => p.protocol === "venus")!, aave = EARN_PRODUCTS.find(p => p.protocol === "aave-v3")!;
+      const same = async (work: (c: (typeof clients)[number]) => Promise<string>): Promise<string | null> => {
+        try { return agenticAddress(agree(await Promise.all(clients.map(work)))); } catch { return null; }
+      };
+      const venusOk = await same(c => c.readContract({ address: venus.receiptToken, abi: EARN_ABI, functionName: "underlying", blockNumber: n })) === EARN_USDT;
+      const aaveOk = await same(c => c.readContract({ address: aave.receiptToken, abi: EARN_ABI, functionName: "UNDERLYING_ASSET_ADDRESS", blockNumber: n })) === EARN_USDT
+        && await same(c => c.readContract({ address: aave.receiptToken, abi: EARN_ABI, functionName: "POOL", blockNumber: n })) === aave.pool
+        && await same(async c => (await c.readContract({ address: aave.pool!, abi: AAVE_POOL, functionName: "getReserveData", args: [EARN_USDT], blockNumber: n })).aTokenAddress) === aave.receiptToken;
+      return { venus: venusOk, "aave-v3": aaveOk };
     },
     async receipt(hash) {
       try {
@@ -192,6 +231,8 @@ export async function resolveAgenticOrder(input: { store: AgenticStore; journal:
   }
   if (row === null) return null;
   if (["sealed", "not-started"].includes(row.dispatch)) { await terminalizeAgenticOrder(store, journal, row); return null; }
+  // AGENTIC-EARN-SPEC R11.9: an earn row is held and resolved only by the earn step (earnLane.ts); a stale unclaimed one was still sealed above.
+  if (row.kind === "earn-deposit" || row.kind === "earn-redeem") return null;
   if (row.kind !== "swap") {
     if (row.outcome === "open" && row.dispatch === "spawned" && row.holdReason === null) await store.patchOrder(row, {
       holdReason: row.response === null || row.response === "no-response" ? "no-response" : "sign-recovery" });

@@ -20,7 +20,7 @@ import { acquireAgenticFence } from "./obligations.js";
 import { verifyAgenticSwap, type AgenticChain } from "./resolve.js";
 import { readAgenticSettings, type AgenticExecutionDeps } from "./execute.js";
 import type { AgenticCmc } from "./cmc.js";
-import { DCA_BUY_BNB_FLOOR_WEI, DCA_COOLDOWN_MS, DCA_FAIL_BACKOFF_MS, DCA_THROTTLE_MS, DCA_TP_BNB_FLOOR_WEI, dcaAdvanceCounter, dcaBaseDecisionId, dcaBuyQuoteReaches, dcaCounterConfirmed,
+import { DCA_BNB_RESERVE_WEI, DCA_BUY_BNB_FLOOR_WEI, DCA_COOLDOWN_MS, DCA_FAIL_BACKOFF_MS, DCA_THROTTLE_MS, DCA_TP_BNB_FLOOR_WEI, dcaAdvanceCounter, dcaBaseDecisionId, dcaBuyQuoteReaches, dcaCounterConfirmed,
   dcaCounterIn, dcaCounterOut, dcaFireDecisionId, dcaFireDecisionPrefix, dcaGte, dcaLevelAt, dcaLevelReached, dcaLte, dcaMinOut, dcaNextAttempt, dcaOrderKey, dcaP0, dcaPriceOf,
   dcaRoundOpen, dcaRoundStartBnbFloorWei, dcaSellQuoteReaches, dcaSlippageBps, dcaTargetReached, dcaTpQty } from "./dca.js";
 
@@ -101,6 +101,8 @@ async function computeHolds(ctx: Ctx): Promise<Holds> {
 function blockCode(h: Holds): string | null {
   return h.paused ? "paused" : h.off ? "dca-agentic-off" : h.held ? "dca-order-held" : h.throttled ? "dca-binance-throttled" : h.settings ? "dca-settings-hold" : null;
 }
+/** AGENTIC-EARN-SPEC 3.10: an earn hire's buys leave one more operation reserve (0.0004 BNB) for a redeem; sells and other hires are unchanged. */
+const earnReserve = (ctx: Ctx): bigint => ctx.row.hireFacts?.earn !== undefined ? DCA_BNB_RESERVE_WEI : 0n;
 async function bnb(ctx: Ctx): Promise<bigint | null> { try { return await ctx.deps.chain.balance(ctx.W, null); } catch { return null; } }
 async function usdtBalance(ctx: Ctx): Promise<bigint | null> { try { return await ctx.deps.chain.balance(ctx.W, agenticAddress(USDT_56)); } catch { return null; } }
 async function stockBalance(ctx: Ctx): Promise<bigint | null> { try { return await ctx.deps.chain.balance(ctx.W, ctx.stock); } catch { return null; } }
@@ -336,7 +338,7 @@ async function phaseStarting(ctx: Ctx, round: AgenticDcaRound, h: Holds): Promis
   const triggerOn = round.roundNo === 1 && trigger !== null;
   if (triggerOn && !dcaLte(ctx.mid, dcaPriceFromE8(trigger))) { setCode(ctx, "dca-trigger-not-reached"); return; }
   const gas = await bnb(ctx);
-  if (gas === null || gas < dcaRoundStartBnbFloorWei(ctx.N)) { setCode(ctx, "dca-low-bnb"); return; }
+  if (gas === null || gas < dcaRoundStartBnbFloorWei(ctx.N) + earnReserve(ctx)) { setCode(ctx, "dca-low-bnb"); return; }
   const cash = await usdtBalance(ctx);
   if (cash === null || cash < ctx.base + BigInt(ctx.a) * ctx.D + await deps.cmc.protectedExposure(ctx.agentId)) { setCode(ctx, "dca-cash-low"); return; }
   if (!dayCap(ctx, await deps.store.orders(ctx.W), ctx.base)) { setCode(ctx, "dca-cap-exhausted"); return; }
@@ -434,7 +436,7 @@ async function fire(ctx: Ctx, round: AgenticDcaRound, order: AgenticDcaOrder, h:
   if (round.backoffUntilMs !== null && round.backoffUntilMs > ctx.now) { setCode(ctx, "dca-retry-backoff"); return "not-fired"; }
   if (await deps.store.walletObligations(ctx.W)) { setCode(ctx, "dca-waiting"); return "not-fired"; }
   const gas = await bnb(ctx);
-  if (gas === null || gas < (tp ? DCA_TP_BNB_FLOOR_WEI : DCA_BUY_BNB_FLOOR_WEI)) { setCode(ctx, "dca-low-bnb"); return "not-fired"; }
+  if (gas === null || gas < (tp ? DCA_TP_BNB_FLOOR_WEI : DCA_BUY_BNB_FLOOR_WEI + earnReserve(ctx))) { setCode(ctx, "dca-low-bnb"); return "not-fired"; }
   let amount = ctx.D;
   if (buy) {
     const cash = await usdtBalance(ctx);

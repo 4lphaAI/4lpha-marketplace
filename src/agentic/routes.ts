@@ -20,6 +20,8 @@ import type { AgenticInstanceManager } from "./instances.js";
 import { acquireAgenticFence } from "./obligations.js";
 import { categoryForAgenticHire } from "../identity/types.js";
 import { AGENTIC_RFQ_PIN_MAX, agenticRfqFacts, mapWithConcurrency, type AgenticRfqPin } from "./rfq.js";
+import { EARN_PRODUCTS, earnConfigured, type EarnProduct } from "./earnAdapter.js";
+import { EARN_DUST_WEI } from "./earn.js";
 
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
 export type AgenticRoutesDeps = {
@@ -31,6 +33,12 @@ export type AgenticRoutesDeps = {
   dcaEnabled?: boolean;
   /** AGENTIC_RFQ_STOCKS_ENABLED of this process (AGENTIC-RFQ-STOCKS E1): absent or false leaves every hire on today's pin and sizing. */
   rfqEnabled?: boolean;
+  /** AGENTIC_MEME_STOCKS_ENABLED of this process (AGENTIC-MEME-STOCKS-SPEC 9.1): absent or false refuses every 8-key paper meme body. */
+  memeEnabled?: boolean;
+  /** AGENTIC_EARN_ENABLED of this process (AGENTIC-EARN-SPEC 3.1): absent or false refuses every 8-key earn body. */
+  earnEnabled?: boolean;
+  /** Test seam: the Earn product table. Production never passes it, so the null-pinned constants of earnAdapter.ts apply. */
+  earnProducts?: readonly EarnProduct[];
 };
 
 export class AgenticPairings {
@@ -211,7 +219,7 @@ export class AgenticPairings {
     } finally { if (fence !== null) await this.deps.store.releaseFence(fence); }
   }
   async hire(row: AgenticWallet, body: unknown): Promise<AgenticWallet> {
-    const params = parseAgenticHireParams(body);
+    const params = parseAgenticHireParams(body, { meme: this.deps.memeEnabled === true, earn: this.deps.earnEnabled === true });
     if (params === null || params.pairingId !== row.pairingId) throw new Error("agentic_hire_invalid");
     const identity = agenticHireIdentity(params);
     if (row.state === "hiring" || row.state === "bound") {
@@ -221,6 +229,7 @@ export class AgenticPairings {
       if (isTradeScheduleSettings(params.settings) && row.state === "paired" && row.factsRead !== null) await this.schedulePrecheck(row, params);
       if (isTradePortfolioSettings(params.settings) && row.state === "paired" && row.factsRead !== null) await this.portfolioPrecheck(params);
       if (isTradeDcaSettings(params.settings) && row.state === "paired" && row.factsRead !== null) await this.dcaChecks(params.settings.dcaToken!);
+      if (params.earn === true && row.state === "paired" && row.factsRead !== null) await this.earnChecks(row.walletAddress!);
       const accepted = await this.deps.store.acceptHire(row, { hireOpId: identity.hireOpId, agentId: identity.agentId, hireParams: params, termEndAction: params.termEndAction });
       if (accepted === null) throw new Error("agentic_hire_conflict");
       row = accepted;
@@ -286,11 +295,24 @@ export class AgenticPairings {
     if (state.token0.toLowerCase() !== legs.token0.toLowerCase() || state.token1.toLowerCase() !== legs.token1.toLowerCase()
       || state.fee !== pool.fee || state.tickSpacing !== pool.tickSpacing) throw new Error("dca-pool-mismatch");
   }
+  /** AGENTIC-EARN-SPEC 3.14: read-only, on the chain pair. An earn hire needs one configured and pin-checked product, and a wallet that supplies no USDT to either product yet (the term-end redeem-all must never take a position the owner had before).
+   *  renew is the fence renewal the gated stage runs before each read; the pre-check has no fence. */
+  async earnChecks(W: Address, renew: () => Promise<void> = async () => undefined): Promise<void> {
+    const configured = (this.deps.earnProducts ?? EARN_PRODUCTS).filter(earnConfigured), chain = this.deps.chain;
+    if (configured.length === 0 || chain.earnPins === undefined || chain.earnBalances === undefined) throw new Error("earn-unavailable");
+    let pins: Awaited<ReturnType<NonNullable<AgenticChain["earnPins"]>>>, balances: Awaited<ReturnType<NonNullable<AgenticChain["earnBalances"]>>>;
+    try { await renew(); pins = await chain.earnPins(); await renew(); balances = await chain.earnBalances(W); }
+    catch (error) { if (error instanceof Error && error.message === "agentic_wallet_busy") throw error; throw new Error("earn-unavailable"); }
+    if (!configured.some(p => pins[p.protocol])) throw new Error("earn-unavailable");
+    if (balances.venusWei >= EARN_DUST_WEI || balances.aaveWei >= EARN_DUST_WEI) throw new Error("earn-wallet-has-supply");
+  }
   async resumeHire(row: AgenticWallet): Promise<AgenticWallet> {
     if (row.state === "bound") return row;
     if (row.state !== "hiring" || row.hireParams === null || row.walletAddress === null || row.agentId === null || row.acceptedAt === null) throw new Error("agentic_hire_invalid");
     const { store, runner, masterKey, chain, agents, settings, cmc } = this.deps;
     const p = row.hireParams, s = p.settings, W = row.walletAddress, schedule = isTradeScheduleSettings(s), portfolio = isTradePortfolioSettings(s), dca = isTradeDcaSettings(s);
+    // AGENTIC-MEME-STOCKS-SPEC 9.1: a paper meme hire reads no pin (pinned = []), sizes one granted token, has no CMC budget and writes hire_facts.meme.
+    const meme = p.strategy === "meme-stocks-paper";
     const fence = await acquireAgenticFence(store, W, this.deps.instance.row.instanceId);
     if (fence === null) throw new Error("agentic_wallet_busy");
     try {
@@ -312,6 +334,11 @@ export class AgenticPairings {
           const gate = agenticGate(agenticGateInput(p, facts, W, acceptedAt));
           reason = gate.rows.some(r => r.code === "sizing" && r.state === "FAIL") ? "sizing" : "gate-rows";
           if (gate.rows.some(r => r.state === "FAIL")) throw new Error("gate-failed");
+          // AGENTIC-EARN-SPEC 3.14: authoritative at this stage, a fence renewal before each read; the refusal keeps its own closed reason (R11.3).
+          if (p.earn === true) {
+            reason = "earn-unavailable";
+            await this.earnChecks(W, async () => { if (await store.renewFence(fence) === null) throw new Error("agentic_wallet_busy"); });
+          }
           // A portfolio grants exactly its signed stocks: no pin is read and the pin-unavailable guard does not apply to it.
           if (portfolio) { reason = "portfolio-disabled"; if (this.portfolioBuyQuote === null) throw new Error("gate-failed"); }
           else if (dca) {
@@ -326,13 +353,13 @@ export class AgenticPairings {
             const out = quote.kind === "ok" && typeof quote.data === "object" && quote.data !== null ? agenticDecimal((quote.data as Record<string, unknown>)["toCoinAmount"]) : null;
             if (out === null || out <= 0n) throw new Error("gate-failed");
           }
-          else { reason = "pin-unavailable"; if (this.pin === null || schedule && this.schedulable === null) throw new Error("gate-failed"); }
+          else if (!meme) { reason = "pin-unavailable"; if (this.pin === null || schedule && this.schedulable === null) throw new Error("gate-failed"); }
           const pinned: Address[] = [];
           reason = "pin-error";
           const chosen = schedule ? s.scheduleToken!.toLowerCase() : "";
           // AGENTIC-RFQ-STOCKS E4: an AI hire with the flag on takes the RFQ pin variant; every other hire runs today's line.
-          const rfq: AgenticRfqPin | null = !schedule && !portfolio && !dca && this.rfqPin !== null ? await this.rfqPin() : null;
-          let candidates: readonly Address[] = portfolio ? s.portfolioTokens!.map(token => agenticAddress(token)) : dca ? [agenticAddress(s.dcaToken!)] : rfq !== null ? [...rfq.pooled, ...rfq.rfqOnly] : await this.pin!(W, BigInt(s.minEntryWei!), s.slippageBps, schedule ? "schedule" : "ai");
+          const rfq: AgenticRfqPin | null = !schedule && !portfolio && !dca && !meme && this.rfqPin !== null ? await this.rfqPin() : null;
+          let candidates: readonly Address[] = meme ? [] : portfolio ? s.portfolioTokens!.map(token => agenticAddress(token)) : dca ? [agenticAddress(s.dcaToken!)] : rfq !== null ? [...rfq.pooled, ...rfq.rfqOnly] : await this.pin!(W, BigInt(s.minEntryWei!), s.slippageBps, schedule ? "schedule" : "ai");
           if (schedule) {
             // The grant is the chosen stock first, then the pin order, cut at the grant ceiling; the lease is renewed after each slow read.
             if (await store.renewFence(fence) === null) throw new Error("agentic_wallet_busy");
@@ -362,7 +389,7 @@ export class AgenticPairings {
           if (portfolio && pinned.length !== s.portfolioTokens!.length) { reason = "portfolio-capability-incomplete"; throw new Error("gate-failed"); }
           if (dca && pinned.length !== 1) { reason = "dca-capability-incomplete"; throw new Error("gate-failed"); }
           reason = "pinned-empty";
-          if (pinned.length === 0) throw new Error("gate-failed");
+          if (pinned.length === 0 && !meme) throw new Error("gate-failed");
           // A DCA hire has no sizing call: its capital is base + N x order by the parser rule (AGENTIC-DCA-SPEC 3.12).
           const sizing: { ok: boolean } = dca ? { ok: true } : portfolio
             ? checkTradfiPortfolioSizing({ capDayWei: MAX_UINT256, capitalQuoteWei: BigInt(s.capitalQuoteWei!), tokenCount: pinned.length, intervalSec: s.portfolioIntervalSec as 14400 | 28800 | 43200 | 86400 })
@@ -371,22 +398,24 @@ export class AgenticPairings {
               intervalSec: s.scheduleIntervalSec!, ttlSec: Math.floor((gate.hireEndMs - acceptedAt) / 1_000), endKind: s.scheduleEndKind!, endRuns: s.scheduleEndRuns!, endAtSec: s.scheduleEndAtSec!,
               anchorAtSec: s.scheduleFirstAtSec ?? Math.floor(acceptedAt / 1_000) })
             : checkTradfiV2Sizing({ minEntryWei: BigInt(s.minEntryWei!), maxEntryWei: BigInt(s.entryWei), capitalQuoteWei: BigInt(s.capitalQuoteWei!),
-              maxOpenPositions: s.maxOpenPositions, platformFeeBps: 0, grantedTokenCount: rfq !== null ? 1 : pinned.length, capDayWei: tradfiV2NativeReserveWei(s.maxOpenPositions, rfq !== null ? 1 : pinned.length) });
+              maxOpenPositions: s.maxOpenPositions, platformFeeBps: 0, grantedTokenCount: rfq !== null || meme ? 1 : pinned.length, capDayWei: tradfiV2NativeReserveWei(s.maxOpenPositions, rfq !== null || meme ? 1 : pinned.length) });
           reason = "sizing";
           if (!sizing.ok) throw new Error("gate-failed");
           const next = await store.patchWallet(row, { hireStage: "gated", factsRead: facts, hireEndMs: gate.hireEndMs, entryCutoffMs: gate.entryCutoffMs,
             hireFacts: { acceptedAtMs: acceptedAt, acceptedDedicatedWalletAtMs: acceptedAt, termSec: p.term * 86_400, termEndAction: p.termEndAction,
               hireEndMs: gate.hireEndMs, entryCutoffMs: gate.entryCutoffMs, signInMaxTimeMs: facts.signInMaxTimeMs!, pinned,
-              quoteDayCapWei: agenticQuoteDayCapWei(s).toString(), budgetWei: agenticHireBudgetWei(s, p.term).toString(),
+              quoteDayCapWei: agenticQuoteDayCapWei(s).toString(), budgetWei: meme ? "0" : agenticHireBudgetWei(s, p.term).toString(),
               hireSizing: { name: "trade-v1", version: 1, openNativeBudgetWei: "0", settlementAsset: "USDT", capitalQuoteWei: s.capitalQuoteWei!,
-                entryWei: s.entryWei, minEntryWei: s.minEntryWei!, quotePerTradeWei: s.entryWei, cmcNewsEnabled: agenticHasCmc(s),
-                ...(agenticHasCmc(s) ? { cmcTotalBudgetWei: agenticHireBudgetWei(s, p.term).toString() } : {}) },
-              ...(rfq === null ? {} : { rfq: agenticRfqFacts(rfq, pinned) }) } });
+                entryWei: s.entryWei, minEntryWei: s.minEntryWei!, quotePerTradeWei: s.entryWei, cmcNewsEnabled: !meme && agenticHasCmc(s),
+                ...(!meme && agenticHasCmc(s) ? { cmcTotalBudgetWei: agenticHireBudgetWei(s, p.term).toString() } : {}) },
+              ...(rfq === null ? {} : { rfq: agenticRfqFacts(rfq, pinned) }), ...(meme ? { meme: { v: 1 as const, mode: "paper" as const } } : {}),
+              ...(p.earn === true ? { earn: { v: 1 as const } } : {}) } });
           if (next === null) throw new Error("agentic_hire_conflict");
           row = next;
         } catch (error) {
-          const code = error instanceof Error && ["wallet_has_pending_orders", "wallet_has_limit_orders", "AGENTIC_SETTINGS_UNREADABLE", "agentic_wallet_busy"].includes(error.message) ? error.message : "gate-failed";
-          reason = ({ wallet_has_pending_orders: "pending-orders", wallet_has_limit_orders: "limit-orders", AGENTIC_SETTINGS_UNREADABLE: "settings-unreadable", agentic_wallet_busy: "wallet-busy" } as Readonly<Record<string, string>>)[code] ?? reason;
+          const code = error instanceof Error && ["wallet_has_pending_orders", "wallet_has_limit_orders", "AGENTIC_SETTINGS_UNREADABLE", "agentic_wallet_busy", "earn-unavailable", "earn-wallet-has-supply"].includes(error.message) ? error.message : "gate-failed";
+          reason = ({ wallet_has_pending_orders: "pending-orders", wallet_has_limit_orders: "limit-orders", AGENTIC_SETTINGS_UNREADABLE: "settings-unreadable", agentic_wallet_busy: "wallet-busy",
+            "earn-unavailable": "earn-unavailable", "earn-wallet-has-supply": "earn-wallet-has-supply" } as Readonly<Record<string, string>>)[code] ?? reason;
           const cleaning = await store.patchWallet(row, { state: "cleaning", cleanupReason: "gate-failed", failure: reason, ...(facts === null ? {} : { factsRead: facts }) });
           if (cleaning !== null) row = cleaning;
           throw new Error(code);
@@ -400,7 +429,7 @@ export class AgenticPairings {
       const staged = await store.patchWallet(row, { hireStage: "agent-created" }); if (staged === null) throw new Error("agentic_hire_conflict"); row = staged;
       if ((await settings.putInitialIfAbsentOrSameDigest({ ownerAddress: W, agentId: row.agentId!, params: s, digest: tradeSettingsDigest(s) })).kind === "conflict") throw new Error("agentic_hire_conflict");
       const stored = await store.patchWallet(row, { hireStage: "settings-stored" }); if (stored === null) throw new Error("agentic_hire_conflict"); row = stored;
-      if (agenticHasCmc(s)) {
+      if (!meme && agenticHasCmc(s)) {
         const budget = await cmc.putInitial({ agentId: row.agentId!, ownerAddress: W, wallet: W, totalWei: agenticHireBudgetWei(s, p.term) });
         if (await cmc.setSetup({ agentId: row.agentId!, ownerAddress: W, wallet: W, generation: budget.generation,
           sessionPublicKey: projectAgenticSessionFacts(row).publicKey, sessionExpiry: Math.floor(row.hireEndMs! / 1_000), allowanceWei: agenticHireBudgetWei(s, p.term) }) === null) throw new Error("agentic_cmc_setup_failed");
@@ -431,7 +460,8 @@ export class AgenticPairings {
           const agent = await this.deps.agents.getAgentById(row.agentId);
           if (agent?.status === "armed") await this.deps.agents.transitionAgentStatus({ ownerAddress: agent.ownerAddress, agentId: agent.id, expectedStatus: "armed", expectedRowVersion: agent.rowVersion, status: "revoked" });
         }
-        else if (row.state === "bound" && row.hireStage === "active" && row.agentId !== null && row.walletAddress !== null && row.hireParams !== null) {
+        // D15: no ERC-8004 enrollment for a meme hire.
+        else if (row.state === "bound" && row.hireStage === "active" && row.agentId !== null && row.walletAddress !== null && row.hireParams !== null && row.hireFacts?.meme === undefined) {
           const category = categoryForAgenticHire(row.hireParams.settings);
           if (category !== null) await this.deps.agents.enrollAgenticIdentity({ ownerAddress: row.walletAddress, agentId: row.agentId, category });
         }
@@ -492,7 +522,7 @@ export function registerAgenticRoutes(app: Hono, pairing: AgenticPairings,
       const allowed = new Set(["agentic_not_ready", "pairing_slots_full", "pairing_signin_failed", "pairing_conflict", "pairing_code_attempts", "pairing_code_expired", "pairing_code_invalid", "pairing_code_mismatch", "pairing_not_ready", "agentic_hire_invalid", "agentic_hire_conflict", "agentic_admission_refused", "gate-failed", "agentic_wallet_busy", "AGENTIC_SETTINGS_UNREADABLE", "agentic_cmc_setup_failed", "wallet_has_pending_orders", "wallet_has_limit_orders",
         "schedule-token-not-granted", "schedule-token-unquotable", "schedule-capability-incomplete", "schedule-first-buy-past", "schedule-end-past", "pin-error",
         "portfolio-disabled", "portfolio-token-unsupported", "portfolio-token-unquotable", "portfolio-capability-incomplete",
-        "dca-disabled", "dca-token-unsupported", "dca-capability-incomplete", "dca-pool-mismatch", "dca-token-unquotable"]);
+        "dca-disabled", "dca-token-unsupported", "dca-capability-incomplete", "dca-pool-mismatch", "dca-token-unquotable", "earn-unavailable", "earn-wallet-has-supply"]);
       const code = error instanceof Error && allowed.has(error.message) ? error.message : "agentic_unavailable";
       if (c.req.path === "/agentic/hire") {
         const body = await c.req.json<unknown>();
@@ -501,7 +531,7 @@ export function registerAgenticRoutes(app: Hono, pairing: AgenticPairings,
         // in-flight hire of the same pairing (a second click answers wallet-busy) and break its CAS.
         const row = typeof id === "string" ? await pairing.deps.store.getWallet(id) : null;
         // A lost lease whose winner already bound this exact hire is a success, not a refusal.
-        const requested = parseAgenticHireParams(body);
+        const requested = parseAgenticHireParams(body, { meme: pairing.deps.memeEnabled === true, earn: pairing.deps.earnEnabled === true });
         if (row?.state === "bound" && requested !== null && row.hireOpId === agenticHireIdentity(requested).hireOpId) {
           return c.json({ data: { walletAddress: row.walletAddress, hireEndMs: row.hireEndMs, entryCutoffMs: row.entryCutoffMs, state: row.state } });
         }
@@ -512,9 +542,10 @@ export function registerAgenticRoutes(app: Hono, pairing: AgenticPairings,
             "portfolio-disabled": "portfolio-disabled", "portfolio-token-unsupported": "portfolio-token-unsupported", "portfolio-token-unquotable": "portfolio-token-unquotable",
             "portfolio-capability-incomplete": "portfolio-capability-incomplete",
             "dca-disabled": "dca-disabled", "dca-token-unsupported": "dca-token-unsupported", "dca-capability-incomplete": "dca-capability-incomplete",
-            "dca-pool-mismatch": "dca-pool-mismatch", "dca-token-unquotable": "dca-token-unquotable" } as Readonly<Record<string, string>>)[code] ?? null;
+            "dca-pool-mismatch": "dca-pool-mismatch", "dca-token-unquotable": "dca-token-unquotable",
+            "earn-unavailable": "earn-unavailable", "earn-wallet-has-supply": "earn-wallet-has-supply" } as Readonly<Record<string, string>>)[code] ?? null;
         console.error("agentic_hire_refused", reason ?? code);
-        const params = row?.hireParams ?? parseAgenticHireParams(body);
+        const params = row?.hireParams ?? parseAgenticHireParams(body, { meme: pairing.deps.memeEnabled === true, earn: pairing.deps.earnEnabled === true });
         if (row?.factsRead != null && params !== null) {
           const gate = agenticGate(agenticGateInput(params, row.factsRead, row.walletAddress!, row.acceptedAt ?? await pairing.deps.store.now()));
           return c.json({ data: null, error: { code }, meta: { reason, gate: gate.rows } }, 409);

@@ -66,7 +66,7 @@ export function KitApp() {
   let screen;
   if (route.startsWith("/agent/")) screen = <AgentDetailScreen agent={agentFrom("/agent/")} go={go} onHire={setHiring} />;
   else if (route.startsWith("/account/")) screen = <HiredAgentScreen agentId={route.slice("/account/".length)} go={go} />;
-  else if (agenticEnabled && route.startsWith("/agentic/")) screen = <AgenticPublicScreen wallet={route.slice("/agentic/".length)} />;
+  else if (agenticEnabled && route.startsWith("/agentic/")) screen = <AgenticPublicScreen wallet={route.slice("/agentic/".length)} go={go} />;
   else if (route === "/account") screen = <MyAgentsScreen go={go} />;
   else if (route.startsWith("/deploy/")) screen = <DeployAgentScreen key={route} kind={route.slice(8) === "lending" ? "health" : route.slice(8)} go={go} />;
   else if (route.startsWith("/demo/")) screen = <DemoAgentDetail demoId={route.slice("/demo/".length)} go={go} />;

@@ -392,7 +392,7 @@ export function ScheduleSummary({ schedule, settings, open, hiredEntryWei, readO
 }
 
 /** The Buys / Run log toggle and its panel, shown only while the owner is not editing. */
-export function ScheduleTabs({ schedule, settings, trade, refresh, simulationLog }: {
+export function ScheduleTabs({ schedule, settings, trade, refresh, simulationLog, earnTab }: {
   readonly schedule: Schedule;
   readonly settings: ScheduleSettings;
   readonly trade: Pick<TradeView, "open" | "runs">;
@@ -401,8 +401,10 @@ export function ScheduleTabs({ schedule, settings, trade, refresh, simulationLog
   readonly simulationLog?: React.ReactNode;
   /** The Agentic public page. Nothing in the tabs is an owner action, so this changes no output; it keeps one contract with ScheduleSummary. */
   readonly readOnly?: boolean;
+  /** The Agentic public page of an earn hire: when given, the toggle gains an Earn tab showing this node. Absent, nothing changes. */
+  readonly earnTab?: React.ReactNode;
 }) {
-  const [tab, setTab] = useState<"Buys" | "Run log">("Buys");
+  const [tab, setTab] = useState<"Buys" | "Run log" | "Earn">("Buys");
   const [showChart, setShowChart] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNowMs(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
@@ -416,9 +418,9 @@ export function ScheduleTabs({ schedule, settings, trade, refresh, simulationLog
 
   return <>
     <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>
-      <SegmentedToggle value={tab} onChange={(next: string) => setTab(next === "Run log" ? next : "Buys")} options={["Buys", "Run log"]} />
+      <SegmentedToggle value={tab} onChange={(next: string) => setTab(next === "Run log" || next === "Earn" && earnTab !== undefined ? next : "Buys")} options={earnTab === undefined ? ["Buys", "Run log"] : ["Buys", "Run log", "Earn"]} />
     </div>
-    {tab === "Buys" ? <>
+    {tab === "Earn" && earnTab !== undefined ? earnTab : tab === "Buys" ? <>
       <div style={{ display: "flex", marginBottom: 12 }}>
         <Button variant="ghost" size="sm" icon={<Icon name="yield" size={14} />} onClick={() => setShowChart((value) => !value)}
           style={showChart ? { background: "var(--cat-yield-tint)", color: "var(--cat-yield)", border: "1px solid var(--cat-yield)" } : undefined}>

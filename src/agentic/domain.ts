@@ -19,6 +19,10 @@ export type AgenticFactsRead = {
 export type AgenticHireParams = {
   pairingId: string; term: 7 | 30; termEndAction: "sell-all" | "keep"; executionModel: "tradfi";
   hireRunId: string; settings: TradeSettings; acceptedDedicatedWallet: true;
+  /** AGENTIC-MEME-STOCKS-SPEC 9.1: present only on a paper meme hire (the 8-key body); inside the canonical params, so the agent id differs from any stock hire. */
+  strategy?: "meme-stocks-paper";
+  /** AGENTIC-EARN-SPEC 3.1: present only when the owner opted in at Deploy (the earn body); inside the canonical params, so the agent id differs from the same hire without it. */
+  earn?: true;
 };
 export type AgenticHireFacts = {
   acceptedAtMs: number; termSec: number; termEndAction: "sell-all" | "keep"; hireEndMs: number;
@@ -29,7 +33,22 @@ export type AgenticHireFacts = {
    * `costs` is the validated Flash proxy buy quote at 20 USDT, for ordering only; the binding price check of every RFQ trade is the Agentic quote.
    */
   rfq?: { v: 1; notionalWei: string; pooledCount: number; rfqOnly: readonly Address[]; costs: readonly { token: Address; costBps: number | null }[] };
+  /** AGENTIC-MEME-STOCKS-SPEC 9.1 (PA2): written only by a paper meme hire; every meme branch keys on it, so a row without it takes today's paths. */
+  meme?: { v: 1; mode: "paper" };
+  /** AGENTIC-EARN-SPEC 3.1: written once at stage gated by an earn hire; every Earn branch keys on it, so a row without it takes today's paths. */
+  earn?: { v: 1 };
 };
+/** One paper position of a meme hire (AGENTIC-MEME-STOCKS-SPEC 8.2, table `agentic_meme_paper`). Amounts are atomic USDT (or token) decimal strings. */
+export type AgenticMemePaper = {
+  positionId: string; agentId: string; walletAddress: Address; token: Address; symbol: string | null; quoteToken: Address; quoteSymbol: string | null;
+  venueEntry: "flap-bonding" | "pancake-v2"; buyTaxBps: number; sellTaxBps: number; tokenVersion: number;
+  entryUsdt: string; gasBuyUsdt: string; bnbUsdtE18: string; tokens: string; costBps: number; status: "open" | "closed";
+  lastMarkUsdt: string | null; lastMarkAt: number | null; peakPnlBps: number | null; markSkips: number; markCount: number; closeRequestedAt: number | null;
+  closeCode: "stop" | "trailing" | "dead-chart" | "smart-out" | "flow-flip" | "time" | "drain" | "ended" | null;
+  exitUsdt: string | null; gasSellUsdt: string | null; pnlUsdt: string | null; closedAt: number | null; openedAt: number; version: number;
+};
+/** One decision-log row (AGENTIC-MEME-STOCKS-SPEC 8.6, table `agentic_meme_log`); `agentId` is null on the global `market` row. */
+export type AgenticMemeLog = { id: string; agentId: string | null; kind: "market" | "cycle" | "signal" | "llm" | "entry" | "mark" | "exit"; token: string | null; atMs: number; data: unknown };
 export type AgenticWallet = {
   pairingId: string; state: AgenticState; walletAddress: Address | null; ownerAddress: Address | null;
   pairingSecretHash: string; qr: { qrCodeId: string; urlForWeb: string; expireAtMs: number } | null;
@@ -48,7 +67,7 @@ export type AgenticWallet = {
 };
 export type AgenticOrder = {
   /** The last two kinds are written only by the retired limit-order build (legacy rows, AGENTIC-DCA-SPEC R3.8); nothing writes them now. */
-  idempotencyKey: string; kind: "swap" | "x402-sign" | "limit-place" | "limit-cancel"; walletAddress: Address; agentId: string;
+  idempotencyKey: string; kind: "swap" | "x402-sign" | "limit-place" | "limit-cancel" | "earn-deposit" | "earn-redeem"; walletAddress: Address; agentId: string;
   decisionId: string | null; side: "buy" | "sell" | null; fromToken: Address | null; toToken: Address | null;
   amountAtomic: string | null; intendedRaw: string | null; fromQty: string | null; minOutAtomic: string | null;
   binanceQuoteOutAtomic: string | null; slippagePct: string | null; multiplierPre: string | null; multiplierUsed: string | null;
@@ -89,8 +108,8 @@ export type AgenticInstance = {
   bootAt: number; heartbeatAt: number; retiredAt: number | null; retiredBy: "dispose" | "exit" | null;
 };
 export type AgenticGateRun = {
-  runId: string; gate: "G0" | "G1" | "G2" | "G3" | "G4" | "DG1" | "DG2" | "DG3" | "DG4" | "DG5" | "DG6" | "RG1" | "RG2" | "RG3" | "RG4"; agentId: string; wallet: Address;
-  side: "buy" | "sell" | "none" | "dca"; maxDispatches: number; dispatches: number; maxNotionalUsdt: string;
+  runId: string; gate: "G0" | "G1" | "G2" | "G3" | "G4" | "DG1" | "DG2" | "DG3" | "DG4" | "DG5" | "DG6" | "RG1" | "RG2" | "RG3" | "RG4" | "EG1"; agentId: string; wallet: Address;
+  side: "buy" | "sell" | "none" | "dca" | "earn"; maxDispatches: number; dispatches: number; maxNotionalUsdt: string;
   maxCmcPayments: number; cmcPayments: number; cmcOperationIds: readonly string[];
   deadlineMs: number; createdAt: number; closedAt: number | null;
 };
@@ -99,7 +118,8 @@ export type AgenticGateRow = { code: string; state: "PASS" | "FAIL" | "WARN"; fi
 export const AGENTIC_HIRE_REASONS: readonly string[] = ["gate-rows", "sizing", "pin-unavailable", "pinned-empty", "pin-error", "settings-unreadable", "wallet-busy", "pending-orders", "limit-orders",
   "schedule-token-not-granted", "schedule-token-unquotable", "schedule-capability-incomplete", "schedule-first-buy-past", "schedule-end-past",
   "portfolio-disabled", "portfolio-token-unsupported", "portfolio-token-unquotable", "portfolio-capability-incomplete",
-  "dca-disabled", "dca-token-unsupported", "dca-capability-incomplete", "dca-pool-mismatch", "dca-token-unquotable"];
+  "dca-disabled", "dca-token-unsupported", "dca-capability-incomplete", "dca-pool-mismatch", "dca-token-unquotable",
+  "earn-unavailable", "earn-wallet-has-supply"];
 
 export function agenticAddress(value: string): Address {
   return `0x${getAddress(value).slice(2).toLowerCase()}`;
@@ -202,7 +222,11 @@ export function agenticSlippage(quote: bigint, minimum: bigint, settingsBps: num
 export type AgenticScheduleGate = { intervalSec: 3600 | 14400 | 28800 | 43200 | 86400; endKind: "budget" | "date" | "runs";
   endRuns: number | null; endAtSec: number | null; firstAtSec: number | null };
 export type AgenticGateInput = { facts: AgenticFactsRead; wallet?: string; capitalQuoteWei: bigint; maxOpenPositions: number;
-  entryWei: bigint; termSec: number; nowMs: number; budgetWei: bigint; quoteDayCapWei?: bigint; schedule?: AgenticScheduleGate; portfolio?: { tokenCount: number }; dca?: { maxOrders: number } };
+  entryWei: bigint; termSec: number; nowMs: number; budgetWei: bigint; quoteDayCapWei?: bigint; schedule?: AgenticScheduleGate; portfolio?: { tokenCount: number }; dca?: { maxOrders: number };
+  /** AGENTIC-MEME-STOCKS-SPEC 9.1: a paper meme hire, which swaps nothing and pays nothing. */ meme?: "paper";
+  /** AGENTIC-EARN-SPEC 3.10: an earn hire keeps two more operation reserves of BNB (a deposit and a redeem). */ earn?: true };
+/** The paper gate's rows (review R2-H2): `trade-all-tokens` is a WARN, never a FAIL, while U11 has not shown that quotes need it. */
+const MEME_PAPER_ROWS: ReadonlySet<string> = new Set(["status", "trade-all-tokens", "sign-in-time", "sizing"]);
 
 export function agenticGate(input: AgenticGateInput): { rows: AgenticGateRow[]; hireEndMs: number; entryCutoffMs: number } {
   const f = input.facts;
@@ -222,7 +246,8 @@ export function agenticGate(input: AgenticGateInput): { rows: AgenticGateRow[]; 
   // A portfolio buys through every stock: the executor floor is (N + 2) x 0.0004 BNB and the gate adds one 0.0004 per first-basket buy.
   // A DCA hire pays one swap per fill (R3.7): two rounds of base, N levels and a take profit, (2N + 4) x 0.0004 BNB.
   const bnbNeed = BigInt(input.dca !== undefined ? 2 * input.dca.maxOrders + 4 : input.portfolio !== undefined ? 2 * input.portfolio.tokenCount + 2
-    : input.maxOpenPositions + 2 + (counts === null ? 0 : Math.min(counts.plannedBuys, counts.buysThisSession))) * 400_000_000_000_000n;
+    : input.maxOpenPositions + 2 + (counts === null ? 0 : Math.min(counts.plannedBuys, counts.buysThisSession))) * 400_000_000_000_000n
+    + (input.earn === true ? 800_000_000_000_000n : 0n);
   const sizingNeed = BigInt(input.maxOpenPositions) * input.entryWei;
   const entryCutoffMs = end - Math.min(7_200_000, (end - input.nowMs) / 2);
   const nowSec = Math.floor(input.nowMs / 1_000);
@@ -234,7 +259,7 @@ export function agenticGate(input: AgenticGateInput): { rows: AgenticGateRow[]; 
   const x402Rows: AgenticGateRow[] = s !== undefined ? [] : [
     { code: "x402-limit", state: x402 !== null && x402 >= AGENTIC_UNIT / 2n ? "PASS" : "FAIL", fix: "Raise x402 Daily limit to 0.50 USDT." },
   ];
-  return { hireEndMs: end, entryCutoffMs, rows: [
+  const rows: AgenticGateRow[] = [
     { code: "status", state: f.status === "CONNECTED" ? "PASS" : "FAIL", fix: "Connect in the Binance App." },
     { code: "trade-all-tokens", state: f.tradeAllTokens === true ? "PASS" : "FAIL", fix: "Enable Trade all tokens in the Binance App." },
     { code: "abnormal-handling", state: f.abnormalTxnHandling === "AutoReject" ? "PASS" : "FAIL", fix: "Choose AutoReject in the Binance App." },
@@ -246,13 +271,31 @@ export function agenticGate(input: AgenticGateInput): { rows: AgenticGateRow[]; 
     { code: "quota-today", state: daily !== null && used !== null && daily - used >= input.entryWei ? "PASS" : "WARN", fix: "Wait for the Binance daily quota to reset." },
     { code: "sizing", state: input.capitalQuoteWei >= sizingNeed ? "PASS" : "FAIL", fix: `Capital ${agenticUiString(input.capitalQuoteWei)} USDT is below ${input.maxOpenPositions} positions x ${agenticUiString(input.entryWei)} USDT = ${agenticUiString(sizingNeed)} USDT; raise capital or lower the entry size.` },
     ...scheduleRows,
-  ] };
+  ];
+  if (input.meme !== "paper") return { hireEndMs: end, entryCutoffMs, rows };
+  return { hireEndMs: end, entryCutoffMs, rows: rows.filter(r => MEME_PAPER_ROWS.has(r.code)).map(r => r.code !== "trade-all-tokens" ? r
+    : { code: r.code, state: f.tradeAllTokens === true ? "PASS" : "WARN", fix: "Not needed for paper trading. A live agent will need Trade all tokens." }) };
 }
 
-export function parseAgenticHireParams(value: unknown): AgenticHireParams | null {
+/** The paper meme hire's fixed settings bounds (AGENTIC-MEME-STOCKS-SPEC 9.1, D4, D14): 10 USDT minimum, 10..50 per trade, 1..3 open, no CMC, no owner exits or text, sell-all. */
+function memePaperSettingsOk(s: TradeSettings, termEndAction: unknown): boolean {
+  const entry = BigInt(s.entryWei);
+  return isTradfiAiSettings(s) && s.cmcNewsEnabled === false && s.cmcTotalBudgetWei === undefined && s.minEntryWei === (10n * AGENTIC_UNIT).toString()
+    && entry >= 10n * AGENTIC_UNIT && entry <= 50n * AGENTIC_UNIT && s.maxOpenPositions >= 1 && s.maxOpenPositions <= 3
+    && BigInt(s.capitalQuoteWei!) >= BigInt(s.maxOpenPositions) * entry && s.slippageBps === 500
+    && s.takeProfitBps === null && s.stopLossBps === null && s.maxHoldSec === null && s.instructions === null && s.skillMarkdown === null && termEndAction === "sell-all";
+}
+
+export function parseAgenticHireParams(value: unknown, options: { meme?: boolean; earn?: boolean } = {}): AgenticHireParams | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const p = value as Record<string, unknown>;
-  const keys = ["pairingId", "term", "termEndAction", "executionModel", "hireRunId", "settings", "acceptedDedicatedWallet"];
+  // AGENTIC-MEME-STOCKS-SPEC 9.1: the 8-key paper body exists only when the caller's flag is on; every other body keeps exactly today's 7 keys.
+  const meme = options.meme === true && Object.hasOwn(p, "strategy");
+  // AGENTIC-EARN-SPEC 3.1: the optional `earn: true` key exists only when the caller's flag is on; with it off, such a body is the wrong key count and refused.
+  const earn = options.earn === true && Object.hasOwn(p, "earn");
+  const keys = ["pairingId", "term", "termEndAction", "executionModel", "hireRunId", "settings", "acceptedDedicatedWallet", ...(meme ? ["strategy"] : []), ...(earn ? ["earn"] : [])];
+  if (meme && p["strategy"] !== "meme-stocks-paper") return null;
+  if (earn && p["earn"] !== true) return null;
   if (Object.keys(p).length !== keys.length || keys.some(k => !Object.hasOwn(p, k))
     || typeof p["pairingId"] !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(p["pairingId"])
     || (p["term"] !== 7 && p["term"] !== 30) || (p["termEndAction"] !== "keep" && p["termEndAction"] !== "sell-all")
@@ -261,13 +304,20 @@ export function parseAgenticHireParams(value: unknown): AgenticHireParams | null
   const settings = parseTradeSettings(p["settings"]);
   if (!settings.ok) return null;
   const effective = settings.value.effective;
+  if (meme) {
+    if (earn || !memePaperSettingsOk(effective, p["termEndAction"])) return null;
+    return { pairingId: p["pairingId"], term: p["term"], termEndAction: p["termEndAction"], executionModel: "tradfi",
+      hireRunId: p["hireRunId"], settings: p["settings"] as TradeSettings, acceptedDedicatedWallet: true, strategy: "meme-stocks-paper" };
+  }
   // AI keeps its CMC budget; Schedule and portfolio (the parser already forbids CMC and exits) must keep holdings at term end.
   if (!(isTradfiAiSettings(effective) && effective.cmcNewsEnabled === true && effective.cmcTotalBudgetWei === agenticBudgetWei(p["term"]).toString())
     && !(isTradeScheduleSettings(effective) && p["termEndAction"] === "keep")
     && !(isTradePortfolioSettings(effective) && p["termEndAction"] === "keep")
     && !(isTradeDcaSettings(effective) && p["termEndAction"] === "keep")) return null;
+  // Earn: AI, Schedule, and DCA with N >= 5 levels; never a portfolio.
+  if (earn && (isTradePortfolioSettings(effective) || isTradeDcaSettings(effective) && (effective.dcaMaxOrders ?? 0) < 5)) return null;
   return { pairingId: p["pairingId"], term: p["term"], termEndAction: p["termEndAction"], executionModel: "tradfi",
-    hireRunId: p["hireRunId"], settings: p["settings"] as TradeSettings, acceptedDedicatedWallet: true };
+    hireRunId: p["hireRunId"], settings: p["settings"] as TradeSettings, acceptedDedicatedWallet: true, ...(earn ? { earn: true as const } : {}) };
 }
 
 /** The ONE builder of the gate input from a stored hire body, so stage `gated`, the refusal response and the pre-check cannot disagree. */
@@ -278,7 +328,8 @@ export function agenticGateInput(p: AgenticHireParams, facts: AgenticFactsRead, 
     ...(!isTradeScheduleSettings(s) ? {} : { schedule: { intervalSec: s.scheduleIntervalSec!, endKind: s.scheduleEndKind!, endRuns: s.scheduleEndRuns!,
       endAtSec: s.scheduleEndAtSec!, firstAtSec: s.scheduleFirstAtSec! } }),
     ...(!isTradePortfolioSettings(s) ? {} : { portfolio: { tokenCount: s.portfolioTokens!.length } }),
-    ...(!isTradeDcaSettings(s) ? {} : { dca: { maxOrders: s.dcaMaxOrders! } }) };
+    ...(!isTradeDcaSettings(s) ? {} : { dca: { maxOrders: s.dcaMaxOrders! } }),
+    ...(p.strategy === undefined ? {} : { meme: "paper" as const }), ...(p.earn === true ? { earn: true as const } : {}) };
 }
 
 export function agenticHireIdentity(params: AgenticHireParams): { paramsDigest: Hex; hireOpId: Hex; agentId: string } {

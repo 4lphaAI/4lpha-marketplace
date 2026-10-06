@@ -1259,8 +1259,9 @@ function dcaReadOnlyNotes(dca: TradeDcaView, status: string | null, endReason: s
   ];
 }
 
-type DcaTab = "Orders" | "Ongoing" | "Rounds" | "Order history" | "Holdings" | "Run log";
+type DcaTab = "Orders" | "Ongoing" | "Rounds" | "Order history" | "Holdings" | "Run log" | "Earn";
 const DCA_TABS: readonly DcaTab[] = ["Orders", "Ongoing", "Rounds", "Order history", "Holdings", "Run log"];
+const DCA_TABS_WITH_EARN: readonly DcaTab[] = [...DCA_TABS, "Earn"];
 
 /**
  * DCA-DETAIL — the Auto DCA detail page (mock `DCA-DETAIL-MOCK.jsx`, spec
@@ -1268,7 +1269,7 @@ const DCA_TABS: readonly DcaTab[] = ["Orders", "Ongoing", "Rounds", "Order histo
  * notes, the "Current round" card, the tab bar with the chart toggle, and
  * the five tabs (Orders, Ongoing, Rounds, Order history, Run log).
  */
-export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull, refresh, icon, runs, symbols, simulationLog, readOnly = false, endReason = null, holdingsExtra }: {
+export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull, refresh, icon, runs, symbols, simulationLog, readOnly = false, endReason = null, holdingsExtra, earnTab }: {
   readonly dca: TradeDcaView;
   readonly status: string | null;
   readonly draining: boolean;
@@ -1289,6 +1290,8 @@ export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull,
   readonly endReason?: string | null;
   /** Extra content under the Holdings tab (the public page's keep-alive panel). */
   readonly holdingsExtra?: React.ReactNode;
+  /** The Agentic public page of an earn hire: when given, an Earn tab is appended showing this node (no chart button on it). Absent, nothing changes. */
+  readonly earnTab?: React.ReactNode;
 }) {
   const [tab, setTab] = useState<DcaTab>("Orders");
   const [showChart, setShowChart] = useState(false);
@@ -1313,14 +1316,15 @@ export function DcaDetail({ dca, status, draining, planeUnreachable, busy, pull,
     </>}
     <DcaCurrentRoundCard dca={dca} icon={icon} onOpenOngoing={() => setTab("Ongoing")} />
     <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      <div className="fl-trade-tabs">{DCA_TABS.map((item) => <button key={item} type="button" className={tab === item ? "is-active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
-      {tab !== "Run log" ? <Button variant={showChart ? "secondary" : "ghost"} size="sm" icon={<Icon name="yield" size={14} />} onClick={() => setShowChart((value) => !value)} style={{ marginLeft: "auto" }}>{showChart ? "Hide chart" : "Show chart"}</Button> : null}
+      <div className="fl-trade-tabs">{(earnTab === undefined ? DCA_TABS : DCA_TABS_WITH_EARN).map((item) => <button key={item} type="button" className={tab === item ? "is-active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
+      {tab !== "Run log" && tab !== "Earn" ? <Button variant={showChart ? "secondary" : "ghost"} size="sm" icon={<Icon name="yield" size={14} />} onClick={() => setShowChart((value) => !value)} style={{ marginLeft: "auto" }}>{showChart ? "Hide chart" : "Show chart"}</Button> : null}
     </div>
-    {showChart && tab !== "Run log" ? <section className="fl-trade-table" style={{ marginBottom: 16 }}>
+    {showChart && tab !== "Run log" && tab !== "Earn" ? <section className="fl-trade-table" style={{ marginBottom: 16 }}>
       <div style={{ padding: "14px 16px 12px" }}>
         <MarketChart kind="token" address={dca.token} title={`${dca.symbol} / USDT`} embedded height={230} defaultInterval="15m" priceLines={dcaChartPriceLines(dca, readOnly)} markers={dcaChartMarkers(dca)} />
       </div>
     </section> : null}
+    {tab === "Earn" && earnTab !== undefined ? earnTab : null}
     {tab === "Orders" ? <DcaOrdersTable dca={dca} door={door} busy={busy} pull={pull} refresh={refresh} readOnly={readOnly} /> : null}
     {tab === "Ongoing" ? <DcaOngoing dca={dca} live={status === "armed"} /> : null}
     {tab === "Rounds" ? <DcaRoundsHistory dca={dca} /> : null}

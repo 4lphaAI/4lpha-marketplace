@@ -22,6 +22,8 @@ import type { AgenticStore } from "./store.js";
 import { agenticExecutedQuantity, type AgenticChain } from "./resolve.js";
 import { isCurrentCmcSkill } from "../trade/cmcUsEquity.js";
 import { identityOwnerView } from "../identity/types.js";
+import { EARN_PRODUCTS, earnSelfRescueCommand, type EarnProduct } from "./earnAdapter.js";
+import { EARN_DUST_WEI, EARN_REDEEM_ALL_MS, earnEvidence } from "./earn.js";
 
 /** An opaque public id: the first 16 hex of sha256 of the raw id, never the raw id. */
 const opaque = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 16);
@@ -36,8 +38,12 @@ function publicRunReason(reason: string, portfolio = false): string {
 /** A closed code of a portfolio hire's run log: executor codes such as AGENTIC_LOW_BNB or fence codes such as portfolio_leg_taken. */
 const PORTFOLIO_REASON = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
 const REASONS = new Set(["owner-request", "stop-loss", "take-profit", "max-hold", "llm", "balance-gone", "crash-stop", "session-expiring", "trailing-stop", "stale-exit"]);
-const STAGES = new Set(["screen", "score", "entry-llm", "exit-llm", "route", "buy", "sell", "cycle", "cmc"]);
-const CODES = new Set(["committed", "rolled-back", "denied", "unknown", "empty", "ready", "skipped", "no-buy", "no-sell", "buy", "sell", "held", "cost-unavailable", "quoted", "available", "invalid", "service-error", "settings-hold", "fill-below-minimum"]);
+const STAGES = new Set(["screen", "score", "entry-llm", "exit-llm", "route", "buy", "sell", "cycle", "cmc", "earn"]);
+const CODES = new Set(["committed", "rolled-back", "denied", "unknown", "empty", "ready", "skipped", "no-buy", "no-sell", "buy", "sell", "held", "cost-unavailable", "quoted", "available", "invalid", "service-error", "settings-hold", "fill-below-minimum",
+  "earn-sent", "earn-deposited", "earn-redeemed", "earn-refused", "earn-held", "earn-redeem-blocked", "earn-unavailable", "earn-read-failed"]);
+/** AGENTIC-EARN-SPEC 3.15: the only free text an earn event may carry is one of these closed formats (protocols, APYs and USDT amounts, or a closed blocked reason). */
+const EARN_REASON = /^(?:(?:venus|aave-v3) [0-9]+\.[0-9]{2}% vs (?:venus|aave-v3) (?:[0-9]+\.[0-9]{2}%|n\/a), [0-9]+\.[0-9]{2} USDT|(?:venus|aave-v3), (?:[0-9]+\.[0-9]{2}|all) USDT|read-failed|low-bnb|unconfigured|paused|preview-refused|held)$/u;
+const EARN_HOLDS = new Set(["no-response", "receipt-missing", "chain-verification", "redeem-delayed"]);
 const REFUSALS: Readonly<Record<string, string>> = {
   AGENTIC_QUOTE_BELOW_MIN: "quote-below-minimum", AGENTIC_QUOTE_NO_HEADROOM: "quote-no-headroom", AGENTIC_AMOUNT_UNREPRESENTABLE: "amount-unrepresentable",
   AGENTIC_LOW_BNB: "insufficient-bnb", AGENTIC_UNREACHABLE: "binance-unreachable", AGENTIC_WALLET_OBLIGATION: "wallet-blocked", agentic_wallet_busy: "wallet-blocked",
@@ -155,11 +161,52 @@ async function agenticDcaPublicView(input: { store: AgenticStore; chain?: Pick<A
     keepAlive: { lastActivityAtMs: last, dueAtMs: last === null ? null : last + AGENTIC_PAID_KEEPALIVE_IDLE_MS, lastPaidAtMs: settled.length === 0 ? null : Math.max(...settled) } };
 }
 
+const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+/** AGENTIC-EARN-SPEC 3.15: the public Earn block, field by field. Chain reads and store rows only (never a Binance call); a failed read leaves its field null with a closed reason and never throws. */
+async function agenticEarnPublicView(input: { chain?: Pick<AgenticChain, "earnBalances"> | undefined; row: AgenticWallet; orders: readonly AgenticOrder[]; products: readonly EarnProduct[]; nowMs: number }): Promise<Record<string, unknown>> {
+  const { row, orders } = input, earnRows = orders.filter(o => (o.kind === "earn-deposit" || o.kind === "earn-redeem") && o.agentId === row.agentId).sort((a, b) => a.createdAt - b.createdAt);
+  let balances: Awaited<ReturnType<NonNullable<AgenticChain["earnBalances"]>>> | null = null;
+  try { if (row.walletAddress !== null && input.chain?.earnBalances !== undefined) balances = await input.chain.earnBalances(row.walletAddress); } catch { balances = null; }
+  const value = (protocol: string): string | null => balances === null ? null : (protocol === "venus" ? balances.venusWei : balances.aaveWei).toString();
+  const total = balances === null ? null : balances.venusWei + balances.aaveWei;
+  const deposit = earnRows.filter(o => o.kind === "earn-deposit" && o.outcome === "committed").at(-1);
+  const evidence = deposit === undefined ? null : earnEvidence(deposit.evidence);
+  const open = earnRows.find(o => o.outcome === "open");
+  // The Earn tab (store rows only): this agent's own committed rows, newest first, and per protocol the newest APY its deposits carried.
+  // Operator gate-tool rows (evidence reason "gate") are tests, not the agent's decisions: the public history and rates leave them out.
+  const committed = earnRows.filter(o => o.outcome === "committed" && earnEvidence(o.evidence)?.reason !== "gate").reverse();
+  const rates: { venus: number | null; "aave-v3": number | null; atMs: number | null } = { venus: null, "aave-v3": null, atMs: null };
+  for (const o of committed) {
+    const apy = o.kind === "earn-deposit" ? earnEvidence(o.evidence)?.apyBps : undefined;
+    for (const protocol of ["venus", "aave-v3"] as const) {
+      const bps = apy?.[protocol];
+      if (rates[protocol] === null && typeof bps === "number") { rates[protocol] = bps; rates.atMs ??= o.createdAt; }
+    }
+  }
+  const activity = committed.slice(0, 20).flatMap(o => {
+    const ev = earnEvidence(o.evidence);
+    if (ev === null) return [];
+    const deposit = o.kind === "earn-deposit", post = isRecord(o.evidence) && isRecord(o.evidence["post"]) ? o.evidence["post"]["usdtMoved"] : undefined;
+    const other = ev.protocol === "venus" ? "aave-v3" : "venus";
+    return [{ action: deposit ? "supply" : "withdraw", protocol: ev.protocol, atMs: o.createdAt,
+      amountWei: deposit ? o.amountAtomic : typeof post === "string" && /^[0-9]+$/u.test(post) ? post : o.fromQty === "ratio:1" ? null : o.amountAtomic,
+      apyBps: deposit ? ev.apyBps?.[ev.protocol] ?? null : null, otherApyBps: deposit ? ev.apyBps?.[other] ?? null : null, reason: ev.reason, txHash: o.txHash }];
+  });
+  return { products: input.products.map(p => ({ protocol: p.protocol, valueWei: value(p.protocol), reason: balances === null ? "chain-unreadable" : null, selfRescue: earnSelfRescueCommand(p) })),
+    totalWei: total === null ? null : total.toString(), liquidWei: balances === null ? null : balances.usdt.toString(), rates, activity,
+    lastDeposit: deposit === undefined || evidence === null ? null : { protocol: evidence.protocol, amountWei: deposit.amountAtomic, atMs: deposit.createdAt, txHash: deposit.txHash,
+      apyBps: { venus: evidence.apyBps?.["venus"] ?? null, "aave-v3": evidence.apyBps?.["aave-v3"] ?? null } },
+    open: open === undefined ? null : { kind: open.kind === "earn-deposit" ? "deposit" : "redeem", held: open.holdReason !== null,
+      holdReason: open.holdReason === null ? null : EARN_HOLDS.has(open.holdReason) ? open.holdReason : "other" },
+    withdrawingBeforeSignOut: (row.state === "ending" || row.state === "bound" && row.hireEndMs !== null && input.nowMs >= row.hireEndMs - EARN_REDEEM_ALL_MS) && (total === null || total >= EARN_DUST_WEI) };
+}
+
 export function createAgenticPublicView(input: { store: AgenticStore; agents: AgentStore; settings: TradeSettingsStore;
   positions: TradePositionStore; intents: TradeIntentStore; cmc: CmcBudgetStore; observer: TradeDetailObserver; killswitch: KillSwitch;
   /** Display only: the lane tickers the plane already knows. */ symbols?: () => ReadonlyMap<string, string> | undefined;
   /** Schedule agents only: the wallet reads, the holding's sell mark and the reference premium; each is resolved at call time and any failure leaves its field null. */
-  chain?: Pick<AgenticChain, "balance" | "metadata" | "poolState">;
+  chain?: Pick<AgenticChain, "balance" | "metadata" | "poolState" | "earnBalances">;
+  /** Test seam: the Earn product table (production reads the constants of earnAdapter.ts). */ earnProducts?: readonly EarnProduct[];
   scheduleSellQuote?: () => ((input: { token: Address; amountInAtomic: bigint; slippageBps: number; signal?: AbortSignal }) => Promise<{ quotedOutAtomic: bigint }>) | undefined;
   schedulePremiumBps?: () => ((token: Address) => Promise<number | null>) | undefined;
   /** Portfolio agents only: the journal evidence of the legs, the lane display names and the pinned-pool valuation; each is resolved at call time and any failure degrades only its own field. */
@@ -209,7 +256,8 @@ export function createAgenticPublicView(input: { store: AgenticStore; agents: Ag
         ...(e.confidence === undefined ? {} : { confidence: e.confidence }),
         ...(e.reason !== undefined && LLM_STAGES.has(e.stage) && LLM_DECISION_CODES.has(e.code) ? { reason: sanitizeMessage(e.reason) } : {}),
         // A portfolio refusal reason is a closed code the detail page decodes; any other portfolio event reason (a proof conflict names a decision id) stays private.
-        ...(portfolio && e.reason !== undefined && e.stage === "screen" && e.code === "portfolio-refused" && PORTFOLIO_REASON.test(e.reason) ? { reason: e.reason } : {}) })) }));
+        ...(portfolio && e.reason !== undefined && e.stage === "screen" && e.code === "portfolio-refused" && PORTFOLIO_REASON.test(e.reason) ? { reason: e.reason } : {}),
+        ...(e.reason !== undefined && e.stage === "earn" && EARN_REASON.test(e.reason) ? { reason: e.reason } : {}) })) }));
     // Same read as the Altana owner view (`_PROBE` and retired skills filtered, 50 caps); operation ids are opaque and the model's request reason is capped.
     // A DCA hire exposes no CMC log (AGENTIC-DCA-SPEC R7, DI12).
     const cmcLog = dca ? null : {
@@ -351,10 +399,32 @@ export function createAgenticPublicView(input: { store: AgenticStore; agents: Ag
           }) };
       } catch { portfolioView = null; }
     }
+    // AGENTIC-MEME-STOCKS-SPEC 9.3: the paper ledger of a meme hire, field by field from agentic_meme_paper (`ref` only, no internal id); no Binance or data-plane call.
+    let memeView: Record<string, unknown> | undefined;
+    if (row.hireFacts?.meme?.mode === "paper") {
+      const papers = await input.store.paperList(agent.id), closedPapers = papers.filter(p => p.status === "closed");
+      const basis = (p: (typeof papers)[number]): bigint => BigInt(p.entryUsdt) + BigInt(p.gasBuyUsdt);
+      const bpsOf = (value: bigint, base: bigint): number => Number((value - base) * 10_000n / base);
+      const wins = closedPapers.filter(p => BigInt(p.pnlUsdt ?? "0") > 0n).length;
+      memeView = { mode: "paper",
+        tokens: [...new Map(papers.map(p => [p.token, { address: p.token, symbol: p.symbol, quoteSymbol: p.quoteSymbol }])).values()],
+        paper: { summary: { open: papers.length - closedPapers.length, closed: closedPapers.length, wins,
+          pnlUsdtWei: closedPapers.length === 0 ? null : closedPapers.reduce((sum, p) => sum + BigInt(p.pnlUsdt ?? "0"), 0n).toString(),
+          winRateBps: closedPapers.length === 0 ? null : Math.floor(wins * 10_000 / closedPapers.length) },
+          positions: papers.map((p, index) => ({ ref: "m" + index, token: p.token, symbol: p.symbol, quoteSymbol: p.quoteSymbol, venue: p.venueEntry, status: p.status,
+            openedAt: p.openedAt, closedAt: p.closedAt, entryUsdtWei: p.entryUsdt, exitUsdtWei: p.exitUsdt, markUsdtWei: p.lastMarkUsdt, markAtMs: p.lastMarkAt,
+            pnlBps: p.status === "closed" ? bpsOf(BigInt(p.pnlUsdt ?? "0") + basis(p), basis(p)) : p.lastMarkUsdt === null ? null : bpsOf(BigInt(p.lastMarkUsdt), basis(p)),
+            closeCode: p.closeCode })) } };
+    }
     let dcaView: Record<string, unknown> | null | undefined;
     if (dca) {
       try { dcaView = await agenticDcaPublicView({ store: input.store, chain: input.chain, cmc: input.cmc, row, s, W, agentId: agent.id, orders }); }
       catch { dcaView = null; } // a failed read is a null block, not a missing key: the page still knows this is a DCA hire
+    }
+    // AGENTIC-EARN-SPEC 3.15: present only for an earn hire; a failed read is a null block, not a missing key.
+    let earnView: Record<string, unknown> | null | undefined;
+    if (row.hireFacts?.earn !== undefined) {
+      try { earnView = await agenticEarnPublicView({ chain: input.chain, row, orders, products: input.earnProducts ?? EARN_PRODUCTS, nowMs: Date.now() }); } catch { earnView = null; }
     }
     const hold = row.settingsHold?.code;
     const holdCode = hold === undefined ? null : new Set(["trade-all-tokens", "abnormal-handling", "sign-in-time", "daily-limit", "x402-limit"]).has(hold) ? hold : "other";
@@ -390,6 +460,8 @@ export function createAgenticPublicView(input: { store: AgenticStore; agents: Ag
       ...(scheduleView === undefined ? {} : { schedule: scheduleView }),
       ...(portfolioView === undefined ? {} : { portfolio: portfolioView }),
       ...(dcaView === undefined ? {} : { dca: dcaView }),
+      ...(memeView === undefined ? {} : { meme: memeView }),
+      ...(earnView === undefined ? {} : { earn: earnView }),
     } };
   };
 }

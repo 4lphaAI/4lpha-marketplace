@@ -7,10 +7,11 @@ import * as React from "react";
 import { useAccount } from "wagmi";
 import { AgenticWalletBadge, Button, Icon } from "@/design-system";
 import type { TradeSettings } from "@/lib/trade";
-import { AGENTIC_DCA_COPY, agenticDcaBnbSlots, agenticDcaResting, agenticGate, agenticHireSettings, agenticKeepAliveBudgetWei, agenticRequest, agenticScheduleCounts, agenticUiString, AgenticRequestError, rememberAgenticWallet, type AgenticGateRow, type AgenticPairing } from "@/lib/agentic";
+import { AGENTIC_DCA_COPY, AGENTIC_EARN_COPY, AGENTIC_EARN_PRODUCTS, AGENTIC_MEME_COPY, agenticEarnEnabled, agenticEarnEstimate, agenticEarnOffered, agenticMemeEnabled, agenticMemeSettings, agenticDcaBnbSlots, agenticDcaResting, agenticGate, agenticHireSettings, agenticKeepAliveBudgetWei, agenticRequest, agenticScheduleCounts, agenticUiString, AgenticRequestError, rememberAgenticWallet, type AgenticGateRow, type AgenticPairing } from "@/lib/agentic";
 import { PairingQr } from "@/components/agentic/PairingQr";
 import { FundsModal } from "@/components/FundsModal";
 import { LinearProgress } from "./DeployRunModal";
+import { EarnDisclosure } from "./EarnDisclosure";
 
 // Binance gold, as the Agentic Wallet badge on the Deploy tiles. The CSS variable this used was never defined, so the selected tile drew no radio dot and no border.
 const GOLD = "#F0B90B";
@@ -132,6 +133,17 @@ export function AgenticDeployModal({ settings, go, blockedReason, altanaBlockedR
   // Agentic Auto DCA never sells either: its orders are cancelled at term end and the holdings stay.
   const dca = settings.tradeMode === "dca";
   const [action, setAction] = React.useState<"keep" | "sell-all" | null>(schedule || portfolio || dca ? "keep" : null);
+  // AGENTIC-MEME-STOCKS-SPEC 9.4: AI Trade with Agentic custody offers a paper meme strategy (flag on); it sells all at term end and has its own sizing inputs.
+  const [strategy, setStrategy] = React.useState<"stocks" | "meme">("stocks");
+  const meme = agenticMemeEnabled && !schedule && !portfolio && !dca && strategy === "meme";
+  const [memeSizing, setMemeSizing] = React.useState({ entryUsdt: 10, maxOpenPositions: 2, capitalUsdt: 20 });
+  const memeSizingOk = Number.isInteger(memeSizing.entryUsdt) && memeSizing.entryUsdt >= 10 && memeSizing.entryUsdt <= 50 && Number.isInteger(memeSizing.maxOpenPositions)
+    && memeSizing.maxOpenPositions >= 1 && memeSizing.maxOpenPositions <= 3 && Number.isInteger(memeSizing.capitalUsdt) && memeSizing.capitalUsdt >= memeSizing.maxOpenPositions * memeSizing.entryUsdt;
+  // AGENTIC-EARN-SPEC 3.15: one unchecked opt-in, offered only with the flag on, a configured product and a lane that may use it.
+  const [earn, setEarn] = React.useState(false);
+  const earnOffered = agenticEarnOffered({ tradeMode: settings.tradeMode, dcaMaxOrders: settings.dcaMaxOrders ?? null, meme }, agenticEarnEnabled, AGENTIC_EARN_PRODUCTS);
+  const earnOn = earnOffered && earn;
+  const chooseStrategy = (value: "stocks" | "meme") => { setStrategy(value); setAction(value === "meme" ? "sell-all" : null); };
   const [pairing, setPairing] = React.useState<{ pairingId: string; urlForWeb: string; expireAtMs: number } | null>(null);
   const [state, setState] = React.useState<AgenticPairing | null>(null);
   const [code, setCode] = React.useState("");
@@ -160,8 +172,10 @@ export function AgenticDeployModal({ settings, go, blockedReason, altanaBlockedR
     return () => window.removeEventListener("keydown", onKey);
   }, [funding, onClose]);
 
-  const budgetWei = schedule ? 0n : portfolio || dca ? agenticKeepAliveBudgetWei(term) : BigInt(term === 7 ? 2 : 8) * 10n ** 18n;
-  const capitalWei = BigInt(settings.capitalQuoteWei ?? "0");
+  const budgetWei = schedule || meme ? 0n : portfolio || dca ? agenticKeepAliveBudgetWei(term) : BigInt(term === 7 ? 2 : 8) * 10n ** 18n;
+  const capitalWei = meme ? BigInt(memeSizing.capitalUsdt) * 10n ** 18n : BigInt(settings.capitalQuoteWei ?? "0");
+  const entryWei = meme ? BigInt(memeSizing.entryUsdt) * 10n ** 18n : BigInt(settings.entryWei);
+  const maxOpenPositions = meme ? memeSizing.maxOpenPositions : settings.maxOpenPositions;
   const scheduleInput = !schedule ? undefined : { intervalSec: settings.scheduleIntervalSec!, endKind: settings.scheduleEndKind!, endRuns: settings.scheduleEndRuns ?? null,
     endAtSec: settings.scheduleEndAtSec ?? null, firstAtSec: settings.scheduleFirstAtSec ?? null };
   // The whole-term count (not the gate's clipped one), so the funding step never under-asks BNB.
@@ -169,15 +183,16 @@ export function AgenticDeployModal({ settings, go, blockedReason, altanaBlockedR
   const stockCount = settings.portfolioTokens?.length ?? 0;
   const dcaMaxOrders = settings.dcaMaxOrders ?? 8;
   const gate = state?.facts == null ? null : agenticGate({ facts: state.facts, ...(state.walletAddress === null ? {} : { wallet: state.walletAddress }), capitalQuoteWei: capitalWei,
-    entryWei: BigInt(settings.entryWei), maxOpenPositions: settings.maxOpenPositions, termSec: term * 86_400, nowMs: now, budgetWei,
+    entryWei, maxOpenPositions, termSec: term * 86_400, nowMs: now, budgetWei, ...(meme ? { meme: "paper" as const } : {}), ...(earnOn ? { earn: true as const } : {}),
     ...(scheduleInput === undefined ? {} : { quoteDayCapWei: capitalWei, schedule: scheduleInput }), ...(portfolio ? { portfolio: { tokenCount: stockCount } } : {}), ...(dca ? { dca: { maxOrders: dcaMaxOrders } } : {}) });
-  const need = { USDT: capitalWei + budgetWei, BNB: BigInt(dca ? agenticDcaBnbSlots(dcaMaxOrders) : portfolio ? 2 * stockCount + 2 : settings.maxOpenPositions + 2 + (buys === null ? 0 : Math.min(buys.plannedBuys, buys.buysThisSession))) * BNB_PER_SLOT_WEI } as const;
+  const need = { USDT: capitalWei + budgetWei, BNB: BigInt(dca ? agenticDcaBnbSlots(dcaMaxOrders) : portfolio ? 2 * stockCount + 2 : settings.maxOpenPositions + 2 + (buys === null ? 0 : Math.min(buys.plannedBuys, buys.buysThisSession))) * BNB_PER_SLOT_WEI + (earnOn ? 2n * BNB_PER_SLOT_WEI : 0n) } as const;
   const have = (asset: "USDT" | "BNB"): bigint | null => {
     const raw = asset === "USDT" ? state?.facts?.usdtWei : state?.facts?.bnbWei;
     return raw !== undefined && /^\d+$/.test(raw) ? BigInt(raw) : null;
   };
   const deficit = (asset: "USDT" | "BNB"): bigint => { const value = have(asset); return value === null ? 0n : need[asset] - value; };
-  const funded = (["USDT", "BNB"] as const).every(asset => { const value = have(asset); return value !== null && value >= need[asset]; });
+  // A paper meme hire needs no funding (9.1): no USDT and no BNB.
+  const funded = meme || (["USDT", "BNB"] as const).every(asset => { const value = have(asset); return value !== null && value >= need[asset]; });
   const wallet = state?.walletAddress ?? null;
   // On the funding step the balances re-read on their own every 10 s (the plane refreshes the two chain balances at that pace).
   React.useEffect(() => {
@@ -196,14 +211,15 @@ export function AgenticDeployModal({ settings, go, blockedReason, altanaBlockedR
     ? { text: "Observe your Agentic Wallet", disabled: false, run: () => go("/agentic/" + started.walletAddress) }
     : terminal && step >= 2 ? { text: "Start a new pairing", disabled: busy, run: resetPairing }
     : step === 0 ? { text: "Next", disabled: custody === null || (custody === "altana" && altanaBlockedReason !== null), run: () => (custody === "altana" ? onAltana() : setStep(1)) }
-    : step === 1 ? { text: "Next", disabled: busy || action === null || !!blockedReason, run: () => (pairing === null ? startPairing(2) : setStep(2)) }
+    : step === 1 ? { text: "Next", disabled: busy || action === null || !!blockedReason || meme && !memeSizingOk, run: () => (pairing === null ? startPairing(2) : setStep(2)) }
     : step === 2 ? pairing === null ? { text: "Pair in the Binance App", disabled: busy || action === null || !!blockedReason, run: () => startPairing() }
       : { text: "Finalize pairing", disabled: busy || (state?.state !== "verified" && state?.state !== "paired"),
         run: () => void run(async () => { setState(await agenticRequest(`pairings/${pairing.pairingId}/finalize`, {})); setNow(Date.now()); setStep(3); }) }
     : step === 3 ? { text: "Next", disabled: !funded, run: () => setStep(4) }
-    : { text: schedule ? "Deploy Agentic Schedule buy" : portfolio ? "Deploy Agentic Smart Portfolio" : dca ? "Deploy Agentic Auto DCA" : "Deploy Agentic AI Trade", disabled: deployBlocked, run: () => void run(async () => {
+    : { text: meme ? "Deploy Agentic Meme stocks (paper)" : schedule ? "Deploy Agentic Schedule buy" : portfolio ? "Deploy Agentic Smart Portfolio" : dca ? "Deploy Agentic Auto DCA" : "Deploy Agentic AI Trade", disabled: deployBlocked, run: () => void run(async () => {
         const deployed = await agenticRequest<{ walletAddress: string; hireEndMs: number }>("hire", { pairingId: pairing!.pairingId, term, termEndAction: action, executionModel: "tradfi", hireRunId,
-          settings: schedule || portfolio || dca ? settings : agenticHireSettings(settings, term), acceptedDedicatedWallet: true });
+          settings: meme ? agenticMemeSettings(settings, { entryWei, maxOpenPositions, capitalQuoteWei: capitalWei }) : schedule || portfolio || dca ? settings : agenticHireSettings(settings, term), acceptedDedicatedWallet: true,
+          ...(meme ? { strategy: "meme-stocks-paper" } : {}), ...(earnOn ? { earn: true } : {}) });
         // The agent is live: go straight to its read-only detail page (the Started panel stays as the fallback if navigation is slow).
         rememberAgenticWallet(deployed.walletAddress); setStarted(deployed); go("/agentic/" + deployed.walletAddress);
       }) };
@@ -243,7 +259,25 @@ export function AgenticDeployModal({ settings, go, blockedReason, altanaBlockedR
               <OptionCard on={term === 30} onClick={() => setTerm(30)} title="30 days" />
             </div>
           </div>
-          {buys !== null ? <p style={{ ...body, color: "var(--ink-1)" }}>Your {term}-day term covers up to {buys.buysThisSession} buys; {buys.plannedBuys} are planned.</p> : <>
+          {agenticMemeEnabled && !schedule && !portfolio && !dca ? <div style={{ display: "grid", gap: 10 }}>
+            <span className="fl-field__label">Strategy</span>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0,1fr))", gap: 10 }}>
+              <OptionCard on={strategy === "stocks"} onClick={() => chooseStrategy("stocks")} title="Stocks" />
+              <OptionCard on={strategy === "meme"} onClick={() => chooseStrategy("meme")} title="Meme stocks (paper)" />
+            </div>
+          </div> : null}
+          {meme ? <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10 }}>
+              {([["entryUsdt", "Per trade (USDT)", 10, 50], ["maxOpenPositions", "Max open", 1, 3], ["capitalUsdt", "Capital (USDT)", 10, 150]] as const).map(([key, title, min, max]) =>
+                <label key={key} style={{ display: "grid", gap: 6 }}><span className="fl-field__label">{title}</span>
+                  <input type="number" aria-label={title} min={min} max={max} step={1} value={memeSizing[key]}
+                    onChange={e => setMemeSizing({ ...memeSizing, [key]: Number(e.target.value) })} style={{ ...sunken, padding: "8px 10px", color: "var(--ink-1)", font: "var(--weight-medium) var(--text-sm)/1 var(--font-mono)" }} /></label>)}
+            </div>
+            <span style={mono}>Models: {settings.primaryModel} · fallback {settings.fallbackModel}</span>
+            {memeSizingOk ? null : <p role="alert" style={{ ...body, color: "var(--loss)" }}>Per trade 10 to 50 USDT, max open 1 to 3, capital at least max open x per trade.</p>}
+            <p style={body}>{AGENTIC_MEME_COPY.paper}</p>
+            <p style={{ ...body, color: "var(--ink-1)" }}>{AGENTIC_MEME_COPY.law1}</p>
+          </> : buys !== null ? <p style={{ ...body, color: "var(--ink-1)" }}>Your {term}-day term covers up to {buys.buysThisSession} buys; {buys.plannedBuys} are planned.</p> : <>
             <div style={{ ...sunken, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "9px 12px" }}>
               <Icon name="key" size={14} />
               <span style={{ ...body, color: "var(--ink-1)" }}>{dca ? AGENTIC_DCA_COPY.keepAlive : "CMC Agent Hub x402 is required and locked on."}</span>
@@ -265,6 +299,16 @@ export function AgenticDeployModal({ settings, go, blockedReason, altanaBlockedR
               </div>
             </div>}
           </>}
+          {earnOffered ? <div style={{ display: "grid", gap: 10 }}>
+            <label style={{ ...sunken, display: "flex", gap: 10, alignItems: "center", padding: "10px 12px", cursor: "pointer" }}>
+              <input type="checkbox" checked={earn} onChange={e => setEarn(e.target.checked)} aria-label={AGENTIC_EARN_COPY.label} />
+              <span style={label}>{AGENTIC_EARN_COPY.label}</span>
+            </label>
+            {earn ? <EarnDisclosure mode={dca ? "dca" : schedule ? "schedule" : "ai"} estimate={dca
+              ? agenticEarnEstimate({ mode: "dca", capitalWei, baseWei: entryWei, orderWei: BigInt(settings.dcaOrderWei ?? "0"), maxOrders: dcaMaxOrders })
+              : schedule && buys !== null ? agenticEarnEstimate({ mode: "schedule", capitalWei, entryWei, intervalSec: settings.scheduleIntervalSec!, plannedBuys: buys.plannedBuys, buysThisSession: buys.buysThisSession })
+              : agenticEarnEstimate({ mode: "ai", capitalWei, entryWei, maxOpenPositions })} /> : null}
+          </div> : null}
         </> : null}
 
         {started === null && step === 2 && pairing !== null && !terminal ? <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "flex-start" }}>
@@ -293,14 +337,14 @@ export function AgenticDeployModal({ settings, go, blockedReason, altanaBlockedR
             </div>
           </section>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {(["USDT", "BNB"] as const).filter(asset => deficit(asset) > 0n).map(asset =>
+            {(["USDT", "BNB"] as const).filter(asset => !meme && deficit(asset) > 0n).map(asset =>
               <Button key={asset} variant="secondary" size="sm" icon={<Icon name="wallet" size={13} />} onClick={() => setFunding({ asset, amount: deficit(asset) })}>Send {asset} from extension wallet</Button>)}
             <Button variant="secondary" size="sm" icon={<Icon name="refresh" size={13} />} disabled={busy} onClick={refreshFacts}>Check Funds</Button>
           </div>
-          <div style={sunken}>
+          {meme ? <p role="status" style={{ ...body, color: "var(--ink-1)" }}>{AGENTIC_MEME_COPY.noFunding}</p> : <div style={sunken}>
             <FundRow asset="USDT" have={have("USDT")} need={need.USDT} first />
             <FundRow asset="BNB" have={have("BNB")} need={need.BNB} first={false} />
-          </div>
+          </div>}
           {funding !== null ? <AgenticFunding wallet={wallet} asset={funding.asset} amount={funding.amount} close={() => setFunding(null)} onSent={() => setDepositSent(true)} /> : null}
           {depositSent && !funded ? <span role="status" style={{ display: "flex", alignItems: "center", gap: 7, ...body }}><Spinner />Deposit sent. Waiting for it to land in the Agentic Wallet.</span> : null}
           <span style={mono}>Send funds from any wallet, exchange or extension wallet. Checks read {state?.facts ? clock(state.facts.balancesAtMs ?? state.facts.readAtMs) : "time unavailable"}; balances refresh every 10 seconds.</span>

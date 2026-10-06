@@ -2,7 +2,7 @@ import { sanitizeMessage } from "../core/errors.js";
 
 /** Observations only: never consumed by execution, reconciliation or authorization. */
 export type TradeRunEvent = {
-  readonly stage: "screen" | "score" | "entry-llm" | "exit-llm" | "route" | "buy" | "sell" | "cycle" | "cmc";
+  readonly stage: "screen" | "score" | "entry-llm" | "exit-llm" | "route" | "buy" | "sell" | "cycle" | "cmc" | "earn";
   readonly code: string;
   readonly elapsedMs: number;
   readonly token?: string;
@@ -11,7 +11,7 @@ export type TradeRunEvent = {
   readonly confidence?: number;
 };
 
-const STAGES = new Set(["screen", "score", "entry-llm", "exit-llm", "route", "buy", "sell", "cycle", "cmc"]);
+const STAGES = new Set(["screen", "score", "entry-llm", "exit-llm", "route", "buy", "sell", "cycle", "cmc", "earn"]);
 function text(value: unknown, limit: number): string | undefined {
   if (typeof value !== "string") return undefined;
   return sanitizeMessage(value

@@ -31,7 +31,12 @@ import { acquireAgenticFence } from "../src/agentic/obligations.js";
 import { createAgenticChain, verifyAgenticSwap, verifyAgenticApproval, agenticList, agenticResolutionEvidence,
   resolveAgenticOrder, type AgenticChain } from "../src/agentic/resolve.js";
 import { createAgenticCmc } from "../src/agentic/cmc.js";
+import { runEarnOnce, type EarnOnceInput } from "../src/agentic/earnLane.js";
+import { earnEvidence, verifyEarnReceipt } from "../src/agentic/earn.js";
 import { createAgenticWorkerDeps, runAgenticCycle } from "../src/agentic/worker.js";
+import { runAgenticMemeStep, type MemeStepDeps } from "../src/agentic/memeLane.js";
+import { MEME_BARS_BATCH_MAX, barLagMs, memeRead, parseBars, parseEligibility, parseShortlist } from "../src/agentic/memeData.js";
+import type { TradeDataPlaneReads } from "../src/trade/dataPlaneReads.js";
 
 export type AgenticGateArgs = { command: string; values: Readonly<Record<string, string>>; live: boolean; simulateNoResponse: boolean };
 const OPTIONS: Readonly<Record<string, readonly string[]>> = {
@@ -40,6 +45,10 @@ const OPTIONS: Readonly<Record<string, readonly string[]>> = {
   "cycle-once": ["run", "yes-live", "simulate-no-response"], "cmc-once": ["run", "yes-live", "retry-failed"], "run-close": ["run"], "repair-fill": ["order", "yes-live"],
   "request-exit": ["agent", "position-index", "yes-live"], hold: ["agent"], unhold: ["agent"], "rfq-buy": ["run", "token", "yes-live"],
   dispose: ["order", "commit-tx", "commit-partial-tx", "rollback", "approve-tx", "no-approve", "attest", "deployment-stopped", "yes-live"],
+  // AGENTIC-MEME-STOCKS-SPEC 9.6: read-only reports and the operator's paper close; none of them runs a Binance command.
+  "meme-data": [], "meme-log": ["agent", "since", "until"], "meme-close": ["agent", "ref"],
+  // AGENTIC-EARN-SPEC 9.3: one earn operation under a run of gate EG1, side earn; without --yes-live it reads the list and the preview and writes nothing.
+  "earn-once": ["run", "protocol", "action", "amount", "yes-live"],
 };
 export function parseAgenticGateArgs(argv: readonly string[]): AgenticGateArgs {
   const command = argv[0] ?? "", allowed = OPTIONS[command];
@@ -66,10 +75,51 @@ export type AgenticGateContext = {
   /** AGENTIC-RFQ-STOCKS E13: this process's AGENTIC_RFQ_STOCKS_ENABLED, and the one RFQ buy (priced only unless `live`). Absent: the flag reads off. */
   rfqEnabled?: boolean;
   rfqBuy?(input: { agentId: string; run: AgenticGateRun; token: Address; live: boolean }): Promise<unknown>;
+  /** AGENTIC-MEME-STOCKS-SPEC 9.6: the data plane and LLM of the meme dry run and `meme-data`, and this process's AGENTIC_MEME_STOCKS_ENABLED. */
+  meme?: { worker: MemeStepDeps["worker"]; enabled: boolean };
+  /** AGENTIC-EARN-SPEC 9.3: this process's AGENTIC_EARN_ENABLED (a deposit needs it on; a redeem does not), and the one earn operation. Absent: the flag reads off and `earn-once` refuses. */
+  earnEnabled?: boolean;
+  earnOnce?(input: { agentId: string; run: AgenticGateRun; once: EarnOnceInput }): Promise<unknown>;
   print(value: unknown): void;
 };
+
+/** 9.6 `meme-data` (gate MA-pre): one read of the shortlist, its bars and its eligibility rows; no wallet, no Binance call, nothing written. */
+export async function memeDataReport(plane: Pick<TradeDataPlaneReads, "universe" | "memeShortlist" | "memeBars" | "memeEligibility">, nowMs: number): Promise<Record<string, unknown>> {
+  const shortlist = await memeRead(plane.memeShortlist === undefined ? undefined : () => plane.memeShortlist!(), parseShortlist);
+  if (shortlist === null) return { shortlist: "unavailable" };
+  const universe = await memeRead(() => plane.universe("bstocks"), value => Array.isArray(value) ? value as { address: string }[] : null);
+  const bstocks = new Set((universe ?? []).map(row => row.address.toLowerCase()));
+  const addresses = shortlist.rows.map(row => row.address), batch = addresses.slice(0, MEME_BARS_BATCH_MAX);
+  const bars = batch.length === 0 ? new Map() : await memeRead(plane.memeBars === undefined ? undefined : () => plane.memeBars!(batch), value => parseBars(value, batch));
+  const eligibility = addresses.length === 0 ? new Map() : await memeRead(plane.memeEligibility === undefined ? undefined : () => plane.memeEligibility!(addresses.slice(0, 50)), parseEligibility);
+  const lags = bars === null ? [] : [...bars.values()].map(series => barLagMs(series, nowMs)).sort((a, b) => a - b);
+  const at = (q: number): number | null => lags.length === 0 ? null : lags[Math.min(lags.length - 1, Math.floor(q * lags.length))]!;
+  const histogram = (values: readonly (string | number | null)[]): Record<string, number> => values.reduce<Record<string, number>>((out, value) => { out[String(value)] = (out[String(value)] ?? 0) + 1; return out; }, {});
+  const rows = shortlist.rows, count = (test: (row: typeof rows[number]) => boolean): number => rows.filter(test).length;
+  return { asOf: shortlist.asOf, staleness: shortlist.staleness, ageMs: nowMs - shortlist.asOf, rows: shortlist.rows.length, invalidRows: shortlist.invalid,
+    boardTotal: shortlist.boardTotal, candidates: shortlist.candidates, picked: shortlist.picked,
+    bars: bars === null ? "unavailable" : { read: bars.size, requested: batch.length, tracked: [...bars.values()].filter(series => series.tracked).length,
+      underFifteen: [...bars.values()].filter(series => series.bars.length < 15).length, lagP50Ms: at(0.5), lagP90Ms: at(0.9), lagMaxMs: lags.at(-1) ?? null },
+    coverage: { flow5m: count(row => row.flow5m !== null), flow1h: count(row => row.flow1h !== null), smartInflow5m: count(row => row.smartInflow5m !== null),
+      smartInflow1h: count(row => row.smartInflow1h !== null), venue: count(row => row.venue !== null), tax: count(row => row.tax !== null) },
+    tokenVersion: eligibility === null ? "unavailable" : histogram([...eligibility.values()].map(row => row.flap?.tokenVersion ?? null)),
+    bstockUniverse: universe === null ? "unavailable" : bstocks.size,
+    quoteInUniverse: count(row => row.quote.address !== null && bstocks.has(row.quote.address)), quoteSymbols: histogram(shortlist.rows.map(row => row.quote.symbol)) };
+}
 export async function runAgenticGate(args: AgenticGateArgs, context: AgenticGateContext): Promise<void> {
   const { values, command } = args;
+  if (command === "meme-data") {
+    if (context.meme === undefined) throw new Error("AGENTIC_GATE_MEME_DISABLED");
+    context.print(await memeDataReport(context.meme.worker.dataPlane, await context.store.now())); return;
+  }
+  if (command === "meme-log") {
+    // 8.6 export (read-only): one JSON line per row of the window, the global market rows included; with --agent, that agent's rows and the market rows.
+    const since = Number(values["since"]), until = values["until"] === undefined ? Number.MAX_SAFE_INTEGER : Number(values["until"]);
+    if (!Number.isSafeInteger(since) || !Number.isSafeInteger(until) || since > until) throw new Error("AGENTIC_GATE_ARGUMENT");
+    const rows = (await context.store.memeLog(null, since, until)).filter(row => values["agent"] === undefined || row.agentId === values["agent"] || row.agentId === null);
+    for (const row of rows) context.print(row);
+    return;
+  }
   const order = command === "dispose" || command === "repair-fill" ? await context.store.getOrder(values["order"] ?? "") : null;
   const run = values["run"] === undefined ? null : await context.store.getRun(values["run"]);
   if (values["run"] !== undefined && run === null || (command === "dispose" || command === "repair-fill") && order === null) throw new Error("AGENTIC_GATE_TARGET");
@@ -80,6 +130,22 @@ export async function runAgenticGate(args: AgenticGateArgs, context: AgenticGate
     || order !== null && order.walletAddress !== row.walletAddress || run !== null && run.wallet !== row.walletAddress) throw new Error("AGENTIC_GATE_CONFINEMENT");
   if (["cycle-once", "cmc-once"].includes(command) && (run === null || run.closedAt !== null || await context.store.now() >= run.deadlineMs)) throw new Error("AGENTIC_GATE_CLOSED");
   if (["cycle-once", "cmc-once", "request-exit", "repair-fill"].includes(command) && !args.live) throw new Error("AGENTIC_GATE_LIVE_REQUIRED");
+  if (command === "meme-close") {
+    // R2-M7: one CAS setting close_requested_at on one open paper row of this paper meme hire; the lane closes it with `drain` at its next mark. No Binance call.
+    const index = /^m\d+$/u.test(values["ref"] ?? "") ? Number(values["ref"]!.slice(1)) : NaN;
+    if (row.hireFacts?.meme?.mode !== "paper") throw new Error("AGENTIC_GATE_NOT_MEME");
+    const target = (await context.store.paperList(agentId))[index];
+    if (target === undefined || target.status !== "open" || target.closeRequestedAt !== null) throw new Error("AGENTIC_GATE_POSITION");
+    if (await context.store.patchPaper(target, { closeRequestedAt: await context.store.now() }) === null) throw new Error("AGENTIC_GATE_CONFLICT");
+    context.print({ ref: values["ref"], closeRequested: true }); return;
+  }
+  if (command === "dry-run" && row.hireFacts?.meme !== undefined) {
+    // 9.6: the meme dry run computes the step and prints what it would write; quotes are reads, nothing is written.
+    if (context.meme === undefined) throw new Error("AGENTIC_GATE_MEME_DISABLED");
+    const { report } = await runAgenticMemeStep({ store: context.store, positions: context.positions, runner: context.runner, masterKey: context.masterKey, instance: context.instance,
+      chain: context.chain, worker: context.meme.worker, memeEnabled: context.meme.enabled }, row, { dryRun: true });
+    context.print(report); return;
+  }
   if (command === "rfq-buy") {
     // AGENTIC-RFQ-STOCKS E13: every condition below refuses before any quote or command; without --yes-live the buy is priced and nothing is written.
     const token = values["token"] !== undefined && /^0x[0-9a-fA-F]{40}$/u.test(values["token"]) ? agenticAddress(values["token"]) : null;
@@ -92,6 +158,19 @@ export async function runAgenticGate(args: AgenticGateArgs, context: AgenticGate
     const amount = BigInt(settings.value.effective.minEntryWei!), cap = agenticDecimal(run.maxNotionalUsdt);
     if (cap === null || amount > cap) throw new Error("AGENTIC_GATE_LIMITS");
     context.print(await context.rfqBuy({ agentId, run, token, live: args.live })); return;
+  }
+  if (command === "earn-once") {
+    // Every condition below refuses before any list, preview or command; the amount is bounded by the run's notional.
+    const protocol = values["protocol"], action = values["action"], amountText = values["amount"];
+    if (protocol !== "venus" && protocol !== "aave-v3" || action !== "deposit" && action !== "redeem" && action !== "redeem-all" || run === null) throw new Error("AGENTIC_GATE_TARGET");
+    const amount = amountText === undefined ? null : agenticDecimal(amountText);
+    if (action === "redeem-all" ? amountText !== undefined : amount === null || amount <= 0n) throw new Error("AGENTIC_GATE_LIMITS");
+    if (run.gate !== "EG1" || run.side !== "earn" || run.closedAt !== null || run.dispatches >= run.maxDispatches || await context.store.now() >= run.deadlineMs) throw new Error("AGENTIC_GATE_CLOSED");
+    if (context.earnOnce === undefined || action === "deposit" && context.earnEnabled !== true) throw new Error("AGENTIC_GATE_EARN_DISABLED");
+    if (row.state !== "bound" || row.hireFacts?.earn?.v !== 1) throw new Error("AGENTIC_GATE_EARN_NOT_ACTIVE");
+    const cap = agenticDecimal(run.maxNotionalUsdt);
+    if (cap === null || amount !== null && amount > cap) throw new Error("AGENTIC_GATE_LIMITS");
+    context.print(await context.earnOnce({ agentId, run, once: { protocol, action, ...(amount === null ? {} : { amountWei: amount }), maxWei: cap, live: args.live } })); return;
   }
   if (command === "status") {
     let connection = row.state === "ended" ? "ended" : row.probe?.unreachableAtMs == null ? "connected" : "unreachable";
@@ -125,7 +204,7 @@ export async function runAgenticGate(args: AgenticGateArgs, context: AgenticGate
     const gate = values["gate"], side = values["side"];
     const dispatches = Number(values["max-dispatches"]), cmc = Number(values["max-cmc-payments"]), minutes = Number(values["deadline-min"]);
     const notional = values["max-notional-usdt"];
-    if (!["G0", "G1", "G2", "G3", "G4", "DG1", "DG2", "DG3", "DG4", "DG5", "DG6", "RG1", "RG2", "RG3", "RG4"].includes(gate ?? "") || !["buy", "sell", "none", "dca"].includes(side ?? "")
+    if (!["G0", "G1", "G2", "G3", "G4", "DG1", "DG2", "DG3", "DG4", "DG5", "DG6", "RG1", "RG2", "RG3", "RG4", "EG1"].includes(gate ?? "") || !["buy", "sell", "none", "dca", "earn"].includes(side ?? "")
       || !Number.isSafeInteger(dispatches) || dispatches < 0 || !Number.isSafeInteger(cmc) || cmc < 0 || !Number.isSafeInteger(minutes) || minutes <= 0
       || notional === undefined || agenticDecimal(notional) === null) throw new Error("AGENTIC_GATE_LIMITS");
     const now = await context.store.now();
@@ -214,6 +293,22 @@ export async function runAgenticGate(args: AgenticGateArgs, context: AgenticGate
       const proof = branch === "approve-tx" && hash !== null ? await verifyAgenticApproval(context.chain, current.walletAddress, hash) : null;
       if (branch === "approve-tx" && proof === null) throw new Error("AGENTIC_APPROVAL_UNVERIFIED");
       if (await context.store.patchOrder(current, { outcome: "committed", approveTxHash: hash, holdReason: null, evidence: { disposition: branch, proof, quiescence, attest } }) === null) throw new Error("AGENTIC_DISPOSITION_CONFLICT");
+    } else if (current.kind === "earn-deposit" || current.kind === "earn-redeem") {
+      // AGENTIC-EARN-SPEC 3.8 rule 27 and R11.2: a commit runs the lane's own receipt verifier; --attest waives the value band and the USDT-leg bounds (never the token allowlist, the sender, the status or the receipt token into the wallet).
+      if (!["rollback", "commit-tx"].includes(branch)) throw new Error("AGENTIC_DISPOSITION_BRANCH");
+      if (branch === "rollback") {
+        if (await context.store.patchOrder(current, { outcome: "rolled-back", holdReason: null, evidence: { ...(earnEvidence(current.evidence) ?? {}), disposition: branch, quiescence, attest } }) === null) throw new Error("AGENTIC_DISPOSITION_CONFLICT");
+      } else {
+        const ev = earnEvidence(current.evidence);
+        if (hash === null || ev === null || (await context.store.orders()).some(o => o.idempotencyKey !== current.idempotencyKey && o.txHash === hash)) throw new Error("AGENTIC_DISPOSITION_CONFLICT");
+        const proof = await context.chain.receipt(hash);
+        let value: bigint | null = null;
+        try { const b = context.chain.earnBalances === undefined ? null : await context.chain.earnBalances(current.walletAddress); value = b === null ? null : ev.protocol === "venus" ? b.venusWei : b.aaveWei; } catch { value = null; }
+        const verdict = verifyEarnReceipt(proof, current, { value, nowMs: await context.store.now(), waive: attest !== undefined && attest !== "" });
+        if (verdict.kind !== "commit") throw new Error("AGENTIC_EARN_UNVERIFIED");
+        if (await context.store.patchOrder(current, { outcome: "committed", txHash: hash, holdReason: null, evidence: { ...ev, disposition: "operator-commit",
+          post: { usdtMoved: verdict.usdtMoved.toString(), receiptMoved: verdict.receiptMoved.toString(), block: verdict.block.toString() }, quiescence, attest } }) === null) throw new Error("AGENTIC_DISPOSITION_CONFLICT");
+      }
     } else if (current.kind !== "swap") {
       // R3.8: a row left by the retired limit build (neither a swap nor a sign) can only be rolled back: no journal step exists for it. Its DCA order, if not terminal, is cancelled by the plane.
       if (branch !== "rollback") throw new Error("AGENTIC_DISPOSITION_BRANCH");
@@ -259,11 +354,21 @@ async function main(): Promise<void> {
   const store = new AgenticStore(await createPgSqlClient(process.env["DATABASE_URL"]!), { agents, journal, intents, cmc, killswitch }); await store.initialize();
   const instance = await AgenticInstanceManager.start(store, runner, "agentic-gate");
   const chain = createAgenticChain(rpcUrls);
-  if (["dry-run", "reconcile-once"].includes(args.command)) instance.stopClaiming();
+  if (["dry-run", "reconcile-once", "meme-data", "meme-log", "meme-close"].includes(args.command)) instance.stopClaiming();
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => { instance.stopClaiming(); runner.killChildren(); });
   let rfqOutput: unknown = null;
   try {
-    await runAgenticGate(args, { store, agents, positions, journal, killswitch, instance, chain, runner, masterKey, wallets, rfqEnabled: config.rfq,
+    const memeLlm = (modelId: string) => createTradeLlm({ readKey: () => process.env["TRADE_LLM_API_KEY"] ?? process.env["OPENROUTER_API_KEY"] ?? "", model: modelId,
+      ...(process.env["TRADE_LLM_BASE_URL"] ? { baseUrl: process.env["TRADE_LLM_BASE_URL"] } : {}) });
+    // Audit F-D: only meme-data and the dry run read the data plane; every other command boots without DATA_PLANE_URL as before.
+    const meme = !["meme-data", "dry-run"].includes(args.command) ? undefined
+      : { enabled: config.meme, worker: { dataPlane: new HttpTradeDataPlaneReads({ baseUrl: process.env["DATA_PLANE_URL"] ?? "", token: process.env["DATA_PLANE_TOKEN"] ?? "" }), llmFor: memeLlm, killswitch } as MemeStepDeps["worker"] };
+    await runAgenticGate(args, { store, agents, positions, journal, killswitch, instance, chain, runner, masterKey, wallets, rfqEnabled: config.rfq, earnEnabled: config.earn, ...(meme === undefined ? {} : { meme }),
+      async earnOnce(input) {
+        const current = await store.byAgent(input.agentId);
+        if (current === null) throw new Error("AGENTIC_GATE_TARGET");
+        return runEarnOnce({ store, positions, runner, masterKey, instance, chain, earnEnabled: config.earn, gateRunId: input.run.runId, killswitch }, current, input.once);
+      },
       async rfqBuy(input) {
         rfqOutput = null;
         await this.cycle({ command: "rfq-buy", values: { token: input.token }, live: input.live, simulateNoResponse: false }, input.agentId, input.run);

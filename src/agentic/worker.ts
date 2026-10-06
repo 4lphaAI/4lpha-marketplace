@@ -10,19 +10,24 @@ import { WBNB_56 } from "../ops/venues.js";
 import { USDT_56 } from "../trade/settlement.js";
 import { isTradeDcaSettings, parseTradeSettings } from "../trade/settings.js";
 import { agenticLastActivityMs, agenticUsesPaidIdleKeepAlive, projectAgenticSessionFacts, type AgenticWallet } from "./domain.js";
-import { agenticDcaEnabled } from "./config.js";
+import { agenticDcaEnabled, agenticEarnEnabled, agenticMemeEnabled } from "./config.js";
 import { runAgenticDcaStep } from "./dcaLane.js";
+import { earnBlocksSignOut, runAgenticEarnStep } from "./earnLane.js";
+import type { EarnProduct } from "./earnAdapter.js";
+import { runAgenticMemeStep } from "./memeLane.js";
 import { bawConnectionSignal, type BawRunner } from "./baw.js";
 import { decryptAgenticSession, type AgenticStore } from "./store.js";
 import type { AgenticInstanceManager } from "./instances.js";
 import { acquireAgenticFence } from "./obligations.js";
-import { resolveAgenticOrder, verifyAgenticSwap } from "./resolve.js";
+import { resolveAgenticOrder, verifyAgenticSwap, type AgenticChain } from "./resolve.js";
 import { executeAgenticTrade, readAgenticSettings, type AgenticExecutionDeps } from "./execute.js";
 import type { AgenticCmc } from "./cmc.js";
 import { createAgenticRfqStocks } from "./rfq.js";
 
 export type AgenticLifecycleDeps = { store: AgenticStore; agents: AgentStore; settings: TradeSettingsStore;
-  positions: TradePositionStore; runner: BawRunner; masterKey: Buffer; instance: AgenticInstanceManager };
+  positions: TradePositionStore; runner: BawRunner; masterKey: Buffer; instance: AgenticInstanceManager;
+  /** AGENTIC-EARN-SPEC 3.9: the chain reader of the sign-out guard of an earn hire; absent reads as a failed read, so such a hire is never signed out. */
+  chain?: AgenticChain };
 
 async function revokeAgenticAgent(deps: AgenticLifecycleDeps, row: AgenticWallet): Promise<void> {
   if (row.agentId === null) return;
@@ -48,6 +53,8 @@ export async function resumeAgenticEnding(deps: AgenticLifecycleDeps, row: Agent
     const current = await deps.store.getWallet(row.pairingId);
     if (current?.state !== "ending" || current.sessionCiphertext === null || current.logout !== null && now - current.logout.lastAtMs < 600_000) return;
     row = current;
+    // AGENTIC-EARN-SPEC 3.9: an earn hire is never signed out while an earn row is open, a product holds dust or more, or the chain read fails. The max-time end above stays first, so the wait is bounded.
+    if (row.hireFacts?.earn !== undefined && await earnBlocksSignOut(deps, row)) return;
     if (await deps.store.renewFence(fence) === null) return;
     await deps.runner.run(["auth", "signout"], decryptAgenticSession(row, deps.masterKey));
     const attempted = await deps.store.patchWallet(row, { endStage: "signout-attempted", logout: { attempts: (row.logout?.attempts ?? 0) + 1, lastAtMs: now, lastResult: "unverified" } });
@@ -78,6 +85,8 @@ export function createAgenticWorkerDeps(input: { shared: TradeWorkerDeps; agents
       if (stored === null) continue;
       // The DCA lane step drives a DCA row; the shared entry listing would only answer dca-disabled for it every cycle (AGENTIC-DCA-SPEC 3.12). The projection listing is unchanged.
       if (!projection) { const parsed = parseTradeSettings(stored.params); if (parsed.ok && isTradeDcaSettings(parsed.value.effective)) continue; }
+      // AGENTIC-MEME-STOCKS-SPEC 9.2: a meme hire is driven only by its own lane step; with pinned = [] the shared lane would find no candidate anyway (PA1).
+      if (!projection && wallet.hireFacts?.meme !== undefined) continue;
       rows.push(stored);
     }
     rows.sort((a, b) => a.agentId.localeCompare(b.agentId));
@@ -133,10 +142,27 @@ export function createAgenticWorkerDeps(input: { shared: TradeWorkerDeps; agents
   };
 }
 
+/** AGENTIC-MEME-STOCKS-SPEC 17 (R3.2): with the meme flag on, the lane starts each cycle at this phase of the minute, just after the data plane writes the closed bar. */
+export const AGENTIC_LANE_ALIGN_OFFSET_MS = 25_000;
+/** 17: the pause after a cycle. Not aligned (meme flag off) it is exactly the legacy rule; aligned it is never later than that and lands the next start on the 25 s phase. */
+export function agenticLaneSleepMs(nowMs: number, startMs: number, aligned: boolean): number {
+  const legacy = Math.max(0, 60_000 - (nowMs - startMs));
+  if (!aligned) return legacy;
+  const untilSlot = (((AGENTIC_LANE_ALIGN_OFFSET_MS - (nowMs % 60_000)) % 60_000) + 60_000) % 60_000;
+  // Audit F-B: when the slot passed during this cycle, shorten this sleep by the overshoot so the next cycle starts before the slot; never later than legacy.
+  if (untilSlot <= legacy) return untilSlot;
+  return Math.max(0, legacy - (60_000 - untilSlot));
+}
+
 export async function runAgenticCycle(input: AgenticLifecycleDeps & { execution: AgenticExecutionDeps; worker: TradeWorkerDeps; cmc: AgenticCmc; journal: ExecutionJournal;
-  /** AGENTIC_DCA_ENABLED of this process; absent reads the environment (the boot already refused an invalid value). */ dcaEnabled?: boolean },
+  /** AGENTIC_DCA_ENABLED of this process; absent reads the environment (the boot already refused an invalid value). */ dcaEnabled?: boolean;
+  /** AGENTIC_MEME_STOCKS_ENABLED of this process (paper meme entries only); absent reads the environment. */ memeEnabled?: boolean;
+  /** AGENTIC_EARN_ENABLED of this process (earn deposits only; redeems and the sign-out guard run regardless); absent reads the environment. */ earnEnabled?: boolean;
+  /** Test seam: the Earn product table. Production never passes it, so the null-pinned constants of earnAdapter.ts apply. */ earnProducts?: readonly EarnProduct[] },
   options: { dryRun?: boolean; reconciliationOnly?: boolean; cmcOnly?: boolean } = {}): Promise<void> {
   const { store, instance } = input;
+  // 17: the meme cycle row logs this cycle's start phase.
+  const cycleStartMs = Date.now();
   if (input.execution.gateRunId !== undefined && !options.reconciliationOnly) {
     const run = await store.getRun(input.execution.gateRunId);
     if (run === null || run.closedAt !== null || await store.now() >= run.deadlineMs) throw new Error("AGENTIC_GATE_CLOSED");
@@ -175,7 +201,8 @@ export async function runAgenticCycle(input: AgenticLifecycleDeps & { execution:
               if (signal === "connected" && (row.hireFacts?.hireSizing.cmcNewsEnabled !== true || paid)
                 && now - (paid ? Math.max(row.probe?.keepAliveAtMs ?? row.acceptedAt ?? now, agenticLastActivityMs({ acceptedAt: row.acceptedAt ?? now, agentId: row.agentId!,
                   orders: await store.orders(row.walletAddress!), settledAttemptsCreatedAt: [] }, ["swap-quote"]))
-                  : Math.max(row.probe?.keepAliveAtMs ?? row.acceptedAt ?? now, ...(await store.orders(row.walletAddress!)).map(o => o.createdAt))) >= 43_200_000) {
+                  // AGENTIC-EARN-SPEC R11.12: an earn row is not Binance activity for the free clock (a refused redeem writes a row every few minutes).
+                  : Math.max(row.probe?.keepAliveAtMs ?? row.acceptedAt ?? now, ...(await store.orders(row.walletAddress!)).filter(o => o.kind !== "earn-deposit" && o.kind !== "earn-redeem").map(o => o.createdAt))) >= 43_200_000) {
                 const current = await store.byAgent(row.agentId!);
                 if (current?.state === "bound" && await store.renewFence(fence) !== null) {
                   await input.runner.run(["market-order", "list", "--binanceChainId", "56", "--page", "1", "--pageSize", "1"], decryptAgenticSession(current, input.masterKey));
@@ -200,10 +227,21 @@ export async function runAgenticCycle(input: AgenticLifecycleDeps & { execution:
         if (fence !== null) try { await resolveAgenticOrder({ ...input.execution, journal: input.journal, order, fence }); }
         finally { await store.releaseFence(fence); }
       }
+      // The Agentic Earn step (AGENTIC-EARN-SPEC 3.4): after the generic resolver and before the DCA step, so a redeem lands before a fire and before the shared worker in the same cycle; earn hires only.
+      if (row.hireFacts?.earn?.v === 1 && ["bound", "ending", "ended"].includes(row.state)) {
+        row = await runAgenticEarnStep({ store, positions: input.positions, runner: input.runner, masterKey: input.masterKey, instance, chain: input.execution.chain,
+          worker: input.worker, cmc: input.cmc, killswitch: input.worker.killswitch, earnEnabled: input.earnEnabled ?? agenticEarnEnabled(process.env),
+          ...(input.earnProducts === undefined ? {} : { products: input.earnProducts }), ...(input.execution.gateRunId === undefined ? {} : { gateRunId: input.execution.gateRunId }) }, row, options);
+      }
       // The Agentic DCA step (AGENTIC-DCA-SPEC R21.6): after the generic resolver and before the logout stages, for bound, ending and ended DCA rows; it returns the row it last wrote.
       if (row.hireParams !== null && isTradeDcaSettings(row.hireParams.settings) && ["bound", "ending", "ended"].includes(row.state)) {
         row = await runAgenticDcaStep({ store, positions: input.positions, runner: input.runner, masterKey: input.masterKey, instance, chain: input.execution.chain, execution: input.execution,
           worker: input.worker, cmc: input.cmc, journal: input.journal, dcaEnabled: input.dcaEnabled ?? agenticDcaEnabled(process.env) }, row, options);
+      }
+      // AGENTIC-MEME-STOCKS-SPEC 8.1 / 9.2: the paper meme step, beside the DCA step, for bound, ending and ended meme rows; it returns the row it last read.
+      if (row.hireFacts?.meme !== undefined && ["bound", "ending", "ended"].includes(row.state)) {
+        row = (await runAgenticMemeStep({ store, positions: input.positions, runner: input.runner, masterKey: input.masterKey, instance, chain: input.execution.chain,
+          worker: input.worker, memeEnabled: input.memeEnabled ?? agenticMemeEnabled(process.env), cycleStartMs }, row, options)).row;
       }
       if (!options.reconciliationOnly && row.state === "ending") await resumeAgenticEnding(input, row);
       if (row.state === "ended") await revokeAgenticAgent(input, row);
@@ -225,12 +263,14 @@ export async function runAgenticCycle(input: AgenticLifecycleDeps & { execution:
 export function startAgenticLane(input: Parameters<typeof runAgenticCycle>[0], options: { dryRun: boolean; once: boolean }) {
   let stopping = false;
   let wake: (() => void) | null = null;
+  // 17: aligned is this process's meme flag, read once at boot (no new flag).
+  const aligned = input.memeEnabled ?? agenticMemeEnabled(process.env);
   const done = (async () => {
     do {
       const start = Date.now();
       try { await runAgenticCycle(input, { dryRun: options.dryRun }); } catch { console.error("agentic_lane_failed"); }
       if (stopping || options.once) break;
-      await new Promise<void>(resolve => { const timer = setTimeout(resolve, Math.max(0, 60_000 - (Date.now() - start))); wake = () => { clearTimeout(timer); resolve(); }; });
+      await new Promise<void>(resolve => { const timer = setTimeout(resolve, agenticLaneSleepMs(Date.now(), start, aligned)); wake = () => { clearTimeout(timer); resolve(); }; });
     } while (!stopping);
   })();
   return { done, stop() { stopping = true; input.instance.stopClaiming(); wake?.(); }, async close() {

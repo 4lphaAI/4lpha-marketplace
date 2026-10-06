@@ -28,7 +28,8 @@ async function proxy(request: NextRequest, segments: readonly string[], method: 
     if (!url || !token) throw new Error();
     const body = method === "POST" ? await request.text() : undefined;
     if (body !== undefined && Buffer.byteLength(body) > 16_384) return NextResponse.json({ data: null, error: { code: "invalid_body" } }, { status: 413 });
-    const upstream = await fetch(url.replace(/\/$/, "") + "/agentic/" + path, { method, cache: "no-store", signal: AbortSignal.timeout(30_000),
+    // A hire runs the gated Binance checks (and the Earn reads when opted in): measured ~40 s locally, so it gets 120 s; every other call keeps 30 s.
+    const upstream = await fetch(url.replace(/\/$/, "") + "/agentic/" + path, { method, cache: "no-store", signal: AbortSignal.timeout(method === "POST" && path === "hire" ? 120_000 : 30_000),
       headers: { accept: "application/json", "x-exec-token": token, ...(body === undefined ? {} : { "content-type": "application/json", origin: publicOrigin(request) }),
         ...(!publicRead && path !== "pairings" && cookie !== undefined ? { "x-agentic-pairing": cookie } : {}) }, ...(body === undefined ? {} : { body }) });
     const raw = await upstream.text();

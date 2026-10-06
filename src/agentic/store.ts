@@ -10,7 +10,7 @@ import type { CmcBudgetStore } from "../store/tradeCmc.js";
 import type { KillSwitch } from "../killswitch/killswitch.js";
 import type { SqlClient } from "../store/sql.js";
 import { agenticAddress, type AgenticWallet, type AgenticOrder, type AgenticFence, type AgenticInstance,
-  type AgenticGateRun, type AgenticSession, type AgenticDcaRound, type AgenticDcaOrder } from "./domain.js";
+  type AgenticGateRun, type AgenticSession, type AgenticDcaRound, type AgenticDcaOrder, type AgenticMemePaper, type AgenticMemeLog } from "./domain.js";
 
 export const AGENTIC_DDL: readonly string[] = [
 `create table if not exists agentic_wallets (
@@ -77,7 +77,7 @@ create unique index if not exists agentic_orders_tx on agentic_orders (tx_hash) 
 `create table if not exists agentic_gate_runs(run_id text primary key, gate text not null, agent_id text not null, wallet text not null, side text not null, max_dispatches integer not null, dispatches integer not null, max_notional_usdt text not null, max_cmc_payments integer not null, cmc_payments integer not null, cmc_operation_ids jsonb not null, deadline_ms bigint not null, created_at bigint not null, closed_at bigint);`,
 // AGENTIC-DCA-SPEC 3.3 (Revisions 2, 2.2): appended last so the entries above keep their positions; every statement is idempotent.
 `alter table agentic_orders drop constraint if exists agentic_orders_kind_check;
-alter table agentic_orders add constraint agentic_orders_kind_check check (kind in ('swap','x402-sign','limit-place','limit-cancel'));
+alter table agentic_orders add constraint agentic_orders_kind_check check (kind in ('swap','x402-sign','limit-place','limit-cancel','earn-deposit','earn-redeem'));
 alter table agentic_orders add column if not exists binance_answered_at bigint;
 alter table agentic_wallets drop constraint if exists agentic_wallets_end_reason_check;
 alter table agentic_wallets add constraint agentic_wallets_end_reason_check check (end_reason in ('owner-signed-out','term-ended','stop-loss'));
@@ -107,6 +107,29 @@ create table if not exists agentic_dca_orders (
 create unique index if not exists agentic_dca_orders_strategy on agentic_dca_orders (wallet_address, strategy_id) where strategy_id is not null;
 create unique index if not exists agentic_dca_orders_tx on agentic_dca_orders (tx_hash) where tx_hash is not null;
 create unique index if not exists agentic_dca_rounds_open on agentic_dca_rounds (agent_id) where phase not in ('settled','stopped','ended','interrupted');
+`,
+// AGENTIC-MEME-STOCKS-SPEC 8.2: the paper ledger and the decision log of paper meme hires, appended last (the rule above); nothing else reads or writes them.
+`create table if not exists agentic_meme_paper (
+  position_id text primary key,
+  agent_id text not null, wallet_address text not null, token text not null,
+  symbol text, quote_token text not null, quote_symbol text,
+  venue_entry text not null check (venue_entry in ('flap-bonding','pancake-v2')),
+  buy_tax_bps integer not null, sell_tax_bps integer not null, token_version integer not null,
+  entry_usdt text not null, gas_buy_usdt text not null, bnb_usdt_e18 text not null,
+  tokens text not null, cost_bps integer not null,
+  status text not null check (status in ('open','closed')),
+  last_mark_usdt text, last_mark_at bigint, peak_pnl_bps integer, mark_skips integer not null default 0,
+  mark_count integer not null default 0, close_requested_at bigint,
+  close_code text check (close_code in ('stop','trailing','dead-chart','smart-out','flow-flip','time','drain','ended')),
+  exit_usdt text, gas_sell_usdt text, pnl_usdt text, closed_at bigint,
+  opened_at bigint not null, version integer not null default 1);
+create unique index if not exists agentic_meme_paper_open on agentic_meme_paper (agent_id, token) where status = 'open';
+create table if not exists agentic_meme_log (
+  id text primary key, agent_id text,
+  kind text not null check (kind in ('market','cycle','signal','llm','entry','mark','exit')),
+  token text, at_ms bigint not null, data jsonb not null);
+create index if not exists agentic_meme_log_agent on agentic_meme_log (agent_id, at_ms);
+create index if not exists agentic_meme_log_kind on agentic_meme_log (kind, at_ms);
 `
 ];
 const CLOCK = "(extract(epoch from clock_timestamp()) * 1000)::bigint";
@@ -148,11 +171,17 @@ const IC = { instanceId: "instance_id", service: "service", host: "host", pid: "
 const GC = { runId: "run_id", gate: "gate", agentId: "agent_id", wallet: "wallet", side: "side", maxDispatches: "max_dispatches",
   dispatches: "dispatches", maxNotionalUsdt: "max_notional_usdt", maxCmcPayments: "max_cmc_payments", cmcPayments: "cmc_payments",
   cmcOperationIds: "cmc_operation_ids", deadlineMs: "deadline_ms", createdAt: "created_at", closedAt: "closed_at" } satisfies Record<keyof AgenticGateRun, string>;
-const JSON_FIELDS = new Set(["qr", "factsRead", "hireParams", "hireFacts", "settingsHold", "entriesStopped", "probe", "endBlockers", "logout", "listSnapshot", "evidence", "cmcOperationIds", "stopCounter"]);
+const MC = { positionId: "position_id", agentId: "agent_id", walletAddress: "wallet_address", token: "token", symbol: "symbol", quoteToken: "quote_token", quoteSymbol: "quote_symbol",
+  venueEntry: "venue_entry", buyTaxBps: "buy_tax_bps", sellTaxBps: "sell_tax_bps", tokenVersion: "token_version", entryUsdt: "entry_usdt", gasBuyUsdt: "gas_buy_usdt",
+  bnbUsdtE18: "bnb_usdt_e18", tokens: "tokens", costBps: "cost_bps", status: "status", lastMarkUsdt: "last_mark_usdt", lastMarkAt: "last_mark_at", peakPnlBps: "peak_pnl_bps",
+  markSkips: "mark_skips", markCount: "mark_count", closeRequestedAt: "close_requested_at", closeCode: "close_code", exitUsdt: "exit_usdt", gasSellUsdt: "gas_sell_usdt",
+  pnlUsdt: "pnl_usdt", closedAt: "closed_at", openedAt: "opened_at", version: "version" } satisfies Record<keyof AgenticMemePaper, string>;
+const LC = { id: "id", agentId: "agent_id", kind: "kind", token: "token", atMs: "at_ms", data: "data" } satisfies Record<keyof AgenticMemeLog, string>;
+const JSON_FIELDS = new Set(["qr", "factsRead", "hireParams", "hireFacts", "settingsHold", "entriesStopped", "probe", "endBlockers", "logout", "listSnapshot", "evidence", "cmcOperationIds", "stopCounter", "data"]);
 const NUMBERS = new Set(["codeAttempts", "codeMatchedAt", "verifiedAt", "continuationDeadline", "acceptedAt", "hireEndMs", "entryCutoffMs",
   "drainRequestedAt", "version", "createdAt", "updatedAt", "quoteAt", "claimedAt", "claimDeadline", "leaseUntil", "pid", "bootAt",
   "heartbeatAt", "retiredAt", "maxDispatches", "dispatches", "maxCmcPayments", "cmcPayments", "deadlineMs", "closedAt",
-  "roundNo", "levelNo", "rowVersion", "failStreak", "tpFilledAt", "backoffUntilMs", "tpDueAt", "openedAt", "settledAt"]);
+  "roundNo", "levelNo", "rowVersion", "failStreak", "tpFilledAt", "backoffUntilMs", "tpDueAt", "openedAt", "settledAt", "lastMarkAt", "closeRequestedAt", "atMs"]);
 type Columns = Readonly<Record<string, string>>;
 export type AgenticSources = { agents: AgentStore; journal: ExecutionJournal; intents: TradeIntentStore; cmc: CmcBudgetStore; killswitch: KillSwitch };
 
@@ -598,7 +627,99 @@ export class AgenticStore {
       return structuredClone(updated);
     });
   }
+
+  /* ---- Agentic meme paper (AGENTIC-MEME-STOCKS-SPEC 8.2): the lane is the only writer, except `meme-close` setting close_requested_at; every update a version CAS ---- */
+  readonly #memePaper = new Map<string, AgenticMemePaper>();
+  readonly #memeLog = new Map<string, AgenticMemeLog>();
+  async paperList(agentId: string): Promise<AgenticMemePaper[]> {
+    const rows = this.#sql === null ? structuredClone([...this.#memePaper.values()].filter(r => r.agentId === agentId))
+      : await this.#select<AgenticMemePaper>("agentic_meme_paper", MC, "where agent_id=$1", [agentId]);
+    return rows.sort((a, b) => a.openedAt - b.openedAt || a.positionId.localeCompare(b.positionId));
+  }
+  async paperOpen(agentId: string): Promise<AgenticMemePaper[]> { return (await this.paperList(agentId)).filter(r => r.status === "open"); }
+  /** False on a duplicate id or a second open row of the same agent and token. */
+  async insertPaper(row: AgenticMemePaper): Promise<boolean> {
+    if (this.#sql !== null) return this.#insert("agentic_meme_paper", MC, row);
+    return this.#locked(async () => {
+      if (this.#memePaper.has(row.positionId) || row.status === "open" && [...this.#memePaper.values()].some(r => r.agentId === row.agentId && r.token === row.token && r.status === "open")) return false;
+      this.#memePaper.set(row.positionId, structuredClone(row)); return true;
+    });
+  }
+  async patchPaper(row: AgenticMemePaper, patch: Partial<AgenticMemePaper>): Promise<AgenticMemePaper | null> {
+    const next = { ...patch, version: row.version + 1 };
+    if (this.#sql !== null) return this.#update<AgenticMemePaper>("agentic_meme_paper", MC, next, "position_id=$1 and version=$2", [row.positionId, row.version]);
+    return this.#locked(async () => {
+      const current = this.#memePaper.get(row.positionId);
+      if (current === undefined || current.version !== row.version) return null;
+      const updated = { ...current, ...next };
+      this.#memePaper.set(row.positionId, structuredClone(updated)); return structuredClone(updated);
+    });
+  }
+  /** A duplicate id is a no-op (false). */
+  async insertMemeLog(row: AgenticMemeLog): Promise<boolean> {
+    if (this.#sql !== null) return this.#insert("agentic_meme_log", LC, row);
+    return this.#locked(async () => { if (this.#memeLog.has(row.id)) return false; this.#memeLog.set(row.id, structuredClone(row)); return true; });
+  }
+  /** One agent's rows (`agentId` null: every row, the global `market` rows included) with `sinceMs <= at_ms <= untilMs`, oldest first. */
+  async memeLog(agentId: string | null, sinceMs: number, untilMs: number): Promise<AgenticMemeLog[]> {
+    const rows = this.#sql === null ? structuredClone([...this.#memeLog.values()].filter(r => (agentId === null || r.agentId === agentId) && r.atMs >= sinceMs && r.atMs <= untilMs))
+      : await this.#select<AgenticMemeLog>("agentic_meme_log", LC, agentId === null ? "where at_ms>=$1 and at_ms<=$2" : "where agent_id=$3 and at_ms>=$1 and at_ms<=$2",
+        agentId === null ? [sinceMs, untilMs] : [sinceMs, untilMs, agentId]);
+    return rows.sort((a, b) => a.atMs - b.atMs || a.id.localeCompare(b.id));
+  }
+
+  /* ---- Agentic Earn (AGENTIC-EARN-SPEC 3.12, 36): one claim CAS for an earn row, outside the PIN2 slices; the memory twin mirrors EARN_CLAIM_SQL predicate by predicate ---- */
+  async claimEarnOrder(row: AgenticOrder, f: AgenticFence): Promise<AgenticOrder | null> {
+    if (row.kind !== "earn-deposit" && row.kind !== "earn-redeem") return null;
+    if (this.#sql !== null) {
+      const result = await this.#sql.query<Record<string, unknown>>(EARN_CLAIM_SQL, [row.idempotencyKey, f.holder, f.token, row.kind]);
+      return result.rows[0] === undefined ? null : decoded(result.rows[0], OC);
+    }
+    return this.#locked(async () => {
+      const current = this.#orders.get(row.idempotencyKey), now = this.#now();
+      if (current === undefined || current.kind !== row.kind || current.dispatch !== "unclaimed" || current.outcome !== "open" || current.createdAt < now - 60_000) return null;
+      const instance = this.#instances.get(f.holder), fence = this.#fences.get(current.walletAddress);
+      const wallet = [...this.#wallets.values()].find(w => w.agentId === current.agentId && w.walletAddress === current.walletAddress);
+      const deposit = current.kind === "earn-deposit";
+      const [agent, halted, paused] = await Promise.all([this.#sources.agents.getAgentById(current.agentId), this.#sources.killswitch.isHalted(),
+        this.#sources.killswitch.isAgentPaused(current.agentId, current.walletAddress)]);
+      const signInMax = wallet?.hireFacts?.signInMaxTimeMs;
+      if (instance === undefined || !["trade-worker", "agentic-gate"].includes(instance.service) || instance.retiredAt !== null || instance.heartbeatAt < now - 30_000
+        || fence === undefined || fence.holder !== f.holder || fence.token !== f.token || fence.leaseUntil < now + 75_000
+        || wallet === undefined || wallet.hireFacts?.earn === undefined || wallet.sessionCiphertext === null || signInMax === undefined
+        || (deposit ? !(wallet.state === "bound" && wallet.settingsHold === null && wallet.entriesStopped === null && wallet.drainRequestedAt === null && wallet.hireEndMs !== null && now + 5_000 < wallet.hireEndMs - 86_400_000)
+          : !(["bound", "ending"].includes(wallet.state) && now + 5_000 < signInMax - 1_800_000))
+        || agent?.custodyModel !== "binance-agentic" || !(agent.status === "armed" || !deposit && agent.status === "revoked") || halted || paused) return null;
+      if ([...this.#orders.values()].some(o => o.walletAddress === current.walletAddress && o.idempotencyKey !== current.idempotencyKey && (o.outcome === "open" || o.fillCheck === "pending"))) return null;
+      for (const w of [...this.#wallets.values()].filter(w => w.walletAddress === current.walletAddress && w.agentId !== null)) {
+        if ((await this.#sources.intents.listUnsettled(current.walletAddress, w.agentId!)).length !== 0) return null;
+      }
+      const next = { ...current, dispatch: "spawned" as const, claimedAt: now, claimant: f.holder, fenceToken: f.token, updatedAt: now,
+        claimDeadline: deposit ? wallet.hireEndMs! - 86_400_000 : signInMax - 1_800_000 };
+      this.#orders.set(row.idempotencyKey, next); return structuredClone(next);
+    });
+  }
 }
+
+/** AGENTIC-EARN-SPEC 3.12: the earn claim. A deposit needs a bound hire with no hold, entries open and more than 24 h before the end; a redeem also runs while `ending`, on a revoked agent and under a hold, up to 30 min before the Binance maximum sign-in time. */
+export const EARN_CLAIM_SQL = `with n as materialized (select ${CLOCK} as ms)
+update agentic_orders o set dispatch='spawned',claimed_at=n.ms,claimant=$2,fence_token=$3,updated_at=n.ms,
+ claim_deadline=(select case when o.kind='earn-deposit' then w.hire_end_ms-86400000
+   else (w.hire_facts->>'signInMaxTimeMs')::bigint-1800000 end from agentic_wallets w where w.agent_id=o.agent_id)
+from n where o.idempotency_key=$1 and o.kind=$4 and o.kind in ('earn-deposit','earn-redeem')
+ and o.dispatch='unclaimed' and o.outcome='open' and o.created_at>=n.ms-60000
+ and exists(select 1 from agentic_instances i where i.instance_id=$2 and i.service in ('trade-worker','agentic-gate') and i.retired_at is null and i.heartbeat_at>=n.ms-30000)
+ and exists(select 1 from agentic_wallet_fences f where f.wallet_address=o.wallet_address and f.holder=$2 and f.token=$3 and f.lease_until>=n.ms+75000)
+ and exists(select 1 from agentic_wallets w where w.agent_id=o.agent_id and w.wallet_address=o.wallet_address
+   and w.hire_facts->'earn' is not null and w.session_ciphertext is not null
+   and (o.kind='earn-deposit' and w.state='bound' and w.settings_hold is null and w.entries_stopped is null
+        and w.drain_requested_at is null and n.ms+5000<w.hire_end_ms-86400000
+     or o.kind='earn-redeem' and w.state in ('bound','ending') and n.ms+5000<(w.hire_facts->>'signInMaxTimeMs')::bigint-1800000))
+ and exists(select 1 from agents a where a.id=o.agent_id and a.custody_model='binance-agentic'
+   and (a.status='armed' or o.kind='earn-redeem' and a.status='revoked'))
+ and not exists(select 1 from global_halt where id='global') and not exists(select 1 from agent_pause p where p.agent_id=o.agent_id)
+ and not exists(select 1 from agentic_orders x where x.wallet_address=o.wallet_address and x.idempotency_key<>o.idempotency_key and (x.outcome='open' or x.fill_check='pending'))
+ and not exists(select 1 from trade_intents i where i.state='pending' and i.agent_id in (select h.agent_id from agentic_wallets h where h.wallet_address=o.wallet_address and h.agent_id is not null)) returning o.*`;
 
 export const AGENTIC_CLAIM_SQL = `with n as materialized (select ${CLOCK} as ms)
 update agentic_orders o set dispatch='spawned',claimed_at=n.ms,claimant=$2,fence_token=$3,

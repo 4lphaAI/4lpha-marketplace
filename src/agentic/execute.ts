@@ -58,6 +58,8 @@ export async function executeAgenticTrade(input: ExecuteTradeInput, deps: Agenti
   const denied = (code: string): ExecuteTradeResult => ({ kind: "denied", status: 409, code });
   let wallet = await deps.store.byAgent(agent.id);
   if (wallet === null || wallet.walletAddress === null || wallet.hireFacts === null || agent.custodyModel !== "binance-agentic") return denied("not_executable");
+  // AGENTIC-MEME-STOCKS-SPEC PA1: a paper meme hire never trades, whatever reaches this executor.
+  if (wallet.hireFacts.meme?.mode === "paper") return denied("AGENTIC_MEME_PAPER");
   // 0 = not a portfolio hire: every portfolio branch below keys on this and leaves AI and Schedule hires as they were.
   const portfolioTokens = wallet.hireParams !== null && isTradePortfolioSettings(wallet.hireParams.settings) ? wallet.hireParams.settings.portfolioTokens!.length : 0;
   // R3.5: a gate run opened with side "dca" admits both sides of a DCA hire (its base, level and take-profit swaps); every other run side keeps its exact-match rule.
@@ -112,7 +114,8 @@ export async function executeAgenticTrade(input: ExecuteTradeInput, deps: Agenti
     // A Schedule agent never sells, so its buy floor counts one token however many fills it holds.
     // A portfolio never opens a position: its buy floor counts the granted stocks, (N + 2) x 0.0004 BNB.
     const open = bounds.scheduleAgent ? 1 : portfolioTokens > 0 ? portfolioTokens : (await deps.positions.listOpen(agent.ownerAddress, agent.id)).length;
-    if (await deps.chain.balance(W, null) < (request.side === "buy" ? BigInt(open + 2) * 400_000_000_000_000n : 100_000_000_000_000n)) return denied("AGENTIC_LOW_BNB");
+    // AGENTIC-EARN-SPEC 3.10: an earn hire's buy never spends the last 0.0004 BNB redeem reserve; sells keep their floor.
+    if (await deps.chain.balance(W, null) < (request.side === "buy" ? BigInt(open + 2 + (wallet.hireFacts.earn !== undefined ? 1 : 0)) * 400_000_000_000_000n : 100_000_000_000_000n)) return denied("AGENTIC_LOW_BNB");
     const metadata = await deps.chain.metadata(token), multiplier = await deps.chain.multiplier(token);
     if (metadata.decimals !== 18 || multiplier < 10n ** 18n) return denied("AGENTIC_AMOUNT_UNREPRESENTABLE");
     let fromQty = agenticUiString(request.amountWei), multiplierPre = agenticUiString(multiplier);

@@ -6,7 +6,8 @@ import { useTokenIcons } from "@/components/TokenIcon";
 import { ZeroGCredit } from "@/components/ZeroGCredit";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
 import { ClosedPositionRow, CmcLog, DcaDetail, DcaTiles, Metric, PositionRow, bps, closedNewestFirst, compactAddress, usdt2, type PositionRowSettings } from "@/components/trade/TradeAgentDetail";
-import { AGENTIC_DCA_COPY, agenticDcaView, agenticRequest, isAgenticDcaDto } from "@/lib/agentic";
+import { AGENTIC_DCA_COPY, AGENTIC_MEME_COPY, agenticDcaView, agenticRequest, isAgenticDcaDto, isAgenticMemeDto, type AgenticMemeDto } from "@/lib/agentic";
+import { AgenticEarnTab } from "./AgenticEarnTab";
 import { relativeTime } from "@/lib/exec/agent-detail";
 import { parseErc8004Identity } from "@/lib/exec/erc8004-identity";
 import { TradeRunLog } from "@/components/trade/TradeRunLog";
@@ -42,8 +43,12 @@ type PublicWallet = { wallet: string; custody: "binance-agentic"; agent: null | 
   dca?: unknown;
   /** The ERC-8004 summary (absent before the identity is enrolled or on a plane without the field); read through parseErc8004Identity, never cast. */
   erc8004Identity?: unknown;
+  /** Present only for a paper meme hire (AGENTIC-MEME-STOCKS-SPEC 9.3); read through isAgenticMemeDto, never cast. */
+  meme?: unknown;
+  /** Present only for an earn hire (AGENTIC-EARN-SPEC 3.15); read through isAgenticEarnDto, never cast. */
+  earn?: unknown;
 } };
-type Tab = "Open Positions" | "Closed Positions" | "Kept Positions" | "Run log" | "CMC x402";
+type Tab = "Open Positions" | "Closed Positions" | "Kept Positions" | "Run log" | "Earn" | "CMC x402";
 
 /** Not a number: every amount formatter the rows use prints a dash for it, so a value the public view does not carry is never invented. */
 const UNAVAILABLE = "unavailable";
@@ -52,6 +57,35 @@ const QUOTE_STATUSES = ["quoted", "unattributed", "balance-gone", "unavailable",
 const CMC_STATUS: Readonly<Record<string, string>> = { disabled: "Off", "setup-required": "Setup required", pending: "Pending owner evidence", ready: "Ready", exhausted: "Exhausted" };
 const NO_POSITIONS: readonly PublicPosition[] = [];
 const USDT_ADDRESS = "0x55d398326f99059ff775485246999027b3197955";
+
+/** 9.4 (review R2-M2): a paper meme hire shows only its paper ledger, labelled paper; it has no real-summary tile, and a tile without a paper source shows a dash with its reason. */
+function MemePaper({ meme, capital, runs, symbols }: { meme: AgenticMemeDto; capital: string | null; runs: NonNullable<TradeView["runs"]>; symbols: Record<string, string> }) {
+  const s = meme.paper.summary, pnl = s.pnlUsdtWei, tone = pnl === null || !/^-?\d+$/u.test(pnl) ? "normal" : BigInt(pnl) < 0n ? "loss" : "profit";
+  const newestFirst = [...meme.paper.positions].sort((a, b) => b.openedAt - a.openedAt);
+  return <>
+    <div className="fl-trade-message" role="status" data-testid="meme-paper-banner"><p><strong>{AGENTIC_MEME_COPY.banner}</strong></p><p>{AGENTIC_MEME_COPY.noTokenList}</p></div>
+    <div className="fl-trade-metrics">
+      <Metric label="Paper budget" value={usdt2(capital)} note={capital === null ? "Capital is not recorded for this agent." : "Sizing only: no USDT is held"} />
+      <Metric label="Paper PnL (closed)" value={usdt2(pnl, true)} tone={tone} {...(pnl === null ? { note: "No closed paper trade yet" } : { note: "After fees, taxes and gas" })} />
+      <Metric label="Paper win rate" value={s.winRateBps === null ? "-" : bps(s.winRateBps)} note={s.winRateBps === null ? "No closed paper trade yet" : `${s.wins}/${s.closed} wins`} />
+      <Metric label="Paper positions" value={`${s.open} open`} note={`${s.closed} closed`} />
+    </div>
+    <section className="fl-trade-table" aria-label="Paper ledger">
+      <div className="fl-trade-table__bar"><span>Paper ledger</span></div>
+      <div className="fl-trade-scroll" role="region" aria-label="Paper positions" tabIndex={0}>
+        {newestFirst.length === 0 ? <div className="fl-trade-empty">No paper positions yet.</div> : newestFirst.map((p) => <div key={p.ref} className="fl-trade-position" data-testid="meme-paper-row">
+          <span>{p.symbol ?? compactAddress(p.token)}{p.quoteSymbol === null ? "" : ` / ${p.quoteSymbol}`}</span>
+          <span>{p.venue === "flap-bonding" ? "curve" : "graduated"}</span>
+          <span>{p.status === "closed" ? (p.closeCode ?? "closed").replace(/-/gu, " ") : "open"}</span>
+          <span>{usdt2(p.entryUsdtWei)}</span>
+          <span>{p.status === "closed" ? usdt2(p.exitUsdtWei) : p.markUsdtWei === null ? "- (no mark yet)" : usdt2(p.markUsdtWei)}</span>
+          <span className="fl-trade-heading-end">{p.pnlBps === null ? "- (no mark yet)" : bps(p.pnlBps, true)}</span>
+        </div>)}
+      </div>
+    </section>
+    <RunLogPanel runLog={<section className="fl-trade-table"><div className="fl-trade-table__bar"><span>Run log</span></div><TradeRunLog runs={runs} symbols={symbols} /></section>} />
+  </>;
+}
 
 function modelLabel(id: string): string {
   return (TRADE_LLM_MODELS.find((model) => model.id === id)?.label ?? id).replace(/^Auto:\s*/u, "");
@@ -75,7 +109,7 @@ function tradePosition(p: PublicPosition, observedAt: number): TradePositionView
       currentQuoteWei: p.live?.currentQuoteWei ?? null, pnlBps: p.pnlBps, quoteStatus, reason: null, observedAt } };
 }
 
-export function AgenticPublicScreen({ wallet }: { wallet: string }) {
+export function AgenticPublicScreen({ wallet, go }: { wallet: string; go?: (route: string) => void }) {
   const [data, setData] = React.useState<PublicWallet | null>(null), [error, setError] = React.useState<string | null>(null);
   const [loadedAt, setLoadedAt] = React.useState(0), [tab, setTab] = React.useState<Tab>("Open Positions"), [expanded, setExpanded] = React.useState<string | null>(null);
   const active = React.useRef(true);
@@ -128,13 +162,17 @@ export function AgenticPublicScreen({ wallet }: { wallet: string }) {
   const state = agent === null ? "paused" : agent.status === "ended" ? "danger" : agent.status === "running" || agent.status === "entries-stopped" ? "live" : "paused";
   const stateLabel = agent === null ? undefined : agent.status === "ended" ? (hasDca && agent.endReason === "stop-loss" ? "Stopped by stop loss" : "Ended") : agent.schedule?.finished != null ? "Finished: " + agent.schedule.finished
     : agent.status === "running" ? undefined : agent.status.replace(/-/gu, " ");
-  const tabs: readonly Tab[] = kept.length > 0 ? ["Open Positions", "Closed Positions", "Kept Positions", "Run log", "CMC x402"] : ["Open Positions", "Closed Positions", "Run log", "CMC x402"];
+  // The Earn tab exists only for an earn hire (its block is present); a malformed block is reported inside the tab.
+  const earnTab = agent !== null && agent.earn !== undefined ? <AgenticEarnTab earn={agent.earn} refresh={load} /> : undefined;
+  const earnTabs: readonly Tab[] = earnTab === undefined ? [] : ["Earn"];
+  const tabs: readonly Tab[] = kept.length > 0 ? ["Open Positions", "Closed Positions", "Kept Positions", "Run log", ...earnTabs, "CMC x402"] : ["Open Positions", "Closed Positions", "Run log", ...earnTabs, "CMC x402"];
   const shown: Tab = tabs.includes(tab) ? tab : "Open Positions";
   const refresh = <Button variant="ghost" size="sm" icon={<Icon name="refresh" size={13} />} onClick={() => void load()}>Refresh</Button>;
   const openHead = <div className="fl-trade-position fl-trade-position--head"><span>Position</span><span>Age</span><span>Size</span><span>Exit plan</span><span>Chart</span><span className="fl-trade-heading-end">Unrealised</span><span className="fl-trade-heading-end">Actions</span></div>;
   const toggle = (id: string) => () => setExpanded(expanded === id ? null : id);
   const unsoldPlan = (p: PublicPosition) => <><strong>{(p.unsold?.code ?? "kept").replace(/-/gu, " ")}</strong>{p.unsold?.atMs == null ? null : <span>{relativeTime(p.unsold.atMs, Date.now()).text}</span>}</>;
   return <div className="fl-shell fl-hired-agent-page fl-trade-detail-page">
+    {go === undefined ? null : <Button variant="ghost" size="sm" icon={<Icon name="chevron-right" size={14} style={{ transform: "rotate(180deg)" }} />} onClick={() => go("/account")}>My agents</Button>}
     <div className="fl-trade-hero">
       <div className="fl-trade-title-stack">
         <div className="fl-trade-title"><span className="fl-card__glyph"><Icon name="yield" size={22} /></span><h1>{agent?.name ?? "Binance Agentic Wallet"}</h1>
@@ -156,13 +194,14 @@ export function AgenticPublicScreen({ wallet }: { wallet: string }) {
       {agent?.connection === "unreachable" ? <p>The Binance connection is unreachable; the figures below are the last verified ones.</p> : null}
     </div> : null}
     {error ? <p role="alert">{error}</p> : null}{data === null && !error ? <p>Loading...</p> : null}{data !== null && agent === null ? <p>No Agentic hire found for this wallet.</p> : null}
-    {agent === null ? null : hasDca ? (dcaView === null ? <p role="alert">Auto DCA data unavailable.</p>
+    {agent === null ? null : agent.meme !== undefined ? (isAgenticMemeDto(agent.meme) ? <MemePaper meme={agent.meme} capital={capital} runs={agent.runs ?? []} symbols={symbols} />
+      : <p role="alert">Paper data unavailable.</p>) : hasDca ? (dcaView === null ? <p role="alert">Auto DCA data unavailable.</p>
       : <>
         {/* The Altana stat row (R3.10): after a stop, a term end or an owner end the round is nulled so the PnL tile takes its rounds rule, and the Average-price tile keeps the holding (R31.3). */}
         <DcaTiles dca={dcaTerminal ? { ...dcaView, round: null } : dcaView} settings={capital === null ? null : { capitalQuoteWei: capital }} live={live}
           {...(dcaTerminal ? { ended: { avgCostE8: dcaView.round?.avgCostE8 ?? null } } : {})} />
         <DcaDetail dca={dcaView} status={live ? "armed" : agent.status} draining={false} planeUnreachable={false} busy={false} refresh={load} icon={icons[dcaView.token.toLowerCase()] ?? null}
-        runs={agent.runs ?? []} symbols={{ [dcaView.token.toLowerCase()]: dcaView.symbol }} readOnly endReason={agent.endReason}
+        runs={agent.runs ?? []} symbols={{ [dcaView.token.toLowerCase()]: dcaView.symbol }} readOnly endReason={agent.endReason} {...(earnTab === undefined ? {} : { earnTab })}
         holdingsExtra={<section className="fl-trade-budget" data-testid="dca-keepalive-panel">
           <div className="fl-trade-budget__head"><div><span className="fl-trade-kicker">CMC keep-alive (x402)</span><p>{AGENTIC_DCA_COPY.keepAlivePanel}</p></div><strong>{CMC_STATUS[agent.cmc.status] ?? "Unavailable"}</strong></div>
           <div className="fl-trade-budget__facts"><span>Remaining <b>{usdt2(agent.cmc.remainingWei)}</b></span><span>Settled <b>{usdt2(agent.cmc.settledWei)}</b></span><span>Total <b>{usdt2(agent.cmc.authorizedTotalWei)}</b></span>
@@ -173,7 +212,7 @@ export function AgenticPublicScreen({ wallet }: { wallet: string }) {
       <PortfolioDetail portfolio={portfolioData.portfolio} settings={portfolioData.settings} runs={agent.runs ?? []} icons={icons} refresh={load} readOnly />
     </>) : schedule !== null ? (scheduleData === null ? <p role="alert">Schedule data unavailable.</p> : <>
       <ScheduleSummary {...scheduleData} open={scheduleOpen} readOnly label={`Schedule buy · ${scheduleData.schedule.symbol}`} />
-      <ScheduleTabs {...scheduleData} trade={{ open: scheduleOpen, runs: agent.runs ?? [] }} refresh={load} readOnly />
+      <ScheduleTabs {...scheduleData} trade={{ open: scheduleOpen, runs: agent.runs ?? [] }} refresh={load} readOnly {...(earnTab === undefined ? {} : { earnTab })} />
     </>) : <>
       <div className="fl-trade-metrics">
         <Metric label="Total Delegated" value={usdt2(capital)} {...(capital === null ? { note: "Capital is not recorded for this agent." } : {})} />
@@ -183,7 +222,7 @@ export function AgenticPublicScreen({ wallet }: { wallet: string }) {
         <Metric label="Open positions" value={`${agent.summary.openPositions} / ${agent.summary.maxOpenPositions}`} />
       </div>
       <div className="fl-trade-tabs">{tabs.map((item) => <button key={item} type="button" className={shown === item ? "is-active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
-      {shown === "CMC x402" ? <><section className="fl-trade-budget" data-testid="cmc-budget-panel">
+      {shown === "Earn" ? earnTab : shown === "CMC x402" ? <><section className="fl-trade-budget" data-testid="cmc-budget-panel">
         <div className="fl-trade-budget__head"><div><span className="fl-trade-kicker">CMC data (x402)</span><p>Required market data for Agentic Wallet agents, paid from a fixed USDT budget; the paid calls also keep the Binance session active. Never blocks exits.</p></div><strong>{CMC_STATUS[agent.cmc.status] ?? "Unavailable"}</strong></div>
         <div className="fl-trade-budget__facts"><span>Remaining <b>{usdt2(agent.cmc.remainingWei)}</b></span><span>Settled <b>{usdt2(agent.cmc.settledWei)}</b></span><span>Total <b>{usdt2(agent.cmc.authorizedTotalWei)}</b></span></div>
       </section>
