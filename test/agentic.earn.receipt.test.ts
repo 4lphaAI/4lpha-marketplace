@@ -1,6 +1,6 @@
 /** AGENTIC-EARN-SPEC ET8 (+ R11.2): the receipt verifier of rule 25, the value band and USDT-leg bounds, the attested waiver, the balance delta of rule 26 and the receipt-missing hold. */
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { type Address, type Hex } from "viem";
 import type { AgenticOrder } from "../src/agentic/domain.js";
 import type { AgenticReceipt } from "../src/agentic/resolve.js";
@@ -136,4 +136,127 @@ test("R10 lane: an accepted row with no finalized receipt waits, then holds rece
   await w.at(row.claimedAt! + 30 * MINUTE); await w.step();
   assert.equal((await w.rows())[0]!.holdReason, "receipt-missing");
   assert.equal((await w.f.store.createOrder({ ...(await w.rows())[0]!, idempotencyKey: "earn:other:1", outcome: "open" })), false, "the same transaction hash cannot be bound twice");
+});
+
+/** AGENTIC-RECEIPT-WAIT-2 B: a landed deposit row (receipt tx(1) removed) bound to tx(99), held receipt-missing by default; its receipt is absent until a test adds it. */
+const DAY = 24 * HOUR;
+async function missingDeposit(t: TestContext, patch: Partial<AgenticOrder> = {}) {
+  const w = await earnWorld(t, { lane: "schedule" });
+  w.market.deposit = "land-lost";
+  await w.step();
+  const row = (await w.rows())[0]!, amount = BigInt(row.amountAtomic!);
+  assert.ok(await w.f.store.patchOrder(row, { response: "accepted", cliResult: "accepted", holdReason: "receipt-missing", txHash: tx(99), ...patch }));
+  w.market.receipts.delete(tx(1));
+  const good = (): AgenticReceipt => swapReceipt(tx(99), [[USDT, W, POOL, amount], [RECEIPT.venus, ZERO, W, amount]]);
+  const target = async () => (await w.f.store.getOrder(row.idempotencyKey))!;
+  return { w, row, amount, good, target, key: row.idempotencyKey };
+}
+const reconcile = (w: Awaited<ReturnType<typeof earnWorld>>) => w.step(undefined, { reconciliationOnly: true });
+const missingRedeem = async (w: Awaited<ReturnType<typeof earnWorld>>, patch: Partial<AgenticOrder> = {}) => {
+  const row = { ...mk("earn-redeem", 20n * E, { preValue: 60n * E, claimedAt: w.now(), createdAt: w.now() }), agentId: w.f.agent.id, claimant: w.f.instance.row.instanceId,
+    holdReason: "receipt-missing", txHash: tx(99), ...patch };
+  assert.ok(await w.f.store.createOrder(row));
+  return row.idempotencyKey;
+};
+
+test("AGENTIC-RECEIPT-WAIT-2 B: a receipt-missing deposit commits when its receipt reads on a later pass", async t => {
+  const { w, good, target, amount } = await missingDeposit(t);
+  w.market.receipts.set(tx(99), good());
+  await w.step();
+  const row = await target(), post = (row.evidence as { post: { usdtMoved: string; receiptMoved: string; block: string }; disposition: string });
+  assert.deepEqual([row.outcome, row.holdReason, post.disposition], ["committed", null, "receipt"]);
+  assert.deepEqual([post.post.usdtMoved, post.post.receiptMoved, post.post.block], [amount.toString(), amount.toString(), "1"]);
+  assert.ok((await w.codes()).includes("earn-deposited"));
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 B: a receipt-missing redeem commits from the receipt alone, whatever the value", async t => {
+  const w = await earnWorld(t, { lane: "schedule" });
+  const key = await missingRedeem(w);
+  w.failures.balances = true;
+  w.market.receipts.set(tx(99), swapReceipt(tx(99), [[RECEIPT.venus, W, ZERO, 20n * E], [USDT, POOL, W, 20n * E]]));
+  await w.step();
+  assert.deepEqual([(await w.f.store.getOrder(key))!.outcome, (await w.f.store.getOrder(key))!.holdReason], ["committed", null]);
+  assert.ok((await w.codes()).includes("earn-redeemed"));
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 B: a receipt-missing row whose receipt landed reverted rolls back", async t => {
+  const { w, good, target } = await missingDeposit(t);
+  const ok = good();
+  w.market.receipts.set(tx(99), { ...ok, observation: { ...ok.observation, receipt: { ...ok.observation.receipt, status: 0n, logs: [] } } } as unknown as AgenticReceipt);
+  await w.step();
+  const row = await target();
+  assert.deepEqual([row.outcome, (row.evidence as { disposition: string }).disposition], ["rolled-back", "landed-reverted"]);
+  assert.ok((await w.codes()).includes("earn-refused"));
+});
+
+for (const mutation of ["foreign-token", "sender", "usdt-debit", "value-floor"] as const)
+  test(`AGENTIC-RECEIPT-WAIT-2 B: a receipt-missing row whose read receipt fails a check holds chain-verification and is never re-examined (${mutation})`, async t => {
+    const { w, amount, good, target, row } = await missingDeposit(t);
+    const bad = mutation === "foreign-token" ? withLog(good(), { address: OTHER, topics: [TRANSFER, topicOf(W), topicOf(POOL)], data: word(1n) })
+      : mutation === "sender" ? { ...good(), from: POOL } : mutation === "usdt-debit" ? swapReceipt(tx(99), [[USDT, W, POOL, amount - 1n], [RECEIPT.venus, ZERO, W, amount]]) : good();
+    if (mutation === "value-floor") w.state.venus = amount * 9_000n / 10_000n - 1n;
+    w.market.receipts.set(tx(99), bad);
+    await reconcile(w);
+    assert.equal((await target()).holdReason, "chain-verification"); assert.equal((await target()).outcome, "open");
+    w.state.venus = amount; w.market.receipts.set(tx(99), good());
+    const patch = t.mock.method(w.f.store, "patchOrder");
+    await reconcile(w); await reconcile(w);
+    assert.equal((await target()).holdReason, "chain-verification"); assert.equal(patch.mock.calls.filter(c => c.arguments[0].idempotencyKey === row.idempotencyKey).length, 0);
+  });
+
+test("AGENTIC-RECEIPT-WAIT-2 B: an unreadable receipt leaves receipt-missing without a write", async t => {
+  const { w, target, key } = await missingDeposit(t);
+  const before = structuredClone(await target()), patch = t.mock.method(w.f.store, "patchOrder");
+  await reconcile(w); await reconcile(w); await reconcile(w);
+  assert.equal(patch.mock.calls.filter(c => c.arguments[0].idempotencyKey === key).length, 0);
+  assert.deepEqual(await target(), before); assert.equal((await target()).holdReason, "receipt-missing");
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 B: a read deposit receipt with a failed value read waits without a write", async t => {
+  const { w, good, target, key } = await missingDeposit(t);
+  w.market.receipts.set(tx(99), good()); w.failures.balances = true;
+  const before = structuredClone(await target()), patch = t.mock.method(w.f.store, "patchOrder");
+  await reconcile(w);
+  assert.equal(patch.mock.calls.filter(c => c.arguments[0].idempotencyKey === key).length, 0); assert.deepEqual(await target(), before);
+  w.failures.balances = false;
+  await reconcile(w);
+  assert.equal((await target()).outcome, "committed"); assert.equal(await w.f.store.walletObligations(W), false);
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 B: a deposit read 30 days late commits inside the band and holds outside it", async t => {
+  const late = async (valueOf: (amount: bigint, age: number) => bigint) => {
+    const { w, amount, good, target, row } = await missingDeposit(t);
+    const age = 30 * DAY;
+    await w.at(row.createdAt + age);
+    w.state.venus = valueOf(amount, age); w.market.receipts.set(tx(99), good());
+    await reconcile(w);
+    return target();
+  };
+  assert.equal((await late(a => a + a * 345n * 30n / (10_000n * 365n))).outcome, "committed");
+  assert.equal((await late((a, age) => a + EARN_DUST_WEI + earnAccrualWei(a, age) + 1n)).holdReason, "chain-verification");
+  assert.equal((await late(a => a * 9_000n / 10_000n - 1n)).holdReason, "chain-verification");
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 B: the receipt-missing write happens once", async t => {
+  const { w, row, target, key } = await missingDeposit(t, { holdReason: null });
+  await w.at(row.claimedAt! + 30 * MINUTE);
+  const patch = t.mock.method(w.f.store, "patchOrder"), writes = () => patch.mock.calls.filter(c => c.arguments[0].idempotencyKey === key);
+  await reconcile(w);
+  assert.equal(writes().length, 1); assert.equal(writes()[0]!.arguments[1].holdReason, "receipt-missing"); assert.equal((await target()).holdReason, "receipt-missing");
+  await reconcile(w); await reconcile(w);
+  assert.equal(writes().length, 1);
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 B: other earn holds are still never re-examined by the receipt branch", async t => {
+  const deposit = await missingDeposit(t, { holdReason: "chain-verification" });
+  const redeemWorld = await earnWorld(t, { lane: "schedule" });
+  const redeemKey = await missingRedeem(redeemWorld, { holdReason: "redeem-delayed" });
+  for (const [w, key, proof] of [[deposit.w, deposit.key, deposit.good()], [redeemWorld, redeemKey, swapReceipt(tx(99), [[RECEIPT.venus, W, ZERO, 20n * E], [USDT, POOL, W, 20n * E]])]] as const) {
+    const seen: Hex[] = [], read = w.f.chain.receipt;
+    w.market.receipts.set(tx(99), proof);
+    w.f.chain.receipt = async hash => { seen.push(hash); return read(hash); };
+    const before = structuredClone((await w.f.store.getOrder(key))!);
+    await reconcile(w); await reconcile(w);
+    assert.deepEqual(await w.f.store.getOrder(key), before); assert.equal(seen.includes(tx(99)), false);
+  }
 });

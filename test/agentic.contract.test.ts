@@ -1479,3 +1479,179 @@ test("AGENTIC-RECEIPT-WAIT F1: an unheld waiting order delays the logout only to
   f.setTime(hireEnd + 1_800_000); await resumeAgenticEnding(f.lifecycle, (await f.store.byAgent(f.agent.id))!);
   assert.equal(signouts(), 1);
 });
+
+/** AGENTIC-RECEIPT-WAIT-2 A: an open sign row held approve-unverified (default HASH), a fence, and one resolver pass. */
+const approveAbi = parseAbi(["function approve(address,uint256) returns (bool)", "function transfer(address,uint256) returns (bool)"]);
+const approveReceipt = (patch: Partial<AgenticReceipt> = {}, status = 1n): AgenticReceipt => { const base = receipt();
+  return { ...base, to: getAddress(USDT_56), input: encodeFunctionData({ abi: approveAbi, functionName: "approve", args: [CMC_PERMIT2, E] }),
+    observation: { ...base.observation, receipt: { ...base.observation.receipt, status } }, ...patch }; };
+async function approveWait(t: TestContext, patch: Partial<AgenticOrder> = {}, wallet: Partial<AgenticWallet> = {}) {
+  const f = await fixture(t, wallet);
+  await f.store.createOrder(f.order({ kind: "x402-sign", side: null, fromToken: null, toToken: null, operationId: "op", dispatch: "spawned", response: "accepted", cliResult: "signed",
+    claimant: f.instance.row.instanceId, claimedAt: NOW, holdReason: "approve-unverified", approveTxHash: HASH, ...patch }));
+  const fence = (await f.store.acquireFence(W, f.instance.row.instanceId))!;
+  const pass = async () => resolveAgenticOrder({ ...f.execution, journal: f.journal, order: (await f.store.getOrder(HASH))!, fence });
+  return { f, pass, fence };
+}
+
+test("AGENTIC-RECEIPT-WAIT-2 A: an approve receipt unreadable past the 60 s loop commits the sign row on a later pass with dispose-equivalent evidence and makes no payment", async t => {
+  t.mock.method(Date, "now", () => NOW);
+  const f = await fixture(t); let paid = 0, signs = 0;
+  const transport: CmcTransport = { async request(request) {
+    if (request.headers === undefined) {
+      const body = JSON.parse(request.body) as { params: { name: string } };
+      const challenge = { x402Version: 2, resource: { url: "X402_" + body.params.name }, accepts: [{ scheme: "exact", network: "eip155:56", asset: USDT_56,
+        amount: CMC_PRICE_ATOMIC.toString(), payTo: CMC_PAYEE, maxTimeoutSeconds: 500,
+        extra: { name: "Tether USD", version: "1", assetTransferMethod: "permit2-exact", spenderAddress: CMC_SPENDER, signerAddress: CMC_SIGNER, x402PaymentConfigId: CMC_CONFIG_ID } }] };
+      return { status: 402, headers: { "payment-required": Buffer.from(JSON.stringify(challenge)).toString("base64") }, body: "" };
+    }
+    paid += 1; return { status: 200, headers: {}, body: JSON.stringify({ result: { content: [] } }) };
+  } };
+  await f.store.createRun({ runId: "cmc-run", gate: "G0", agentId: f.agent.id, wallet: W, side: "none", maxDispatches: 1, dispatches: 0,
+    maxNotionalUsdt: "0", maxCmcPayments: 1, cmcPayments: 0, cmcOperationIds: [], deadlineMs: NOW + 900_000, createdAt: NOW, closedAt: null });
+  f.runner.replies.set("x402-payment preview", async () => ({ kind: "ok", sessionPresent: true, rwaTokens: null, data: { paymentId: "offline-payment",
+    options: [{ index: 1, status: "READY_TO_SIGN", reasons: [], scheme: "exact", binanceChainId: "56", tokenAddress: USDT_56, tokenSymbol: "USDT", userWalletAddress: W,
+      amount: "0.010000000000000000", payTo: CMC_PAYEE, needApproveFirst: true, assetTransferMethod: "permit2" }] } }));
+  f.runner.replies.set("x402-payment sign", async () => {
+    signs += 1;
+    const payload = { x402Version: 2, payload: { signature: "0x" + "55".repeat(65), permit2Authorization: { from: W, spender: CMC_SPENDER,
+      permitted: { token: USDT_56, amount: CMC_PRICE_ATOMIC.toString() }, nonce: "7", deadline: String(NOW / 1000 + 400), witness: { to: CMC_PAYEE, validAfter: "0" } } } };
+    return { kind: "ok", sessionPresent: true, rwaTokens: null, data: { paymentHeaderName: "PAYMENT-SIGNATURE", paymentHeaderValue: Buffer.from(JSON.stringify(payload)).toString("base64"),
+      signatureExpiresAt: NOW / 1000 + 400, approveTxHash: HASH } };
+  });
+  // The pinned clock would freeze the fence retry loop, so the mock handle is kept and restored right after the refresh.
+  const clocks: { mock: { restore(): void } }[] = [];
+  f.chain.receipt = async () => { const at = process.hrtime.bigint() + 61_000_000_000n; clocks.push(t.mock.method(process.hrtime, "bigint", () => at)); return null; };
+  const cmc = createAgenticCmc({ ...f.execution, agents: f.agents, settings: f.settings, cmc: f.cmcStore, journal: f.journal, killswitch: f.killswitch,
+    rpcUrls: ["offline://1", "offline://2", "offline://3"], transport, gateRunId: "cmc-run" });
+  await cmc.enqueue(f.agent.id, ["NVDA"], ["MSFT"]); await cmc.refresh(f.agent.id);
+  for (const clock of clocks.reverse()) clock.mock.restore();
+  const stuck = (await f.store.orders(W)).find(o => o.kind === "x402-sign")!;
+  assert.equal(stuck.outcome, "open"); assert.equal(stuck.holdReason, "approve-unverified"); assert.equal(paid, 0); assert.equal(signs, 1);
+  const attempt = (await f.cmcStore.listAttempts(f.agent.id, W)).find(a => a.operationId === stuck.operationId)!;
+  assert.equal(attempt.state, "released");
+  const S0 = structuredClone(f.cmcStore.snapshot(f.agent.id)), C0 = f.runner.calls.length;
+  const proof = approveReceipt();
+  f.chain.receipt = async () => proof;
+  const fence = (await f.store.acquireFence(W, f.instance.row.instanceId))!;
+  await resolveAgenticOrder({ ...f.execution, journal: f.journal, order: (await f.store.getOrder(stuck.idempotencyKey))!, fence });
+  const row = (await f.store.getOrder(stuck.idempotencyKey))!;
+  assert.equal(row.outcome, "committed"); assert.equal(row.holdReason, null); assert.equal(row.approveTxHash, HASH);
+  assert.deepEqual(row.evidence, { disposition: "approve-receipt", proof, quiescence: null });
+  assert.deepEqual(f.cmcStore.snapshot(f.agent.id), S0); assert.equal(f.runner.calls.length, C0); assert.equal(paid, 0);
+  assert.equal(await f.store.walletObligations(W), false);
+  await cmc.runtime.close();
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 A: the per-cycle reconcile commits an approve-unverified sign row once its receipt reads", async t => {
+  const { f, fence } = await approveWait(t); await f.store.releaseFence(fence);
+  f.chain.receipt = async () => null;
+  await runAgenticCycle(f.lifecycle, { reconciliationOnly: true });
+  assert.deepEqual([(await f.store.getOrder(HASH))?.outcome, (await f.store.getOrder(HASH))?.holdReason], ["open", "approve-unverified"]);
+  f.chain.receipt = async () => approveReceipt();
+  await runAgenticCycle(f.lifecycle, { reconciliationOnly: true });
+  assert.deepEqual([(await f.store.getOrder(HASH))?.outcome, (await f.store.getOrder(HASH))?.holdReason], ["committed", null]);
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 A: an unreadable approve receipt writes nothing on any pass", async t => {
+  const { f, pass } = await approveWait(t);
+  f.chain.receipt = async () => null;
+  const before = structuredClone((await f.store.getOrder(HASH))!), patch = t.mock.method(f.store, "patchOrder");
+  await pass(); await pass(); await pass();
+  assert.equal(patch.mock.callCount(), 0); assert.deepEqual(await f.store.getOrder(HASH), before); assert.equal(await f.store.walletObligations(W), true);
+});
+
+for (const mutation of ["sender", "target", "spender", "transfer", "empty-input"] as const)
+  test(`AGENTIC-RECEIPT-WAIT-2 A: a read receipt that is not the Permit2 approve holds chain-verification at once and is never re-examined (${mutation})`, async t => {
+    const { f, pass } = await approveWait(t);
+    const proof = mutation === "sender" ? approveReceipt({ from: TOKEN }) : mutation === "target" ? approveReceipt({ to: TOKEN })
+      : mutation === "spender" ? approveReceipt({ input: encodeFunctionData({ abi: approveAbi, functionName: "approve", args: [TOKEN, E] }) })
+      : mutation === "transfer" ? approveReceipt({ input: encodeFunctionData({ abi: approveAbi, functionName: "transfer", args: [CMC_PERMIT2, E] }) }) : approveReceipt({ input: "0x" });
+    f.chain.receipt = async () => proof;
+    await pass();
+    const row = (await f.store.getOrder(HASH))!;
+    assert.equal(row.holdReason, "chain-verification"); assert.equal(row.outcome, "open");
+    let reads = 0; f.chain.receipt = async () => { reads += 1; return approveReceipt(); };
+    const patch = t.mock.method(f.store, "patchOrder");
+    await pass(); await pass();
+    assert.equal((await f.store.getOrder(HASH))?.holdReason, "chain-verification"); assert.equal(patch.mock.callCount(), 0); assert.equal(reads, 0);
+  });
+
+test("AGENTIC-RECEIPT-WAIT-2 A: one receipt read per pass", async t => {
+  for (const proof of [approveReceipt(), approveReceipt({ from: TOKEN }), null]) {
+    const { f, pass } = await approveWait(t); let reads = 0;
+    f.chain.receipt = async () => { reads += 1; return proof; };
+    await pass();
+    assert.equal(reads, 1);
+  }
+  const { f, pass } = await approveWait(t); let reads = 0;
+  f.chain.receipt = async () => { reads += 1; return reads === 1 ? approveReceipt() : null; };
+  await pass();
+  const row = (await f.store.getOrder(HASH))!;
+  assert.equal(row.outcome, "committed"); assert.equal(row.holdReason, null); assert.equal(reads, 1);
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 A: a reverted Permit2 approve commits like the in-dispatch path", async t => {
+  const { f, pass } = await approveWait(t);
+  f.chain.receipt = async () => approveReceipt({}, 0n);
+  await pass();
+  const row = (await f.store.getOrder(HASH))!;
+  assert.equal(row.outcome, "committed"); assert.equal((row.evidence as { disposition: string }).disposition, "approve-receipt");
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 A: other sign rows are untouched while a valid approve receipt is readable", async t => {
+  const cases: [string, Partial<AgenticOrder>][] = [
+    ["a", { holdReason: "sign-failed", response: "no-response" }],
+    ["b", { holdReason: "sign-recovery" }],
+    ["d", { approveTxHash: null }],
+    ["e", { outcome: "committed" }],
+    ["g", { response: "no-response" }]];
+  for (const [name, patch] of cases) {
+    const { f, pass } = await approveWait(t, patch); let reads = 0;
+    f.chain.receipt = async () => { reads += 1; return approveReceipt(); };
+    const before = structuredClone((await f.store.getOrder(HASH))!);
+    await pass();
+    assert.deepEqual(await f.store.getOrder(HASH), before, name); assert.equal(reads, 0, name);
+  }
+  // (c) a recorded answer with no hash becomes sign-recovery exactly as today.
+  const recovered = await approveWait(t, { holdReason: null, approveTxHash: null });
+  recovered.f.chain.receipt = async () => approveReceipt();
+  await recovered.pass();
+  assert.equal((await recovered.f.store.getOrder(HASH))?.holdReason, "sign-recovery"); assert.equal((await recovered.f.store.getOrder(HASH))?.outcome, "open");
+  // (f) a sealed row is terminalized as today.
+  const sealed = await approveWait(t, { dispatch: "sealed" });
+  sealed.f.chain.receipt = async () => approveReceipt();
+  await sealed.pass();
+  assert.equal((await sealed.f.store.getOrder(HASH))?.outcome, "rolled-back");
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 A: after the owner signed out the per-cycle loop still resolves an approve-unverified sign row from chain reads only", async t => {
+  const { f, fence } = await approveWait(t); await f.store.releaseFence(fence);
+  await f.store.leaveBound(f.row, "owner-signed-out");
+  assert.equal((await f.store.byAgent(f.agent.id))?.state, "ended");
+  f.chain.receipt = async () => approveReceipt();
+  const calls = f.runner.calls.length;
+  await runAgenticCycle(f.lifecycle, { reconciliationOnly: true });
+  assert.equal((await f.store.getOrder(HASH))?.outcome, "committed"); assert.equal(f.runner.calls.length, calls);
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 A: dispose still resolves approve-unverified and chain-verification sign rows", async t => {
+  const dispose = async (f: Awaited<ReturnType<typeof approveWait>>["f"], extra: string[]) => {
+    const context = { ...f.execution, agents: f.agents, journal: f.journal, positions: f.positions, killswitch: f.killswitch, wallets: new Set([W]), print: () => undefined, cycle: async () => undefined };
+    await runAgenticGate(parseAgenticGateArgs(["dispose", "--order", HASH, ...extra, "--yes-live"]), context);
+  };
+  const ok = await approveWait(t); await ok.f.store.releaseFence(ok.fence);
+  ok.f.chain.receipt = async () => approveReceipt();
+  await dispose(ok.f, ["--approve-tx", HASH]);
+  const done = (await ok.f.store.getOrder(HASH))!;
+  assert.equal(done.outcome, "committed"); assert.equal((done.evidence as { disposition: string }).disposition, "approve-tx");
+  const bad = await approveWait(t); await bad.f.store.releaseFence(bad.fence);
+  bad.f.chain.receipt = async () => approveReceipt({ from: TOKEN });
+  const before = structuredClone((await bad.f.store.getOrder(HASH))!);
+  await assert.rejects(() => dispose(bad.f, ["--approve-tx", HASH]), /AGENTIC_APPROVAL_UNVERIFIED/);
+  assert.deepEqual(await bad.f.store.getOrder(HASH), before);
+  const held = await approveWait(t, { holdReason: "chain-verification" }); await held.f.store.releaseFence(held.fence);
+  await dispose(held.f, ["--no-approve", "--attest", "offline reviewed evidence"]);
+  const cleared = (await held.f.store.getOrder(HASH))!;
+  assert.equal(cleared.outcome, "committed"); assert.equal((cleared.evidence as { disposition: string }).disposition, "no-approve");
+});

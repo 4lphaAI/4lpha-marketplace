@@ -2,7 +2,7 @@
  *  a DCA stop loss redeems before it signs out; an owner sign-out makes no Binance call. */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { E, DAY, HOUR, MINUTE, NOW, W, earnWorld, type EarnWorld } from "./support/agenticEarn.js";
+import { E, DAY, HOUR, MINUTE, NOW, W, RECEIPT, USDT, POOL, ZERO, earnWorld, swapReceipt, tx, type EarnWorld } from "./support/agenticEarn.js";
 import { resumeAgenticEnding } from "../src/agentic/worker.js";
 import { earnBlocksSignOut } from "../src/agentic/earnLane.js";
 
@@ -115,4 +115,49 @@ test("E6 an owner sign-out (ended) makes no Binance call: open rows resolve by r
   assert.equal((await w.rows())[0]!.outcome, "committed", "the landed deposit committed by the balance delta (chain only)");
   await w.advance(MINUTE); await w.step();
   assert.equal(w.market.calls.length, callsBefore, "an ended row with no open earn row never takes the fence again");
+});
+
+/** AGENTIC-RECEIPT-WAIT-2 B: an accepted ratio-1 redeem row held receipt-missing; its landing is already in the fake state and its receipt is absent until the test adds it. */
+async function parkedRedeem(w: EarnWorld) {
+  const key = "earn:agentic-fixture:1";
+  assert.ok(await w.f.store.createOrder({ idempotencyKey: key, kind: "earn-redeem", walletAddress: W, agentId: w.f.agent.id, decisionId: null, side: null, fromToken: null, toToken: null,
+    amountAtomic: (30n * E).toString(), intendedRaw: null, fromQty: "ratio:1", minOutAtomic: null, binanceQuoteOutAtomic: null, slippagePct: null, multiplierPre: null, multiplierUsed: null, listSnapshot: null,
+    operationId: null, walletNoncePre: "0", quoteAt: null, dispatch: "spawned", claimedAt: NOW, claimant: w.f.instance.row.instanceId, fenceToken: "1", claimDeadline: null, response: "accepted",
+    cliResult: "accepted", returnedOrderId: null, listedOrderId: null, txHash: tx(99), approveTxHash: null, outcome: "open", holdReason: "receipt-missing",
+    evidence: { v: 1, protocol: "venus", investmentId: "venus-usdt", receiptToken: RECEIPT.venus, reason: "redeem-all", apyBps: null, pre: { block: "1", usdt: (70n * E).toString(), valueWei: (30n * E).toString(), bnb: "0" } },
+    fillCheck: "none", createdAt: NOW, updatedAt: NOW }));
+  w.state.nonce = 1n; w.state.usdt = 100n * E;
+  return { key, land: () => w.market.receipts.set(tx(99), swapReceipt(tx(99), [[RECEIPT.venus, W, ZERO, 30n * E], [USDT, POOL, W, 30n * E]])) };
+}
+
+test("AGENTIC-RECEIPT-WAIT-2 B: a receipt-missing redeem in ending blocks the sign-out until its receipt reads, then the sign-out follows", async t => {
+  const w = await earnWorld(t, { lane: "schedule", flag: false });
+  await w.tick();
+  await ending(w);
+  const { key, land } = await parkedRedeem(w);
+  // the hire max time ends the wait before the guard is consulted, so every tick must stay below it and in ending
+  const tick = async () => { await w.tick(); const wallet = await w.wallet(); assert.ok(w.now() < wallet.hireFacts!.signInMaxTimeMs); assert.equal(wallet.state, "ending"); };
+  await w.at(END + 31 * MINUTE); await tick();
+  assert.deepEqual([(await w.f.store.getOrder(key))!.outcome, (await w.f.store.getOrder(key))!.holdReason], ["open", "receipt-missing"]);
+  assert.equal(signouts(w), 0, "the open row blocks the guarded sign-out");
+  land();
+  await w.advance(MINUTE); await tick();
+  assert.deepEqual([(await w.f.store.getOrder(key))!.outcome, (await w.f.store.getOrder(key))!.holdReason], ["committed", null]);
+  assert.equal(signouts(w), 1, "nothing parked and no open row: the guarded sign-out goes");
+});
+
+test("AGENTIC-RECEIPT-WAIT-2 B: after the owner signed out a receipt-missing row resolves from chain reads only", async t => {
+  const w = await earnWorld(t, { lane: "schedule", flag: false });
+  await w.tick();
+  const { key, land } = await parkedRedeem(w);
+  const callsBefore = w.market.calls.length;
+  await w.f.store.leaveBound(await w.wallet(), "owner-signed-out");
+  assert.equal((await w.wallet()).state, "ended");
+  land();
+  await w.step();
+  assert.equal((await w.f.store.getOrder(key))!.outcome, "committed");
+  assert.equal(w.market.calls.length, callsBefore, "no Binance command after the owner signed out");
+  const fence = t.mock.method(w.f.store, "acquireFence");
+  await w.advance(MINUTE); await w.step();
+  assert.equal(w.market.calls.length, callsBefore); assert.equal(fence.mock.callCount(), 0, "an ended row with no open earn row never takes the fence again");
 });

@@ -187,3 +187,24 @@ test("G7 audit M-2: earn-once deposit keeps rule 15's BNB floor (0.0012); a rede
   await gate(ok, [...once(), "--yes-live"]);
   assert.equal((await ok.rows()).length, 1);
 });
+
+test("AGENTIC-RECEIPT-WAIT-2 B: dispose resolves a receipt-missing earn row exactly as before", async t => {
+  const parked = async () => {
+    const w = await earnWorld(t, { lane: "schedule" });
+    await planted(w, { response: "accepted", cliResult: "accepted", holdReason: "receipt-missing", txHash: tx(7) });
+    w.state.venus = 30n * E; w.state.usdt = 40n * E; w.state.nonce = 1n;
+    w.market.receipts.set(tx(7), swapReceipt(tx(7), [[USDT, W, POOL, 60n * E], [RECEIPT.venus, ZERO, W, 30n * E]]));
+    return w;
+  };
+  const strict = await parked();
+  await assert.rejects(dispose(strict, ["--commit-tx", tx(7)]), /AGENTIC_EARN_UNVERIFIED/u, "the stranding band applies without --attest");
+  assert.equal((await strict.f.store.getOrder("earn:agentic-fixture:1"))!.holdReason, "receipt-missing");
+  const attested = await parked();
+  await dispose(attested, ["--commit-tx", tx(7), "--attest", "measured: debit 60, value 30"]);
+  const row = (await attested.f.store.getOrder("earn:agentic-fixture:1"))!;
+  assert.deepEqual([row.outcome, row.txHash, (row.evidence as { disposition: string }).disposition], ["committed", tx(7), "operator-commit"]);
+  const rb = await parked();
+  await dispose(rb, ["--rollback", "--attest", "checked on chain"]);
+  assert.equal((await rb.f.store.getOrder("earn:agentic-fixture:1"))!.outcome, "rolled-back");
+  assert.equal(await rb.f.store.walletObligations(W), false);
+});

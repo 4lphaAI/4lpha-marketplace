@@ -78,7 +78,8 @@ async function resolveOne(ctx: Ctx, start: AgenticOrder): Promise<AgenticOrder> 
   const now = await store.now(), ev = earnEvidence(row.evidence);
   // R11.9: the hold the generic resolver no longer writes for an earn row.
   if (row.holdReason === null && row.response === null) return await store.patchOrder(row, { holdReason: "no-response" }) ?? row;
-  if (row.response === "accepted" && row.holdReason === null && row.txHash !== null) {
+  // AGENTIC-RECEIPT-WAIT-2 B: a receipt-missing row is re-examined by this branch every pass (unreadable: no write); the hold is written once, from an unheld row.
+  if (row.response === "accepted" && (row.holdReason === null || row.holdReason === "receipt-missing") && row.txHash !== null) {
     const proof = await chain.receipt(row.txHash);
     let value: bigint | null = null;
     if (proof !== null && ev !== null) { const b = await readBalances(ctx, true); value = b === null ? null : valueOf(b, ev.protocol); }
@@ -90,7 +91,7 @@ async function resolveOne(ctx: Ctx, start: AgenticOrder): Promise<AgenticOrder> 
       const next = await store.patchOrder(row, { outcome: "rolled-back", holdReason: null, evidence: { ...ev, disposition: "landed-reverted" } });
       if (next !== null) { note(ctx, "earn-refused"); return next; }
     } else if (verdict.kind === "hold") return await store.patchOrder(row, { holdReason: "chain-verification" }) ?? row;
-    else if (proof === null && row.claimedAt !== null && now - row.claimedAt >= EARN_RECEIPT_WAIT_MS) return await store.patchOrder(row, { holdReason: "receipt-missing" }) ?? row;
+    else if (row.holdReason === null && proof === null && row.claimedAt !== null && now - row.claimedAt >= EARN_RECEIPT_WAIT_MS) return await store.patchOrder(row, { holdReason: "receipt-missing" }) ?? row;
     return row;
   }
   if (row.holdReason !== "no-response" || ev === null || row.claimedAt === null || row.walletNoncePre === null || now - row.claimedAt < EARN_DELTA_MIN_AGE_MS) return row;

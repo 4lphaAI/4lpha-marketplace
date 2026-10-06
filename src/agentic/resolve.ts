@@ -234,6 +234,18 @@ export async function resolveAgenticOrder(input: { store: AgenticStore; journal:
   // AGENTIC-EARN-SPEC R11.9: an earn row is held and resolved only by the earn step (earnLane.ts); a stale unclaimed one was still sealed above.
   if (row.kind === "earn-deposit" || row.kind === "earn-redeem") return null;
   if (row.kind !== "swap") {
+    // AGENTIC-RECEIPT-WAIT-2 A: an approve-unverified sign is re-examined every pass with ONE receipt read: unreadable waits, a read approve
+    // commits as dispose --approve-tx would, a read receipt that is not that approve holds chain-verification (terminal).
+    if (row.kind === "x402-sign" && row.outcome === "open" && row.dispatch === "spawned" && row.response === "accepted"
+      && row.holdReason === "approve-unverified" && row.approveTxHash !== null) {
+      const hash = row.approveTxHash, read = await chain.receipt(hash);
+      if (read !== null) {
+        const proof = await verifyAgenticApproval({ ...chain, receipt: async () => read }, row.walletAddress, hash);
+        await store.patchOrder(row, proof === null ? { holdReason: "chain-verification" }
+          : { outcome: "committed", holdReason: null, evidence: { disposition: "approve-receipt", proof, quiescence: null } });
+      }
+      return null;
+    }
     if (row.outcome === "open" && row.dispatch === "spawned" && row.holdReason === null) await store.patchOrder(row, {
       holdReason: row.response === null || row.response === "no-response" ? "no-response" : "sign-recovery" });
     return null;
