@@ -16,7 +16,7 @@ type Patch = Record<string, unknown>;
 const w = (n: number): string => (BigInt(n) * E).toString();
 const earn = (patch: Patch = {}): Patch => ({
   products: [{ protocol: "venus", valueWei: w(60), reason: null, selfRescue: VENUS_RESCUE }, { protocol: "aave-v3", valueWei: "0", reason: null, selfRescue: AAVE_RESCUE }],
-  totalWei: w(60), liquidWei: w(30), rates: { venus: 345, "aave-v3": 306, atMs: NOW },
+  totalWei: w(60), liquidWei: w(30), rates: { venus: 345, "aave-v3": 306, atMs: NOW }, earnedWei: "1234000000000000",
   lastDeposit: { protocol: "venus", amountWei: w(70), atMs: NOW - 1000, txHash: HASH(1), apyBps: { venus: 345, "aave-v3": 306 } }, open: null, withdrawingBeforeSignOut: false,
   activity: [
     { action: "withdraw", protocol: "venus", atMs: NOW - 1000, amountWei: w(5), apyBps: null, otherApyBps: null, reason: "lane", txHash: HASH(3) },
@@ -68,7 +68,7 @@ it("AI Trade: the Earn tab sits between Run log and CMC x402, only with an earn 
   await without.done();
 });
 
-it("shows the real figures: supplied, the wallet it came from, the rate it earns at, the daily estimate from known rates, the liquid USDT, the bar shares, the best-rate badge and the rate note", async () => {
+it("shows the real figures: supplied, the wallet it came from, the rate it earns at, the interest earned, the liquid USDT, the bar shares, the best-rate badge and the rate note", async () => {
   const { host, click, done } = await render(lane.ai(earn()));
   await click("Earn");
   const t = text(host);
@@ -77,8 +77,8 @@ it("shows the real figures: supplied, the wallet it came from, the rate it earns
   expect(t).toContain("Supplied from 90.00 USDT in the Agentic Wallet");
   expect(t).toContain("3.45% APY");
   expect(t).toContain("On Venus");
-  expect(t).toContain("+0.0056 USDT");
-  expect(t).toContain("At the last known rates, before gas");
+  expect(t).toContain("Interest earned"); expect(t).toContain("+0.0012 USDT"); expect(t).toContain("Since the first supply, before gas"); expect(t).not.toContain("Est. per day");
+  
   expect(t).toContain("30.00 USDT");
   expect(t).toContain("Ready for the next buys");
   expect(t).toContain("Kept in wallet");
@@ -117,7 +117,7 @@ it("activity: newest first, the reason copy, the amount and rate, the BscScan li
 it("with nothing supplied the best known rate is shown with its note; unknown rates and an unreadable wallet are n/a and dashes with a reason, never numbers", async () => {
   const idle = await render(lane.ai(earn({ totalWei: "0", products: [{ protocol: "venus", valueWei: "0", reason: null, selfRescue: null }, { protocol: "aave-v3", valueWei: "0", reason: null, selfRescue: null }] })));
   await idle.click("Earn");
-  expect(text(idle.host)).toContain("3.45% APY"); expect(text(idle.host)).toContain("Nothing supplied right now (best rate: Venus)"); expect(text(idle.host)).toContain("+0.0000 USDT");
+  expect(text(idle.host)).toContain("3.45% APY"); expect(text(idle.host)).toContain("Nothing supplied right now (best rate: Venus)"); expect(text(idle.host)).toContain("+0.0012 USDT");
   await idle.done();
   const blind = await render(lane.ai(earn({ totalWei: null, liquidWei: null, rates: { venus: null, "aave-v3": null, atMs: null }, activity: [],
     products: [{ protocol: "venus", valueWei: null, reason: "chain-unreadable", selfRescue: null }, { protocol: "aave-v3", valueWei: null, reason: "chain-unreadable", selfRescue: null }] })));
@@ -136,7 +136,7 @@ it("with nothing supplied the best known rate is shown with its note; unknown ra
 it("one known rate is used for the estimate but earns no BEST RATE badge (nothing to compare it with)", async () => {
   const { host, click, done } = await render(lane.ai(earn({ rates: { venus: 345, "aave-v3": null, atMs: NOW } })));
   await click("Earn");
-  expect(text(host)).toContain("+0.0056 USDT"); expect(text(host)).not.toContain("BEST RATE");
+  expect(text(host)).toContain("+0.0012 USDT"); expect(text(host)).not.toContain("BEST RATE");
   await done();
 });
 
@@ -227,4 +227,21 @@ it("every Agentic detail page, with or without Earn, starts with the My agents b
     await act(async () => bareRoot.unmount());
   }
   delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+});
+
+it("interest earned is the plane's figure: 6 decimals while below 0.0001, a minus sign when negative, and a dash with its reason when the plane has none", async () => {
+  for (const [earnedWei, shown] of [["5000000000000", "+0.000005 USDT"], ["-100000000000000", "-0.0001 USDT"], ["0", "+0.0000 USDT"]] as const) {
+    const { host, click, done } = await render(lane.ai(earn({ earnedWei })));
+    await click("Earn");
+    expect(text(host)).toContain(shown);
+    await done();
+  }
+  const none = await render(lane.ai(earn({ earnedWei: null })));
+  await none.click("Earn");
+  expect(text(none.host)).toContain("Earned amount unavailable");
+  await none.done();
+  const fresh = await render(lane.ai(earn({ earnedWei: null, totalWei: "0", products: [{ protocol: "venus", valueWei: "0", reason: null, selfRescue: null }, { protocol: "aave-v3", valueWei: "0", reason: null, selfRescue: null }] })));
+  await fresh.click("Earn");
+  expect(text(fresh.host)).toContain("Nothing supplied yet");
+  await fresh.done();
 });

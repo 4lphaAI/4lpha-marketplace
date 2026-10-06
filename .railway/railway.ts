@@ -144,6 +144,8 @@ export default defineRailway(() => {
     AGENTIC_BAW_CLI: "/opt/baw/node_modules/@binance/agentic-wallet/dist/index.js",
     AGENTIC_DCA_ENABLED: "true",
     AGENTIC_RFQ_STOCKS_ENABLED: "true",
+    // Earn on idle USDT (2026-10-06 operator go): api + trade-worker from the same build.
+    AGENTIC_EARN_ENABLED: "true",
   };
 
   const api = service("execution-api", {
@@ -448,6 +450,7 @@ export default defineRailway(() => {
       // so a change needs a rebuild, not a restart.
       NEXT_PUBLIC_AGENTIC_WALLET_ENABLED: "true",
       NEXT_PUBLIC_AGENTIC_DCA_ENABLED: "true",
+      NEXT_PUBLIC_AGENTIC_EARN_ENABLED: "true",
       NEXT_TELEMETRY_DISABLED: "1",
       NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: preserve(),
     },

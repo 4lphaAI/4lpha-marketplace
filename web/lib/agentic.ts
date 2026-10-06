@@ -191,7 +191,7 @@ export type AgenticEarnDto = { products: { protocol: string; valueWei: string | 
   lastDeposit: null | { protocol: string; amountWei: string | null; atMs: number; txHash: string | null; apyBps: { venus: number | null; "aave-v3": number | null } };
   open: null | { kind: "deposit" | "redeem"; held: boolean; holdReason: string | null }; withdrawingBeforeSignOut: boolean;
   /** The Earn tab's additive fields (a plane without them omits them); read through agenticEarnTabData, never cast. */
-  liquidWei?: unknown; rates?: unknown; activity?: unknown };
+  liquidWei?: unknown; rates?: unknown; activity?: unknown; earnedWei?: unknown };
 export function isAgenticEarnDto(value: unknown): value is AgenticEarnDto {
   const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   return record(value) && Array.isArray(value["products"]) && value["products"].every(p => record(p) && typeof p["protocol"] === "string")
@@ -204,14 +204,14 @@ export type AgenticEarnActivity = { action: "supply" | "withdraw"; protocol: "ve
  * The Earn tab's new fields, read defensively: a malformed field is treated as unavailable (null or dropped), never thrown over.
  * `liquidWei` is the wallet's USDT from the plane's own chain read; `rates` are the newest APYs the agent read from Binance (not live); `activity` is the newest committed operations, newest first.
  */
-export function agenticEarnTabData(earn: AgenticEarnDto): { liquidWei: bigint | null; rates: { venus: number | null; "aave-v3": number | null; atMs: number | null }; activity: AgenticEarnActivity[] } {
+export function agenticEarnTabData(earn: AgenticEarnDto): { liquidWei: bigint | null; earnedWei: bigint | null; rates: { venus: number | null; "aave-v3": number | null; atMs: number | null }; activity: AgenticEarnActivity[] } {
   const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   const wei = (v: unknown): bigint | null => typeof v === "string" && /^[0-9]+$/u.test(v) ? BigInt(v) : null;
   const bps = (v: unknown): number | null => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= 5_000 ? v : null;
   const protocol = (v: unknown): "venus" | "aave-v3" | null => v === "venus" || v === "aave-v3" ? v : null;
   const r = record(earn.rates) ? earn.rates : {};
   const rows = Array.isArray(earn.activity) ? earn.activity : [];
-  return { liquidWei: wei(earn.liquidWei), rates: { venus: bps(r["venus"]), "aave-v3": bps(r["aave-v3"]), atMs: typeof r["atMs"] === "number" && Number.isSafeInteger(r["atMs"]) ? r["atMs"] : null },
+  return { liquidWei: wei(earn.liquidWei), earnedWei: typeof earn.earnedWei === "string" && /^-?[0-9]+$/u.test(earn.earnedWei) ? BigInt(earn.earnedWei) : null, rates: { venus: bps(r["venus"]), "aave-v3": bps(r["aave-v3"]), atMs: typeof r["atMs"] === "number" && Number.isSafeInteger(r["atMs"]) ? r["atMs"] : null },
     activity: rows.flatMap((row: unknown): AgenticEarnActivity[] => {
       if (!record(row)) return [];
       const p = protocol(row["protocol"]);

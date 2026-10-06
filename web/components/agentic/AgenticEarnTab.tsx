@@ -48,7 +48,7 @@ function whyOf(row: AgenticEarnActivity): string {
 
 export function AgenticEarnTab({ earn, refresh }: { earn: unknown; refresh: () => Promise<unknown> }) {
   if (!isAgenticEarnDto(earn)) return <p role="alert">Earn data unavailable.</p>;
-  const { liquidWei, rates, activity } = agenticEarnTabData(earn);
+  const { liquidWei, earnedWei, rates, activity } = agenticEarnTabData(earn);
   const protocols: Protocol[] = ["venus", "aave-v3"];
   const read = (protocol: Protocol): { name: string; supplied: bigint | null; apy: number | null; reason: string | null } => {
     const p = earn.products.find(row => row.protocol === protocol);
@@ -63,8 +63,13 @@ export function AgenticEarnTab({ earn, refresh }: { earn: unknown; refresh: () =
   // "Earning now": the product holding the most; with nothing supplied, the best known rate (and a note saying so).
   const active = holding ? rows.reduce((a, b) => b.supplied! > a.supplied! ? b : a) : known.length > 0 ? known.reduce((a, b) => b.apy! > a.apy! ? b : a) : null;
   const best = rows[0]!.apy !== null && rows[1]!.apy !== null ? (rows[0]!.apy >= rows[1]!.apy ? rows[0]!.key : rows[1]!.key) : null;
-  const daily = readable && known.length > 0 ? known.reduce((sum, r) => sum + r.supplied! * BigInt(r.apy!) / 10_000n / 365n, 0n) : null;
-  const dailyText = daily === null ? "-" : `+${(daily / 10n ** 14n / 10_000n).toString()}.${((daily / 10n ** 14n) % 10_000n).toString().padStart(4, "0")} USDT`;
+  // Interest earned so far (the plane's figure: held now + returned - supplied, the agent's own rows): 4 decimals, 6 when it is still below 0.0001.
+  const earned = (() => {
+    if (earnedWei === null) return null;
+    const negative = earnedWei < 0n, abs = negative ? -earnedWei : earnedWei, places = abs > 0n && abs < 10n ** 14n ? 6 : 4;
+    const units = abs / 10n ** BigInt(18 - places), scale = 10n ** BigInt(places);
+    return `${negative ? "-" : "+"}${(units / scale).toString()}.${(units % scale).toString().padStart(places, "0")} USDT`;
+  })();
   const held = earn.open?.held === true ? (AGENTIC_EARN_COPY.held as Readonly<Record<string, string>>)[earn.open.holdReason ?? "other"] ?? AGENTIC_EARN_COPY.held.other : null;
   const rescue = earn.products.flatMap(p => p.selfRescue === null ? [] : [p.selfRescue]);
   const segments = [{ key: "venus" as const, name: "Venus", v: rows[0]!.supplied, logo: LOGO.venus }, { key: "aave-v3" as const, name: "Aave v3", v: rows[1]!.supplied, logo: LOGO["aave-v3"] },
@@ -84,7 +89,8 @@ export function AgenticEarnTab({ earn, refresh }: { earn: unknown; refresh: () =
         </div>
         <EarnStat label="Earning now" value={active === null || active.apy === null ? "n/a" : `${(active.apy / 100).toFixed(2)}% APY`}
           note={active === null ? "No rate known yet" : holding ? `On ${active.name}` : `Nothing supplied right now (best rate: ${active.name})`} />
-        <EarnStat label="Est. per day" value={dailyText} {...(daily === null ? {} : { tone: "profit" as const })} note={daily === null ? "No rate or amount to estimate from" : "At the last known rates, before gas"} />
+        <EarnStat label="Interest earned" value={earned ?? "-"} {...(earnedWei !== null && earnedWei > 0n ? { tone: "profit" as const } : {})}
+          note={earned === null ? (holding ? "Earned amount unavailable" : "Nothing supplied yet") : "Since the first supply, before gas"} />
         <EarnStat label="Kept liquid" value={liquidWei === null ? "-" : `${f2e(liquidWei)} USDT`} note={liquidWei === null ? "Wallet balance unavailable" : "Ready for the next buys"} />
       </div>
       {rates.atMs === null ? null : <span style={{ ...mono, textTransform: "none", letterSpacing: 0 }} data-testid="earn-rates-note">Rates from the agent's last Binance read, {new Date(rates.atMs).toLocaleString()}</span>}

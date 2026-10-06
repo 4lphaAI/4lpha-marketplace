@@ -101,13 +101,16 @@ test("V5 the Earn tab data: liquidWei from the same chain read, the newest known
   assert.ok(rows.every(r => /^0x[0-9a-f]{64}$/u.test(r.txHash)));
   const rates = earn["rates"] as { venus: number | null; "aave-v3": number | null; atMs: number | null };
   assert.deepEqual([rates.venus, rates["aave-v3"], rates.atMs], [302, 250, rows[0]!.atMs], "per protocol the newest non-null of the agent's own deposits; a gate row supplies no rate");
+  // Interest earned = held now (chain) + withdrawn - supplied over every committed row, gate rows too (the chain total reflects them): 5 held + 60 back - 65 in = 0 in this rate-free fake.
+  assert.equal(earn["earnedWei"], ((BigInt(String((earn["totalWei"]))) + 60n * E) - 65n * E).toString());
+  assert.equal(earn["earnedWei"], "0");
   void gateAt;
 });
 
 test("V6 the Earn tab data with nothing known: rates null, no activity, and a failed chain read leaves liquidWei null; a redeem by amount shows the moved USDT, a ratio row with no figure shows null; only committed rows count and at most 20", async t => {
   const w = await earnWorld(t, { lane: "schedule" });
   const empty = (await viewOf(w)(W) as unknown as { agent: { earn: Record<string, unknown> } }).agent.earn;
-  assert.deepEqual([empty["rates"], empty["activity"], empty["liquidWei"]], [{ venus: null, "aave-v3": null, atMs: null }, [], (100n * E).toString()]);
+  assert.deepEqual([empty["rates"], empty["activity"], empty["liquidWei"], empty["earnedWei"]], [{ venus: null, "aave-v3": null, atMs: null }, [], (100n * E).toString(), null]);
   w.failures.balances = true;
   assert.equal(((await viewOf(w)(W)) as unknown as { agent: { earn: Record<string, unknown> } }).agent.earn["liquidWei"], null);
   w.failures.balances = false;

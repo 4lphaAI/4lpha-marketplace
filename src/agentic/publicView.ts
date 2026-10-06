@@ -183,6 +183,22 @@ async function agenticEarnPublicView(input: { chain?: Pick<AgenticChain, "earnBa
       if (rates[protocol] === null && typeof bps === "number") { rates[protocol] = bps; rates.atMs ??= o.createdAt; }
     }
   }
+  // Interest earned so far by this agent: what it holds now (chain) + the USDT its withdrawals returned - the USDT it supplied. Null with no supply,
+  // a failed chain read, or a withdrawal whose returned USDT is unknown (a ratio row with no measured figure).
+  let earnedWei: string | null = null;
+  // Every committed row of the agent counts here, operator gate rows too: the chain total reflects them.
+  const allCommitted = earnRows.filter(o => o.outcome === "committed");
+  if (total !== null && allCommitted.some(o => o.kind === "earn-deposit")) {
+    let flows: bigint | null = 0n;
+    for (const o of allCommitted) {
+      if (flows === null) break;
+      const amount = o.amountAtomic !== null && /^[0-9]+$/u.test(o.amountAtomic) ? BigInt(o.amountAtomic) : null;
+      if (o.kind === "earn-deposit") { flows = amount === null ? null : flows - amount; continue; }
+      const moved = isRecord(o.evidence) && isRecord(o.evidence["post"]) ? o.evidence["post"]["usdtMoved"] : undefined;
+      flows = typeof moved === "string" && /^[0-9]+$/u.test(moved) ? flows + BigInt(moved) : o.fromQty === "ratio:1" || amount === null ? null : flows + amount;
+    }
+    earnedWei = flows === null ? null : (total + flows).toString();
+  }
   const activity = committed.slice(0, 20).flatMap(o => {
     const ev = earnEvidence(o.evidence);
     if (ev === null) return [];
@@ -193,7 +209,7 @@ async function agenticEarnPublicView(input: { chain?: Pick<AgenticChain, "earnBa
       apyBps: deposit ? ev.apyBps?.[ev.protocol] ?? null : null, otherApyBps: deposit ? ev.apyBps?.[other] ?? null : null, reason: ev.reason, txHash: o.txHash }];
   });
   return { products: input.products.map(p => ({ protocol: p.protocol, valueWei: value(p.protocol), reason: balances === null ? "chain-unreadable" : null, selfRescue: earnSelfRescueCommand(p) })),
-    totalWei: total === null ? null : total.toString(), liquidWei: balances === null ? null : balances.usdt.toString(), rates, activity,
+    totalWei: total === null ? null : total.toString(), liquidWei: balances === null ? null : balances.usdt.toString(), rates, activity, earnedWei,
     lastDeposit: deposit === undefined || evidence === null ? null : { protocol: evidence.protocol, amountWei: deposit.amountAtomic, atMs: deposit.createdAt, txHash: deposit.txHash,
       apyBps: { venus: evidence.apyBps?.["venus"] ?? null, "aave-v3": evidence.apyBps?.["aave-v3"] ?? null } },
     open: open === undefined ? null : { kind: open.kind === "earn-deposit" ? "deposit" : "redeem", held: open.holdReason !== null,
