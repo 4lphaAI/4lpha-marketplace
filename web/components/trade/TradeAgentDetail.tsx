@@ -1214,7 +1214,7 @@ function DcaOrderHistory({ dca, refresh }: { readonly dca: TradeDcaView; readonl
   </section>;
 }
 
-/** DCA-DETAIL §6: entry, TP and every resting level's own tick-edge price. The read-only Agentic page has no NFT: an armed (resting) order is drawn at its trigger price. */
+/** DCA-DETAIL §6: entry, TP, every resting level's own tick-edge price and every pending level's planned price. The read-only Agentic page has no NFT: an armed (resting) order is drawn at its trigger price. */
 function dcaChartPriceLines(dca: TradeDcaView, readOnly = false): readonly { readonly price: number; readonly color: string; readonly title: string }[] {
   const round = dca.round;
   if (round === null) return [];
@@ -1226,8 +1226,10 @@ function dcaChartPriceLines(dca: TradeDcaView, readOnly = false): readonly { rea
   };
   pushLine(round.avgCostE8, "#2fd48c", "ENTRY");
   if (round.tp !== null && round.tp.state === "resting" && (round.tp.tokenId !== null || readOnly)) pushLine(round.tp.edgePriceE8, "#2fd48c", "TP");
+  // Operator 2026-10-06: every DCA level still to come is drawn, not only the armed ones (a pending level at its planned price).
   for (const level of round.levels) {
     if (level.state === "resting" && (level.tokenId !== null || readOnly)) pushLine(level.edgePriceE8, "#2fd48c", `DCA #${level.levelNo}`);
+    else if (level.state === "pending") pushLine(dcaOrderPriceE8(level, "level"), "#2fd48c", `DCA #${level.levelNo}`);
   }
   return lines;
 }
