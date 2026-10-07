@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { publicOrigin } from "@/lib/exec/public-origin";
+import { readAgenticWallet } from "@/lib/exec/agentic-wallet-read";
 
 const COOKIE = "4lpha_agentic_pairing";
 const requests = new Map<string, { start: number; count: number }>();
-const cache = new Map<string, { at: number; body: string; status: number }>();
 function limited(key: string, limit: number, windowMs: number): boolean {
   const now = Date.now();
   for (const [k, row] of requests) if (now - row.start >= 600_000) requests.delete(k);
@@ -21,9 +21,12 @@ async function proxy(request: NextRequest, segments: readonly string[], method: 
   if (method === "POST" && (request.headers.get("content-type")?.split(";")[0]?.trim() !== "application/json" || request.headers.get("origin") !== publicOrigin(request))) return NextResponse.json({ data: null, error: { code: "forbidden" } }, { status: 403 });
   const cookie = request.cookies.get(COOKIE)?.value;
   if (!publicRead && path !== "pairings" && (cookie === undefined || !/^[0-9a-f-]{36}\.[0-9a-f]{64}$/.test(cookie))) return NextResponse.json({ data: null, error: { code: "unauthorized" } }, { status: 401 });
-  const key = path.toLowerCase(), saved = cache.get(key);
-  if (publicRead && saved !== undefined && Date.now() - saved.at < 15_000) return new NextResponse(saved.body, { status: saved.status, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
   try {
+    // The public wallet read is shared with the MCP `agent_status` tool: one 15 s cache, one flight per wallet.
+    if (publicRead) {
+      const read = await readAgenticWallet(path);
+      return new NextResponse(read.body, { status: read.status, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
+    }
     const url = process.env["EXECUTION_URL"]?.trim(), token = process.env["EXECUTION_API_TOKEN"]?.trim();
     if (!url || !token) throw new Error();
     const body = method === "POST" ? await request.text() : undefined;
@@ -45,7 +48,6 @@ async function proxy(request: NextRequest, segments: readonly string[], method: 
       response.cookies.set(COOKIE, credential, { httpOnly: true, secure: true, sameSite: "strict", path: "/api/agentic",
         maxAge: typeof deadline === "number" ? Math.max(60, Math.ceil((deadline - Date.now()) / 1_000) + 300) : 2_400 });
     }
-    if (publicRead && upstream.ok) { for (const [k, entry] of cache) if (Date.now() - entry.at >= 15_000) cache.delete(k); cache.set(key, { at: Date.now(), body: JSON.stringify(envelope), status: upstream.status }); }
     return response;
   } catch { return NextResponse.json({ data: null, error: { code: "execution_unavailable" } }, { status: 502 }); }
 }
