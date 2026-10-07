@@ -452,10 +452,10 @@ export default defineRailway(() => {
       NEXT_PUBLIC_AGENTIC_DCA_ENABLED: "true",
       NEXT_PUBLIC_AGENTIC_EARN_ENABLED: "true",
       // Public MCP (/mcp). Runtime variables: a restart is enough. MCP_DATA_TOOLS_ENABLED switches on the three data tools
-      // (agent_status, bstock_analysis, meme_stocks); the operator flips it to "true" at deploy. MCP_PUBLIC_ORIGIN pins the
-      // origin of every link the MCP returns, so a forged forwarded-host header cannot change the official deploy link.
+      // (agent_status, bstock_analysis, meme_stocks); turned on in production 2026-10-07 on the operator's go. MCP_PUBLIC_ORIGIN
+      // pins the origin of every link the MCP returns, so a forged forwarded-host header cannot change the official deploy link.
       MCP_PUBLIC_ORIGIN: "https://4lpha.tech",
-      MCP_DATA_TOOLS_ENABLED: "false",
+      MCP_DATA_TOOLS_ENABLED: "true",
       NEXT_TELEMETRY_DISABLED: "1",
       NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: preserve(),
     },

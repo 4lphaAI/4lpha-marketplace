@@ -233,7 +233,7 @@ describe("agent_status", () => {
     expect(agent.positions).toHaveLength(10);
     expect(agent.positionCount).toBe(12);
     for (const absent of ["schedule", "portfolio", "dca", "earn", "meme"]) expect(agent, absent).not.toHaveProperty(absent);
-    expect(agent.positions[0]).toEqual({ symbol: "S0", status: "open", entryUsdtWei: "20000000000000000000", exitUsdtWei: null, pnlBps: 150, live: { quoteStatus: "quoted" } });
+    expect(agent.positions[0]).toEqual({ symbol: "S0", status: "open", entryUsdtWei: "20000000000000000000", entryUsdt: "20.00", exitUsdtWei: null, exitUsdt: null, pnlBps: 150, live: { quoteStatus: "quoted" } });
     const raw = JSON.stringify(out);
     for (const leak of ["LLM reasoning leak", "cmc leak", "events", "runs", "cmcLog", "entryTxHash", "secret\"", "exec-secret", "leak"]) expect(raw, leak).not.toContain(leak);
   });

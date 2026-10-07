@@ -1,0 +1,309 @@
+{
+  "name": "TradFi Portfolio Agent",
+  "status": "running",
+  "holdCode": null,
+  "endReason": null,
+  "termDays": 7,
+  "termEndAction": "keep",
+  "hireStartedAtMs": 1791384943221,
+  "entryCutoffAtMs": 1791982543221,
+  "hireEndsAtMs": 1791989743221,
+  "connection": "connected",
+  "lastProbeAtMs": 1791391434060,
+  "heldOrders": 0,
+  "logoutPending": false,
+  "settings": {
+    "executionModel": "tradfi",
+    "primaryModel": "qwen3.7-flash",
+    "capitalQuoteWei": "125000000000000000000",
+    "entryWei": "125000000000000000000",
+    "minEntryWei": "100000000000000000",
+    "maxOpenPositions": 1,
+    "slippageBps": 100,
+    "stopLossBps": null,
+    "takeProfitBps": null,
+    "maxHoldSec": null,
+    "portfolioDriftBps": 50
+  },
+  "limits": {
+    "readAtMs": 1791384944210,
+    "dailyLimit": 50000,
+    "quotaLeft": "50000",
+    "x402DailyLimit": 20,
+    "x402QuotaLeft": "20",
+    "tradeAllTokens": true,
+    "abnormalTxnHandling": "AutoReject",
+    "signInMaxTimeMs": 1822920902000
+  },
+  "cmc": {
+    "authorizedTotalWei": "200000000000000000",
+    "settledWei": "0",
+    "remainingWei": "200000000000000000",
+    "status": "ready"
+  },
+  "summary": {
+    "openPositions": 0,
+    "maxOpenPositions": 1,
+    "closedTrades": 0,
+    "wins": 0,
+    "winRateBps": null,
+    "grossDeltaWei": "0",
+    "grossComplete": true
+  },
+  "positions": [],
+  "pinned": [
+    {
+      "address": "0x80f3d493ebce97e343c53d29a137942416b4ffc0",
+      "symbol": "CRCLB"
+    },
+    {
+      "address": "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14",
+      "symbol": "MSTRB"
+    },
+    {
+      "address": "0xa394dcea3fd3847fd793afbfd163e2e3858b7c65",
+      "symbol": "HOODB"
+    },
+    {
+      "address": "0x7425889fe94f9d693e8daefe88bcced6acfef4c0",
+      "symbol": "METAB"
+    },
+    {
+      "address": "0xd97d097a89113fa59b76c572e5b2eb647e8eefaf",
+      "symbol": "SOXLB"
+    }
+  ],
+  "erc8004Identity": {
+    "status": "registered",
+    "agentId": "365842",
+    "version": 1,
+    "category": "agentic-portfolio",
+    "revision": 5,
+    "errorCode": null,
+    "publicRef": "fbbd0746-45b5-4eaa-9aad-a2e34c5e1c75",
+    "uriUpdateTxHash": "0x96c62dfe357c025e6cf3eda61a1749e041b03d454a6c2396c14d72049761a629",
+    "registrationTxHash": "0xefa0d67e71ad4881f229f404a3eae1bf1642d96e0134a3718a5effce9dfa92a9"
+  },
+  "portfolio": {
+    "tokens": [
+      {
+        "token": "0x80f3d493ebce97e343c53d29a137942416b4ffc0",
+        "symbol": "CRCLB",
+        "displayName": "Circle Internet Group (bStocks)",
+        "initial": {
+          "quantityAtomic": "530221299803343196",
+          "quantityReason": null,
+          "quoteWei": "42500000000000000000",
+          "quoteReason": null
+        },
+        "targetBps": 3400,
+        "balanceAtomic": "530221299803343196",
+        "valueWei": "42894012200608074602",
+        "valueReason": null,
+        "weightBps": 3422,
+        "driftBps": 66
+      },
+      {
+        "token": "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14",
+        "symbol": "MSTRB",
+        "displayName": "Strategy (bStocks)",
+        "initial": {
+          "quantityAtomic": "88466134919908877",
+          "quantityReason": null,
+          "quoteWei": "13714616034537965089",
+          "quoteReason": null
+        },
+        "targetBps": 1100,
+        "balanceAtomic": "88466134919908877",
+        "valueWei": "13701277078870697406",
+        "valueReason": null,
+        "weightBps": 1093,
+        "driftBps": 61
+      },
+      {
+        "token": "0xa394dcea3fd3847fd793afbfd163e2e3858b7c65",
+        "symbol": "HOODB",
+        "displayName": "Robinhood (bStocks)",
+        "initial": {
+          "quantityAtomic": "126784165850353195",
+          "quantityReason": null,
+          "quoteWei": "13718068957788782761",
+          "quoteReason": null
+        },
+        "targetBps": 1100,
+        "balanceAtomic": "126784165850353195",
+        "valueWei": "13796328893962418738",
+        "valueReason": null,
+        "weightBps": 1100,
+        "driftBps": 7
+      },
+      {
+        "token": "0x7425889fe94f9d693e8daefe88bcced6acfef4c0",
+        "symbol": "METAB",
+        "displayName": "Meta (bStocks)",
+        "initial": {
+          "quantityAtomic": "56776663921205938",
+          "quantityReason": null,
+          "quoteWei": "41182107626080599532",
+          "quoteReason": null
+        },
+        "targetBps": 3300,
+        "balanceAtomic": "56776663921205938",
+        "valueWei": "41070216231762159920",
+        "valueReason": null,
+        "weightBps": 3277,
+        "driftBps": 69
+      },
+      {
+        "token": "0xd97d097a89113fa59b76c572e5b2eb647e8eefaf",
+        "symbol": "SOXLB",
+        "displayName": "Semicon Bull 3X ETF (bStocks)",
+        "initial": {
+          "quantityAtomic": "87966381980903748",
+          "quantityReason": null,
+          "quoteWei": "13714801437259898320",
+          "quoteReason": null
+        },
+        "targetBps": 1100,
+        "balanceAtomic": "87966381980903748",
+        "valueWei": "13691999331204871912",
+        "valueReason": null,
+        "weightBps": 1092,
+        "driftBps": 67
+      }
+    ],
+    "capitalQuoteWei": "125000000000000000000",
+    "netInvestedWei": "124829594055667245702",
+    "cashCapWei": "170405944332754298",
+    "walletUsdtWei": "370405944332754298",
+    "portfolioCashWei": "170405944332754298",
+    "idleUsdtWei": "200000000000000000",
+    "stockValueWei": "125153833736408222578",
+    "totalValueWei": "125324239680740976876",
+    "pnlWei": "324239680740976876",
+    "driftBps": 69,
+    "intervalSec": 14400,
+    "anchorMs": 1791384950334,
+    "currentSlot": 0,
+    "nextCheckAtMs": 1791399350334,
+    "check": {
+      "slot": 0,
+      "state": "done",
+      "maxDriftBps": 10000,
+      "valueWei": "125000000000000000000",
+      "checkedAt": 1791384995644
+    },
+    "legs": [
+      {
+        "slot": 0,
+        "side": "buy",
+        "token": "0xd97d097a89113fa59b76c572E5b2Eb647E8eefaf",
+        "symbol": "SOXLB",
+        "amountWei": "13714801437259898320",
+        "quotedOutAtomic": "87965314377650443",
+        "minOutAtomic": "87085661233873938",
+        "proceedsAtomic": null,
+        "state": "projected",
+        "txHash": "0x14b849b67cef8dce7d96949ee98b9e553c49b61eded90a34be1b949b436a324d",
+        "createdAt": 1791385236861,
+        "detail": {
+          "id": "c5f0f24ec117bda6",
+          "executionState": "COMMITTED",
+          "executionReason": null,
+          "quantityAtomic": "87966381980903748",
+          "quantityReason": null,
+          "quoteWei": "13714801437259898320",
+          "quoteReason": null
+        }
+      },
+      {
+        "slot": 0,
+        "side": "buy",
+        "token": "0xA394dCEa3fd3847fD793afBFd163E2e3858B7c65",
+        "symbol": "HOODB",
+        "amountWei": "13718068957788782761",
+        "quotedOutAtomic": "126455574123990913",
+        "minOutAtomic": "125191018382751003",
+        "proceedsAtomic": null,
+        "state": "projected",
+        "txHash": "0x580513b5b2a2262d9ae2a705241f379deaae32091f77f3e6e08774d5eaad4a0c",
+        "createdAt": 1791385177044,
+        "detail": {
+          "id": "eb7e93f7bb71850f",
+          "executionState": "COMMITTED",
+          "executionReason": null,
+          "quantityAtomic": "126784165850353195",
+          "quantityReason": null,
+          "quoteWei": "13718068957788782761",
+          "quoteReason": null
+        }
+      },
+      {
+        "slot": 0,
+        "side": "buy",
+        "token": "0xE87afb3076AeB0f9B14E368DE8145ae6a2826A14",
+        "symbol": "MSTRB",
+        "amountWei": "13714616034537965089",
+        "quotedOutAtomic": "87999601664660387",
+        "minOutAtomic": "87119605648013783",
+        "proceedsAtomic": null,
+        "state": "projected",
+        "txHash": "0x4acb8c0508739331ac76b988f53bf8b031e5ffe70ab2f9dc13ec92628c54d43a",
+        "createdAt": 1791385116859,
+        "detail": {
+          "id": "f8ae2ee6fd4e1015",
+          "executionState": "COMMITTED",
+          "executionReason": null,
+          "quantityAtomic": "88466134919908877",
+          "quantityReason": null,
+          "quoteWei": "13714616034537965089",
+          "quoteReason": null
+        }
+      },
+      {
+        "slot": 0,
+        "side": "buy",
+        "token": "0x7425889FE94F9d693E8daefE88BCCed6AcFEf4c0",
+        "symbol": "METAB",
+        "amountWei": "41182107626080599532",
+        "quotedOutAtomic": "56750394796335369",
+        "minOutAtomic": "56182890848372015",
+        "proceedsAtomic": null,
+        "state": "projected",
+        "txHash": "0xc1ed51fb2533c69a749edfe0c3d47f4ddefb64273899eb42a81743b9a72fea9e",
+        "createdAt": 1791385056541,
+        "detail": {
+          "id": "44ee30d9decfcb64",
+          "executionState": "COMMITTED",
+          "executionReason": null,
+          "quantityAtomic": "56776663921205938",
+          "quantityReason": null,
+          "quoteWei": "41182107626080599532",
+          "quoteReason": null
+        }
+      },
+      {
+        "slot": 0,
+        "side": "buy",
+        "token": "0x80f3D493EBCe97e343c53D29a137942416B4ffC0",
+        "symbol": "CRCLB",
+        "amountWei": "42500000000000000000",
+        "quotedOutAtomic": "530127932613187237",
+        "minOutAtomic": "524826653287055364",
+        "proceedsAtomic": null,
+        "state": "projected",
+        "txHash": "0x0bbc552c08ff826d0c774f6d677d5b73582462322062b359d1579804afc7c461",
+        "createdAt": 1791384996777,
+        "detail": {
+          "id": "48f4ef32c80bde03",
+          "executionState": "COMMITTED",
+          "executionReason": null,
+          "quantityAtomic": "530221299803343196",
+          "quantityReason": null,
+          "quoteWei": "42500000000000000000",
+          "quoteReason": null
+        }
+      }
+    ]
+  }
+}

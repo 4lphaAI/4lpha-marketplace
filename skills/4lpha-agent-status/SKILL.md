@@ -12,7 +12,7 @@ description: |
 license: MIT
 metadata:
   author: 4lpha
-  version: "1.0"
+  version: "1.1"
 ---
 
 # 4lpha Agent Status Skill
@@ -47,11 +47,19 @@ tool: `agent_status` on `https://4lpha.tech/mcp`.
   often a Binance App setting changed or a limit was reached), `draining` / `entries-stopped` (no new
   entries, exits still managed), `ending` (term end in progress), `ended` (`endReason` says why, for
   example the owner signed out or the term finished).
-- Amounts: every field ending in `Wei` is USDT as an integer string with 18 decimals; divide by
-  10^18 before showing it (`"25000000000000000000"` = 25 USDT). `pnlBps` is profit or loss in basis
-  points (100 bps = 1 %). Open positions carry `live`; their value moves with the market.
-- Mode blocks: `schedule`, `portfolio`, `dca` or `earn` appear only for that kind of agent; `null`
-  means 4lpha could not read that part this time (say so, do not show zeros).
+- Amounts: next to every raw `...Wei` string (USDT, 18 decimals) there is a ready decimal string
+  ending in `Usdt` with two decimals (`valueWei` / `valueUsdt: "42.89"`); show that one. Token
+  quantities come as `quantity` (plain decimal, six significant digits) beside `quantityAtomic`.
+  Prices end in `PriceUsdt` (USDT per share). `...Bps` fields are numbers (100 bps = 1 %). Open
+  AI Trade positions carry `live`; their value moves with the market.
+- Which block answers what: AI Trade (`mode: "trade"`) is `positions` and `summary`. The other
+  modes have no positions: Smart Portfolio is `portfolio` (each stock's target and current weight,
+  drift, value and quantity, the last rebalance check, the totals, the last legs); Schedule buy is
+  `schedule` (the plan, buys done / planned / postponed, spent and remaining, the holding with
+  average cost, market price and PnL, the premium); Auto DCA is `dca` (the round, the ladder
+  levels, take-profit price, average price, holding, PnL since hire, market price, stop loss).
+  `earn` can appear on any mode. A block that is `null` means 4lpha could not read that part this
+  time (say so, do not show zeros).
 - Times are epoch milliseconds; convert them to the user's local time.
 - Point the user to `pageUrl` for the full run log, the agent's reasons and the order history.
 

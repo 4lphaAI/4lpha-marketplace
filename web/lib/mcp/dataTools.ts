@@ -12,6 +12,7 @@
  * read fails a whole bstock_analysis.
  */
 import { readAgenticWallet } from "../exec/agentic-wallet-read";
+import { dcaBlock, earnBlock, money, portfolioBlock, scheduleBlock, usdtText } from "./agentModes";
 import { DpError, dpGet } from "./dpRead";
 import { sanitizeAgentName, sanitizeSymbol } from "./sanitize";
 
@@ -31,7 +32,7 @@ export const DATA_TOOLS = [
   {
     name: "agent_status",
     description:
-      "Public status summary of the 4lpha Binance Agentic Wallet agent running on a wallet: mode, status, hold code, term, positions and short per-mode blocks, plus the link to the full public page. A wallet with no hire answers agent: null.",
+      "Public status summary of the 4lpha Binance Agentic Wallet agent running on a wallet: mode, status, hold code, term, and what the agent holds and how it is doing: positions for AI Trade, or the mode block (Schedule buy, Auto DCA, Smart Portfolio, Earn) with USDT amounts as decimal strings next to the raw values, plus the link to the full public page. A wallet with no hire answers agent: null.",
     inputSchema: {
       type: "object",
       properties: { wallet: { type: "string", pattern: "^0x[0-9a-fA-F]{40}$", description: "The Agentic Wallet address (0x plus 40 hex)." } },
@@ -98,7 +99,9 @@ function positionSummary(value: unknown): Json | null {
     symbol: str(p["symbol"]) === null ? null : sanitizeSymbol(p["symbol"]),
     status: str(p["status"]),
     entryUsdtWei: weiString(p["entryUsdtWei"]),
+    entryUsdt: usdtText(weiString(p["entryUsdtWei"])),
     exitUsdtWei: weiString(p["exitUsdtWei"]),
+    exitUsdt: usdtText(weiString(p["exitUsdtWei"])),
     pnlBps: typeof p["pnlBps"] === "string" && WEI.test(p["pnlBps"]) ? Number(p["pnlBps"]) : num(p["pnlBps"]),
     live: live === null ? null : { quoteStatus: str(live["quoteStatus"]) },
   };
@@ -119,9 +122,8 @@ export function summariseAgent(wallet: string, agent: Json, origin: string): Jso
   // A meme paper hire (flag off in production) reports as trade; its block is never summarised here.
   const mode = MODES.find((m) => agent[m] !== undefined) ?? "trade";
   const settings = rec(agent["settings"]);
-  const earn = rec(agent["earn"]);
   const identity = rec(agent["erc8004Identity"]);
-  return {
+  const common = {
     wallet,
     name: sanitizeAgentName(agent["name"]),
     mode,
@@ -134,18 +136,49 @@ export function summariseAgent(wallet: string, agent: Json, origin: string): Jso
     entryCutoffAtMs: num(agent["entryCutoffAtMs"]),
     hireEndsAtMs: num(agent["hireEndsAtMs"]),
     connection: str(agent["connection"]),
-    settings: pick(settings, ["executionModel", "capitalQuoteWei", "entryWei", "maxOpenPositions", "slippageBps", "stopLossBps", "takeProfitBps", "maxHoldSec"]),
-    summary: pick(agent["summary"], ["openPositions", "maxOpenPositions", "closedTrades", "wins", "winRateBps", "grossDeltaWei", "grossComplete"]),
-    positions: arr(agent["positions"]).slice(0, 10).map(positionSummary).filter((p): p is Json => p !== null),
-    positionCount: arr(agent["positions"]).length,
-    schedule: agent["schedule"] === undefined ? undefined : pick(agent["schedule"], ["symbol", "amountWei", "intervalSec", "nextDueAtMs", "plannedBuys", "buysThisSession", "spentWei", "remainingWei", "finished", "endKind", "premiumBps", "maxPremiumBps"]),
-    portfolio: agent["portfolio"] === undefined ? undefined : pick(agent["portfolio"], ["capitalQuoteWei", "netInvestedWei", "stockValueWei", "totalValueWei", "pnlWei", "driftBps", "intervalSec", "nextCheckAtMs"]),
-    dca: agent["dca"] === undefined ? undefined : pick(agent["dca"], ["symbol", "heldOrders", "reason"]),
-    earn: agent["earn"] === undefined ? undefined : pick(earn, ["totalWei", "liquidWei", "earnedWei", "withdrawingBeforeSignOut"]),
+  };
+  const tail = {
+    earn: agent["earn"] === undefined ? undefined : earnBlock(agent["earn"]),
     erc8004: identity === null ? null : { status: str(identity["status"]), agentId: typeof identity["agentId"] === "string" && /^[0-9]{1,78}$/u.test(identity["agentId"]) ? identity["agentId"] : null },
     pageUrl: `${origin}/agentic/${wallet}`,
     note: "Summary of the public view. Events, run logs, model reasons and the data-spend log are on the page.",
   };
+  if (mode === "trade") {
+    const summary = pick(agent["summary"], ["openPositions", "maxOpenPositions", "closedTrades", "wins", "winRateBps", "grossDeltaWei", "grossComplete"]);
+    return {
+      ...common,
+      settings: withUsdt(pick(settings, ["executionModel", "capitalQuoteWei", "entryWei", "maxOpenPositions", "slippageBps", "stopLossBps", "takeProfitBps", "maxHoldSec"]), ["capitalQuote", "entry"]),
+      summary: summary === null ? null : { ...summary, ...money("grossDelta", summary["grossDeltaWei"]) },
+      positions: arr(agent["positions"]).slice(0, 10).map(positionSummary).filter((p): p is Json => p !== null),
+      positionCount: arr(agent["positions"]).length,
+      ...tail,
+    };
+  }
+  // Schedule, DCA and Smart Portfolio: the mode block is the body. The AI Trade position list, summary and per-trade settings do not apply.
+  const own = settings === null ? null : {
+    ...money("capitalQuote", settings["capitalQuoteWei"]),
+    slippageBps: num(settings["slippageBps"]),
+    ...(mode === "portfolio" ? { portfolioDriftBps: num(settings["portfolioDriftBps"]) } : {}),
+  };
+  return {
+    ...common,
+    settings: own,
+    ...(mode === "schedule" ? { schedule: scheduleBlock(agent["schedule"]) } : {}),
+    ...(mode === "portfolio" ? { portfolio: portfolioBlock(agent["portfolio"]) } : {}),
+    ...(mode === "dca" ? { dca: dcaBlock(agent["dca"], settings?.["capitalQuoteWei"]) } : {}),
+    ...tail,
+  };
+}
+
+/** Adds the two-decimal USDT string next to each named raw `...Wei` field the block carries. */
+function withUsdt(block: Json | null, names: readonly string[]): Json | null {
+  if (block === null) return null;
+  const out: Json = { ...block };
+  for (const name of names) {
+    const raw = block[`${name}Wei`];
+    if (raw !== undefined) out[`${name}Usdt`] = usdtText(raw);
+  }
+  return out;
 }
 
 async function agentStatus(args: Json, origin: string): Promise<ToolResult | null> {
