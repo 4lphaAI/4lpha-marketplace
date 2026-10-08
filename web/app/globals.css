@@ -491,6 +491,12 @@
   --gold-tint: var(--brand-tint);
   --gold-line: var(--brand-line);
 
+  /* Agentic Wallet integration badge — near-black chip, literal gold.
+     Independent of --brand; this is the one place gold isn't the green alias. */
+  --integration-bg: #050505;
+  --integration-gold: #F0B90B;
+  --integration-gold-tint: rgb(240 185 11 / 0.14);
+
   /* Status scale */
   --live: #2fd48c;
   --live-tint: rgb(47 212 140 / 0.10);

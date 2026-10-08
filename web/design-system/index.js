@@ -413,7 +413,8 @@ const PATHS = {
   "chevron-down": `<path d="M7 10l5 5 5-5"/>`,
   "close": `<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>`,
   "plus": `<path d="M12 5v14M5 12h14"/>`,
-  "arrow-right": `<path d="M4.5 12h15M14 6.5l5.5 5.5-5.5 5.5"/>`
+  "arrow-right": `<path d="M4.5 12h15M14 6.5l5.5 5.5-5.5 5.5"/>`,
+  "spark": `<path d="M12 3c.4 3.2 1.4 5.6 3 7.2 1.6 1.6 4 2.6 7.2 3-3.2.4-5.6 1.4-7.2 3-1.6 1.6-2.6 4-3 7.2-.4-3.2-1.4-5.6-3-7.2-1.6-1.6-4-2.6-7.2-3 3.2-.4 5.6-1.4 7.2-3 1.6-1.6 2.6-4 3-7.2z" fill="currentColor" stroke="none"/>`
 };
 const iconNames = Object.keys(PATHS);
 /** Capitalized alias so the compiled bundle exposes it. */

@@ -22,4 +22,8 @@ export const RESOURCES = {
   erc8004: "/design/erc8004.png",
   altana: "/design/altana.png",
   zeroG: "/design/0g.svg",
+  aiClaude: "/design/ai/claude-default.svg",
+  aiCodex: "/design/ai/codex-dark.svg",
+  aiCursor: "/design/ai/cursor-dark.svg",
+  aiOpenClaw: "/design/ai/openclaw-default.svg",
 } as const;

@@ -15,7 +15,7 @@ function KitHeader({ route, go, search, onSearchChange }: {
   onSearchChange: (value: string) => void;
 }) {
   const [netOpen, setNetOpen] = React.useState(false);
-  const nav: Array<[string, string]> = [["/", "Marketplace"], ["/account", "Account"]];
+  const nav: Array<[string, string]> = [["/", "Marketplace"], ["/account", "Account"], ["/skills", "Skill"]];
   const isOn = (href: string) => route.startsWith(href) && (href !== "/" || route === "/");
   // `whiteSpace: nowrap` keeps a label and its external icon on one line: the
   // nav shares the header row with a flexible search field, so at 1280px the

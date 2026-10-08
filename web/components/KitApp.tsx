@@ -18,6 +18,7 @@ import { HireFlow } from "@/components/screens/HireFlow";
 import { MyAgentsScreen } from "@/components/screens/MyAgentsScreen";
 import { HiredAgentScreen } from "@/components/screens/HiredAgentScreen";
 import { ListAgentScreen } from "@/components/screens/ListAgentScreen";
+import { SkillsScreen } from "@/components/screens/SkillsScreen";
 import { DemoAgentDetail } from "@/components/demo/DemoAgentDetail";
 import { AgenticPublicScreen } from "@/components/agentic/AgenticPublicScreen";
 import { agenticEnabled } from "@/lib/agentic";
@@ -70,6 +71,7 @@ export function KitApp() {
   else if (route === "/account") screen = <MyAgentsScreen go={go} />;
   else if (route.startsWith("/deploy/")) screen = <DeployAgentScreen key={route} kind={route.slice(8) === "lending" ? "health" : route.slice(8)} go={go} />;
   else if (route.startsWith("/demo/")) screen = <DemoAgentDetail demoId={route.slice("/demo/".length)} go={go} />;
+  else if (route === "/skills") screen = <SkillsScreen go={go} />;
   else if (route === "/list-your-agent") screen = <ListAgentScreen go={go} />;
   else screen = <MarketplaceScreen go={go} onHire={setHiring} search={search} />;
 
