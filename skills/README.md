@@ -2,7 +2,7 @@
 
 Skills that let an AI assistant (Claude Code, Codex, Cursor, OpenClaw and other Agent Skills
 clients) work with 4lpha: hosted agents that trade tokenized US stocks (bStocks) on BNB Chain from
-the user's own Binance Agentic Wallet, plus 4lpha's market data for bStocks and meme stocks.
+the user's own Binance Agentic Wallet, plus 4lpha's market data for bStocks, meme stocks and the bStock against Ondo comparison.
 
 The skills are read-only. They never place orders, sign, hold keys or log in to a wallet. Trading is
 done by 4lpha's hosted agents after the user hires one on https://4lpha.tech and approves it in the
@@ -14,12 +14,15 @@ Binance App.
 | [`4lpha-agent-status`](4lpha-agent-status/SKILL.md) | Status, positions and results of the 4lpha agent on a wallet address |
 | [`4lpha-bstock-analysis`](4lpha-bstock-analysis/SKILL.md) | Indicators, market regime, price vs the underlying, session and depth for one bStock, plus optional news, macro and a paid deep report |
 | [`4lpha-meme-stocks`](4lpha-meme-stocks/SKILL.md) | Summary of meme tokens quoted in a bStock, grouped by stock |
+| [`4lpha-stock-compare`](4lpha-stock-compare/SKILL.md) | Compares the bStock and the Ondo token of one US stock for the same USDT: shares received, cost against the share price, exit cost, session and a verdict per size |
 
 ## Install
 
 ```bash
 npx skills add 4lphaAI/4lpha-marketplace
 ```
+
+This installs all five skills.
 
 Requirements: Node.js 22 or newer. No API key. The skills call the public endpoint
 `https://4lpha.tech/mcp`, which allows 10 calls per minute per IP (and a shared ceiling across all
@@ -38,6 +41,7 @@ Optional companions from Binance's skills hub (`npx skills add binance/binance-s
 
 ```bash
 node skills/4lpha-bstock-analysis/scripts/cli.mjs bstock-analysis token=NVDAB
+node skills/4lpha-stock-compare/scripts/cli.mjs stock-compare ticker=NVDA usdt=500
 ```
 
 Arguments are `key=value` pairs, which work unchanged in bash, zsh and Windows PowerShell. A JSON

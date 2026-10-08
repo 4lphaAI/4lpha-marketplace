@@ -1,5 +1,5 @@
 /**
- * The three data tools of the public MCP: `agent_status`, `bstock_analysis`, `meme_stocks`.
+ * The data tools of the public MCP: `agent_status`, `bstock_analysis`, `meme_stocks`, `stock_compare`.
  *
  * Listed only when MCP_DATA_TOOLS_ENABLED === "true" (agent_status also needs NEXT_PUBLIC_AGENTIC_WALLET_ENABLED),
  * both read at request time. Every datum comes from a cached, single-flight read: the data plane through `dpGet`
@@ -14,19 +14,19 @@
 import { readAgenticWallet } from "../exec/agentic-wallet-read";
 import { dcaBlock, earnBlock, money, portfolioBlock, scheduleBlock, usdtText } from "./agentModes";
 import { DpError, dpGet } from "./dpRead";
-import { sanitizeAgentName, sanitizeSymbol } from "./sanitize";
+import { sanitizeAgentName, sanitizeSymbol, sanitizeText } from "./sanitize";
 
 type Json = Record<string, unknown>;
 export type ToolResult = { content: [{ type: "text"; text: string }]; isError?: true };
 
-export const DATA_TOOL_NAMES = ["agent_status", "bstock_analysis", "meme_stocks"] as const;
+export const DATA_TOOL_NAMES = ["agent_status", "bstock_analysis", "meme_stocks", "stock_compare"] as const;
 export type DataToolName = (typeof DATA_TOOL_NAMES)[number];
 
 type Env = Readonly<Record<string, string | undefined>>;
 export const dataToolsEnabled = (env: Env = process.env): boolean => env["MCP_DATA_TOOLS_ENABLED"] === "true";
 export const agentStatusEnabled = (env: Env = process.env): boolean => dataToolsEnabled(env) && env["NEXT_PUBLIC_AGENTIC_WALLET_ENABLED"] === "true";
 export const isDataToolListed = (name: string, env: Env = process.env): boolean =>
-  name === "agent_status" ? agentStatusEnabled(env) : name === "bstock_analysis" || name === "meme_stocks" ? dataToolsEnabled(env) : false;
+  name === "agent_status" ? agentStatusEnabled(env) : name === "bstock_analysis" || name === "meme_stocks" || name === "stock_compare" ? dataToolsEnabled(env) : false;
 
 export const DATA_TOOLS = [
   {
@@ -63,6 +63,19 @@ export const DATA_TOOLS = [
       properties: {
         limit: { type: "integer", minimum: 1, maximum: 10, description: "Stocks to return (default 5)." },
         orderBy: { type: "string", enum: ["volume1hUsd", "live", "new1h"], description: "Stock ordering (default volume1hUsd)." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "stock_compare",
+    description:
+      "Compare the tokenized versions of one US stock on BNB Chain (the bStock and the Ondo token) for the same USDT: shares of the stock received, cost against the share price, cost of selling straight back, route type, whether each version is open now, and a verdict per size (better version, about the same, avoid with reasons: expensive to buy, expensive to sell back, no sell route found; or unreadable). Quotes are stored, about 15 minutes old, at 100, 1000 and 5000 USDT. Omit ticker for the list of stocks covered. Data, not a recommendation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ticker: { type: "string", pattern: "^[A-Za-z]{1,8}$", description: "The stock (NVDA) or one of its token symbols (NVDAB, NVDAon), case-insensitive. Omit for the list of covered stocks." },
+        usdt: { type: "number", minimum: 1, maximum: 1000000, description: "Amount in USDT; picks the nearest stored size and reports it as sizeUsedUsdt. All sizes are still returned." },
       },
       additionalProperties: false,
     },
@@ -426,9 +439,193 @@ async function memeStocks(args: Json): Promise<ToolResult | null> {
   });
 }
 
+// --------------------------------------------------------------- stock_compare
+
+// The closed lists below mirror the data plane's `src/query/stockCompare.ts` (head 15f42df: STOCK_COMPARE_CODES,
+// StockCompareIssuer / Route / Staleness, StockCompareAvoidReason). web/ never imports the plane, so
+// `stockCompare.test.ts` pins each list as a literal: a plane addition shows up as a red test, not as a silent null.
+export const COMPARE_ISSUERS = ["bstock", "ondo"] as const;
+export const COMPARE_ROUTES = ["rfq", "amm", "mixed"] as const;
+/** Size codes. On an `ok: true` size a code always refers to the sell-back (the exit could not be checked). */
+export const COMPARE_SIZE_CODES = ["no_route", "quote_failed", "decimals_mismatch", "implausible", "sell_no_route", "sell_failed"] as const;
+export const COMPARE_AVOID_REASONS = ["buy_cost", "round_trip", "no_exit"] as const;
+export const COMPARE_STALENESS = ["fresh", "stale", "dead"] as const;
+const ISSUERS = COMPARE_ISSUERS, ROUTES = COMPARE_ROUTES, SIZE_CODES = COMPARE_SIZE_CODES;
+/** The plane's STOCK_COMPARE_FRESH_MS / STOCK_COMPARE_STALE_MS (30 min, 2 h). */
+const FRESH_MS = 30 * 60_000, STALE_MS = 2 * 60 * 60_000;
+const TICKER_INPUT = /^[A-Za-z]{1,8}$/u;
+const PLANE_TICKER = /^[A-Z]{1,6}$/u;
+/** What the plane's `cleanMarketStatus` stores; still passed through the text sanitiser and capped at 32. */
+const MARKET_STATUS = /^[A-Za-z0-9._ -]{1,32}$/u;
+const MAX_TICKERS = 100;
+const MAX_VENUES = 4;
+const MAX_SIZES = 5;
+const COMPARE_NOTE =
+  "Quotes are stored and refresh about every 15 minutes at fixed sizes (100, 1000 and 5000 USDT). The Binance quote for the exact amount is the final word. Data, not a recommendation and not investment advice.";
+
+function compareSize(v: unknown): Json | null {
+  const s = rec(v);
+  const usdt = s === null ? null : num(s["usdt"]);
+  if (s === null || usdt === null) return null;
+  const venues = arr(s["venues"]).map((name) => sanitizeText(name, 32, "")).filter((name) => name !== "").slice(0, MAX_VENUES);
+  const failure = oneOf(s["code"], SIZE_CODES);
+  return {
+    usdt,
+    ok: s["ok"] === true,
+    ...(failure === null ? {} : { code: failure }),
+    tokensOut: num(s["tokensOut"]),
+    shares: num(s["shares"]),
+    costBps: num(s["costBps"]),
+    roundTripBps: num(s["roundTripBps"]),
+    route: oneOf(s["route"], ROUTES),
+    venues,
+  };
+}
+
+function compareVersion(v: unknown): Json | null {
+  const x = rec(v);
+  const issuer = x === null ? null : oneOf(x["issuer"], ISSUERS);
+  if (x === null || issuer === null) return null;
+  const status = str(x["marketStatus"]);
+  return {
+    issuer,
+    symbol: str(x["symbol"]) === null ? null : sanitizeSymbol(x["symbol"]),
+    address: address(x["address"]),
+    ratio: num(x["ratio"]),
+    openState: bool(x["openState"]),
+    marketStatus: status !== null && MARKET_STATUS.test(status) ? sanitizeText(status, 32, "") || null : null,
+    sizes: arr(x["sizes"]).map(compareSize).filter((s): s is Json => s !== null).sort((a, b) => (a["usdt"] as number) - (b["usdt"] as number)).slice(0, MAX_SIZES),
+  };
+}
+
+/**
+ * One avoid entry: the plane's `{ issuer, reasons[] }`, or the older bare issuer string (no reasons). `null` when the entry
+ * is neither, which makes the whole verdict unreadable rather than letting an unknown shape read as "nothing to avoid".
+ */
+function avoidEntry(v: unknown): Json | null {
+  const bare = oneOf(v, ISSUERS);
+  if (bare !== null) return { issuer: bare, reasons: [] };
+  const e = rec(v);
+  const issuer = e === null ? null : oneOf(e["issuer"], ISSUERS);
+  if (e === null || issuer === null) return null;
+  const reasons = [...new Set(arr(e["reasons"]).filter((r): r is (typeof COMPARE_AVOID_REASONS)[number] => oneOf(r, COMPARE_AVOID_REASONS) !== null))].slice(0, COMPARE_AVOID_REASONS.length);
+  return { issuer, reasons };
+}
+
+/** An issuer field that is null or a known issuer; anything else is unrecognisable (`undefined`). */
+const issuerOrNull = (v: unknown): (typeof ISSUERS)[number] | null | undefined => (v === null ? null : oneOf(v, ISSUERS) ?? undefined);
+
+function compareVerdict(v: unknown): Json | null {
+  const x = rec(v);
+  const usdt = x === null ? null : num(x["usdt"]);
+  if (x === null || usdt === null) return null;
+  const best = issuerOrNull(x["best"]), only = issuerOrNull(x["only"]);
+  const entries = Array.isArray(x["avoid"]) ? x["avoid"].map(avoidEntry) : null;
+  // Fail closed: an unreadable verdict names no winner, no empty avoid list and no "about the same".
+  if (best === undefined || only === undefined || typeof x["about_same"] !== "boolean" || entries === null || entries.some((e) => e === null)) {
+    return { usdt, unreadable: true, best: null, edgeBps: num(x["edgeBps"]), about_same: false, avoid: null, only: null };
+  }
+  return {
+    usdt,
+    unreadable: false,
+    best,
+    edgeBps: num(x["edgeBps"]),
+    about_same: x["about_same"],
+    avoid: entries.slice(0, ISSUERS.length),
+    only,
+  };
+}
+
+/** Nearest by absolute distance; the smaller size on a tie. */
+function nearestSize(sizes: readonly number[], usdt: number): number | null {
+  let best: number | null = null;
+  for (const size of [...sizes].sort((a, b) => a - b)) if (best === null || Math.abs(size - usdt) < Math.abs(best - usdt)) best = size;
+  return best;
+}
+
+/** The size to report for `usdt`: the nearest stored size that has an answered buy in some version, plus a note when that is not the whole story. */
+function pickSize(stored: readonly number[], quoted: readonly number[], usdt: number): { used: number | null; note: string | null } {
+  const notes: string[] = [];
+  const nearestAny = nearestSize(stored, usdt);
+  const used = nearestSize(quoted, usdt);
+  const largest = stored.length === 0 ? null : Math.max(...stored);
+  if (used === null) notes.push("No stored size has a quote.");
+  else if (nearestAny !== used) notes.push(`The nearest stored size (${nearestAny} USDT) has no quote, so the nearest size with a quote is used.`);
+  if (largest !== null && usdt > largest) notes.push(`The largest stored size is ${largest} USDT; the numbers do not describe a larger amount.`);
+  return { used, note: notes.length === 0 ? null : notes.join(" ") };
+}
+
+/** Staleness from an age, with the plane's own limits, so `staleness` and `ageMinutes` come from the same moment. */
+const stalenessAt = (ageMs: number): (typeof COMPARE_STALENESS)[number] => (ageMs <= FRESH_MS ? "fresh" : ageMs <= STALE_MS ? "stale" : "dead");
+
+/** The underlying ticker for a ticker or a version symbol, only when the plane's own list has it. */
+function resolveTicker(raw: string, known: ReadonlySet<string>): string | null {
+  const up = raw.toUpperCase();
+  if (known.has(up)) return up;
+  if (up.endsWith("B") && known.has(up.slice(0, -1))) return up.slice(0, -1);
+  if (up.endsWith("ON") && known.has(up.slice(0, -2))) return up.slice(0, -2);
+  return null;
+}
+
+async function stockCompare(args: Json): Promise<ToolResult | null> {
+  if (!hasOwn(args, ["ticker", "usdt"])) return null;
+  const rawTicker = args["ticker"];
+  if (rawTicker !== undefined && (typeof rawTicker !== "string" || !TICKER_INPUT.test(rawTicker))) return null;
+  const usdt = args["usdt"];
+  if (usdt !== undefined && (typeof usdt !== "number" || !Number.isFinite(usdt) || usdt < 1 || usdt > 1_000_000)) return null;
+
+  let listBody: Json | null;
+  try { listBody = rec(await dpGet("/trading/stock-compare")); } catch { return fail("data_unavailable"); }
+  if (!Array.isArray(listBody?.["data"])) return fail("data_unavailable");
+  const listed = arr(listBody?.["data"]).map(rec).filter((r): r is Json => r !== null && typeof r["ticker"] === "string" && PLANE_TICKER.test(r["ticker"]));
+  const listMeta = rec(listBody?.["meta"]);
+
+  if (rawTicker === undefined) {
+    const newest = num(listMeta?.["newestQuotedAt"]);
+    return text({
+      count: Math.min(listed.length, MAX_TICKERS),
+      total: listed.length,
+      truncated: listed.length > MAX_TICKERS,
+      staleness: newest === null ? oneOf(listMeta?.["staleness"], COMPARE_STALENESS) : stalenessAt(Date.now() - newest),
+      tickers: listed.slice(0, MAX_TICKERS).map((r) => ({ ticker: r["ticker"] as string, quotedAt: num(r["quotedAt"]) })),
+      note: COMPARE_NOTE,
+    });
+  }
+
+  const ticker = resolveTicker(rawTicker, new Set(listed.map((r) => r["ticker"] as string)));
+  if (ticker === null) return fail("not_found");
+  let body: Json | null;
+  try { body = rec(await dpGet(`/trading/stock-compare?ticker=${ticker}`)); } catch { return fail("data_unavailable"); }
+  const row = rec(body?.["data"]);
+  if (row === null || row["ticker"] !== ticker) return fail("data_unavailable");
+  const meta = rec(body?.["meta"]);
+  const versions = arr(row["versions"]).map(compareVersion).filter((x): x is Json => x !== null).slice(0, ISSUERS.length);
+  const verdicts = arr(row["verdicts"]).map(compareVerdict).filter((x): x is Json => x !== null).sort((a, b) => (a["usdt"] as number) - (b["usdt"] as number)).slice(0, MAX_SIZES);
+  const allSizes = versions.flatMap((x) => x["sizes"] as Json[]);
+  const stored = [...new Set([...allSizes.map((s) => s["usdt"] as number), ...verdicts.map((x) => x["usdt"] as number)])].sort((a, b) => a - b);
+  const quoted = [...new Set(allSizes.filter((s) => s["ok"] === true).map((s) => s["usdt"] as number))];
+  const picked = usdt === undefined ? null : pickSize(stored, quoted, usdt);
+  const quotedAt = num(row["quotedAt"]);
+  const ageMs = quotedAt === null ? num(meta?.["ageMs"]) : Math.max(0, Date.now() - quotedAt);
+  return text({
+    ticker,
+    quotedAt,
+    ageMinutes: ageMs === null ? null : Math.round(ageMs / 60_000),
+    staleness: quotedAt === null ? oneOf(meta?.["staleness"], COMPARE_STALENESS) : stalenessAt(ageMs as number),
+    referencePriceUsd: num(row["referencePriceUsd"]),
+    sizeUsedUsdt: picked === null ? null : picked.used,
+    sizeNote: picked === null ? null : picked.note,
+    versions,
+    verdicts,
+    thresholds: { aboutSameBps: num(meta?.["aboutSameBps"]), avoidCostBps: num(meta?.["avoidCostBps"]), avoidRoundTripBps: num(meta?.["avoidRoundTripBps"]), roundTripGapBps: num(meta?.["roundTripGapBps"]) },
+    note: COMPARE_NOTE,
+  });
+}
+
 /** `null` = arguments refused (JSON-RPC -32602). */
 export async function runDataTool(name: DataToolName, args: Json, origin: string): Promise<ToolResult | null> {
   if (name === "agent_status") return agentStatus(args, origin);
   if (name === "bstock_analysis") return bstockAnalysis(args);
+  if (name === "stock_compare") return stockCompare(args);
   return memeStocks(args);
 }

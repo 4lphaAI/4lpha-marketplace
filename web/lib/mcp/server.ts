@@ -198,7 +198,10 @@ export async function handleMcpMessage(message: unknown, origin: string, env: En
   if (method === "ping") return ok(id, {});
   if (method === "tools/list") return ok(id, { tools: listTools(env) });
   if (method === "tools/call") {
-    const called = await callTool(args.name, args.arguments !== null && typeof args.arguments === "object" && !Array.isArray(args.arguments) ? (args.arguments as Json) : {}, origin, env);
+    const given = args.arguments;
+    // Absent arguments mean {}; present but not a plain object is refused, never read as "no arguments".
+    if (given !== undefined && (given === null || typeof given !== "object" || Array.isArray(given))) return err(id, -32602, "Unknown tool or invalid arguments");
+    const called = await callTool(args.name, given === undefined ? {} : (given as Json), origin, env);
     return called ? ok(id, called) : err(id, -32602, "Unknown tool or invalid arguments");
   }
   return err(id, -32601, `Method not found: ${method}`);

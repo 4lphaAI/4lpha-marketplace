@@ -15,7 +15,7 @@ const HEADERS = {
   'user-agent': '4lpha-skill/1.0',
 };
 
-// command -> MCP tool, allowed arguments, required arguments, numeric arguments
+// command -> MCP tool, allowed arguments, required arguments, integer arguments (numeric), decimal arguments (decimal)
 const COMMANDS = {
   'list-agents': { tool: 'list_agents', args: [], required: [] },
   'hire-link': { tool: 'get_hire_link', args: ['agent'], required: ['agent'] },
@@ -23,6 +23,7 @@ const COMMANDS = {
   'agent-status': { tool: 'agent_status', args: ['wallet'], required: ['wallet'] },
   'bstock-analysis': { tool: 'bstock_analysis', args: ['token', 'interval'], required: ['token'] },
   'meme-stocks': { tool: 'meme_stocks', args: ['limit', 'orderBy'], required: [], numeric: ['limit'] },
+  'stock-compare': { tool: 'stock_compare', args: ['ticker', 'usdt'], required: [], decimal: ['usdt'] },
 };
 
 function usageError(message) {
@@ -54,6 +55,14 @@ function parseArgs(command, rest) {
     if (params[key] === undefined) continue;
     const n = Number(params[key]);
     if (!Number.isInteger(n)) throw usageError(`${key} must be an integer`);
+    params[key] = n;
+  }
+  for (const key of spec.decimal ?? []) {
+    if (params[key] === undefined) continue;
+    const v = params[key];
+    // Only a number or a non-empty numeric string; a boolean, null, array or object is refused, never coerced.
+    const n = typeof v === 'number' || (typeof v === 'string' && v.trim() !== '') ? Number(v) : NaN;
+    if (!Number.isFinite(n)) throw usageError(`${key} must be a number`);
     params[key] = n;
   }
   return { tool: spec.tool, arguments: params };

@@ -38,7 +38,28 @@ export const featureSnapshot = (stale = false, interval = "15m") => ({
   session: { usEquity: true, reason: null, state: "rth", nextBoundaryAt: 1_900_000_100_000, sessionStart: 1_899_990_000_000, lastRthCloseAt: 1_899_900_000_000, evaluatedAt: 1 },
 });
 
-export type PlaneOptions = { stale?: boolean; universeStatus?: number; eligibilityStatus?: number; memeStocks?: unknown; paths?: string[] };
+export type PlaneOptions = { stale?: boolean; universeStatus?: number; eligibilityStatus?: number; memeStocks?: unknown; paths?: string[]; stockCompare?: { list?: unknown; row?: unknown; rowTicker?: string; meta?: Record<string, unknown>; listStatus?: number; rowStatus?: number } };
+
+/** Shaped exactly like the data plane's `GET /trading/stock-compare?ticker=NVDA` (STOCK-COMPARE-BUILD-2026-10-07). */
+export const COMPARE_QUOTED_AT = 1_900_000_000_000;
+const compareSize = (usdt: number, over: Record<string, unknown> = {}) => ({ usdt, ok: true, tokensOut: usdt / 237, shares: usdt / 237, costBps: -12, roundTripBps: 2, route: "rfq", venues: ["Rfq Neptunex"], ...over });
+export const stockCompareRow = (over: Record<string, unknown> = {}) => ({
+  ticker: "NVDA", quotedAt: COMPARE_QUOTED_AT, referencePriceUsd: 237.40985268157382,
+  versions: [
+    { issuer: "bstock", symbol: "NVDAB", address: NVDAB, ratio: 1.0007782237528078, openState: true, marketStatus: null,
+      sizes: [compareSize(100, { shares: 0.42162787, costBps: -10 }), compareSize(1000, { shares: 4.2169792 }), { usdt: 5000, ok: false, tokensOut: null, shares: null, costBps: null, roundTripBps: null, route: null, venues: [], code: "no_route" }] },
+    { issuer: "ondo", symbol: "NVDAon", address: "0xa9ee28c80f960b889dfbd1902055218cba016f75", ratio: 1.0017152487959897, openState: true, marketStatus: "regular",
+      sizes: [compareSize(100, { shares: 0.42212281, costBps: -22, route: "amm", venues: ["Metric", "Uniswap V4"] }), compareSize(1000, { shares: 4.22112789, costBps: -21, route: "mixed", venues: ["Metric", "Elfomofi", "Rfq Neptunex"] }), compareSize(5000, { shares: 21.10043052, costBps: -19, route: "amm", venues: ["Metric"] })] },
+  ],
+  verdicts: [
+    { usdt: 100, best: null, edgeBps: 11.7, about_same: true, avoid: [], only: null },
+    { usdt: 1000, best: null, edgeBps: 9.8, about_same: true, avoid: [], only: null },
+    { usdt: 5000, best: "ondo", edgeBps: null, about_same: false, avoid: [], only: "ondo" },
+  ],
+  ...over,
+});
+export const stockCompareMeta = { staleness: "fresh", quotedAt: COMPARE_QUOTED_AT, ageMs: 240_012, sizesUsdt: [100, 1000, 5000], aboutSameBps: 20, avoidCostBps: 200, avoidRoundTripBps: 200, roundTripGapBps: 200 };
+export const stockCompareList = () => [{ ticker: "NVDA", quotedAt: COMPARE_QUOTED_AT }, { ticker: "ON", quotedAt: COMPARE_QUOTED_AT }, { ticker: "SPY", quotedAt: COMPARE_QUOTED_AT }];
 
 const venue = (liq: number) => ({ dex: "pancakeswap", version: "v3", pool: NVDAB_POOL, feeTier: 2500, quote: { address: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT" }, priceUsd: 191.2, liquidityUsd: liq, volume24hUsd: 55_000, asOf: 1_900_000_000_000 });
 export const universeRows = [
@@ -87,6 +108,9 @@ export function installDataPlane(opts: PlaneOptions = {}) {
     if (under) return json({ data: { [under[1]!]: { data: null, error: { code: "features_pending", reason: "not_attempted" } } }, meta: {} });
     if (path === "/trading/regime/us-equity") return json({ data: { asOf: 1, sessionState: "rth", regime: "neutral", reasons: ["mixed or flat 1h trend"], spy: { available: true, staleness: "fresh", reason: null }, qqq: { available: true, staleness: "fresh", reason: null } }, meta: { staleness: "fresh" } });
     if (/^\/eligibility\/0x[0-9a-f]{40}$/u.test(path)) return json({ data: { address: path.slice(13), eligible: true, reason: "listed", source: "allowlist", checkedAt: 5, cached: false } }, opts.eligibilityStatus ?? 200);
+    if (path === "/trading/stock-compare") return json({ data: opts.stockCompare?.list ?? stockCompareList(), meta: { count: 3, staleness: "fresh", newestQuotedAt: COMPARE_QUOTED_AT, retentionMs: 7_200_000, sizesUsdt: [100, 1000, 5000], aboutSameBps: 20, avoidCostBps: 200, avoidRoundTripBps: 200, roundTripGapBps: 200 } }, opts.stockCompare?.listStatus ?? 200);
+    const compare = /^\/trading\/stock-compare\?ticker=([A-Z]{1,6})$/u.exec(path);
+    if (compare) return compare[1] === (opts.stockCompare?.rowTicker ?? "NVDA") ? json({ data: opts.stockCompare?.row ?? stockCompareRow(), meta: { ...stockCompareMeta, ...opts.stockCompare?.meta } }, opts.stockCompare?.rowStatus ?? 200) : json({ data: null, error: { code: "ticker_not_found" } }, 404);
     if (path.startsWith("/memes/stocks?")) return json({ data: opts.memeStocks ?? memeGroups(), meta: { asOf: 1_900_000_000_000, staleness: "fresh" } });
     return json({ error: "nope" }, 404);
   });

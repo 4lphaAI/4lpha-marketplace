@@ -25,7 +25,7 @@ it("initialize echoes a supported protocol version and identifies the server", a
 /** Sample arguments that satisfy each tool's required schema fields. */
 const SAMPLE_ARGS: Record<string, Record<string, unknown>> = {
   explain_strategy: { agent: "lp" }, get_hire_link: { agent: "lp" }, list_agents: {},
-  agent_status: { wallet: WALLET }, bstock_analysis: { token: "NVDAB" }, meme_stocks: {},
+  agent_status: { wallet: WALLET }, bstock_analysis: { token: "NVDAB" }, meme_stocks: {}, stock_compare: { ticker: "NVDA" },
 };
 
 /**
@@ -46,7 +46,7 @@ it("implements every tool it advertises, flag off and flag on", async () => {
   for (const tool of on.result.tools as { name: string; inputSchema: { required?: string[] } }[]) {
     const args = SAMPLE_ARGS[tool.name]!;
     for (const required of tool.inputSchema.required ?? []) expect(Object.keys(args), `${tool.name} sample must supply ${required}`).toContain(required);
-    if (tool.name === "bstock_analysis" || tool.name === "meme_stocks") installDataPlane();
+    if (tool.name === "bstock_analysis" || tool.name === "meme_stocks" || tool.name === "stock_compare") installDataPlane();
     else if (tool.name === "agent_status") installExecPlane();
     const body = await (await call(tool.name, args)).json();
     expect(body.error, `${tool.name} must be implemented`).toBeUndefined();
@@ -60,7 +60,7 @@ it("hides the data tools everywhere when the flag is off, and answers -32602 lik
   const descriptor = await (await GET(new NextRequest(`${ORIGIN}/mcp`))).json();
   expect(descriptor.tools.map((tool: { name: string }) => tool.name)).toEqual(["explain_strategy", "list_agents", "get_hire_link"]);
   const { fetcher } = installDataPlane();
-  for (const name of ["agent_status", "bstock_analysis", "meme_stocks"]) {
+  for (const name of ["agent_status", "bstock_analysis", "meme_stocks", "stock_compare"]) {
     const body = await (await call(name, SAMPLE_ARGS[name])).json();
     expect(body.error.code, name).toBe(-32602);
   }
@@ -70,7 +70,7 @@ it("hides the data tools everywhere when the flag is off, and answers -32602 lik
 it("lists agent_status only when the Agentic Wallet flag is also on", async () => {
   vi.stubEnv("MCP_DATA_TOOLS_ENABLED", "true");
   const noWallet = await (await post({ jsonrpc: "2.0", id: 1, method: "tools/list" })).json();
-  expect(noWallet.result.tools.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS.map((t) => t.name), "bstock_analysis", "meme_stocks"]);
+  expect(noWallet.result.tools.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS.map((t) => t.name), "bstock_analysis", "meme_stocks", "stock_compare"]);
   expect((await (await call("agent_status", { wallet: WALLET })).json()).error.code).toBe(-32602);
   vi.stubEnv("MCP_DATA_TOOLS_ENABLED", "yes");
   vi.stubEnv("NEXT_PUBLIC_AGENTIC_WALLET_ENABLED", "true");

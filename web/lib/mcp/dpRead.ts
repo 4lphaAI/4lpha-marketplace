@@ -25,6 +25,8 @@ export const DP_ALLOWLIST: readonly { readonly name: string; readonly pattern: R
   { name: "regime", pattern: /^\/trading\/regime\/us-equity$/u, ttlMs: 30_000 },
   { name: "eligibility", pattern: new RegExp(`^/eligibility/${ADDR}$`, "u"), ttlMs: 60_000 },
   { name: "memeStocks", pattern: /^\/memes\/stocks\?limit=([1-9]|10)&orderBy=(volume1hUsd|live|new1h)$/u, ttlMs: 30_000 },
+  // Store-only on the plane. A ticker enters the key only after the caller found it in the plane's own list, so the cache stays bounded by that list.
+  { name: "stockCompare", pattern: /^\/trading\/stock-compare(\?ticker=[A-Z]{1,6})?$/u, ttlMs: 60_000 },
 ];
 
 export type DpErrorCode = "path_not_allowed" | "data_unavailable";

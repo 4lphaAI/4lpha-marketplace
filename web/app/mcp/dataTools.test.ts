@@ -317,7 +317,7 @@ describe("server-side cache and single flight (M2)", () => {
 
   it("pins every window and the entry cap to the plan's literal numbers (M2)", () => {
     expect(Object.fromEntries(DP_ALLOWLIST.map((rule) => [rule.name, rule.ttlMs]))).toEqual({
-      universe: 60_000, featureIndex: 60_000, features: 30_000, underlyingIndex: 60_000, underlyingFeatures: 30_000, regime: 30_000, eligibility: 60_000, memeStocks: 30_000,
+      universe: 60_000, featureIndex: 60_000, features: 30_000, underlyingIndex: 60_000, underlyingFeatures: 30_000, regime: 30_000, eligibility: 60_000, memeStocks: 30_000, stockCompare: 60_000,
     });
     expect(MAX_CACHE_ENTRIES).toBe(500);
     expect(AGENTIC_WALLET_TTL_MS).toBe(15_000);
