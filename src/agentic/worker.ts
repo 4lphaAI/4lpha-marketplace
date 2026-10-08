@@ -15,6 +15,7 @@ import { runAgenticDcaStep } from "./dcaLane.js";
 import { earnBlocksSignOut, runAgenticEarnStep } from "./earnLane.js";
 import type { EarnProduct } from "./earnAdapter.js";
 import { runAgenticMemeStep } from "./memeLane.js";
+import { memeJevConfig } from "./memeJev.js";
 import { bawConnectionSignal, type BawRunner } from "./baw.js";
 import { decryptAgenticSession, type AgenticStore } from "./store.js";
 import type { AgenticInstanceManager } from "./instances.js";
@@ -240,8 +241,10 @@ export async function runAgenticCycle(input: AgenticLifecycleDeps & { execution:
       }
       // AGENTIC-MEME-STOCKS-SPEC 8.1 / 9.2: the paper meme step, beside the DCA step, for bound, ending and ended meme rows; it returns the row it last read.
       if (row.hireFacts?.meme !== undefined && ["bound", "ending", "ended"].includes(row.state)) {
+        // JEV-MEME-BENCHMARK-PLAN 3.4: the shadow is the trade-worker's own env (flag exactly true plus a key); otherwise no field and no request.
+        const jevConfig = memeJevConfig(process.env), jev = jevConfig === undefined ? {} : { jev: jevConfig };
         row = (await runAgenticMemeStep({ store, positions: input.positions, runner: input.runner, masterKey: input.masterKey, instance, chain: input.execution.chain,
-          worker: input.worker, memeEnabled: input.memeEnabled ?? agenticMemeEnabled(process.env), cycleStartMs }, row, options)).row;
+          worker: input.worker, memeEnabled: input.memeEnabled ?? agenticMemeEnabled(process.env), cycleStartMs, ...jev }, row, options)).row;
       }
       if (!options.reconciliationOnly && row.state === "ending") await resumeAgenticEnding(input, row);
       if (row.state === "ended") await revokeAgenticAgent(input, row);

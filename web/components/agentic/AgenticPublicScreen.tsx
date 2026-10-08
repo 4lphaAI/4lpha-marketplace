@@ -2,11 +2,13 @@
 import * as React from "react";
 import { Button, Icon, StatusBadge } from "@/design-system";
 import { SessionExpiryChip, useSessionClock } from "@/components/agent/SessionExpiry";
-import { useTokenIcons } from "@/components/TokenIcon";
+import { TokenIcon, useTokenIcons } from "@/components/TokenIcon";
+import { MarketChart, type MarketChartMarker } from "@/components/MarketChart";
 import { ZeroGCredit } from "@/components/ZeroGCredit";
 import { Erc8004IdentityStatus } from "@/components/agent/Erc8004IdentityStatus";
-import { ClosedPositionRow, CmcLog, DcaDetail, DcaTiles, Metric, PositionRow, bps, closedNewestFirst, compactAddress, usdt2, type PositionRowSettings } from "@/components/trade/TradeAgentDetail";
-import { AGENTIC_DCA_COPY, AGENTIC_MEME_COPY, agenticDcaView, agenticRequest, isAgenticDcaDto, isAgenticMemeDto, type AgenticMemeDto } from "@/lib/agentic";
+import { ClosedPositionRow, CmcLog, DcaDetail, DcaTiles, Metric, PositionRow, bps, closedNewestFirst, compactAddress, heldDuration, usdt2, type PositionRowSettings } from "@/components/trade/TradeAgentDetail";
+import { AGENTIC_DCA_COPY, AGENTIC_MEME_COPY, agenticDcaView, agenticRequest, isAgenticDcaDto, isAgenticMemeDecisionLog, isAgenticMemeDto, isAgenticMemeLastCycle, memeReasonLabel,
+  type AgenticMemeDecisionLogDto, type AgenticMemeDto } from "@/lib/agentic";
 import { AgenticEarnTab } from "./AgenticEarnTab";
 import { relativeTime } from "@/lib/exec/agent-detail";
 import { parseErc8004Identity } from "@/lib/exec/erc8004-identity";
@@ -58,33 +60,183 @@ const CMC_STATUS: Readonly<Record<string, string>> = { disabled: "Off", "setup-r
 const NO_POSITIONS: readonly PublicPosition[] = [];
 const USDT_ADDRESS = "0x55d398326f99059ff775485246999027b3197955";
 
-/** 9.4 (review R2-M2): a paper meme hire shows only its paper ledger, labelled paper; it has no real-summary tile, and a tile without a paper source shows a dash with its reason. */
-function MemePaper({ meme, capital, runs, symbols }: { meme: AgenticMemeDto; capital: string | null; runs: NonNullable<TradeView["runs"]>; symbols: Record<string, string> }) {
+type MemePosition = AgenticMemeDto["paper"]["positions"][number];
+type MemeTab = "Open Positions" | "Closed Positions" | "Run log" | "Decision log";
+/** Paper exit codes (spec 6.6) in words. */
+const MEME_CLOSE: Readonly<Record<string, string>> = { stop: "Stop loss (-30%)", trailing: "Trailing stop", "dead-chart": "Dead chart", "smart-out": "Smart money left",
+  "flow-flip": "Sellers took over", time: "Max hold (4 h)", drain: "Agent stopping", ended: "Agent ended" };
+const memeVenue = (venue: string): string => venue === "flap-bonding" || venue === "fourmeme-bonding" ? "curve" : "graduated";
+/** Paper token amounts are 18 decimals (spec 8.1); a missing amount (older plane) is a dash. */
+function memeAmount(wei: string | undefined): string {
+  if (wei === undefined || !/^\d+$/u.test(wei)) return "-";
+  return (Number(BigInt(wei) / 10n ** 12n) / 1e6).toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+function memePrice(entryWei: string, tokens: string | undefined): string {
+  if (tokens === undefined || !/^\d+$/u.test(tokens) || !/^\d+$/u.test(entryWei) || BigInt(tokens) === 0n) return "-";
+  const price = Number(BigInt(entryWei) * 10n ** 18n / BigInt(tokens)) / 1e18;
+  return price >= 1 ? price.toLocaleString("en-US", { maximumFractionDigits: 4 }) : price.toPrecision(4);
+}
+const memeTone = (pnl: number | null): "flat" | "profit" | "loss" => pnl === null ? "flat" : pnl < 0 ? "loss" : "profit";
+const memePnlUsdt = (p: MemePosition): string => p.pnlUsdtWei === undefined ? "-" : usdt2(p.pnlUsdtWei, true);
+const hhmm = (ms: number): string => new Date(ms).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+
+function MemeTokenHead({ p, icon }: { p: MemePosition; icon: string | null }) {
+  const symbol = p.symbol ?? compactAddress(p.token);
+  return <div className="fl-trade-position__token"><TokenIcon src={icon} symbol={symbol} size={26} /><span><strong>{symbol} / {p.quoteSymbol ?? "bStock"}</strong><small><MemeTokenCell address={p.token} /></small></span></div>;
+}
+
+function MemeOpenRow({ p, icon, expanded, onExpand }: { p: MemePosition; icon: string | null; expanded: boolean; onExpand: () => void }) {
+  const symbol = p.symbol ?? compactAddress(p.token), tone = memeTone(p.pnlBps), held = Math.floor((Date.now() - p.openedAt) / 60_000);
+  const marker: readonly MarketChartMarker[] = [{ timestamp: p.openedAt, side: "buy" }];
+  return <>
+    <div className="fl-trade-position" data-testid="meme-paper-row">
+      <MemeTokenHead p={p} icon={icon} />
+      <div className="fl-trade-position__age">{relativeTime(p.openedAt, Date.now()).text}</div>
+      <div className="fl-trade-position__size"><strong>{memeAmount(p.tokens)} <small>{symbol}</small></strong><span>{usdt2(p.entryUsdtWei)} paper · {memeVenue(p.venue)}</span><span>@ {typeof p.entryMcapUsd === "number" ? `${new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(p.entryMcapUsd)} MCap` : `${memePrice(p.entryUsdtWei, p.tokens)} USDT / ${symbol}`}</span></div>
+      <div className="fl-trade-position__plan"><strong><i className="is-tp" />Trail from +50%{p.peakPnlBps == null ? "" : ` · peak ${bps(p.peakPnlBps, true)}`}</strong><span><i />Stop -30% · max 4 h</span></div>
+      <button type="button" className={`fl-trade-chart-button ${expanded ? "is-active" : ""}`} aria-label={`${expanded ? "Hide" : "Show"} ${symbol} chart`} onClick={onExpand}><Icon name="yield" size={18} /></button>
+      <div className={`fl-trade-position__pnl is-${tone}`} title={p.markAtMs === null ? undefined : `Marked ${relativeTime(p.markAtMs, Date.now()).text}`}>
+        <strong>{p.pnlBps === null ? "-" : memePnlUsdt(p)}</strong><span>{p.pnlBps === null ? "no mark yet" : bps(p.pnlBps, true)}</span></div>
+      <div className="fl-trade-position__actions"><span title="Paper trade: no transaction">Paper</span></div>
+    </div>
+    {expanded ? <div className="fl-trade-position__expanded">
+      <div className="fl-trade-position__chart-head"><strong>{symbol} / {p.quoteSymbol ?? "bStock"} paper position</strong><span className="is-entry">● Entry</span><strong className={`is-${tone}`}>{p.pnlBps === null ? "-" : bps(p.pnlBps, true)}</strong></div>
+      <MarketChart kind="token" address={p.token} title={symbol} markers={marker} embedded height={230} />
+      <div className="fl-trade-position__chart-foot"><span>ENTRY {hhmm(p.openedAt)}</span><span>HOLD {held} / 240 MIN</span></div>
+    </div> : null}
+  </>;
+}
+
+function MemeClosedRow({ p, icon }: { p: MemePosition; icon: string | null }) {
+  const symbol = p.symbol ?? compactAddress(p.token), tone = memeTone(p.pnlBps);
+  return <div className="fl-trade-position fl-trade-position--closed" data-testid="meme-paper-row">
+    <MemeTokenHead p={p} icon={icon} />
+    <div className="fl-trade-position__reason"><span>{MEME_CLOSE[p.closeCode ?? ""] ?? (p.closeCode ?? "closed").replace(/-/gu, " ")}</span><small>{memeVenue(p.venue)}{p.costBps === undefined ? "" : ` · cost ${bps(p.costBps)}`}</small></div>
+    <div>{heldDuration(p.openedAt, p.closedAt)}</div>
+    <div>{memeAmount(p.tokens)} {symbol}</div>
+    <div><strong>{usdt2(p.entryUsdtWei)}</strong><span className="fl-trade-position__closed-sub"> → {usdt2(p.exitUsdtWei)}</span></div>
+    <div className={`fl-trade-position__pnl is-${tone}`} title="After fees, taxes and gas"><strong>{memePnlUsdt(p)}</strong><span>{p.pnlBps === null ? "-" : bps(p.pnlBps, true)}</span></div>
+    <div className="fl-trade-position__actions"><span title="Paper trade: no transaction">Paper</span></div>
+  </div>;
+}
+
+/** 9.4 (review R2-M2): a paper meme hire shows only its paper ledger, labelled paper; it has no real-summary tile, and a tile without a paper source shows a dash with its reason.
+ * Operator 2026-10-06: laid out like the real TradFi detail (tiles, tabs, position rows with chart), every figure still the paper one. */
+function MemePaper({ meme, capital, model, maxOpen, runs, symbols, icons, refresh }: { meme: AgenticMemeDto; capital: string | null; model: string; maxOpen: number;
+  runs: NonNullable<TradeView["runs"]>; symbols: Record<string, string>; icons: Readonly<Record<string, string | null>>; refresh: React.ReactNode }) {
+  const [tab, setTab] = React.useState<MemeTab>("Open Positions"), [expanded, setExpanded] = React.useState<string | null>(null);
   const s = meme.paper.summary, pnl = s.pnlUsdtWei, tone = pnl === null || !/^-?\d+$/u.test(pnl) ? "normal" : BigInt(pnl) < 0n ? "loss" : "profit";
-  const newestFirst = [...meme.paper.positions].sort((a, b) => b.openedAt - a.openedAt);
+  const pnlPercent = pnl === null || capital === null || !/^-?\d+$/u.test(pnl) || !/^\d+$/u.test(capital) || BigInt(capital) <= 0n ? null : bps((BigInt(pnl) * 10_000n / BigInt(capital)).toString(10), true);
+  const open = meme.paper.positions.filter(p => p.status !== "closed").sort((a, b) => b.openedAt - a.openedAt);
+  const closed = meme.paper.positions.filter(p => p.status === "closed").sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0));
+  const tabs: readonly MemeTab[] = isAgenticMemeDecisionLog(meme.decisionLog) ? ["Open Positions", "Closed Positions", "Run log", "Decision log"] : ["Open Positions", "Closed Positions", "Run log"];
+  const shown: MemeTab = tabs.includes(tab) ? tab : "Open Positions";
+  const icon = (token: string) => icons[token.toLowerCase()] ?? null;
   return <>
     <div className="fl-trade-message" role="status" data-testid="meme-paper-banner"><p><strong>{AGENTIC_MEME_COPY.banner}</strong></p><p>{AGENTIC_MEME_COPY.noTokenList}</p></div>
     <div className="fl-trade-metrics">
       <Metric label="Paper budget" value={usdt2(capital)} note={capital === null ? "Capital is not recorded for this agent." : "Sizing only: no USDT is held"} />
-      <Metric label="Paper PnL (closed)" value={usdt2(pnl, true)} tone={tone} {...(pnl === null ? { note: "No closed paper trade yet" } : { note: "After fees, taxes and gas" })} />
+      <Metric label="Execution model" value="Meme stocks" note={`LLM model: ${modelLabel(model)}`} credit={<ZeroGCredit />} />
+      <Metric label="Paper PnL (closed)" value={usdt2(pnl, true)} tone={tone} note={pnl === null ? "No closed paper trade yet" : `${pnlPercent === null ? "" : pnlPercent + " · "}after fees, taxes and gas`} noteTone={pnl !== null} />
       <Metric label="Paper win rate" value={s.winRateBps === null ? "-" : bps(s.winRateBps)} note={s.winRateBps === null ? "No closed paper trade yet" : `${s.wins}/${s.closed} wins`} />
-      <Metric label="Paper positions" value={`${s.open} open`} note={`${s.closed} closed`} />
+      <Metric label="Open positions" value={`${s.open} / ${maxOpen}`} note={`${s.closed} closed`} />
     </div>
-    <section className="fl-trade-table" aria-label="Paper ledger">
-      <div className="fl-trade-table__bar"><span>Paper ledger</span></div>
-      <div className="fl-trade-scroll" role="region" aria-label="Paper positions" tabIndex={0}>
-        {newestFirst.length === 0 ? <div className="fl-trade-empty">No paper positions yet.</div> : newestFirst.map((p) => <div key={p.ref} className="fl-trade-position" data-testid="meme-paper-row">
-          <span>{p.symbol ?? compactAddress(p.token)}{p.quoteSymbol === null ? "" : ` / ${p.quoteSymbol}`}</span>
-          <span>{p.venue === "flap-bonding" ? "curve" : "graduated"}</span>
-          <span>{p.status === "closed" ? (p.closeCode ?? "closed").replace(/-/gu, " ") : "open"}</span>
-          <span>{usdt2(p.entryUsdtWei)}</span>
-          <span>{p.status === "closed" ? usdt2(p.exitUsdtWei) : p.markUsdtWei === null ? "- (no mark yet)" : usdt2(p.markUsdtWei)}</span>
-          <span className="fl-trade-heading-end">{p.pnlBps === null ? "- (no mark yet)" : bps(p.pnlBps, true)}</span>
-        </div>)}
-      </div>
-    </section>
-    <RunLogPanel runLog={<section className="fl-trade-table"><div className="fl-trade-table__bar"><span>Run log</span></div><TradeRunLog runs={runs} symbols={symbols} /></section>} />
+    <MemeLastCycle value={meme.lastCycle} />
+    <div className="fl-trade-tabs">{tabs.map((item) => <button key={item} type="button" className={shown === item ? "is-active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
+    {shown === "Run log" ? <RunLogPanel runLog={<section className="fl-trade-table"><div className="fl-trade-table__bar"><span>Run log</span>{refresh}</div><TradeRunLog runs={runs} symbols={symbols} /></section>} />
+      : shown === "Decision log" && isAgenticMemeDecisionLog(meme.decisionLog) ? <MemeDecisionLog log={meme.decisionLog} />
+      : <section className="fl-trade-table" aria-label={shown === "Open Positions" ? "Open paper positions" : "Closed paper positions"}>
+        <div className="fl-trade-table__bar"><span>{shown}</span>{refresh}</div>
+        {shown === "Open Positions"
+          ? <><div className="fl-trade-position fl-trade-position--head"><span>Position</span><span>Age</span><span>Size</span><span>Exit plan</span><span>Chart</span><span className="fl-trade-heading-end">Unrealised</span><span className="fl-trade-heading-end">Actions</span></div>
+            {open.map((p) => <MemeOpenRow key={p.ref} p={p} icon={icon(p.token)} expanded={expanded === p.ref} onExpand={() => setExpanded(expanded === p.ref ? null : p.ref)} />)}</>
+          : <><div className="fl-trade-position fl-trade-position--head fl-trade-position--closed"><span>Position</span><span>Exit reason</span><span>Held</span><span>Size</span><span>Entry / exit</span><span className="fl-trade-heading-end">Realised</span><span className="fl-trade-heading-end">Transactions</span></div>
+            <div className="fl-trade-scroll" role="region" aria-label="Closed positions" tabIndex={0}>{closed.map((p) => <MemeClosedRow key={p.ref} p={p} icon={icon(p.token)} />)}</div></>}
+        {(shown === "Open Positions" ? open : closed).length === 0 ? <div className="fl-trade-empty">{meme.paper.positions.length === 0 ? "No paper positions yet." : `No ${shown.toLowerCase()}.`}</div> : null}
+      </section>}
   </>;
+}
+
+/** Operator hotfix 2026-10-06: the newest paper cycle as counts. A missing or stale cycle shows a dash with its reason, never stale numbers as current. */
+const MEME_CYCLE_STALE_MS = 180_000;
+const memeText: React.CSSProperties = { margin: 0, padding: "4px 16px", color: "var(--text-muted)", font: "var(--type-mono-xs)" };
+function MemeLastCycle({ value }: { value: unknown }) {
+  const c = isAgenticMemeLastCycle(value) ? value : null, now = Date.now();
+  const reasons = c === null ? [] : Object.entries(c.reasons).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+  const stale = c !== null && now - c.atMs > MEME_CYCLE_STALE_MS;
+  const count = (n: number | null, what: string) => `${n === null ? "-" : n} ${what}`;
+  return <section className="fl-trade-table" aria-label="Last cycle" data-testid="meme-last-cycle">
+    <div className="fl-trade-table__bar"><span>Last cycle</span><span className="fl-trade-heading-end">{c === null ? "-" : relativeTime(c.atMs, now).text}</span></div>
+    {c === null || stale ? <div className="fl-trade-empty">{c === null ? "- (no cycle in the last 30 minutes: is the trade-worker running?)"
+      : `- (last cycle ${relativeTime(c.atMs, now).text}: more than 3 minutes ago, is the trade-worker running?)`}</div> : <div style={{ padding: "8px 0" }}>
+      <p style={memeText}>{count(c.listSize, "on the meme list")} · {count(c.checked, "checked on price bars")} · {c.llmAsked} sent to the model · {c.paperEntries} paper entries · {c.paperExits} paper exits</p>
+      <p style={memeText}>{reasons.length === 0 ? `Result: ${c.code ?? "-"}` : `Not taken: ${reasons.map(([code, n]) => `${memeReasonLabel(code)} ${n}`).join(" · ")}`}</p>
+      <p style={memeText}>Data lag {c.barLagMs === null ? "-" : `${Math.round(c.barLagMs / 1000)} s`} · cycle took {c.elapsedMs === null ? "-" : `${(c.elapsedMs / 1000).toFixed(1)} s`}</p>
+    </div>}
+  </section>;
+}
+
+/** Local debug: click the short address to copy the full one; the gmgn link opens the token page in a new tab. */
+function MemeTokenCell({ address }: { address: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const copy = () => { void navigator.clipboard?.writeText(address).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1_500); }).catch(() => undefined); };
+  return <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+    <button type="button" onClick={copy} title={`Copy ${address}`} data-testid="meme-copy-token"
+      style={{ all: "unset", cursor: "pointer", textDecoration: "underline dotted" }}>{copied ? "copied" : compactAddress(address)}</button>
+    <a href={`https://gmgn.ai/bsc/token/${address}`} target="_blank" rel="noopener noreferrer" data-testid="meme-gmgn-link">gmgn</a>
+  </span>;
+}
+
+/** Operator 2026-10-07: "Refreshed 40 s ago (17:21:25) · every 60 s · data plane 52 s old", so a stuck market feed shows as a growing age. */
+function memeFreshness(market: { atMs: number; prevAtMs?: number | null; asOf?: number | null }, now: number): string {
+  const ago = (ms: number) => { const s = Math.max(0, Math.round((now - ms) / 1000)); return s < 90 ? `${s} s` : `${Math.round(s / 60)} min`; };
+  const clock = new Date(market.atMs).toLocaleTimeString("en-GB", { hour12: false });
+  return [`Refreshed ${ago(market.atMs)} ago (${clock})`,
+    market.prevAtMs === undefined || market.prevAtMs === null ? null : `every ${Math.round((market.atMs - market.prevAtMs) / 1000)} s`,
+    market.asOf === undefined || market.asOf === null ? null : `data plane ${ago(market.asOf)} old`].filter(Boolean).join(" · ");
+}
+
+/** Local debug only (the plane adds it with AGENTIC_MEME_DECISION_LOG_PUBLIC=true): the newest market read, this agent's signals and model asks. */
+function MemeDecisionLog({ log }: { log: AgenticMemeDecisionLogDto }) {
+  const now = Date.now(), n = (v: number | null, digits = 0) => v === null ? "-" : v.toLocaleString("en-US", { maximumFractionDigits: digits });
+  const pct = (v: number | null) => v === null ? "-" : `${Math.round(v * 100)}%`;
+  const cell: React.CSSProperties = { padding: "4px 8px", borderBottom: "1px solid var(--line-1)", whiteSpace: "nowrap", textAlign: "left" };
+  const table: React.CSSProperties = { width: "100%", borderCollapse: "collapse", font: "var(--type-mono-xs)", color: "var(--text-muted)" };
+  return <section className="fl-trade-table" aria-label="Decision log" data-testid="meme-decision-log">
+    <div className="fl-trade-table__bar"><span>Decision log (local debug)</span><span className="fl-trade-heading-end" data-testid="meme-market-freshness">{log.market === null ? "no market read in the last 5 minutes" : memeFreshness(log.market, now)}</span></div>
+    <div className="fl-trade-scroll" role="region" aria-label="Decision log rows" tabIndex={0}>
+      {log.market === null || log.market.rows.length === 0 ? <div className="fl-trade-empty">- (no market rows)</div> : <table style={table}><thead><tr>
+        {["Token", "Quote", "Stage", "Vol 5m $", "Tx 5m", "Buys/Sells 5m", "Smart 5m $", "Smart 1h $", "Tax b/s", "Verdict", "Burst x", "Follow x", "Dead", "Range 15m / cost"].map(h => <th key={h} style={cell}>{h}</th>)}
+      </tr></thead><tbody>{log.market.rows.map(r => <tr key={r.address} data-testid="meme-decision-row">
+        <td style={cell}><MemeTokenCell address={r.address} /></td><td style={cell}>{r.quoteSymbol ?? "-"}</td>
+        <td style={cell}>{[...new Set([r.stage, r.venue === "flap-bonding" || r.venue === "fourmeme-bonding" ? "curve" : r.venue === "pancake-v2" ? "graduated" : r.venue].filter(Boolean))].join(" · ")}</td>
+        <td style={cell}>{n(r.volume5mUsd)}</td><td style={cell}>{n(r.txs5m)}</td>
+        <td style={cell}>{r.flow5mBuys === null ? "-" : `${r.flow5mBuys}/${r.flow5mSells ?? "-"}`}</td><td style={cell}>{n(r.smart5mNetUsd)}</td><td style={cell}>{n(r.smart1hNetUsd)}</td>
+        <td style={cell}>{r.buyTaxBps === null ? "-" : `${r.buyTaxBps / 100}% / ${(r.sellTaxBps ?? 0) / 100}%`}</td>
+        <td style={cell}>{r.verdict === "bars-unavailable" && r.bars !== null && r.bars < 8 ? `Too new: ${r.bars}/8 minutes of bars`
+          : r.verdict === null ? "-" : memeReasonLabel(r.verdict)}{r.burstReason === null ? "" : ` (${r.burstReason})`}</td>
+        <td style={cell}>{n(r.burstRatio, 2)}</td><td style={cell}>{n(r.followRatio, 2)}</td><td style={cell}>{r.deadScore === null ? "-" : `${n(r.deadScore)}${r.hardVeto ? " veto" : ""}`}</td>
+        <td style={cell}>{r.range15Bps === null ? "-" : `${n(r.range15Bps)} / ${n(r.costEstBps)} bps`}</td>
+      </tr>)}</tbody></table>}
+      <table style={table}><thead><tr>{["Signal", "Token", "Verdict", "Cost est", "Cost rule", "Model", "Data lag"].map(h => <th key={h} style={cell}>{h}</th>)}</tr></thead>
+        <tbody>{log.signals.length === 0 ? <tr><td style={cell} colSpan={7}>- (no signal in the last 30 minutes: nothing passed the bar checks)</td></tr> : log.signals.map((s, i) => <tr key={`${s.atMs}-${i}`}>
+          <td style={cell}>{relativeTime(s.atMs, now).text}</td><td style={cell}>{s.token === null ? "-" : <MemeTokenCell address={s.token} />}</td><td style={cell}>{s.verdict === null ? "-" : memeReasonLabel(s.verdict)}</td>
+          <td style={cell}>{s.costEstBps === null ? "-" : `${s.costEstBps} bps`}</td><td style={cell}>{s.costRule === null ? "-" : s.costRule ? "pass" : "fail"}</td><td style={cell}>{s.llm ?? "-"}</td>
+          <td style={cell}>{s.barLagMs === null ? "-" : `${Math.round(s.barLagMs / 1000)} s`}</td></tr>)}</tbody></table>
+      <table style={table}><thead><tr>{["Model ask", "Model", "Outcome", "Latency", "Answers", "Jev (shadow)"].map(h => <th key={h} style={cell}>{h}</th>)}</tr></thead>
+        <tbody>{log.llm.length === 0 ? <tr><td style={cell} colSpan={6}>- (no model ask in the last 30 minutes)</td></tr> : log.llm.map((a, i) => <tr key={`${a.atMs}-${i}`}>
+          <td style={cell}>{relativeTime(a.atMs, now).text}</td><td style={cell}>{a.model ?? "-"}</td><td style={cell}>{a.outcome ?? "-"}</td>
+          <td style={cell}>{a.latencyMs === null ? "-" : `${(a.latencyMs / 1000).toFixed(1)} s`}</td><td style={{ ...cell, whiteSpace: "normal" }}>{a.decisions === null ? "-" : JSON.stringify(a.decisions)}</td>
+          <td style={{ ...cell, whiteSpace: "normal" }} data-testid="meme-jev-shadow">{a.jev === undefined || a.jev === null ? "-" : a.jev.outcome !== "ok" ? `${a.jev.outcome ?? "-"}`
+            : a.jev.answers.map(j => `#${j.index ?? "?"} ${j.choice ?? "-"} (buy ${pct(j.pBuy)}, up 60m ${pct(j.pUp60 ?? null)})`).join(", ")}</td></tr>)}</tbody></table>
+      <table style={table} data-testid="meme-jev-scan"><thead><tr>{["Jev scan", "Token", "Dropped by", "Jev", "Buy", "Wait", "Reject", "Up 60m"].map(h => <th key={h} style={cell}>{h}</th>)}</tr></thead>
+        <tbody>{(log.jevScan ?? []).length === 0 ? <tr><td style={cell} colSpan={8}>- (no Jev scan in the last 30 minutes)</td></tr> : (log.jevScan ?? []).flatMap((s, i) => s.outcome !== "ok"
+          ? [<tr key={`${s.atMs}-${i}`}><td style={cell}>{relativeTime(s.atMs, now).text}</td><td style={cell} colSpan={7}>{s.outcome ?? "-"}</td></tr>]
+          : s.answers.map((j, k) => <tr key={`${s.atMs}-${i}-${k}`}><td style={cell}>{k === 0 ? relativeTime(s.atMs, now).text : ""}</td>
+            <td style={cell}>{j.token === null ? "-" : <MemeTokenCell address={j.token} />}</td><td style={cell}>{j.verdict === null ? "-" : memeReasonLabel(j.verdict)}</td>
+            <td style={cell}>{j.choice ?? "-"}</td><td style={cell}>{pct(j.pBuy)}</td><td style={cell}>{pct(j.pWait)}</td><td style={cell}>{pct(j.pReject)}</td><td style={cell}>{pct(j.pUp60 ?? null)}</td></tr>))}</tbody></table>
+    </div>
+  </section>;
 }
 
 function modelLabel(id: string): string {
@@ -133,7 +285,8 @@ export function AgenticPublicScreen({ wallet, go }: { wallet: string; go?: (rout
   // An Auto DCA hire reads its block as sent too: a malformed block is never rendered.
   const hasDca = agent !== null && Object.hasOwn(agent, "dca");
   const dcaView = React.useMemo(() => agent !== null && isAgenticDcaDto(agent.dca) ? agenticDcaView(agent.dca) : null, [agent]);
-  const icons = useTokenIcons(React.useMemo(() => [...positions.map((p) => p.token), ...(portfolioBlock === null ? [] : [...portfolioBlock.tokens.map((row) => row.token), USDT_ADDRESS]), ...(dcaView === null ? [] : [dcaView.token])], [positions, portfolioBlock, dcaView]));
+  const memeTokens = React.useMemo(() => agent !== null && isAgenticMemeDto(agent.meme) ? agent.meme.paper.positions.map((p) => p.token) : [], [agent]);
+  const icons = useTokenIcons(React.useMemo(() => [...positions.map((p) => p.token), ...(portfolioBlock === null ? [] : [...portfolioBlock.tokens.map((row) => row.token), USDT_ADDRESS]), ...(dcaView === null ? [] : [dcaView.token]), ...memeTokens], [positions, portfolioBlock, dcaView, memeTokens]));
   const rows = React.useMemo(() => positions.map((p) => ({ p, view: tradePosition(p, loadedAt) })), [positions, loadedAt]);
   const open = rows.filter(({ p }) => p.status === "open"), closed = rows.filter(({ p }) => p.status === "closed"), kept = rows.filter(({ p }) => p.status === "kept");
   const symbols = Object.fromEntries([
@@ -194,7 +347,7 @@ export function AgenticPublicScreen({ wallet, go }: { wallet: string; go?: (rout
       {agent?.connection === "unreachable" ? <p>The Binance connection is unreachable; the figures below are the last verified ones.</p> : null}
     </div> : null}
     {error ? <p role="alert">{error}</p> : null}{data === null && !error ? <p>Loading...</p> : null}{data !== null && agent === null ? <p>No Agentic hire found for this wallet.</p> : null}
-    {agent === null ? null : agent.meme !== undefined ? (isAgenticMemeDto(agent.meme) ? <MemePaper meme={agent.meme} capital={capital} runs={agent.runs ?? []} symbols={symbols} />
+    {agent === null ? null : agent.meme !== undefined ? (isAgenticMemeDto(agent.meme) ? <MemePaper meme={agent.meme} capital={capital} model={String(agent.settings.primaryModel ?? "-")} maxOpen={agent.summary.maxOpenPositions} runs={agent.runs ?? []} symbols={symbols} icons={icons} refresh={refresh} />
       : <p role="alert">Paper data unavailable.</p>) : hasDca ? (dcaView === null ? <p role="alert">Auto DCA data unavailable.</p>
       : <>
         {/* The Altana stat row (R3.10): after a stop, a term end or an owner end the round is nulled so the PnL tile takes its rounds rule, and the Average-price tile keeps the holding (R31.3). */}

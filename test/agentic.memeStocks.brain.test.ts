@@ -81,9 +81,14 @@ test("6.1 anchors and screen: USDT, the quote token and a bStock-universe token 
   assert.equal(screen({ quote: { address: QUOTE, kind: "bstock", symbol: "Q", stock: { openState: false } } }), "quote-halted");
   assert.equal(screen({ quote: { address: QUOTE, kind: "bstock", symbol: "Q", stock: null } }), "quote-halted", "unread is never assumed open");
   assert.equal(screen({ stage: "graduating" }), "graduating");
-  assert.equal(screen({ launchpad: "fourmeme" }), "launchpad");
+  assert.equal(screen({ launchpad: "pumpfun" }), "launchpad");
+  assert.equal(screen({ launchpad: "fourmeme" }), null, "operator hotfix 2026-10-06: graduated Four.meme passes the screen");
+  assert.equal(screen({ launchpad: "fourmeme", venue: "fourmeme-bonding" }), null, "FOURMEME-CURVE-PAPER-SPEC F1: a curve row with a tax passes the screen");
+  assert.equal(screen({ launchpad: "fourmeme", venue: null }), "fourmeme-venue", "an unread venue is never assumed graduated");
+  assert.equal(screen({ launchpad: "fourmeme", tax: null }), "tax-unknown");
+  assert.equal(screen({ tax: null }), "tax-unknown");
   assert.equal(screen({ flags: ["wash_trading"] }), "flag");
-  assert.equal(screen({ liquidityUsd: 4_139 }), "liquidity");
+  assert.equal(screen({ liquidityUsd: 1_999 }), "liquidity", "0.50 % cap: 10 USDT needs 2 000 USD of liquidity"); assert.notEqual(screen({ liquidityUsd: 2_000 }), "liquidity");
   assert.equal(screen({ address: MEME as Address }), null);
 });
 
@@ -92,9 +97,9 @@ test("7.3 vectors: C_est 1 066 (graduated) and 622 (curve) at P_BNB 717; liquidi
   assert.equal(memeCostEstBps({ venue: "pancake-v2", tax: { buyBps: 300, sellBps: 500 }, liquidityUsd: 16_620, amountWei: 10n * E, gasRoundTripUsdtAtomic: gas("pancake-v2") }), 1_066);
   assert.equal(memeCostEstBps({ venue: "flap-bonding", tax: { buyBps: 0, sellBps: 100 }, liquidityUsd: 5_013, amountWei: 10n * E, gasRoundTripUsdtAtomic: gas("flap-bonding") }), 622);
   assert.equal(memeCostEstBps({ venue: "pancake-v2", tax: null, liquidityUsd: 16_620, amountWei: 10n * E, gasRoundTripUsdtAtomic: 1n }), null, "unknown tax: no estimate");
-  assert.equal(memeLiqCapWei(16_620), 33_240_000_000_000_000_000n);
-  assert.equal(memeLiqCapWei(5_013), 10_026_000_000_000_000_000n);
-  assert.equal(memeLiqCapWei(4_139), 8_278_000_000_000_000_000n);
+  assert.equal(memeLiqCapWei(16_620), 83_100_000_000_000_000_000n);
+  assert.equal(memeLiqCapWei(5_013), 25_065_000_000_000_000_000n);
+  assert.equal(memeLiqCapWei(4_139), 20_695_000_000_000_000_000n);
   assert.deepEqual([memeCostRuleOk(2_131, 1_066), memeCostRuleOk(2_132, 1_066), memeCostRuleOk(null, 1), memeCostRuleOk(5_000, null)], [false, true, false, false]);
 });
 

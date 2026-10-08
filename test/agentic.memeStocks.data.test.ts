@@ -34,7 +34,7 @@ test("freshness boundaries 180 000 / 180 001 ms: envelope, row observation and s
   assert.deepEqual([rowFresh(ranked, NOW + 180_000), rowFresh(ranked, NOW + 180_001)], [true, false]);
 });
 
-test("bars: the reply example with the filled key parses; every rule refuses; lag boundaries; tracked false and fewer than 15 bars refuse entries only", () => {
+test("bars: the reply example with the filled key parses; every rule refuses; lag boundaries; tracked false and fewer than 8 bars refuse entries only", () => {
   const ok = parseBarsElement(element(), MEME)!;
   assert.equal(ok.bars.length, 20);
   const bars = passingBars(NOW);
@@ -49,8 +49,10 @@ test("bars: the reply example with the filled key parses; every rule refuses; la
   assert.deepEqual([barsExitOk(at(300_000), NOW), barsExitOk(at(300_001), NOW)], [true, false]);
   const untracked = parseBarsElement(element({ tracked: false }), MEME)!;
   assert.deepEqual([barsEntryOk(untracked, NOW), barsExitOk(untracked, NOW)], [false, true]);
-  const short = parseBarsElement(element({}, passingBars(NOW, 120_000, 14)), MEME)!;
+  const short = parseBarsElement(element({}, passingBars(NOW, 120_000, 7)), MEME)!;
   assert.deepEqual([barsEntryOk(short, NOW), barsExitOk(short, NOW)], [false, true]);
+  // Operator 2026-10-07: 8 bars are enough (was 15).
+  assert.equal(barsEntryOk(parseBarsElement(element({}, passingBars(NOW, 120_000, 8)), MEME)!, NOW), true);
   const batch = parseBars({ data: [element(), element({ source: "x" }, passingBars(NOW))], meta: {} }, [MEME, MEME])!;
   assert.equal(batch.size, 1);
   assert.equal(parseBars({ data: [element()] }, [MEME, "0x" + "1".repeat(40) as Address]), null, "one element per request");

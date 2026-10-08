@@ -16,11 +16,12 @@ import { recordAgenticConnection, type AgenticExecutionDeps } from "./execute.js
 import { acquireAgenticFence } from "./obligations.js";
 import { decryptAgenticSession, type AgenticStore } from "./store.js";
 import type { AgenticChain } from "./resolve.js";
-import { MEME_BARS_BATCH_MAX, MEME_MIN_BARS, barLagMs, barsEntryOk, barsExitOk, boardFresh, eligibilityFresh, memeRead, parseBars, parseBoardRow, parseEligibility,
+import { MEME_BARS_BATCH_MAX, MEME_MIN_BARS, barLagMs, barsEntryOk, barsEntryReason, barsExitOk, boardFresh, eligibilityFresh, memeRead, parseBars, parseBoardRow, parseEligibility,
   parseShortlist, rowFresh, shortlistFresh, type MemeBars, type MemeBoardRow, type MemeShortlist, type MemeShortlistRow } from "./memeData.js";
 import { MEME_GAS_WEI, memeBurst, memeBurstVerdict, memeCostEstBps, memeCostRuleOk, memeDeadChart, memeDeadVeto, memeExit, memeGasBps, memeLiqCapWei, memePick, memePnlBps,
-  memePressure, memePrompt, memeRange15Bps, memeScreenAgent, memeScreenShared, memeSMark, memeVenue, parseMemeAnswer,
+  memeCandidateState, memePressure, memePrompt, memeRange15Bps, memeScreenAgent, memeScreenShared, memeSMark, memeVenue, parseMemeAnswer, memeCurveFundsOk, memeQuoteOmitsTax,
   type MemeBurst, type MemeDeadChart, type MemeLlmDecision, type MemeVenue } from "./memeBrain.js";
+import { askMemeJev, type MemeJevConfig, type MemeJevData } from "./memeJev.js";
 
 /** The RFQ / DCA per-process throttle precedent: a SERVICE_UNAVAILABLE answer skips this agent's meme quotes for 300 000 ms. */
 export const MEME_THROTTLE_MS = 300_000;
@@ -94,6 +95,8 @@ export type MemeStepDeps = MemeQuoteDeps & {
   memeEnabled: boolean;
   /** 17 (R3.2): when the lane cycle started; its phase in the minute is logged on the cycle row. Absent: the step's own start. */
   cycleStartMs?: number;
+  /** JEV-MEME-BENCHMARK-PLAN 3.2 / 3.3: set only when AGENTIC_MEME_JEV_SHADOW is exactly true and a key exists (memeJevConfig); absent, no Jev request is ever made. Measurement only. */
+  jev?: MemeJevConfig;
 };
 export type MemeStepOptions = { dryRun?: boolean; reconciliationOnly?: boolean; cmcOnly?: boolean };
 type Stage = TradeRunEvent["stage"];
@@ -105,6 +108,9 @@ export type MemeReport = { code: string; events: Event[]; cycle: Record<string, 
 type Evaluated = { row: MemeShortlistRow; verdict: string; bars: MemeBars | null; dead: MemeDeadChart | null; burst: MemeBurst | null; range15: number | null; cEst10: number | null };
 type MarketCache = { asOf: number; shortlist: MemeShortlist; facts: NativeCostFacts | null; evaluated: Evaluated[]; bars: Map<string, MemeBars>; survivors61: number; barsRequested: number };
 const CACHES = new WeakMap<AgenticStore, MarketCache>();
+/** JEV-MEME-BENCHMARK-PLAN 3.3: per process and store, whether a scan is running and when each dropped token was last judged (and under which verdict). */
+const JEV_SCANS = new WeakMap<AgenticStore, { inFlight: boolean; judged: Map<string, { atMs: number; verdict: string }> }>();
+const JEV_SCAN_DUE_MS = 1_800_000;
 
 function median(values: readonly number[]): number | null {
   if (values.length === 0) return null;
@@ -122,13 +128,16 @@ function marketTuple(row: MemeShortlistRow, bstocks: ReadonlySet<string>): unkno
   return [row.address, row.launchpad, row.stage, row.status, row.category, row.venue, row.tax?.buyBps ?? null, row.tax?.sellBps ?? null, row.liquidityUsd, row.priceUsd,
     row.volume5mUsd, row.txs5m, row.flow5m?.buys ?? null, row.flow5m?.sells ?? null, row.flow1h?.buys ?? null, row.flow1h?.sells ?? null,
     row.smartInflow5m?.netUsd ?? null, row.smartInflow5m?.rankedAt ?? null, row.smartInflow1h?.netUsd ?? null, row.smartInflow1h?.rankedAt ?? null,
-    row.quote.address, row.quote.symbol, row.quote.openState, row.quote.address !== null && bstocks.has(row.quote.address), row.flags];
+    row.quote.address, row.quote.symbol, row.quote.openState, row.quote.address !== null && bstocks.has(row.quote.address), row.flags,
+    // Operator hotfix 2026-10-06, measure only (no rule reads them): net USD inflow 5m and 1h and the 1h volume, for the USD pressure replay.
+    row.flow5m?.inflowUsd ?? null, row.flow1h?.inflowUsd ?? null, row.volume1hUsd];
 }
-/** 8.6 brain tuple (review R2-H3); a row whose bars were not read carries its verdict only. */
+/** 8.6 brain tuple (review R2-H3); a row whose bars were not read carries its verdict only. Index 14 (operator 2026-10-07, log only): the failed bars entry rule, or null. */
 function brainTuple(e: Evaluated, nowMs: number): unknown[] {
   if (e.bars === null) return [e.verdict];
   return [e.verdict, barLagMs(e.bars, nowMs), e.bars.lastClosedStartMs, e.bars.bars.length, e.bars.bars.at(-1)!.close, e.dead?.deadScore ?? null, e.dead?.hardVeto ?? null,
-    e.burst?.offset ?? null, e.burst?.burstRatio ?? null, e.burst?.reason ?? null, e.burst?.followRatio ?? null, e.burst?.extensionPct ?? null, e.range15, e.cEst10];
+    e.burst?.offset ?? null, e.burst?.burstRatio ?? null, e.burst?.reason ?? null, e.burst?.followRatio ?? null, e.burst?.extensionPct ?? null, e.range15, e.cEst10,
+    barsEntryReason(e.bars, nowMs)];
 }
 /** 6.2 - 6.4 on one row that passed the shared screen: the first failing agent-independent layer, or `pass`. */
 function evaluate(row: MemeShortlistRow, bars: MemeBars | null, nowMs: number, facts: NativeCostFacts | null): Evaluated {
@@ -174,6 +183,36 @@ async function marketRead<T>(ctx: Ctx, name: string, read: (() => Promise<unknow
   return memeRead(read, parse);
 }
 
+/**
+ * JEV-MEME-BENCHMARK-PLAN 3.3: Jev alone judges the shortlist tokens the shared layers dropped, once per shortlist refresh. Detached: the step never awaits it, it writes its own `jev`
+ * row straight to the store (never into ctx.logs, never a `market` row), at most one runs at a time, and a failure is forgotten. Nothing reads the answers at runtime.
+ */
+function startJevScan(ctx: Ctx, cache: MarketCache): void {
+  const jev = ctx.deps.jev;
+  // Review M3: the scan spends only while this lane would take entries (the 8.1 step 4 gates: meme flag, entry cutoff, drain); a bound row only reaches here.
+  if (jev === undefined || ctx.options.dryRun === true || !ctx.deps.memeEnabled || ctx.row.entryCutoffMs === null || ctx.nowMs + 5_000 >= ctx.row.entryCutoffMs || ctx.row.drainRequestedAt !== null) return;
+  const { store } = ctx.deps, nowMs = ctx.nowMs;
+  let scan = JEV_SCANS.get(store);
+  if (scan === undefined) { scan = { inFlight: false, judged: new Map() }; JEV_SCANS.set(store, scan); }
+  if (scan.inFlight) return;
+  const state = scan;
+  state.inFlight = true;
+  void (async () => {
+    try {
+      // An entry older than the due window is due again anyway, so it is dropped here (the map never grows past one window).
+      for (const [token, seen] of state.judged) if (seen.atMs <= nowMs - JEV_SCAN_DUE_MS) state.judged.delete(token);
+      const due = cache.evaluated.filter(e => { const seen = state.judged.get(e.row.address); return e.verdict !== "pass" && (seen === undefined || seen.verdict !== e.verdict); });
+      if (due.length === 0) return;
+      const content = JSON.stringify({ candidates: due.map((e, index) => ({ ...memeCandidateState({ row: e.row, burst: e.burst, dead: e.dead, costBps: e.cEst10,
+        barLagMs: e.bars === null ? null : barLagMs(e.bars, nowMs), buyTaxBps: e.row.tax?.buyBps ?? null, sellTaxBps: e.row.tax?.sellBps ?? null }, index), verdict: e.verdict })) });
+      const result = await askMemeJev(jev, content, due.length, undefined, true);
+      if (result.outcome === "ok") for (const e of due) state.judged.set(e.row.address, { atMs: nowMs, verdict: e.verdict });
+      await store.insertMemeLog({ id: `jev:${cache.asOf}:${nowMs}`, agentId: null, kind: "jev", token: null, atMs: nowMs, data: { asOf: cache.asOf, model: result.model, latencyMs: result.latencyMs,
+        outcome: result.outcome, inputTokens: result.inputTokens, asked: due.length, answers: result.answers.map(a => ({ ...a, token: due[a.index]!.row.address, verdict: due[a.index]!.verdict })) } });
+    } catch { console.error("agentic_meme_jev_scan_failed"); } finally { state.inFlight = false; }
+  })();
+}
+
 /** 8.1 step 2: the shortlist, and on a new `asOf` the shared work of that shortlist (written once as the global `market` row). */
 async function market(ctx: Ctx): Promise<{ cache: MarketCache | null; code: string | null }> {
   const plane = ctx.deps.worker.dataPlane;
@@ -198,6 +237,7 @@ async function market(ctx: Ctx): Promise<{ cache: MarketCache | null; code: stri
   await log(ctx, { id: `market:${shortlist.asOf}`, agentId: null, kind: "market", token: null, atMs: ctx.nowMs, data: { asOf: shortlist.asOf, boardTotal: shortlist.boardTotal,
     candidates: shortlist.candidates, picked: shortlist.picked, writtenAt: ctx.nowMs, survivors61: cache.survivors61, barsRequested: cache.barsRequested, invalidRows: shortlist.invalid,
     rows: evaluated.map(e => [marketTuple(e.row, bstocks), brainTuple(e, ctx.nowMs)]) } });
+  startJevScan(ctx, cache);
   return { cache, code: null };
 }
 
@@ -226,7 +266,9 @@ async function exitPass(ctx: Ctx, ordered: readonly AgenticMemePaper[], cache: M
     const quote = await memeQuote(ctx.deps, { agentId: ctx.agentId, side: "sell", token: p.token, amountAtomic: BigInt(p.tokens) });
     const board = reads.board.get(p.token) ?? null, fresh = board !== null && boardFresh(board, ctx.nowMs) ? board : null;
     // 6.6: the freshest known venue and taxes decide the unnetting of the mark; the entry's when the board row is not fresh.
-    const venue: MemeVenue = fresh?.venue === "pancake-v2" || fresh?.venue === "flap-bonding" ? fresh.venue : p.venueEntry;
+    // FOURMEME-CURVE-PAPER-SPEC F13: a Four.meme curve position accepts its curve or Pancake V2 (graduation while held), never a Flap venue (that would un-net the tax).
+    const accepted: readonly string[] = p.venueEntry === "fourmeme-bonding" ? ["fourmeme-bonding", "pancake-v2"] : ["pancake-v2", "flap-bonding"];
+    const venue: MemeVenue = fresh?.venue != null && accepted.includes(fresh.venue) ? fresh.venue as MemeVenue : p.venueEntry;
     const inForce = { venue, buyTaxBps: fresh?.tax?.buyBps ?? p.buyTaxBps, sellTaxBps: fresh?.tax?.sellBps ?? p.sellTaxBps };
     if (!quote.ok) {
       quoteFailures += 1;
@@ -307,19 +349,33 @@ async function entryPass(ctx: Ctx, cache: MarketCache | null, dataCode: string |
     const asked = [...survivors].sort((a, b) => (b.e.burst!.burstRatio ?? Infinity) - (a.e.burst!.burstRatio ?? Infinity)).slice(0, 3);
     const model = await modelFor(ctx), started = Date.now();
     let outcome: "buy_now" | "wait" | "reject" | "invalid" | "timeout", decisions: MemeLlmDecision[] | null = null;
+    // JEV-MEME-BENCHMARK-PLAN 3.2: Jev sees the LLM's own user content, starts with the ask and is never awaited; whatever has not settled when the LLM has is `late` and aborted.
+    const jevOn = ctx.deps.jev !== undefined && ctx.options.dryRun !== true, jevAbort = new AbortController(), jev: { result: MemeJevData | null; startedAt: number } = { result: null, startedAt: 0 };
     try {
-      const answer = await ctx.deps.worker.llmFor(model).complete(memePrompt(asked.map(c => ({ row: c.e.row, burst: c.e.burst!, dead: c.e.dead!, costBps: c.costEst,
-        barLagMs: barLagMs(c.e.bars!, ctx.nowMs), buyTaxBps: c.e.row.tax!.buyBps, sellTaxBps: c.e.row.tax!.sellBps }))), AbortSignal.timeout(MEME_LLM_TIMEOUT_MS));
+      const prompt = memePrompt(asked.map(c => ({ row: c.e.row, burst: c.e.burst!, dead: c.e.dead!, costBps: c.costEst,
+        barLagMs: barLagMs(c.e.bars!, ctx.nowMs), buyTaxBps: c.e.row.tax!.buyBps, sellTaxBps: c.e.row.tax!.sellBps })));
+      // Review L2: the LLM call goes first and Jev launches in the same tick, so Jev's synchronous set-up is not inside the LLM's own wait.
+      const asking = ctx.deps.worker.llmFor(model).complete(prompt, AbortSignal.timeout(MEME_LLM_TIMEOUT_MS));
+      if (jevOn) { jev.startedAt = Date.now(); void askMemeJev(ctx.deps.jev!, prompt[1]!.content, asked.length, jevAbort.signal, false).then(result => { jev.result = result; }, () => undefined); }
+      const answer = await asking;
       decisions = parseMemeAnswer(answer.content, asked.length);
       outcome = decisions === null ? "invalid" : memePick(decisions) !== null ? "buy_now" : decisions.some(d => d.action !== "reject") ? "wait" : "reject";
     } catch (error) { outcome = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError") ? "timeout" : "invalid"; }
+    const jevData: MemeJevData | null = !jevOn ? null : jev.result ?? { model: null, latencyMs: Date.now() - jev.startedAt, outcome: "late", answers: [], inputTokens: null };
+    if (jevOn && jev.result === null) jevAbort.abort();
     const pickIndex = decisions === null ? null : memePick(decisions);
     for (const [index, c] of asked.entries()) { const d = decisions?.find(x => x.index === index); c.signal.llm = d === undefined ? outcome : `${d.action}:${d.confidence}`; c.signal.verdict = "llm-not-picked"; }
     bump(ctx, "llmAsked");
     await log(ctx, { id: `llm:${ctx.agentId}:${ctx.nowMs}`, agentId: ctx.agentId, kind: "llm", token: null, atMs: ctx.nowMs,
-      data: { model, latencyMs: Date.now() - started, outcome, tokens: asked.map(c => c.e.row.address), decisions } });
+      data: { model, latencyMs: Date.now() - started, outcome, tokens: asked.map(c => c.e.row.address), decisions, ...(jevData === null ? {} : { jev: jevData }) } });
     const top = pickIndex === null ? undefined : decisions!.find(d => d.index === pickIndex);
     note(ctx, "entry-llm", `meme-llm:${outcome}`, { model, ...(top === undefined ? {} : { confidence: top.confidence, token: asked[pickIndex!]!.e.row.address }) });
+    // Operator 2026-10-07, display only: the Jev shadow's answer as its own run event beside the model's (highest buy probability, its choice); nothing reads it back.
+    if (jevData !== null) {
+      const best = [...jevData.answers].sort((a, b) => b.pBuy - a.pBuy || a.index - b.index)[0];
+      note(ctx, "entry-llm", `meme-jev:${best === undefined ? jevData.outcome : best.choice}`, { ...(jevData.model === null ? {} : { model: jevData.model }),
+        ...(best === undefined ? {} : { confidence: Math.round(best.pBuy * 100), token: asked[best.index]!.e.row.address }) });
+    }
     if (pickIndex === null) { setCode(ctx, `meme-llm:${outcome}`); return; }
     bump(ctx, "llmBuy");
     const pick = asked[pickIndex]!, row = pick.e.row, signal = pick.signal;
@@ -328,12 +384,22 @@ async function entryPass(ctx: Ctx, cache: MarketCache | null, dataCode: string |
     const plane = ctx.deps.worker.dataPlane;
     const eligibility = (await memeRead(plane.memeEligibility === undefined ? undefined : () => plane.memeEligibility!([row.address]), parseEligibility))?.get(row.address) ?? null;
     if (eligibility === null || !eligibilityFresh(eligibility, Date.now())) { veto(ctx, signal, "eligibility-unavailable", "meme-data:eligibility"); return; }
-    const f = eligibility.flap;
-    Object.assign(signal, { eligible: eligibility.eligible, source: eligibility.source, venue: eligibility.venue, checkedAt: eligibility.checkedAt, tokenVersion: f?.tokenVersion ?? null,
-      flapStatus: f?.status ?? null, progress: f?.progress.toString() ?? null, buyTaxBps: f?.buyTaxBps ?? null, sellTaxBps: f?.sellTaxBps ?? null });
-    if (!eligibility.eligible || eligibility.source !== "flap" || f === null || eligibility.venue !== "flap-bonding" && eligibility.venue !== "pancake-v2"
-      || row.venue !== null && row.venue !== eligibility.venue || f.quote !== row.quote.address || eligibility.venue === "flap-bonding" && f.progress >= MEME_MAX_PROGRESS) { veto(ctx, signal, "eligibility", "meme-veto:eligibility"); return; }
-    if (f.tokenVersion !== 6) { veto(ctx, signal, "token-version", "meme-veto:token-version"); return; }
+    const f = eligibility.flap, fm = eligibility.fourmeme;
+    // Operator hotfix 2026-10-06: a Four.meme token (graduated or on its curve) takes the shortlist row's taxes (the screen refused a null tax); a Flap token keeps the eligibility taxes.
+    const t = f !== null ? { tokenVersion: f.tokenVersion, buyTaxBps: f.buyTaxBps, sellTaxBps: f.sellTaxBps }
+      : fm !== null && row.tax !== null ? { tokenVersion: fm.version, buyTaxBps: row.tax.buyBps, sellTaxBps: row.tax.sellBps } : null;
+    Object.assign(signal, { eligible: eligibility.eligible, source: eligibility.source, venue: eligibility.venue, checkedAt: eligibility.checkedAt, tokenVersion: t?.tokenVersion ?? null,
+      flapStatus: f?.status ?? null, progress: f?.progress.toString() ?? null, buyTaxBps: t?.buyTaxBps ?? null, sellTaxBps: t?.sellTaxBps ?? null,
+      ...(eligibility.venue === "fourmeme-bonding" && fm !== null ? { funds: fm.funds?.toString() ?? null, maxFunds: fm.maxFunds?.toString() ?? null } : {}) });
+    const flapOk = eligibility.source === "flap" && f !== null && (eligibility.venue === "flap-bonding" || eligibility.venue === "pancake-v2") && f.quote === row.quote.address
+      && !(eligibility.venue === "flap-bonding" && f.progress >= MEME_MAX_PROGRESS);
+    const fourmemeOk = eligibility.source === "fourmeme" && fm !== null && row.launchpad === "fourmeme" && fm.quote === row.quote.address
+      && (eligibility.venue === "pancake-v2" ? fm.liquidityAdded : eligibility.venue === "fourmeme-bonding" && !fm.liquidityAdded);
+    if (!eligibility.eligible || t === null || !(flapOk || fourmemeOk) || row.venue !== null && row.venue !== eligibility.venue) { veto(ctx, signal, "eligibility", "meme-veto:eligibility"); return; }
+    // FOURMEME-CURVE-PAPER-SPEC F2 / FC2: the curve guard, on the fresh eligibility read and on the curve only (a graduated token's funds sit near maxFunds, so the venue condition is load-bearing, review M8).
+    if (fourmemeOk && eligibility.venue === "fourmeme-bonding" && !memeCurveFundsOk(fm!)) { veto(ctx, signal, "curve-funds", "meme-veto:curve-funds"); return; }
+    if (flapOk ? t.tokenVersion !== 6 : t.tokenVersion !== 2) { veto(ctx, signal, "token-version", "meme-veto:token-version"); return; }
+    // Sound only because `flapOk || fourmemeOk` (above) narrowed `eligibility.venue` to `flap-bonding`, `pancake-v2` or `fourmeme-bonding`; widen either predicate and this cast must be revisited.
     const venue = eligibility.venue as MemeVenue;
     // 8.1: the quote helper takes 18-decimal tokens only, read once here; an open paper row therefore always holds an 18-decimal token.
     let decimals: number | null = null;
@@ -344,11 +410,11 @@ async function entryPass(ctx: Ctx, cache: MarketCache | null, dataCode: string |
     if (overBudget(ctx, "buy-quote")) { signal.verdict = "budget"; return; }
     const A = pick.amount, buy = await memeQuote(ctx.deps, { agentId: ctx.agentId, side: "buy", token: row.address, amountAtomic: A });
     if (!buy.ok) { bump(ctx, "quoteFailures"); veto(ctx, signal, buy.code, buy.code, "route"); return; }
-    const N = buy.outAtomic * BigInt(10_000 - (venue === "pancake-v2" ? f.buyTaxBps : 0)) / 10_000n;
+    const N = buy.outAtomic * BigInt(10_000 - (memeQuoteOmitsTax(venue) ? t.buyTaxBps : 0)) / 10_000n;
     Object.assign(signal, { qb: buy.outAtomic.toString(), n: N.toString(), buySlippageBps: buy.slippageBps, buyQuotedAt: buy.atMs });
     if (overBudget(ctx, "sell-quote")) { signal.verdict = "budget"; return; }
     const sell = N <= 0n ? { ok: false as const, code: "meme-unparseable" } : await memeQuote(ctx.deps, { agentId: ctx.agentId, side: "sell", token: row.address, amountAtomic: N });
-    const S = sell.ok ? sell.outAtomic * BigInt(10_000 - (venue === "pancake-v2" ? f.sellTaxBps : 0)) / 10_000n : 0n;
+    const S = sell.ok ? sell.outAtomic * BigInt(10_000 - (memeQuoteOmitsTax(venue) ? t.sellTaxBps : 0)) / 10_000n : 0n;
     if (!sell.ok) bump(ctx, "quoteFailures");
     if (!sell.ok || S <= 0n) { signal["sellCode"] = sell.ok ? null : sell.code; veto(ctx, signal, "no-exit-quote", "meme-veto:no-exit-quote", "route"); return; }
     const gas = nativeCostToUsdtAtomic(MEME_GAS_WEI[venue].buy + MEME_GAS_WEI[venue].sell, facts), gasBuy = nativeCostToUsdtAtomic(MEME_GAS_WEI[venue].buy, facts), bnb = nativeCostToUsdtAtomic(E18, facts);
@@ -359,7 +425,7 @@ async function entryPass(ctx: Ctx, cache: MarketCache | null, dataCode: string |
     if (!memeCostRuleOk(pick.e.range15, cMeas)) { veto(ctx, signal, "cost-measured", "meme-veto:cost"); return; }
     // PAPER_ENTRY (8.3): one entry per cycle.
     const paper: AgenticMemePaper = { positionId: `meme-${ctx.agentId}-${row.address}-${ctx.nowMs}`, agentId: ctx.agentId, walletAddress: ctx.W, token: row.address, symbol: row.symbol,
-      quoteToken: row.quote.address!, quoteSymbol: row.quote.symbol, venueEntry: venue, buyTaxBps: f.buyTaxBps, sellTaxBps: f.sellTaxBps, tokenVersion: f.tokenVersion,
+      quoteToken: row.quote.address!, quoteSymbol: row.quote.symbol, venueEntry: venue, buyTaxBps: t.buyTaxBps, sellTaxBps: t.sellTaxBps, tokenVersion: t.tokenVersion,
       entryUsdt: A.toString(), gasBuyUsdt: gasBuy.toString(), bnbUsdtE18: bnb.toString(), tokens: N.toString(), costBps: cMeas, status: "open",
       lastMarkUsdt: null, lastMarkAt: null, peakPnlBps: null, markSkips: 0, markCount: 0, closeRequestedAt: null, closeCode: null,
       exitUsdt: null, gasSellUsdt: null, pnlUsdt: null, closedAt: null, openedAt: ctx.nowMs, version: 1 };
@@ -367,8 +433,10 @@ async function entryPass(ctx: Ctx, cache: MarketCache | null, dataCode: string |
     ctx.paperWrites.push(paper);
     signal.verdict = "entered"; bump(ctx, "entered"); setCode(ctx, "meme-entered");
     await log(ctx, { id: `entry:${paper.positionId}`, agentId: ctx.agentId, kind: "entry", token: row.address, atMs: ctx.nowMs, data: { positionId: paper.positionId, amountWei: A.toString(),
-      qb: buy.outAtomic.toString(), tokens: N.toString(), gasBuyUsdt: gasBuy.toString(), bnbUsdtE18: bnb.toString(), costBps: cMeas, venue, buyTaxBps: f.buyTaxBps, sellTaxBps: f.sellTaxBps,
-      slippageBps: buy.slippageBps, quotedAt: buy.atMs, asOf: cache.asOf } });
+      qb: buy.outAtomic.toString(), tokens: N.toString(), gasBuyUsdt: gasBuy.toString(), bnbUsdtE18: bnb.toString(), costBps: cMeas, venue, buyTaxBps: t.buyTaxBps, sellTaxBps: t.sellTaxBps,
+      slippageBps: buy.slippageBps, quotedAt: buy.atMs, asOf: cache.asOf,
+      // Operator 2026-10-07, display only: the shortlist's market cap at the decision, shown as "@ 32.6K MCap" on the position.
+      mcapUsd: row.marketCapUsd } });
     note(ctx, "buy", "meme-paper-entry", { token: row.address });
   } finally {
     for (const signal of signals) await log(ctx, { id: `signal:${ctx.agentId}:${ctx.nowMs}:${signal.token}`, agentId: ctx.agentId, kind: "signal", token: signal.token, atMs: ctx.nowMs, data: signal });

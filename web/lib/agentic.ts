@@ -256,11 +256,11 @@ export type AgenticDcaDto = {
 /** The shape the public page needs before it hands a block to the adapter; anything else shows "unavailable". */
 /** Owner-facing copy of the paper meme hire (AGENTIC-MEME-STOCKS-SPEC 9.4, review R2-M9). */
 export const AGENTIC_MEME_COPY = {
-  paper: "Paper trading: this agent places no orders and spends nothing. It reads live Binance prices through your Agentic Wallet sign-in and records what it would have bought and sold, after fees, taxes and gas. This agent has no fixed token list. Every 60 seconds it picks from the live list of Flap meme stocks, so you cannot see or limit in advance which tokens it chooses. At term end it closes every paper position. Capital and per-trade amounts are only the paper sizing budget: no USDT and no BNB are needed. While this agent runs, this Binance account cannot run another 4lpha agent. Signing 4lpha out in the Binance App, or signing in anywhere else, ends the agent.",
+  paper: "Paper trading: this agent places no orders and spends nothing. It reads live Binance prices through your Agentic Wallet sign-in and records what it would have bought and sold, after fees, taxes and gas. This agent has no fixed token list. Every 60 seconds it picks from the live list of Flap and Four.meme meme stocks, so you cannot see or limit in advance which tokens it chooses. At term end it closes every paper position. Capital and per-trade amounts are only the paper sizing budget: no USDT and no BNB are needed. While this agent runs, this Binance account cannot run another 4lpha agent. Signing 4lpha out in the Binance App, or signing in anywhere else, ends the agent.",
   law1: "I understand this agent uses my Agentic Wallet sign-in only to read prices, and that this Binance account runs no other 4lpha agent meanwhile.",
   noFunding: "No funding needed: no USDT and no BNB",
   banner: "Paper trading (no real orders)",
-  noTokenList: "This agent has no fixed token list. Every 60 seconds it picks from the live list of Flap meme stocks, so you cannot see or limit in advance which tokens it chooses.",
+  noTokenList: "This agent has no fixed token list. Every 60 seconds it picks from the live list of Flap and Four.meme meme stocks, so you cannot see or limit in advance which tokens it chooses.",
 } as const;
 /** The paper meme hire's settings (9.1): the form's models, the three sizing inputs, and every other field fixed by the plane's parser (no CMC, no owner exits or text, slippage 500). */
 export function agenticMemeSettings(settings: TradeSettings, sizing: { entryWei: bigint; maxOpenPositions: number; capitalQuoteWei: bigint }): TradeSettings {
@@ -272,10 +272,61 @@ export function agenticMemeSettings(settings: TradeSettings, sizing: { entryWei:
 export type AgenticMemeDto = { mode: "paper"; tokens: { address: string; symbol: string | null; quoteSymbol: string | null }[];
   paper: { summary: { open: number; closed: number; wins: number; pnlUsdtWei: string | null; winRateBps: number | null };
     positions: { ref: string; token: string; symbol: string | null; quoteSymbol: string | null; venue: string; status: string; openedAt: number; closedAt: number | null;
-      entryUsdtWei: string; exitUsdtWei: string | null; markUsdtWei: string | null; markAtMs: number | null; pnlBps: number | null; closeCode: string | null }[] } };
+      entryUsdtWei: string; exitUsdtWei: string | null; markUsdtWei: string | null; markAtMs: number | null; pnlBps: number | null; closeCode: string | null;
+      /** Hotfix 2026-10-06 (detail parity); absent on an older plane, so every reader shows a dash for them. */
+      tokens?: string; pnlUsdtWei?: string | null; peakPnlBps?: number | null; costBps?: number;
+      /** Operator 2026-10-07: the market cap at entry (USD); null or absent shows the entry price instead. */
+      entryMcapUsd?: number | null }[] };
+  /** Operator hotfix 2026-10-06: read through their own guards; absent on an older plane. */
+  lastCycle?: unknown; decisionLog?: unknown };
 export function isAgenticMemeDto(value: unknown): value is AgenticMemeDto {
   const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   return record(value) && value["mode"] === "paper" && Array.isArray(value["tokens"]) && record(value["paper"]) && record(value["paper"]["summary"]) && Array.isArray(value["paper"]["positions"]);
+}
+/** The newest paper meme cycle as counts (hotfix 2026-10-06). */
+export type AgenticMemeLastCycleDto = { atMs: number; code: string | null; listSize: number | null; checked: number | null; passedScreen: number | null;
+  reasons: Record<string, number>; llmAsked: number; paperEntries: number; paperExits: number; barLagMs: number | null; elapsedMs: number | null };
+export function isAgenticMemeLastCycle(value: unknown): value is AgenticMemeLastCycleDto {
+  const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  return record(value) && typeof value["atMs"] === "number" && record(value["reasons"]) && Object.values(value["reasons"]).every(n => typeof n === "number")
+    && typeof value["llmAsked"] === "number" && typeof value["paperEntries"] === "number" && typeof value["paperExits"] === "number";
+}
+/** The local debug decision log (hotfix 2026-10-06; only when the plane sets AGENTIC_MEME_DECISION_LOG_PUBLIC=true). */
+export type AgenticMemeDecisionRowDto = { address: string; stage: string | null; status: string | null; category: string | null; venue: string | null; buyTaxBps: number | null;
+  sellTaxBps: number | null; liquidityUsd: number | null; volume5mUsd: number | null; txs5m: number | null; flow5mBuys: number | null; flow5mSells: number | null;
+  smart5mNetUsd: number | null; smart1hNetUsd: number | null; quoteSymbol: string | null; flags: string[]; verdict: string | null; barLagMs: number | null; bars: number | null;
+  deadScore: number | null; hardVeto: boolean | null; burstRatio: number | null; burstReason: string | null; followRatio: number | null; extensionPct: number | null;
+  range15Bps: number | null; costEstBps: number | null };
+export type AgenticMemeDecisionLogDto = { market: { atMs: number; prevAtMs?: number | null; asOf?: number | null; rows: AgenticMemeDecisionRowDto[] } | null;
+  signals: { atMs: number; token: string | null; verdict: string | null; costEstBps: number | null; costRule: boolean | null; llm: string | null; barLagMs: number | null }[];
+  llm: { atMs: number; model: string | null; outcome: string | null; latencyMs: number | null; tokens: unknown[]; decisions: unknown[] | null; jev?: AgenticMemeJevDto | null }[];
+  /** Jev benchmark (display only, operator 2026-10-07): the newest Jev scans of the shortlist tokens the checks dropped. */
+  jevScan?: ({ atMs: number } & AgenticMemeJevDto)[] };
+/** Jev benchmark (display only): one Jev reply, as probabilities per candidate; a scan answer also names its token and the check that dropped it. */
+export type AgenticMemeJevDto = { outcome: string | null; model: string | null; latencyMs: number | null;
+  answers: { index: number | null; token: string | null; verdict: string | null; choice: string | null; pBuy: number | null; pWait: number | null; pReject: number | null;
+    /** Operator 2026-10-07: P(higher in 60 min by more than the round-trip cost); absent on an older plane. */
+    pUp60?: number | null }[] };
+export function isAgenticMemeDecisionLog(value: unknown): value is AgenticMemeDecisionLogDto {
+  const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  return record(value) && (value["market"] === null || record(value["market"]) && typeof value["market"]["atMs"] === "number" && Array.isArray(value["market"]["rows"])
+    && value["market"]["rows"].every(r => record(r) && typeof r["address"] === "string")) && Array.isArray(value["signals"]) && Array.isArray(value["llm"]);
+}
+/** Why a meme was not taken, by the lane's verdict and screen codes; an unknown code shows as itself. */
+const MEME_REASON_LABELS: Readonly<Record<string, string>> = {
+  "no-burst": "No volume burst", "no-follow-through": "Burst without follow-through", extended: "Already ran too far", "dead-chart": "Dead chart",
+  pressure: "Buys not 2x sells", "smart-veto": "Smart money selling", "bars-unavailable": "Too new (under 8 minutes of bars) or bars late", cost: "Swing too small for the round-trip cost",
+  "cost-measured": "Measured round-trip cost too high", eligibility: "Not tradable now", "eligibility-unavailable": "Tradability check unavailable",
+  "token-version": "Unsupported token version", "no-exit-quote": "No sell quote", "stale-at-decision": "Data too old at decision", decimals: "Token decimals unreadable",
+  "gas-price": "Gas price unavailable", liquidity: "Pool too thin for the trade size", "llm-not-picked": "Model did not pick it", pass: "Passed every check",
+  "screen:flow-unknown": "No 5-minute buy/sell data", "screen:launchpad": "Not a Flap or Four.meme token", "screen:fourmeme-curve": "Four.meme on its curve (refused before curve support)", "screen:fourmeme-venue": "Four.meme venue not read yet",
+  "curve-funds": "Curve about to graduate (80 % of its funds raised)", "screen:tax-unknown": "Token tax unknown", "screen:liquidity": "Pool too thin for the trade size",
+  "screen:flag": "Risk flag (churn, wash trading or smart exit)", "screen:graduating": "Graduating right now", "screen:quote-halted": "Quote stock halted",
+  "screen:quote-kind": "Quote is not a bStock", "screen:usdt": "Not a meme token", "screen:quote-token": "Not a meme token", "screen:bstock": "Not a meme token",
+  "screen:stale": "Data too old", "screen:held": "Already held", "screen:cooldown": "Closed here less than 3 h ago", "screen:refused-recently": "Binance refused it recently",
+};
+export function memeReasonLabel(code: string): string {
+  return MEME_REASON_LABELS[code] ?? code;
 }
 export function isAgenticDcaDto(value: unknown): value is AgenticDcaDto {
   const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);

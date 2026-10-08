@@ -41,14 +41,14 @@ export type AgenticHireFacts = {
 /** One paper position of a meme hire (AGENTIC-MEME-STOCKS-SPEC 8.2, table `agentic_meme_paper`). Amounts are atomic USDT (or token) decimal strings. */
 export type AgenticMemePaper = {
   positionId: string; agentId: string; walletAddress: Address; token: Address; symbol: string | null; quoteToken: Address; quoteSymbol: string | null;
-  venueEntry: "flap-bonding" | "pancake-v2"; buyTaxBps: number; sellTaxBps: number; tokenVersion: number;
+  venueEntry: "flap-bonding" | "pancake-v2" | "fourmeme-bonding"; buyTaxBps: number; sellTaxBps: number; tokenVersion: number;
   entryUsdt: string; gasBuyUsdt: string; bnbUsdtE18: string; tokens: string; costBps: number; status: "open" | "closed";
   lastMarkUsdt: string | null; lastMarkAt: number | null; peakPnlBps: number | null; markSkips: number; markCount: number; closeRequestedAt: number | null;
   closeCode: "stop" | "trailing" | "dead-chart" | "smart-out" | "flow-flip" | "time" | "drain" | "ended" | null;
   exitUsdt: string | null; gasSellUsdt: string | null; pnlUsdt: string | null; closedAt: number | null; openedAt: number; version: number;
 };
 /** One decision-log row (AGENTIC-MEME-STOCKS-SPEC 8.6, table `agentic_meme_log`); `agentId` is null on the global `market` row. */
-export type AgenticMemeLog = { id: string; agentId: string | null; kind: "market" | "cycle" | "signal" | "llm" | "entry" | "mark" | "exit"; token: string | null; atMs: number; data: unknown };
+export type AgenticMemeLog = { id: string; agentId: string | null; kind: "market" | "cycle" | "signal" | "llm" | "entry" | "mark" | "exit" | "jev"; token: string | null; atMs: number; data: unknown };
 export type AgenticWallet = {
   pairingId: string; state: AgenticState; walletAddress: Address | null; ownerAddress: Address | null;
   pairingSecretHash: string; qr: { qrCodeId: string; urlForWeb: string; expireAtMs: number } | null;

@@ -26,6 +26,11 @@ export function agenticMemeEnabled(env: NodeJS.ProcessEnv): boolean {
   return true;
 }
 
+/** AGENTIC_MEME_DECISION_LOG_PUBLIC (local debug, operator hotfix 2026-10-06): exactly "true" adds the paper meme hire's decision log to its public view; anything else is off and never refuses boot. Off in production until the operator rules. */
+export function agenticMemeDecisionLogPublic(env: NodeJS.ProcessEnv): boolean {
+  return env["AGENTIC_MEME_DECISION_LOG_PUBLIC"] === "true";
+}
+
 /** AGENTIC_EARN_ENABLED (AGENTIC-EARN-SPEC 3.1): exactly "true" enables, empty or "false" is off, anything else refuses boot. Read by execution-api (earn hire bodies), the trade-worker (deposits; redeems and the sign-out guard run regardless) and the gate tool. */
 export function agenticEarnEnabled(env: NodeJS.ProcessEnv): boolean {
   const flag = env["AGENTIC_EARN_ENABLED"];

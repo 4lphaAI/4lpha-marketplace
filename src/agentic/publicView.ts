@@ -4,6 +4,7 @@ import { sanitizeMessage } from "../core/errors.js";
 import type { AgentStore } from "../store/agents.js";
 import type { TradeSettingsStore } from "../store/tradeSettings.js";
 import type { TradePositionStore, TradePositionRecord } from "../store/tradePositions.js";
+import { MEME_RUN_RETAIN_MS } from "../store/tradePositions.js";
 import type { TradeIntentStore } from "../store/tradeIntents.js";
 import type { ExecutionJournal } from "../store/journal.js";
 import type { CmcBudgetStore } from "../store/tradeCmc.js";
@@ -24,6 +25,8 @@ import { isCurrentCmcSkill } from "../trade/cmcUsEquity.js";
 import { identityOwnerView } from "../identity/types.js";
 import { EARN_PRODUCTS, earnSelfRescueCommand, type EarnProduct } from "./earnAdapter.js";
 import { EARN_DUST_WEI, EARN_REDEEM_ALL_MS, earnEvidence } from "./earn.js";
+import { agenticMemeDecisionLogPublic } from "./config.js";
+import { memeDecisionLog, memeLastCycle } from "./memePublic.js";
 
 /** An opaque public id: the first 16 hex of sha256 of the raw id, never the raw id. */
 const opaque = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 16);
@@ -33,7 +36,9 @@ const LLM_DECISION_CODES = new Set(["enter", "llm-veto", "final-below-threshold"
 /** A run reason is a closed code plus counts; free text (an `agent-error:` message) never leaves the plane. */
 function publicRunReason(reason: string, portfolio = false): string {
   return reason.split(";").map((part, index) => /^agent-error(:|$)/u.test(part) ? "agent-error"
-    : (index === 0 ? /^[a-z][a-z0-9-]*(:[a-z0-9-]+)*$/u : /^[a-z-]+=[a-z0-9-]+$/u).test(part) || index === 0 && portfolio && PORTFOLIO_REASON.test(part) ? part : index === 0 ? "other" : "").filter(part => part !== "").join(";");
+    : (index === 0 ? /^[a-z][a-z0-9-]*(:[a-z0-9-]+)*$/u : /^[a-z-]+=[a-z0-9-]+$/u).test(part) || index === 0 && portfolio && PORTFOLIO_REASON.test(part)
+      // Operator hotfix 2026-10-07: a meme quote refusal carries Binance's closed UPPER_SNAKE code (meme-refused:SERVICE_ERROR), not "other".
+      || index === 0 && /^meme-refused:[A-Z][A-Z0-9_]{0,63}$/u.test(part) ? part : index === 0 ? "other" : "").filter(part => part !== "").join(";");
 }
 /** A closed code of a portfolio hire's run log: executor codes such as AGENTIC_LOW_BNB or fence codes such as portfolio_leg_taken. */
 const PORTFOLIO_REASON = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u;
@@ -264,8 +269,14 @@ export function createAgenticPublicView(input: { store: AgenticStore; agents: Ag
     const events = latestRuns.flatMap(run => (run.events ?? []).map(e => ({ atMs: run.createdAt,
       stage: STAGES.has(e.stage) ? e.stage : "other", code: CODES.has(e.code) ? e.code : "other",
       token: typeof e.token === "string" && /^0x[0-9a-f]{40}$/i.test(e.token) ? e.token : null }))).slice(0, 50);
+    // Operator hotfix 2026-10-07: a paper meme hire also lists every notable cycle of the last 24 h (model asks, paper entries and exits, waits and failures),
+    // so the run-log filters can be checked over a night; the routine quiet cycles stay the latest 50 only.
+    const notable = row.hireFacts?.meme?.mode === "paper" && input.positions.listNotableMemeRuns !== undefined
+      ? await input.positions.listNotableMemeRuns(W, agent.id, (await input.store.now()) - MEME_RUN_RETAIN_MS) : [];
+    const seen = new Set(latestRuns.slice(0, 50).map(run => run.id));
+    const listed = [...latestRuns.slice(0, 50), ...notable.filter(run => !seen.has(run.id))].sort((a, b) => b.createdAt - a.createdAt);
     // The agent's LLM decision text is public (operator ruling); every other free-text event reason can carry internal ids and is dropped.
-    const runs = latestRuns.slice(0, 50).map(run => ({ id: opaque(run.id),
+    const runs = listed.map(run => ({ id: opaque(run.id),
       dryRun: run.dryRun, reason: publicRunReason(run.reason, portfolio), candidates: run.candidates, refusals: run.refusals, entries: run.entries, exits: run.exits, createdAt: run.createdAt,
       events: (run.events ?? []).map(e => ({ stage: e.stage, code: e.code, elapsedMs: e.elapsedMs,
         ...(e.token === undefined ? {} : { token: e.token }), ...(e.model === undefined ? {} : { model: e.model }),
@@ -419,6 +430,16 @@ export function createAgenticPublicView(input: { store: AgenticStore; agents: Ag
     let memeView: Record<string, unknown> | undefined;
     if (row.hireFacts?.meme?.mode === "paper") {
       const papers = await input.store.paperList(agent.id), closedPapers = papers.filter(p => p.status === "closed");
+      // Operator 2026-10-07, display only: the market cap at entry from the position's own `entry` log row (written at openedAt), read in a zero-width window.
+      const entryMcap = new Map<string, number>();
+      for (const p of papers) {
+        try {
+          const entry = (await input.store.memeLog(agent.id, p.openedAt, p.openedAt)).find(r => r.kind === "entry" && typeof r.data === "object" && r.data !== null
+            && (r.data as Record<string, unknown>)["positionId"] === p.positionId);
+          const mcap = (entry?.data as Record<string, unknown> | undefined)?.["mcapUsd"];
+          if (typeof mcap === "number" && Number.isFinite(mcap) && mcap > 0) entryMcap.set(p.positionId, mcap);
+        } catch { /* a missing market cap shows the entry price instead */ }
+      }
       const basis = (p: (typeof papers)[number]): bigint => BigInt(p.entryUsdt) + BigInt(p.gasBuyUsdt);
       const bpsOf = (value: bigint, base: bigint): number => Number((value - base) * 10_000n / base);
       const wins = closedPapers.filter(p => BigInt(p.pnlUsdt ?? "0") > 0n).length;
@@ -430,7 +451,18 @@ export function createAgenticPublicView(input: { store: AgenticStore; agents: Ag
           positions: papers.map((p, index) => ({ ref: "m" + index, token: p.token, symbol: p.symbol, quoteSymbol: p.quoteSymbol, venue: p.venueEntry, status: p.status,
             openedAt: p.openedAt, closedAt: p.closedAt, entryUsdtWei: p.entryUsdt, exitUsdtWei: p.exitUsdt, markUsdtWei: p.lastMarkUsdt, markAtMs: p.lastMarkAt,
             pnlBps: p.status === "closed" ? bpsOf(BigInt(p.pnlUsdt ?? "0") + basis(p), basis(p)) : p.lastMarkUsdt === null ? null : bpsOf(BigInt(p.lastMarkUsdt), basis(p)),
-            closeCode: p.closeCode })) } };
+            closeCode: p.closeCode,
+            // Operator hotfix 2026-10-06 (detail page parity): the paper token amount, the PnL in USDT on the same basis as pnlBps, the peak and the entry cost estimate.
+            tokens: p.tokens, pnlUsdtWei: p.status === "closed" ? p.pnlUsdt : p.lastMarkUsdt === null ? null : (BigInt(p.lastMarkUsdt) - basis(p)).toString(),
+            peakPnlBps: p.peakPnlBps, costBps: p.costBps, entryMcapUsd: entryMcap.get(p.positionId) ?? null })) } };
+      // Operator hotfix 2026-10-06: the newest cycle as counts (always); the decision log only with AGENTIC_MEME_DECISION_LOG_PUBLIC=true (local debug). Reads stay in short windows.
+      try {
+        const nowMs = await input.store.now();
+        const agentRows = await input.store.memeLog(agent.id, nowMs - 1_800_000, nowMs);
+        memeView["lastCycle"] = memeLastCycle(agentRows);
+        if (agenticMemeDecisionLogPublic(process.env)) memeView["decisionLog"] = memeDecisionLog(agentRows, await input.store.memeLog(null, nowMs - 300_000, nowMs),
+          (await input.store.memeLog(null, nowMs - 1_800_000, nowMs)).filter(r => r.kind === "jev"));
+      } catch { memeView["lastCycle"] = null; }
     }
     let dcaView: Record<string, unknown> | null | undefined;
     if (dca) {

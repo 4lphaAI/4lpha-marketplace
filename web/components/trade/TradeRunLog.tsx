@@ -5,10 +5,21 @@ import { txUrl, type TradeDcaActionView, type TradeView } from "@/lib/trade";
 import { relativeTime } from "@/lib/exec/agent-detail";
 
 type Run = TradeView["runs"][number];
+/**
+ * Operator hotfix 2026-10-07: a paper meme cycle (reason `meme-...`) never reaches the executor. Its paper buy (`buy`/`meme-paper-entry`) and paper sell
+ * (`sell`/`meme-exit:<code>`) are its trades, its model answers are `entry-llm`/`meme-llm:<answer>`, and a failure is a data, Binance or step failure.
+ */
+const isPaperEvent = (event: { stage: string; code: string }): boolean => event.stage === "buy" && event.code === "meme-paper-entry" || event.stage === "sell" && event.code.startsWith("meme-exit:");
+const MEME_FAILED = new Set(["meme-step-failed", "meme-unreachable", "meme-unparseable", "meme-llm:invalid", "meme-llm:timeout"]);
+const MEME_LLM_ANSWERS = new Set(["meme-llm:buy_now", "meme-llm:wait", "meme-llm:reject"]);
+const memeFailedCode = (code: string): boolean => MEME_FAILED.has(code) || code.startsWith("meme-refused:") || code.startsWith("meme-data:") && code !== "meme-data:no-candidates";
+function memeRunFailed(run: Run): boolean {
+  return memeFailedCode(run.reason.split(";")[0] ?? "") || (run.events ?? []).some((event) => event.stage === "route" && memeFailedCode(event.code));
+}
 export function hasExecutedTrade(run: Run): boolean {
   if (run.dryRun) return false;
   // Entry counts are attempts; route selection and executor denials are not trades.
-  return (run.events ?? []).some((event) => (event.stage === "buy" || event.stage === "sell") && event.code === "committed")
+  return (run.events ?? []).some((event) => (event.stage === "buy" || event.stage === "sell") && event.code === "committed" || isPaperEvent(event))
     || run.exits > 0 || run.reason.split(";")[0] === "entered";
 }
 
@@ -49,7 +60,7 @@ const FAILED_CODES = new Set([
  */
 function hasFailedExecution(run: Run): boolean {
   return (run.events ?? []).some(
-    (event) => (event.stage === "buy" || event.stage === "sell") && event.code !== "committed",
+    (event) => (event.stage === "buy" || event.stage === "sell") && event.code !== "committed" && !isPaperEvent(event),
   );
 }
 
@@ -80,7 +91,7 @@ function isExecutorFailureCode(code: string): boolean {
 
 export function runFailed(run: Run): boolean {
   if (run.dryRun) return false;
-  if (hasFailedExecution(run)) return true;
+  if (hasFailedExecution(run) || memeRunFailed(run)) return true;
   const code = run.reason.split(";")[0] ?? run.reason;
   // The gas gate reports its remedy sentence rather than a code, and a cycle
   // the worker stood down is a cycle that could not run.
@@ -133,13 +144,15 @@ const LLM_DECISION_CODES = new Set(["enter", "llm-veto", "final-below-threshold"
 const NOISE_CODES = new Set(["request", "response", "no-trigger", "feature-ready", "feature-partial", "feature-missing"]);
 
 export function hasLlmDecision(run: Run): boolean {
-  return (run.events ?? []).some((event) => event.stage.endsWith("llm") && LLM_DECISION_CODES.has(event.code));
+  return (run.events ?? []).some((event) => event.stage.endsWith("llm") && LLM_DECISION_CODES.has(event.code) || event.stage === "entry-llm" && MEME_LLM_ANSWERS.has(event.code));
 }
 
 /** V3 cycles log one `score` event per candidate; summarise those instead of the routeable count. */
 export function runSummary(run: Run): string {
   // Entry-timing events share the "score" stage but are not candidates scored.
   const scores = (run.events ?? []).filter((event) => event.stage === "score" && !event.code.startsWith("timing:"));
+  // Operator hotfix 2026-10-06: a paper meme cycle's `candidates` counts the memes that reached the model, not the data plane's shortlist.
+  if (scores.length === 0 && run.reason.startsWith("meme-")) return `${run.candidates} sent to the model after every check · ${run.entries} paper entries · ${run.exits} paper exits`;
   if (scores.length === 0) return `${run.candidates} shortlisted · ${run.entries} buy attempts · ${run.exits} closed · ${run.refusals} skipped/refused`;
   const passed = scores.filter((event) => event.code === "shortlisted" || event.code === "strong").length;
   const vetoed = scores.filter((event) => event.code.startsWith("vetoed")).length;
@@ -160,6 +173,8 @@ export type TradeCard = {
   readonly trigger: RunEvent | null;
   /** Every route event for the bought token, in order (aggregator refusals, then the selection). */
   readonly routes: readonly RunEvent[];
+  /** A paper meme buy or sell (hotfix 2026-10-07): no transaction, the model answer carries no text. */
+  readonly paper?: true;
 };
 
 /** "Filled via the Binance aggregator guard" vs "direct AMM", with why the aggregator was not used. */
@@ -183,6 +198,11 @@ export function tradeCards(runs: readonly Run[]): readonly TradeCard[] {
     const forToken = (token: string | null, stage: string, codes: readonly string[]) =>
       events.find((event) => event.stage === stage && codes.includes(event.code) && same(event, token)) ?? null;
     const routesFor = (token: string | null) => events.filter((event) => event.stage === "route" && same(event, token));
+    if (events.some(isPaperEvent)) return events.filter(isPaperEvent).map((event): TradeCard => {
+      const token = event.token ?? null, sell = event.stage === "sell";
+      return { side: sell ? "sell" : "buy", runId: run.id, createdAt: run.createdAt, token, detail: sell ? runLabel(event.code).replace(/^Paper exit: /u, "") : null, score: null,
+        llm: sell ? null : forToken(token, "entry-llm", ["meme-llm:buy_now"]), trigger: null, routes: [], paper: true };
+    });
     const sells = events.filter((event) => event.stage === "sell" && event.code === "committed").map((sell): TradeCard => {
       const token = sell.token ?? null;
       return { side: "sell", runId: run.id, createdAt: run.createdAt, token, detail: sell.reason ?? null, score: null,
@@ -205,6 +225,8 @@ export function eventLabel(code: string): string {
   const rule = /^rule:(would-exit|exit):(trailing-stop|stale-exit)$/u.exec(code);
   if (rule !== null) return `Robot exit rule ${rule[1] === "exit" ? "sells" : "would sell"}: ${rule[2] === "stale-exit" ? "stale position" : "trailing stop"}`;
   if (code === "rule:peak-implausible") return "Robot exit rule skipped: the recorded peak is implausible";
+  // Jev benchmark (operator 2026-10-07, display only): the Jev shadow's answer beside the model's; it never decides.
+  if (code.startsWith("meme-jev:")) return `Jev (shadow): ${code.slice("meme-jev:".length).replace(/_/gu, " ")}`;
   return code.replace(/[-_]/gu, " ");
 }
 
@@ -379,9 +401,10 @@ export function runLabel(reason: string, readOnly = false): string {
     "meme-veto:liquidity": "Too little liquidity for the trade size",
     "meme-veto:cost": "Price range too small for the round-trip cost",
     "meme-veto:eligibility": "Launchpad check failed",
-    "meme-veto:token-version": "Unsupported Flap token version",
+    "meme-veto:token-version": "Unsupported token version",
     "meme-veto:decimals": "Unsupported token decimals",
     "meme-veto:no-exit-quote": "No sell quote: possible honeypot",
+    "meme-veto:curve-funds": "Curve about to graduate: 80 % of its funds raised",
     "meme-llm:buy_now": "Model: buy now",
     "meme-llm:wait": "Model: wait",
     "meme-llm:reject": "Model: reject",
@@ -525,11 +548,12 @@ export function TradeRunLog({ runs, symbols, schedule = false, portfolio = false
         ? <div className="fl-trade-empty">{runs.length === 0 ? "No runs yet." : `No buys or sells in the latest ${runs.length} cycles.`}</div>
         : cards.map((card) => <div className="fl-run-card is-open" key={`${card.runId}:${card.side}:${card.token ?? "-"}`}>
           <div className="fl-run-detail">
-            <div className="fl-run-meta"><strong>{card.side === "sell" ? "Sold" : "Bought"} {name(card.token)}</strong>{card.detail ? ` · ${card.side === "sell" ? card.detail.replace(/-/gu, " ") : card.detail}` : ""} · <time title={new Date(card.createdAt).toISOString()}>{new Date(card.createdAt).toLocaleString()}</time></div>
+            <div className="fl-run-meta"><strong>{card.paper ? "Paper " + (card.side === "sell" ? "sold" : "bought") : card.side === "sell" ? "Sold" : "Bought"} {name(card.token)}</strong>{card.detail ? ` · ${card.side === "sell" && card.paper !== true ? card.detail.replace(/-/gu, " ") : card.detail}` : ""} · <time title={new Date(card.createdAt).toISOString()}>{new Date(card.createdAt).toLocaleString()}</time></div>
             {routeLine(card.routes) === null ? null : <p>{routeLine(card.routes)}</p>}
             {card.score ? <p>{scoreLine(card.score)}</p> : null}
             {card.trigger ? <p>Exit trigger: {card.trigger.code.slice("trigger:".length).replace(/-/gu, " ")}</p> : null}
-            {card.llm ? <p><strong>Why (LLM{card.llm.model ? `: ${card.llm.model}` : ""}{card.llm.confidence === undefined ? "" : `, ${card.llm.confidence}% confidence`})</strong> {card.llm.reason ?? "—"}</p>
+            {card.paper ? <p>{card.side === "sell" ? "Rule exit: no model decision for a paper sell." : card.llm ? `Model: buy now${card.llm.confidence === undefined ? "" : `, ${card.llm.confidence}% confidence`}${card.llm.model ? ` (${card.llm.model})` : ""}` : "No model answer was recorded for this paper buy."} No transaction: paper trade.</p>
+            : card.llm ? <p><strong>Why (LLM{card.llm.model ? `: ${card.llm.model}` : ""}{card.llm.confidence === undefined ? "" : `, ${card.llm.confidence}% confidence`})</strong> {card.llm.reason ?? "—"}</p>
               : <p>{card.side === "sell" ? "Rule exit — no model decision was recorded for this sell." : "No model reason was recorded for this buy."}</p>}
           </div>
         </div>);
@@ -538,8 +562,8 @@ export function TradeRunLog({ runs, symbols, schedule = false, portfolio = false
       <div className="fl-run-detail"><div className="fl-run-meta">{new Date(run.createdAt).toLocaleString()} · Run {run.id}</div>
         {(run.events?.length ?? 0) > 0 ? <><ol>{run.events!.filter((event) => !NOISE_CODES.has(event.code)).map((event, i) => <li key={i}>
           <span className="fl-run-stage">{event.stage.replace(/-/gu, " ")} <small>+{(event.elapsedMs / 1000).toFixed(1)}s</small></span>
-          <div><strong>{eventLabel(event.code)}</strong>{event.token ? <span title={event.token}> · {symbols[event.token.toLowerCase()] ?? `${event.token.slice(0, 6)}…${event.token.slice(-4)}`}</span> : null}{event.confidence === undefined ? null : <span className="fl-run-confidence">{event.confidence}% confidence</span>}
-            {event.model ? <small className="fl-run-model">LLM model: {event.model}</small> : null}{event.reason ? <p>{event.reason}</p> : null}</div>
+          <div><strong>{eventLabel(event.code)}</strong>{event.token ? <span title={event.token}> · {symbols[event.token.toLowerCase()] ?? `${event.token.slice(0, 6)}…${event.token.slice(-4)}`}</span> : null}{event.confidence === undefined ? null : <span className="fl-run-confidence">{event.confidence}% {event.code.startsWith("meme-jev:") ? "buy" : "confidence"}</span>}
+            {event.model ? <small className="fl-run-model">{event.code.startsWith("meme-jev:") ? "Jev model" : "LLM model"}: {event.model}</small> : null}{event.reason ? <p>{event.reason}</p> : null}</div>
         </li>)}</ol>
         {run.events!.some((event) => NOISE_CODES.has(event.code)) ? <details className="fl-run-raw"><summary>Other events ({run.events!.filter((event) => NOISE_CODES.has(event.code)).length})</summary>
           <ul>{run.events!.filter((event) => NOISE_CODES.has(event.code)).map((event, i) => <li key={i}>{event.stage.replace(/-/gu, " ")} · {event.code.replace(/[-_]/gu, " ")}{event.token ? ` · ${symbols[event.token.toLowerCase()] ?? `${event.token.slice(0, 6)}…${event.token.slice(-4)}`}` : ""}</li>)}</ul>

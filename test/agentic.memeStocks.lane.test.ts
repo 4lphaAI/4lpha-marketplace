@@ -74,7 +74,7 @@ test("fail-closed table 5.6: each missing or stale read refuses entries with its
   }
 });
 
-test("screen and bars vetoes: flow unknown, untracked, fewer than 15 bars, a lag of 120 001 ms, token version 5 and 7, a quote outside the bStock universe is screened like any other", async (t) => {
+test("screen and bars vetoes: flow unknown, untracked, fewer than 8 bars, a lag of 120 001 ms, token version 5 and 7, a quote outside the bStock universe is screened like any other", async (t) => {
   const world = await memeWorld(t);
   world.plane.rows = [shortlistRow(world.clock.now, { flow5m: null })];
   assert.equal((await logs(world, "market")).length, 0);
@@ -82,13 +82,15 @@ test("screen and bars vetoes: flow unknown, untracked, fewer than 15 bars, a lag
   const market = (await logs(world, "market"))[0]!.data as { rows: unknown[][][] };
   assert.deepEqual(market.rows[0]![1], ["screen:flow-unknown"]);
   assert.equal(market.rows[0]![0]![23], false, "quoteInUniverse false for a per-address quote stock (P3), logged, not filtered");
-  for (const [patch, verdict] of [[{ tracked: false }, "bars-unavailable"], [{ bars: passingBars(world.clock.now, 120_000, 14) }, "bars-unavailable"],
-    [{ bars: passingBars(world.clock.now, 120_001) }, "bars-unavailable"], [{ bars: passingBars(world.clock.now, 120_000) }, "pass"]] as const) {
+  for (const [patch, verdict, reason] of [[{ tracked: false }, "bars-unavailable", "untracked"], [{ bars: passingBars(world.clock.now, 120_000, 7) }, "bars-unavailable", "young"],
+    [{ staleness: "stale" }, "bars-unavailable", "stale"], [{ bars: passingBars(world.clock.now, 120_001) }, "bars-unavailable", "lag"],
+    [{ bars: passingBars(world.clock.now, 120_000) }, "pass", null]] as const) {
     const w = await memeWorld(t);
     w.plane.bars.set(MEME, { bars: passingBars(w.clock.now), ...patch } as never);
     await step(w);
     const row = ((await logs(w, "market"))[0]!.data as { rows: unknown[][][] }).rows[0]!;
     assert.equal(row[1]![0], verdict, JSON.stringify(patch).slice(0, 40));
+    assert.equal(row[1]![14], reason, "operator 2026-10-07: the failed bars entry rule is logged at index 14");
   }
   for (const [version, code] of [[5, "meme-veto:token-version"], [7, "meme-veto:token-version"], [6, "meme-entered"]] as const) {
     const w = await memeWorld(t);
@@ -337,7 +339,7 @@ test("flag OFF: exits run, no entry", async (t) => {
 test("shared market cache and brain tuple (R2-H3): two agents in one cycle cause one bars batch and one market row; the logged scalars reproduce every verdict", async (t) => {
   const world = await memeWorld(t);
   world.plane.rows = [shortlistRow(world.clock.now), shortlistRow(world.clock.now, { address: MEME2, flow5m: { buys: 10, sells: 10 } }),
-    shortlistRow(world.clock.now, { address: "0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1", launchpad: "fourmeme" })];
+    shortlistRow(world.clock.now, { address: "0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1", launchpad: "pumpfun" })];
   world.plane.bars.set(MEME2, { bars: passingBars(world.clock.now) });
   await step(world);
   const row = (await world.f.store.byAgent(world.agentId))!;
@@ -348,11 +350,13 @@ test("shared market cache and brain tuple (R2-H3): two agents in one cycle cause
   assert.equal(markets.length, 1);
   const data = markets[0]!.data as { rows: unknown[][][]; survivors61: number; barsRequested: number };
   assert.deepEqual([data.survivors61, data.barsRequested], [2, 2]);
+  assert.deepEqual((data.rows[0]![0] as unknown[]).slice(25), [300, 1_000, 12_000], "hotfix 2026-10-06: 5m and 1h net USD inflow and the 1h volume are logged");
+  assert.deepEqual((data.rows[1]![0] as unknown[]).slice(25, 26), [null], "a flow without inflowUsd logs null, never 0");
   for (const [m, b] of data.rows as [unknown[], unknown[]][]) {
-    assert.equal(m.length, 25);
+    assert.equal(m.length, 28);
     const verdict = b[0] as string;
     if (verdict.startsWith("screen:") || b.length === 1) continue;
-    assert.equal(b.length, 14);
+    assert.equal(b.length, 15);
     const [, , , , , deadScore, hardVeto, , burstRatio, reason, followRatio, extensionPct] = b as [string, number, number, number, number, number, boolean, number | null, number, string | null, number, number];
     const burstVerdict = reason === null ? null : ["silent-base", "volume", "red"].includes(reason) ? "no-burst" : reason === "extended" ? "extended" : "no-follow-through";
     const buys = m[12] as number, sells = m[13] as number, s5 = m[16] as number | null, s1 = m[18] as number | null;
@@ -361,7 +365,7 @@ test("shared market cache and brain tuple (R2-H3): two agents in one cycle cause
     if (verdict === "pass") assert.ok(burstRatio >= 3 && followRatio >= 1.5 && extensionPct <= 60);
   }
   assert.deepEqual(data.rows.map(r => r[1]![0]), ["pass", "pressure", "screen:launchpad"]);
-  assert.deepEqual(data.rows.map(r => r[1]!.length), [14, 14, 1], "every row whose bars were read carries the full brain tuple, vetoed or not");
+  assert.deepEqual(data.rows.map(r => r[1]!.length), [15, 15, 1], "every row whose bars were read carries the full brain tuple, vetoed or not");
   // A new asOf writes a new market row; the same asOf never a second one.
   await world.at(world.clock.now + 60_000); await step(world);
   assert.equal((await logs(world, "market")).length, 1);
@@ -376,7 +380,7 @@ test("R3-2: more than 30 survivors are cut in the shortlist's own order", async 
   await step(world);
   const data = (await logs(world, "market"))[0]!.data as { rows: unknown[][][]; survivors61: number; barsRequested: number };
   assert.deepEqual([data.survivors61, data.barsRequested], [32, 30]);
-  assert.deepEqual(data.rows.map(r => r[1]!.length), [...Array.from({ length: 30 }, () => 14), 1, 1], "the first 30 in shortlist order carry bars; the two after them do not");
+  assert.deepEqual(data.rows.map(r => r[1]!.length), [...Array.from({ length: 30 }, () => 15), 1, 1], "the first 30 in shortlist order carry bars; the two after them do not");
 });
 
 test("run-event stages (R2-M12): every event the step emits survives normalizeTradeRunEvents unchanged", async (t) => {
@@ -522,6 +526,30 @@ test("audit F-C: an eligibility row whose Flap quote differs from the row's quot
   const world = await memeWorld(t);
   world.plane.eligibility = [eligibilityRow(world.clock.now, {}, { quote: "0x" + "ef".repeat(20) })];
   assert.equal((await step(world)).report.code, "meme-veto:eligibility");
+});
+
+test("operator hotfix 2026-10-06: a graduated Four.meme token enters paper with the shortlist taxes, unnetted on Pancake V2", async (t) => {
+  const four = (w: MemeWorld, patch: Record<string, unknown> = {}, fm: Record<string, unknown> = {}) => {
+    w.plane.rows = [shortlistRow(w.clock.now, { launchpad: "fourmeme", tax: { buyBps: 0, sellBps: 0 } })];
+    w.plane.eligibility = [eligibilityRow(w.clock.now, { source: "fourmeme", reason: "fourmeme_factory", flap: null,
+      fourmeme: { version: 2, tokenManager: "0x5c952063c7fc8610ffdb798152d69f0b9550762b", quote: QUOTE, launchTime: 0, liquidityAdded: true, ...fm }, ...patch })];
+  };
+  const world = await memeWorld(t);
+  four(world);
+  assert.equal((await step(world)).report.code, "meme-entered");
+  const paper = (await world.f.store.paperOpen(world.agentId))[0]!;
+  assert.deepEqual([paper.venueEntry, paper.buyTaxBps, paper.sellTaxBps, paper.tokenVersion], ["pancake-v2", 0, 0, 2]);
+  for (const [name, patch, fm, code] of [
+    ["quote differs", {}, { quote: "0x" + "ef".repeat(20) }, "meme-veto:eligibility"],
+    ["not migrated", {}, { liquidityAdded: false }, "meme-veto:eligibility"],
+    ["curve venue in eligibility", { venue: "fourmeme-bonding" }, {}, "meme-veto:eligibility"],
+    ["no fourmeme facts", { fourmeme: null }, {}, "meme-veto:eligibility"],
+    ["version 3", {}, { version: 3 }, "meme-veto:token-version"],
+  ] as const) {
+    const w = await memeWorld(t);
+    four(w, patch, fm);
+    assert.equal((await step(w)).report.code, code, name);
+  }
 });
 
 test("audit FA2: bars within 120 000 ms but a row observed more than 180 000 ms before the decision is refused by the rowFresh clause of the recheck", async (t) => {

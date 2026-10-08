@@ -213,6 +213,8 @@ export interface TradePositionStore {
   listRuns(ownerAddress: Address, agentId: string, limit?: number): Promise<readonly TradeRunRecord[]>;
   /** Every retained run that committed a buy or a sell, or submitted one whose outcome is unknown, newest first: these survive the 200-row prune. */
   listExecutedRuns(ownerAddress: Address, agentId: string): Promise<readonly TradeRunRecord[]>;
+  /** Operator hotfix 2026-10-07: a paper meme hire's runs since `sinceMs` other than the routine quiet cycles, newest first, capped at MEME_NOTABLE_RUN_LIMIT. */
+  listNotableMemeRuns?(ownerAddress: Address, agentId: string, sinceMs: number): Promise<readonly TradeRunRecord[]>;
   close(): Promise<void>;
 }
 
@@ -222,10 +224,18 @@ function ownerKey(ownerAddress: Address): Address {
 
 /** Executed runs are bounded by the positions a session can open; the read still caps them. */
 const EXECUTED_RUN_LIMIT = 1_000;
+/** Operator hotfix 2026-10-07: a paper meme cycle (reason `meme-...`) survives the 200-row prune for 24 h, so a night of cycles stays checkable. */
+export const MEME_RUN_RETAIN_MS = 86_400_000;
+const MEME_NOTABLE_RUN_LIMIT = 500;
+/** The quiet meme cycles a notable read leaves out (a run with a paper entry or exit is never quiet). */
+const MEME_QUIET_REASONS = ["meme-no-candidate", "meme-idle"] as const;
 
 function runExecuted(run: TradeRunRecord): boolean {
   return run.entries > 0 || run.exits > 0 || (run.events ?? []).some(isUnknownSubmissionEvent);
 }
+const memeRunRetained = (run: TradeRunRecord, newestMs: number): boolean => run.reason.startsWith("meme-") && run.createdAt > newestMs - MEME_RUN_RETAIN_MS;
+const memeRunNotable = (run: TradeRunRecord): boolean => run.reason.startsWith("meme-")
+  && (run.entries > 0 || run.exits > 0 || !(MEME_QUIET_REASONS as readonly string[]).includes(run.reason.split(";")[0] ?? ""));
 
 /** AGENTIC-RECEIPT-WAIT F2: a run holding an unknown buy or sell submission, in SQL; the same predicate as the memory store's runExecuted. */
 const UNKNOWN_SUBMISSION_SQL = `(events @> '[{"stage":"buy","code":"unknown"}]'::jsonb or events @> '[{"stage":"sell","code":"unknown"}]'::jsonb)`;
@@ -645,8 +655,16 @@ export class MemoryTradePositionStore implements TradePositionStore {
     rows.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
     // The prune keeps the latest 200 cycles plus every cycle that executed: a fill's run
     // stays readable after a night of refusals has rolled the window past it.
-    this.#runs.set(input.agentId, rows.filter((candidate, index) => index < 200 || runExecuted(candidate)));
+    this.#runs.set(input.agentId, rows.filter((candidate, index) => index < 200 || runExecuted(candidate) || memeRunRetained(candidate, row.createdAt)));
     return structuredClone(row);
+  }
+
+  async listNotableMemeRuns(ownerAddress: Address, agentId: string, sinceMs: number): Promise<readonly TradeRunRecord[]> {
+    const owner = ownerKey(ownerAddress);
+    return (this.#runs.get(agentId) ?? [])
+      .filter((row) => row.ownerAddress === owner && row.createdAt >= sinceMs && memeRunNotable(row))
+      .slice(0, MEME_NOTABLE_RUN_LIMIT)
+      .map((row) => structuredClone(row));
   }
 
   async listExecutedRuns(ownerAddress: Address, agentId: string): Promise<readonly TradeRunRecord[]> {
@@ -1172,12 +1190,24 @@ export class PostgresTradePositionStore implements TradePositionStore {
       await tx.query(
         `/* tradeRuns.prune */ delete from trade_runs where agent_id = $1
          and entries = 0 and exits = 0 and not ${UNKNOWN_SUBMISSION_SQL}
+         and not (reason like 'meme-%' and created_at > $2)
          and id not in (select id from trade_runs where agent_id = $1
                         order by created_at desc, id desc limit 200)`,
-        [row.agentId],
+        [row.agentId, new Date(row.createdAt - MEME_RUN_RETAIN_MS)],
       );
     });
     return row;
+  }
+
+  async listNotableMemeRuns(ownerAddress: Address, agentId: string, sinceMs: number): Promise<readonly TradeRunRecord[]> {
+    const result = await this.#sql.query<RunRow>(
+      `/* tradeRuns.listNotableMeme */ select ${RUN_COLUMNS} from trade_runs
+       where owner_address = $1 and agent_id = $2 and created_at >= $3 and reason like 'meme-%'
+         and (entries > 0 or exits > 0 or split_part(reason, ';', 1) <> all($4::text[]))
+       order by created_at desc, id desc limit $5`,
+      [ownerKey(ownerAddress), agentId, new Date(sinceMs), [...MEME_QUIET_REASONS], MEME_NOTABLE_RUN_LIMIT],
+    );
+    return result.rows.map(rowToRun);
   }
 
   async listRuns(ownerAddress: Address, agentId: string, limit = 10): Promise<readonly TradeRunRecord[]> {

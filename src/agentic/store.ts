@@ -130,6 +130,14 @@ create table if not exists agentic_meme_log (
   token text, at_ms bigint not null, data jsonb not null);
 create index if not exists agentic_meme_log_agent on agentic_meme_log (agent_id, at_ms);
 create index if not exists agentic_meme_log_kind on agentic_meme_log (kind, at_ms);
+`,
+// JEV-MEME-BENCHMARK-PLAN 3.3: the Jev scan rows (kind `jev`, measurement only); appended last, idempotent (the DCA 3.3 constraint precedent above).
+`alter table agentic_meme_log drop constraint if exists agentic_meme_log_kind_check;
+alter table agentic_meme_log add constraint agentic_meme_log_kind_check check (kind in ('market','cycle','signal','llm','entry','mark','exit','jev'));
+`,
+// FOURMEME-CURVE-PAPER-SPEC 6.5: the Four.meme curve venue on the paper ledger; appended last, idempotent (the Jev constraint precedent above).
+`alter table agentic_meme_paper drop constraint if exists agentic_meme_paper_venue_entry_check;
+alter table agentic_meme_paper add constraint agentic_meme_paper_venue_entry_check check (venue_entry in ('flap-bonding','pancake-v2','fourmeme-bonding'));
 `
 ];
 const CLOCK = "(extract(epoch from clock_timestamp()) * 1000)::bigint";

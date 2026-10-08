@@ -297,6 +297,8 @@ describe("run log hotfix (2026-09-24): V3 cycles are readable", () => {
   it("TRADFI-EXIT-RULES: rule events read as sentences in the run log, other codes keep the generic words", () => {
     expect(eventLabel("rule:would-exit:trailing-stop")).toBe("Robot exit rule would sell: trailing stop");
     expect(eventLabel("rule:exit:stale-exit")).toBe("Robot exit rule sells: stale position");
+    expect(eventLabel("meme-jev:buy_now")).toBe("Jev (shadow): buy now");
+    expect(eventLabel("meme-jev:late")).toBe("Jev (shadow): late");
     expect(eventLabel("rule:peak-implausible")).toBe("Robot exit rule skipped: the recorded peak is implausible");
     expect(eventLabel("no-trigger")).toBe("no trigger");
     const html = renderToStaticMarkup(<TradeRunLog symbols={{}} runs={[{ ...quiet, events: [{ stage: "exit-llm", code: "rule:would-exit:trailing-stop", elapsedMs: 1, token: "0x3333333333333333333333333333333333333333", reason: "peak=+312 now=+150" }] }]} />);

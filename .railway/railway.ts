@@ -146,6 +146,11 @@ export default defineRailway(() => {
     AGENTIC_RFQ_STOCKS_ENABLED: "true",
     // Earn on idle USDT (2026-10-06 operator go): api + trade-worker from the same build.
     AGENTIC_EARN_ENABLED: "true",
+    // Meme-stock PAPER lane (2026-10-08 operator go): api (hires, public view) + trade-worker (the paper step; the Agentic loop starts on second 25,
+    // never later than before, so live hires keep their 60 s cadence). Paper only: no swap or payment for a meme hire.
+    AGENTIC_MEME_STOCKS_ENABLED: "true",
+    // The paper hire's decision log on its public page (operator go 2026-10-08; read by execution-api only).
+    AGENTIC_MEME_DECISION_LOG_PUBLIC: "true",
   };
 
   const api = service("execution-api", {
@@ -207,6 +212,9 @@ export default defineRailway(() => {
       ...fromApi,
       ...llm,
       TRADE_LLM_API_KEY: preserve(),
+      // Jev benchmark shadow on the meme paper lane (measurement only; operator go 2026-10-08): the flag plus the TypeSafe key, set once in Railway.
+      AGENTIC_MEME_JEV_SHADOW: "true",
+      TYPESAFE_API_KEY: preserve(),
       // Off ⇒ the exit subset only for an agent hired while on (D17). Flip it
       // together with execution-api's.
       DCA_ENABLED: "true",
@@ -451,6 +459,7 @@ export default defineRailway(() => {
       NEXT_PUBLIC_AGENTIC_WALLET_ENABLED: "true",
       NEXT_PUBLIC_AGENTIC_DCA_ENABLED: "true",
       NEXT_PUBLIC_AGENTIC_EARN_ENABLED: "true",
+      NEXT_PUBLIC_AGENTIC_MEME_ENABLED: "true",
       // Public MCP (/mcp). Runtime variables: a restart is enough. MCP_DATA_TOOLS_ENABLED switches on the three data tools
       // (agent_status, bstock_analysis, meme_stocks); turned on in production 2026-10-07 on the operator's go. MCP_PUBLIC_ORIGIN
       // pins the origin of every link the MCP returns, so a forged forwarded-host header cannot change the official deploy link.

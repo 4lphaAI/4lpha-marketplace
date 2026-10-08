@@ -14,7 +14,8 @@ export const MEME_FRESH_MS = 180_000;
 export const MEME_ENTRY_BAR_LAG_MAX_MS = 120_000;
 export const MEME_EXIT_BAR_LAG_MAX_MS = 300_000;
 export const MEME_ELIGIBILITY_FRESH_MS = 60_000;
-export const MEME_MIN_BARS = 15;
+/** Operator 2026-10-07: was 15. 8 is the fewest bars the 6.3 burst can be computed on (a 5-bar base before the bar at L-2); the 6.5 range then spans the bars there are. */
+export const MEME_MIN_BARS = 8;
 export const MEME_BARS_BATCH_MAX = 30;
 
 export type MemeFlow = { buys: number; sells: number; uniqueTraders: number | null; inflowUsd: number | null };
@@ -35,7 +36,9 @@ export type MemeBoardRow = { status: string; flags: readonly string[]; flow5m: M
 export type MemeBar = { startMs: number; open: number; high: number; low: number; close: number; volume: number; filled: boolean };
 export type MemeBars = { address: Address; tracked: boolean; staleness: string; lastClosedStartMs: number; bars: MemeBar[] };
 export type MemeEligibility = { address: Address; eligible: boolean; source: string | null; venue: string | null; checkedAt: number;
-  flap: { status: number; tokenVersion: number; quote: Address; progress: bigint; buyTaxBps: number; sellTaxBps: number } | null };
+  flap: { status: number; tokenVersion: number; quote: Address; progress: bigint; buyTaxBps: number; sellTaxBps: number } | null;
+  /** Operator hotfix 2026-10-06: the Four.meme TokenManager facts (no tax here; the shortlist row carries it). FOURMEME-CURVE-PAPER-SPEC 6.3: the curve's `funds` and `maxFunds` (raw quote atomic units), null when absent or malformed. */
+  fourmeme: { version: number; quote: Address | null; liquidityAdded: boolean; funds: bigint | null; maxFunds: bigint | null } | null };
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
@@ -141,10 +144,13 @@ export function parseBars(envelope: unknown, requested: readonly Address[]): Map
 }
 /** 5.3: the lag recorded on every decision. */
 export const barLagMs = (bars: MemeBars, nowMs: number): number => nowMs - (bars.lastClosedStartMs + 60_000);
-/** 5.3 entry rule: tracked, at least 15 bars, fresh, lag within MEME_ENTRY_BAR_LAG_MAX_MS. */
+/** 5.3 entry rule: tracked, at least MEME_MIN_BARS bars, fresh, lag within MEME_ENTRY_BAR_LAG_MAX_MS. */
 export const barsEntryOk = (bars: MemeBars, nowMs: number): boolean => bars.tracked && bars.bars.length >= MEME_MIN_BARS && bars.staleness === "fresh"
   && barLagMs(bars, nowMs) <= MEME_ENTRY_BAR_LAG_MAX_MS;
-export const barsExitOk = (bars: MemeBars, nowMs: number): boolean => barLagMs(bars, nowMs) <= MEME_EXIT_BAR_LAG_MAX_MS;
+/** Operator 2026-10-07, log only: which 5.3 entry rule a read series failed, first failing rule in `barsEntryOk` order; null when it passes. A series that was not read at all logs no reason (its brain tuple is the verdict alone). */
+export const barsEntryReason = (bars: MemeBars, nowMs: number): "untracked" | "young" | "stale" | "lag" | null => !bars.tracked ? "untracked"
+  : bars.bars.length < MEME_MIN_BARS ? "young" : bars.staleness !== "fresh" ? "stale" : barLagMs(bars, nowMs) > MEME_ENTRY_BAR_LAG_MAX_MS ? "lag" : null;
+export const barsExitOk =(bars: MemeBars, nowMs: number): boolean => barLagMs(bars, nowMs) <= MEME_EXIT_BAR_LAG_MAX_MS;
 
 /** 5.4: rows keyed by address (order not assumed, duplicates collapsed); a malformed row is absent. */
 export function parseEligibility(envelope: unknown): Map<string, MemeEligibility> | null {
@@ -162,7 +168,15 @@ export function parseEligibility(envelope: unknown): Map<string, MemeEligibility
         || bps(f["buyTaxBps"]) === null || bps(f["sellTaxBps"]) === null) continue;
       flap = { status: f["status"] as number, tokenVersion: f["tokenVersion"] as number, quote, progress: BigInt(f["progress"]), buyTaxBps: f["buyTaxBps"] as number, sellTaxBps: f["sellTaxBps"] as number };
     }
-    out.set(token, { address: token, eligible: row["eligible"], source: row["source"] as string | null, venue: row["venue"] as string | null, checkedAt: row["checkedAt"], flap });
+    let fourmeme: MemeEligibility["fourmeme"] = null;
+    const m = row["fourmeme"];
+    if (m !== null && m !== undefined) {
+      const quote = record(m) && m["quote"] !== null ? address(m["quote"]) : null;
+      if (!record(m) || !Number.isInteger(m["version"]) || typeof m["liquidityAdded"] !== "boolean" || m["quote"] !== null && quote === null) continue;
+      const raw = (value: unknown): bigint | null => typeof value === "string" && /^\d{1,78}$/u.test(value) ? BigInt(value) : null;
+      fourmeme = { version: m["version"] as number, quote, liquidityAdded: m["liquidityAdded"], funds: raw(m["funds"]), maxFunds: raw(m["maxFunds"]) };
+    }
+    out.set(token, { address: token, eligible: row["eligible"], source: row["source"] as string | null, venue: row["venue"] as string | null, checkedAt: row["checkedAt"], flap, fourmeme });
   }
   return out;
 }
