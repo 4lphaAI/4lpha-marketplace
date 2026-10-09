@@ -55,7 +55,7 @@ it("an open paper position: tiles, tabs, size, entry price, exit plan, unrealise
   const text = host.textContent ?? "";
   expect([...host.querySelectorAll(".fl-trade-tabs button")].map(b => b.textContent)).toEqual(["Open Positions", "Closed Positions", "Run log"]);
   for (const want of ["Paper budget", "Execution model", "Meme stocks", "Open positions", "1 / 2", "481,412 MEME", "10 USDT paper · curve", "@ 0.00002077 USDT / MEME",
-    "Trail from +10% · peak -15.15%", "Stop -30% · max 4 h", "-2.07 USDT", "-20.66%", "Paper"]) expect(text).toContain(want);
+    "Trail from +20% · peak -15.15%", "Stop -30% · max 4 h", "-2.07 USDT", "-20.66%", "Paper"]) expect(text).toContain(want);
   expect(host.querySelector('[data-testid="meme-gmgn-link"]')?.getAttribute("href")).toBe(`https://gmgn.ai/bsc/token/${MEME}`);
   expect(host.querySelector('a[href*="bscscan.com/tx"]')).toBeNull();
   await done();

@@ -93,7 +93,7 @@ function MemeOpenRow({ p, icon, expanded, onExpand }: { p: MemePosition; icon: s
       <MemeTokenHead p={p} icon={icon} />
       <div className="fl-trade-position__age">{relativeTime(p.openedAt, Date.now()).text}</div>
       <div className="fl-trade-position__size"><strong>{memeAmount(p.tokens)} <small>{symbol}</small></strong><span>{usdt2(p.entryUsdtWei)} paper · {memeVenue(p.venue)}</span><span>@ {typeof p.entryMcapUsd === "number" ? `${new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(p.entryMcapUsd)} MCap` : `${memePrice(p.entryUsdtWei, p.tokens)} USDT / ${symbol}`}</span></div>
-      <div className="fl-trade-position__plan"><strong><i className="is-tp" />Trail from +10%{p.peakPnlBps == null ? "" : ` · peak ${bps(p.peakPnlBps, true)}`}</strong><span><i />Stop -30% · max 4 h</span></div>
+      <div className="fl-trade-position__plan"><strong><i className="is-tp" />Trail from +20%{p.peakPnlBps == null ? "" : ` · peak ${bps(p.peakPnlBps, true)}`}</strong><span><i />Stop -30% · max 4 h</span></div>
       <button type="button" className={`fl-trade-chart-button ${expanded ? "is-active" : ""}`} aria-label={`${expanded ? "Hide" : "Show"} ${symbol} chart`} onClick={onExpand}><Icon name="yield" size={18} /></button>
       <div className={`fl-trade-position__pnl is-${tone}`} title={p.markAtMs === null ? undefined : `Marked ${relativeTime(p.markAtMs, Date.now()).text}`}>
         <strong>{p.pnlBps === null ? "-" : memePnlUsdt(p)}</strong><span>{p.pnlBps === null ? "no mark yet" : bps(p.pnlBps, true)}</span></div>

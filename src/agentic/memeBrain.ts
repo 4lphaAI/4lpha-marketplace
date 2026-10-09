@@ -8,8 +8,9 @@ import type { MemeBar, MemeShortlistRow } from "./memeData.js";
 import { rowFresh } from "./memeData.js";
 
 export const MEME_STOP_BPS = 3_000;
-/** Operator 2026-10-09 (MD here/MEME-EXIT-REPLAY-2026-10-09.md): armed at net +10 % (was +50 %, never armed in 23 paper trades), giveback max(500 bps, 30 % of peak). */
-export const MEME_TRAIL_ARM_BPS = 1_000;
+/** Operator 2026-10-09 (second ruling, option B): armed at net +20 % with a fixed 1 500 bps giveback, so a +20 % peak sells at +5 %; was +10 % with max(500, 30 % of peak). */
+export const MEME_TRAIL_ARM_BPS = 2_000;
+export const MEME_TRAIL_GIVEBACK_BPS = 1_500;
 export const MEME_MAX_HOLD_MS = 14_400_000;
 export const MEME_MIN_CONFIDENCE = 75;
 /** F7 gas per side in BNB wei: graduated (pancake-v2), the Flap curve (flap-bonding) and the Four.meme curve (fourmeme-bonding, FOURMEME-CURVE-PAPER-SPEC F6: step-0 p90, sell incl. the 5.6e12 approve); a sell includes its exact approve. */
@@ -186,7 +187,7 @@ export function memeExit(x: MemeExitInput): MemeExitCode | null {
   if (x.hardVeto === true) return "dead-chart";
   if (x.board !== null && x.board.status === "dead") return "dead-chart";
   if (x.board !== null && (x.board.flags.includes("smart_exit") || x.board.inflow5mNetUsd !== null && x.board.inflow5mNetUsd <= -100)) return "smart-out";
-  if (x.peakBps >= MEME_TRAIL_ARM_BPS && x.pnlBps <= x.peakBps - Math.max(500, Math.floor(x.peakBps * 30 / 100))) return "trailing";
+  if (x.peakBps >= MEME_TRAIL_ARM_BPS && x.pnlBps <= x.peakBps - MEME_TRAIL_GIVEBACK_BPS) return "trailing";
   if (x.board !== null && x.board.flow5m !== null && x.board.flow5m.sells > x.board.flow5m.buys && x.pnlBps < 0) return "flow-flip";
   if (x.ageMs >= MEME_MAX_HOLD_MS) return "time";
   return null;
