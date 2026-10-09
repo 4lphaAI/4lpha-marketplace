@@ -53,6 +53,29 @@ export function summaryRejection(text: string, facts: readonly string[]): string
 }
 
 /**
+ * Remove pure formatting the free model adds despite the prompt (it wrote markdown on 2026-10-09): heading
+ * marks, list markers, emphasis and code marks, table pipes, brackets and angle brackets. Words are kept and
+ * links are NOT removed: `summaryRejection` still refuses any http(s) or www text. Returns what was removed,
+ * for the operator log.
+ */
+export function stripFormatting(text: string): { readonly text: string; readonly removed: readonly string[] } {
+  const removed: string[] = [];
+  const step = (t: string, re: RegExp, by: string, label: string): string => {
+    const next = t.replace(re, by);
+    if (next !== t) removed.push(label);
+    return next;
+  };
+  let t = text;
+  t = step(t, /^[ \t]*#{1,6}[ \t]*/gm, "", "headings");
+  t = step(t, /^[ \t]*(?:[-*+•]|\d{1,2}[.)])[ \t]+/gm, "", "list markers");
+  t = step(t, /[*`]+/g, "", "emphasis");
+  t = step(t, /\|/g, " ", "pipes");
+  t = step(t, /<\/?[a-z][^<>]*>/gi, "", "html tags");
+  t = step(t, /[[\]<>]/g, "", "brackets");
+  return { text: t, removed };
+}
+
+/**
  * Keep the leading whole sentences of an over-long model text that fit the cap (the free model ran to 2044
  * characters on 2026-10-09). The kept text is still checked in full by `summaryRejection`; a first sentence
  * that alone exceeds the cap leaves the text as it is, so it is refused as too long.
@@ -82,7 +105,10 @@ export async function writeSummary(
 ): Promise<{ readonly text: string; readonly by: "model" | "template" }> {
   if (llm === null) return { text: fallback, by: "template" };
   try {
-    const out = fitSummary(await llm({ system: SUMMARY_SYSTEM, prompt: `FACTS:\n${facts.join("\n")}`, signal }));
+    const raw = await llm({ system: SUMMARY_SYSTEM, prompt: `FACTS:\n${facts.join("\n")}`, signal });
+    const cleaned = stripFormatting(raw);
+    if (cleaned.removed.length > 0) console.warn(`[desk] model summary formatting removed: ${cleaned.removed.join(", ")}`);
+    const out = fitSummary(cleaned.text);
     const why = summaryRejection(out, facts);
     if (why !== null) {
       console.warn(`[desk] model summary rejected (${why}); the template is used`);
