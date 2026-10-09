@@ -470,7 +470,40 @@ export default defineRailway(() => {
     },
   });
 
+  // 4lpha bStock Desk: the BNB Agent Studio seller agent (MD here/STUDIO-DESK-AGENT-PLAN.md, Revision 6).
+  // Its own small wallet on BSC sells research reports through ERC-8183 jobs and pays its data and LLM
+  // through x402; it never touches 4lpha's agents, sessions or user funds. Built from the mirrored
+  // studio/fourlphadesk Dockerfile. The four preserve() values are set once by the operator in Railway.
+  const desk = service("desk-agent", {
+    source: github(REPO, { branch: BRANCH, rootDirectory: "studio/fourlphadesk" }),
+    // Watch paths are matched from the repo root even with a root directory, so only a desk change
+    // redeploys it (a deploy briefly overlaps two containers on the same wallet; see the runbook).
+    build: { builder: "DOCKERFILE", watchPatterns: ["/studio/fourlphadesk/**"] },
+    deploy: {
+      numReplicas: 1,
+      healthcheckPath: "/ping",
+      healthcheckTimeout: 120,
+      restartPolicyType: "ON_FAILURE",
+      restartPolicyMaxRetries: 5,
+    },
+    env: {
+      NODE_ENV: "production",
+      BNBAGENT_PUBLIC_URL: "https://desk.4lpha.tech",
+      STORAGE_API_URL: "https://api.pinata.cloud/pinning/pinJSONToIPFS",
+      // The endpoint is anonymous on Railway: rate-limit per client IP (Cloudflare-aware), checked
+      // before the shared global bucket.
+      SELLER_CALLER_IDENTITY: "railway-client-ip",
+      SELLER_RATE_LIMIT_GLOBAL_MAX_REQUESTS: "120",
+      SELLER_RATE_LIMIT_CALLER_MAX_REQUESTS: "20",
+      SELLER_RATE_LIMIT_WINDOW_SECONDS: "60",
+      WALLET_KEYSTORE_JSON: preserve(),
+      WALLET_PASSWORD: preserve(),
+      PIEVERSE_LLM_API_KEY: preserve(),
+      STORAGE_API_KEY: preserve(),
+    },
+  });
+
   return project("4lpha-execution", {
-    resources: [db, api, lp, trade, lending, identity, quant, quantRebalance, web],
+    resources: [db, api, lp, trade, lending, identity, quant, quantRebalance, web, desk],
   });
 });
