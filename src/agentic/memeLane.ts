@@ -483,8 +483,11 @@ export async function runAgenticMemeStep(deps: MemeStepDeps, row: AgenticWallet,
     const lost = -papers.filter(p => p.closedAt !== null && p.closedAt >= ctx.nowMs - DAY_MS).reduce((sum, p) => sum + BigInt(p.pnlUsdt ?? "0"), 0n);
     const bought = papers.filter(p => p.openedAt >= ctx.nowMs - DAY_MS).reduce((sum, p) => sum + BigInt(p.entryUsdt), 0n);
     const gate = !deps.memeEnabled ? "meme-off" : row.entryCutoffMs === null || ctx.nowMs + 5_000 >= row.entryCutoffMs ? "meme-entry-cutoff" : row.drainRequestedAt !== null ? "meme-draining"
-      : counted >= ctx.s.maxOpenPositions || stillOpen.length >= MEME_MAX_TOTAL_OPEN ? "meme-full" : lost * 100n > BigInt(ctx.s.capitalQuoteWei!) * 25n ? "meme-loss-brake"
+      : counted >= ctx.s.maxOpenPositions || stillOpen.length >= MEME_MAX_TOTAL_OPEN ? "meme-full"
       : bought + BigInt(ctx.s.entryWei) > BigInt(row.hireFacts!.quoteDayCapWei) ? "meme-day-cap" : exitElapsedMs >= MEME_EXIT_PASS_ENTRY_LIMIT_MS ? "meme-exit-slow" : null;
+    // Operator 2026-10-09: a paper hire is never paused by the 8.2 loss brake (it would also stop the LLM and Jev asks the benchmark needs); the cycle
+    // only counts `lossBrakeShadow` where a live hire would have paused. Phase B (live) must restore the brake as a gate (spec D4 amendment).
+    if (lost * 100n > BigInt(ctx.s.capitalQuoteWei!) * 25n) bump(ctx, "lossBrakeShadow");
     if (gate !== null) { setCode(ctx, gate); note(ctx, "cycle", gate); }
     else if (!overBudget(ctx, "entry")) await entryPass(ctx, cache, dataCode, stillOpen, papers);
     const lags = (cache?.evaluated ?? []).filter(e => e.bars !== null).map(e => barLagMs(e.bars!, ctx.nowMs));

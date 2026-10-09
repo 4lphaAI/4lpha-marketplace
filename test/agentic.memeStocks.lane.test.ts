@@ -293,10 +293,13 @@ test("cooldown and loss brake vectors (8.2)", async (t) => {
   const world = await memeWorld(t);
   await world.f.store.insertPaper(paperRow(world, { status: "closed", closedAt: world.clock.now - 10_800_000 + 1, pnlUsdt: "0", positionId: "c1" }));
   assert.ok(codes((await step(world)).report).includes("screen:meme-veto:cooldown"));
-  for (const [pnl, code] of [["-5000000000000000000", "meme-entered"], ["-5000000000000000001", "meme-loss-brake"]] as const) {
+  // Operator 2026-10-09: a paper hire keeps entering past the brake; the cycle counts lossBrakeShadow exactly where a live hire would pause.
+  for (const [pnl, shadow] of [["-5000000000000000000", undefined], ["-5000000000000000001", 1]] as const) {
     const w = await memeWorld(t);
     await w.f.store.insertPaper(paperRow(w, { token: MEME2, status: "closed", closedAt: w.clock.now - 1_000, pnlUsdt: pnl, positionId: "l1" }));
-    assert.equal((await step(w)).report.code, code, pnl);
+    const { report } = await step(w);
+    assert.equal(report.code, "meme-entered", pnl);
+    assert.equal((report.cycle as { counts: Record<string, number> }).counts["lossBrakeShadow"], shadow, pnl);
   }
 });
 

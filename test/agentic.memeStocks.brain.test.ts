@@ -103,14 +103,17 @@ test("7.3 vectors: C_est 1 066 (graduated) and 622 (curve) at P_BNB 717; liquidi
   assert.deepEqual([memeCostRuleOk(2_131, 1_066), memeCostRuleOk(2_132, 1_066), memeCostRuleOk(null, 1), memeCostRuleOk(5_000, null)], [false, true, false, false]);
 });
 
-test("6.6 exits: X2 -3 000 / -2 999 beyond cost, X5 armed at 5 000 with giveback max(800, 35 %), X8 at 14 400 000 ms, first match, no X7", () => {
+test("6.6 exits: X2 -3 000 / -2 999 beyond cost, X5 armed at 1 000 with giveback max(500, 30 %) (operator 2026-10-09), X8 at 14 400 000 ms, first match, no X7", () => {
   const x = (patch: Partial<MemeExitInput>): string | null => memeExit({ drain: false, pnlBps: 0, peakBps: 0, costBps: 1_000, ageMs: 0, hardVeto: null, board: null, ...patch });
   assert.equal(x({ pnlBps: -4_000 }), "stop");
   assert.equal(x({ pnlBps: -3_999 }), null);
-  assert.equal(x({ peakBps: 4_999, pnlBps: 0 }), null, "not armed");
-  assert.equal(x({ peakBps: 5_000, pnlBps: 5_000 - 1_750 }), "trailing", "35 % of 5 000 = 1 750 > 800");
-  assert.equal(x({ peakBps: 5_000, pnlBps: 5_000 - 1_749 }), null);
-  assert.equal(x({ peakBps: 20_000, pnlBps: 13_000 }), "trailing");
+  assert.equal(x({ peakBps: 999, pnlBps: 0 }), null, "not armed");
+  assert.equal(x({ peakBps: 1_000, pnlBps: 500 }), "trailing", "30 % of 1 000 = 300 < 500, so the 500 floor");
+  assert.equal(x({ peakBps: 1_000, pnlBps: 501 }), null);
+  assert.equal(x({ peakBps: 5_000, pnlBps: 5_000 - 1_500 }), "trailing", "30 % of 5 000 = 1 500 > 500");
+  assert.equal(x({ peakBps: 5_000, pnlBps: 5_000 - 1_499 }), null);
+  assert.equal(x({ peakBps: 20_000, pnlBps: 14_000 }), "trailing");
+  assert.equal(x({ peakBps: 20_000, pnlBps: 14_001 }), null);
   assert.equal(x({ ageMs: 14_399_999 }), null);
   assert.equal(x({ ageMs: 14_400_000 }), "time");
   assert.equal(x({ drain: true, pnlBps: -9_000, ageMs: 99_999_999 }), "drain", "X1 first");

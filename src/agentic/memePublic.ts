@@ -6,7 +6,7 @@
 import type { AgenticMemeLog } from "./domain.js";
 
 /** Lane tallies that are not rejection reasons (memeLane.ts `bump` keys). */
-const COUNTERS: ReadonlySet<string> = new Set(["entered", "exits", "llmAsked", "llmBuy", "quoteFailures"]);
+const COUNTERS: ReadonlySet<string> = new Set(["entered", "exits", "llmAsked", "llmBuy", "quoteFailures", "lossBrakeShadow"]);
 const record = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const num = (v: unknown): number | null => typeof v === "number" && Number.isFinite(v) ? v : null;
 const str = (v: unknown): string | null => typeof v === "string" ? v : null;

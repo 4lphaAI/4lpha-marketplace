@@ -16,7 +16,9 @@ const CURVE = agenticAddress("0xafafafafafafafafafafafafafafafafafafafaf");
 const FLAP_CURVE = agenticAddress("0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0");
 const RECORDED: Readonly<Record<string, string>> = {
   "flap-curve": "fd98522961501db7b6480c17459edf1dcd59ed2bde405548181071167f2d54bb",
-  "flap-graduated": "f12592059092b9828dde8c9dc7d3ff8ba0f7ff034dcaaa2be3092975f2bc93e8",
+  // Re-recorded 2026-10-09 (operator: no loss brake on paper): the second cycle used to stop at `meme-loss-brake`; it now runs the entry pass and counts
+  // `lossBrakeShadow`, asserted explicitly in (b). Base digest at 6d5d2af was f12592059092b9828dde8c9dc7d3ff8ba0f7ff034dcaaa2be3092975f2bc93e8.
+  "flap-graduated": "46668b803f36f358595fd7de000d2b464cde6e4727f93bb89240205a47fac843",
   "fourmeme-graduated": "da7d5ef0c0db3cdd2fe00c701a95a179cc4286bb7c58a52628a4959297a00197",
   "mixed-shortlist": "afae5c8c1b7d2d8364910de082c8c8878352d89acef6ca9125838f5bf22334c2",
   "prompt-and-jev": "ab7b2a691f7839f973f136346cbb4a2ba975168d49546eaad952503f5936a251",
@@ -60,6 +62,8 @@ test("(b) a Flap graduated entry and a stop exit (the default fixture, 300 / 500
   world.market.sell = { num: 1n, den: 8_000n };
   reports.push((await step(world)).report);
   assert.equal((await world.f.store.paperList(world.agentId))[0]!.closeCode, "stop");
+  assert.equal(reports[1]!.code, "meme-data:shortlist", "paper is not paused by the loss brake (2026-10-09)");
+  assert.equal((reports[1]!.cycle as { counts: Record<string, number> }).counts["lossBrakeShadow"], 1);
   check("flap-graduated", await state(world, reports));
 });
 
