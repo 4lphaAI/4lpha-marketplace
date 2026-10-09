@@ -115,6 +115,21 @@ describe("checkRuntimeEnv", () => {
     assert.ok(checkRuntimeEnv(full({ SELLER_CALLER_IDENTITY: undefined, SELLER_TRUSTED_CALLER_HEADER: "bad header!" }), cfg).problems.some((m) => m.includes("not a valid header name")));
     assert.deepEqual(checkRuntimeEnv({ SELLER_TRUSTED_CALLER_HEADER: "bad header!" }, cfg).problems, [], "outside production the trusted-header mode is unchanged");
   });
+  it("on AWS AgentCore (BNBAGENT_RUNTIME_SECRET_ID set) no caller identity source is needed, but conflicts are still refused", () => {
+    const agentcore = full({ SELLER_CALLER_IDENTITY: undefined, BNBAGENT_RUNTIME_SECRET_ID: "rt-1", BNBAGENT_PUBLIC_URL: undefined, AGENTCORE_RUNTIME_URL: "https://runtime.example.aws" });
+    assert.deepEqual(checkRuntimeEnv(agentcore, cfg).problems, []);
+    assert.deepEqual(checkRuntimeEnv(agentcore, cfg).missing, []);
+    // a blank id does not count as AgentCore
+    assert.equal(checkRuntimeEnv({ ...agentcore, BNBAGENT_RUNTIME_SECRET_ID: "   " }, cfg).problems.length, 1);
+    assert.equal(checkRuntimeEnv(full({ SELLER_CALLER_IDENTITY: undefined }), cfg).problems.length, 1, "not AgentCore: still refused");
+    // unknown value and both-set stay refused on AgentCore too
+    assert.equal(checkRuntimeEnv({ ...agentcore, SELLER_CALLER_IDENTITY: "SENTINEL_MODE" }, cfg).problems.length, 1);
+    assert.equal(checkRuntimeEnv({ ...agentcore, SELLER_CALLER_IDENTITY: "railway-client-ip", SELLER_TRUSTED_CALLER_HEADER: "x-edge-caller" }, cfg).problems.length, 1);
+    const { error } = capture(() => assertRuntimeEnv({ ...agentcore, SELLER_CALLER_IDENTITY: "SENTINEL_MODE" }, cfg));
+    assert.ok(error instanceof Error && !(error as Error).message.includes("SENTINEL"));
+    // the rest of the check is unchanged on AgentCore
+    assert.deepEqual(checkRuntimeEnv({ ...agentcore, WALLET_PASSWORD: undefined }, cfg).missing, ["WALLET_PASSWORD"]);
+  });
   it("an unknown SELLER_CALLER_IDENTITY refuses the boot, in production or not, without printing the value", () => {
     for (const env of [full({ SELLER_CALLER_IDENTITY: "SENTINEL_MODE_1a2b" }), { SELLER_CALLER_IDENTITY: "SENTINEL_MODE_1a2b" }]) {
       const { error } = capture(() => assertRuntimeEnv(env, cfg));

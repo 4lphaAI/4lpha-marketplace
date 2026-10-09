@@ -164,7 +164,7 @@ export function railwayClientIpMode(env: NodeJS.ProcessEnv): boolean {
 
 /**
  * Boot problems with the caller identity configuration (variable names only, never a value). The unknown-value and
- * both-set refusals apply everywhere; "no source at all" and an unusable header name are production refusals.
+ * both-set refusals apply everywhere; "no source at all" (not on AgentCore) and an unusable header name are production refusals.
  */
 export function callerIdentityProblems(env: NodeJS.ProcessEnv, production: boolean): string[] {
   const problems: string[] = [];
@@ -176,7 +176,8 @@ export function callerIdentityProblems(env: NodeJS.ProcessEnv, production: boole
   if (production && header && !/^[a-z0-9-]+$/u.test((env[TRUSTED_HEADER_ENV] ?? "").trim().toLowerCase())) {
     problems.push(`${TRUSTED_HEADER_ENV} is not a valid header name`);
   }
-  if (production && !mode && !header) {
+  // on AWS AgentCore (BNBAGENT_RUNTIME_SECRET_ID is set) every caller is an authenticated OAuth client: only the global bucket applies
+  if (production && !mode && !header && !filled(env, "BNBAGENT_RUNTIME_SECRET_ID")) {
     problems.push(`no caller identity source: set ${CALLER_IDENTITY_ENV}=${RAILWAY_CLIENT_IP} (or ${TRUSTED_HEADER_ENV})`);
   }
   return problems;
