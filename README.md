@@ -17,15 +17,15 @@ Submitted to **BNB Hack: Tokenized Stocks Edition** (Main Track, plus the *Agent
 ## Contents
 
 1. [What 4lpha is](#what-4lpha-is)
-2. [The four strategies](#the-four-strategies)
-3. [How 4lpha meets each track](#how-4lpha-meets-each-track)
-4. [How 4lpha meets the judging rubric](#how-4lpha-meets-the-judging-rubric)
-5. [Try it in two minutes](#try-it-in-two-minutes)
-6. [On-chain evidence](#on-chain-evidence)
-7. [Screenshots](#screenshots)
-8. [Architecture](#architecture)
-9. [Repository map](#repository-map)
-10. [Contracts](#contracts)
+2. [Contract](#contract)
+3. [The four strategies](#the-four-strategies)
+4. [How 4lpha meets each track](#how-4lpha-meets-each-track)
+5. [How 4lpha meets the judging rubric](#how-4lpha-meets-the-judging-rubric)
+6. [Try it in two minutes](#try-it-in-two-minutes)
+7. [On-chain evidence](#on-chain-evidence)
+8. [Screenshots](#screenshots)
+9. [Architecture](#architecture)
+10. [Repository map](#repository-map)
 11. [Limits, stated plainly](#limits-stated-plainly)
 12. [Development](#development)
 13. [Archive: the earlier agent-marketplace entry](#archive-the-earlier-agent-marketplace-entry)
@@ -41,6 +41,16 @@ Tokenized stocks put US equities on BNB Chain 24/7, but a person still has to wa
 - **The agent cannot buy a bad fill on a tokenized stock blindly.** A stale-price and market-hours guard, a premium-over-NAV check, pre-flight simulation and an on-chain swap guard sit between the strategy and the swap.
 - **Each agent is public and has an identity.** A running agent gets a read-only public page and its own ERC-8004 identity on BSC.
 - **Any AI assistant can use it.** Five read-only Agent Skills and a public MCP server expose the same data, and a Studio-built seller agent sells paid bStock research over ERC-8183.
+
+---
+
+## Contract
+
+Deployed by 4lpha on **BNB Smart Chain mainnet (chain 56)**. There is no testnet deployment.
+
+| Contract | Address | What it does |
+|---|---|---|
+| **TradFiSwapGuard** (verified) | [`0x16B24723aCE1Adc87243338d0A32C50BeC259650`](https://bscscan.com/address/0x16B24723aCE1Adc87243338d0A32C50BeC259650) | Wraps each aggregator swap of the Altana passkey agents in one atomic balance check: pinned router and entry selector, USDT on one side, and a revert if the wallet receives less than the minimum output. [Deploy tx](https://bscscan.com/tx/0xccdfe078b94850806941366386b53a7ac076885a26b32724ca7f2cae35e45457) · [source](contracts/TradFiSwapGuard.sol) |
 
 ---
 
@@ -324,29 +334,6 @@ The repository holds both the Tokenized Stocks product and the earlier agent mar
 | [`scripts/`](scripts) | Workers (`trade-worker.ts` runs the stocks agents, plus `lp-worker`, `lending-worker`, `erc8004-worker`, ...) and operator CLIs | Both |
 | [`test/`](test) | Offline `node:test` suites, including `audit.*` invariants that always stay green | Both |
 | [`.railway/`](.railway) | Railway infrastructure as code | Both |
-
----
-
-## Contracts
-
-All on **BNB Smart Chain mainnet (chain 56)**. There is no testnet deployment.
-
-**Deployed by 4lpha**
-
-| Contract | Address |
-|---|---|
-| TradFiSwapGuard (verified) | [`0x16B24723aCE1Adc87243338d0A32C50BeC259650`](https://bscscan.com/address/0x16B24723aCE1Adc87243338d0A32C50BeC259650) |
-
-**Integrated protocol contracts** (not deployed by 4lpha)
-
-| Contract | Address |
-|---|---|
-| ERC-8004 Identity Registry | [`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`](https://bscscan.com/address/0x8004A169FB4a3325136EB29fA0ceB6D2e539a432) |
-| PancakeSwap V3 Swap Router | [`0x1b81D678ffb9C0263b24A97847620C99d213eB14`](https://bscscan.com/address/0x1b81D678ffb9C0263b24A97847620C99d213eB14) |
-| PancakeSwap V3 Position Manager | [`0x46A15B0b27311cedF172AB29E4f4766fbE7F4364`](https://bscscan.com/address/0x46A15B0b27311cedF172AB29E4f4766fbE7F4364) |
-| Venus vUSDT | [`0xfD5840Cd36d94D7229439859C0112a4185BC0255`](https://bscscan.com/address/0xfD5840Cd36d94D7229439859C0112a4185BC0255) |
-
-User wallets and ERC-8004 agent ids are per hire; the ones above in [On-chain evidence](#on-chain-evidence) are live examples.
 
 ---
 
