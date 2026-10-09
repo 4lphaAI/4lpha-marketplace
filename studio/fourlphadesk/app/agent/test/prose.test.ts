@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { acceptSummary, mapFreeText, summaryRejection, SUMMARY_SYSTEM, writeSummary, type Llm } from "../src/desk/prose.js";
+import { acceptSummary, fitSummary, mapFreeText, summaryRejection, SUMMARY_SYSTEM, writeSummary, type Llm } from "../src/desk/prose.js";
 
 const FACTS = ["token: NVDAB", "venue price USD: 236.97", "premium to NAV: close to NAV (23 bps above)", "1h RSI: 59.4", "term days: 7"];
 
@@ -89,5 +89,28 @@ describe("summaryRejection names why a model summary is refused", () => {
   it("a number-free model summary is used as written", async () => {
     const r = await writeSummary(async () => "NVDAB trades close to its NAV. The RSI is neutral.", FACTS, "fallback");
     assert.deepEqual(r, { text: "NVDAB trades close to its NAV. The RSI is neutral.", by: "model" });
+  });
+});
+
+describe("fitSummary keeps whole leading sentences within the cap", () => {
+  const sentence = "NVDAB trades close to its NAV and the pool is deep, so a small order costs about the same as the share.";
+  it("an over-long model text is cut to whole sentences and used", async () => {
+    const long = Array.from({ length: 20 }, () => sentence).join(" ");
+    assert.ok(long.length > 2000);
+    const fitted = fitSummary(long);
+    assert.ok(fitted.length <= 900 && fitted.endsWith("."));
+    assert.ok(long.startsWith(fitted));
+    const r = await writeSummary(async () => long, FACTS, "fallback");
+    assert.equal(r.by, "model");
+    assert.equal(r.text, fitted);
+  });
+  it("a single sentence above the cap is still refused", async () => {
+    const one = "word ".repeat(300).trim() + ".";
+    assert.equal(fitSummary(one), one);
+    assert.equal((await writeSummary(async () => one, FACTS, "fallback")).by, "template");
+  });
+  it("the cut text is still checked for numbers", async () => {
+    const long = "The price is 999 USD. " + Array.from({ length: 20 }, () => sentence).join(" ");
+    assert.equal((await writeSummary(async () => long, FACTS, "fallback")).by, "template");
   });
 });

@@ -17,7 +17,7 @@ const MAX_SUMMARY_CHARS = 900;
 
 export const SUMMARY_SYSTEM =
   "You write a short summary of FACTS about a tokenized US stock, for a data report. " +
-  "Write 3 to 5 plain sentences in English, one paragraph, no lists, no markdown, no headings, no links. " +
+  "Write 3 or 4 short plain sentences in English, under 600 characters in total, one paragraph, no lists, no markdown, no headings, no links. " +
   "Describe the FACTS in words and do not write any digits or numbers (no prices, percentages, counts or dates): " +
   "the report already lists every number. Use words such as close to its NAV, a neutral RSI, a deep pool, about the same cost. " +
   "Say nothing that is not in the FACTS. Do not give advice and do not tell anyone to buy or sell. " +
@@ -52,6 +52,23 @@ export function summaryRejection(text: string, facts: readonly string[]): string
   return null;
 }
 
+/**
+ * Keep the leading whole sentences of an over-long model text that fit the cap (the free model ran to 2044
+ * characters on 2026-10-09). The kept text is still checked in full by `summaryRejection`; a first sentence
+ * that alone exceeds the cap leaves the text as it is, so it is refused as too long.
+ */
+export function fitSummary(text: string): string {
+  const t = noDashes(text).replace(/\s+/g, " ").trim();
+  if (t.length <= MAX_SUMMARY_CHARS) return t;
+  let kept = "";
+  for (const sentence of t.split(/(?<=[.!?])\s+/)) {
+    const next = kept === "" ? sentence : `${kept} ${sentence}`;
+    if (next.length > MAX_SUMMARY_CHARS) break;
+    kept = next;
+  }
+  return kept === "" ? t : kept;
+}
+
 /** Accept the model's text only if it is clean prose whose numbers all appear in the facts. */
 export function acceptSummary(text: string, facts: readonly string[]): string | null {
   return summaryRejection(text, facts) === null ? noDashes(text).replace(/\s+/g, " ").trim() : null;
@@ -65,13 +82,13 @@ export async function writeSummary(
 ): Promise<{ readonly text: string; readonly by: "model" | "template" }> {
   if (llm === null) return { text: fallback, by: "template" };
   try {
-    const out = await llm({ system: SUMMARY_SYSTEM, prompt: `FACTS:\n${facts.join("\n")}`, signal });
+    const out = fitSummary(await llm({ system: SUMMARY_SYSTEM, prompt: `FACTS:\n${facts.join("\n")}`, signal }));
     const why = summaryRejection(out, facts);
     if (why !== null) {
       console.warn(`[desk] model summary rejected (${why}); the template is used`);
       return { text: fallback, by: "template" };
     }
-    return { text: noDashes(out).replace(/\s+/g, " ").trim(), by: "model" };
+    return { text: out, by: "model" };
   } catch (e) {
     const name = e instanceof Error ? e.name : "error";
     const message = e instanceof Error ? e.message : String(e);
