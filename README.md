@@ -2,16 +2,13 @@
 
 <img src="web/public/4lpha_logo_180.png" alt="4lpha" width="96" />
 
-# 4lpha
-
 **Hosted agents that trade tokenized US stocks on BNB Chain.**
 
 Pick a strategy, give it a budget and a term, and an agent buys and sells **bStocks** (NVDAB, SPYB, QQQB, SPCXB and more) for you around the clock, from your own wallet, on BSC mainnet. You do not need to keep a computer on, run a bot or read a chart.
 
-[Live app](https://4lpha.tech) · [Deploy an agent](https://4lpha.tech/deploy/trading) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
+[Live app](https://4lpha.tech) · [Judge guide](https://4lpha.tech/judge) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
 
 Submitted to **BNB Hack: Tokenized Stocks Edition** (Main Track, plus the *Agentic Wallet / Wallet Skills* and *BNB Agent Studio* special prizes).
-This same repository was our earlier entry to the BNB Chain agent-marketplace hackathon; that work is kept in the [archive section](#archive-the-earlier-agent-marketplace-entry) at the end.
 
 </div>
 
