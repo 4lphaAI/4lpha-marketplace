@@ -1104,21 +1104,6 @@ button { font: inherit; color: inherit; }
 /* Layout helpers used by UI kits ----------------------------------- */
 .fl-page{min-height:100%;background:var(--bg-page)}
 .fl-shell{max-width:var(--page-max);margin:0 auto;padding:var(--space-9) var(--page-gutter) var(--space-12)}
-/* Desktop-only gate. 760px is the width at which the header itself switches to
-   its stacked layout, so "mobile" means one thing across the app. */
-.fl-mobile-gate{display:none}
-@media (max-width:760px){
-  .fl-notice{display:none}
-  .fl-desktop-only{display:none}
-  .fl-mobile-gate{display:flex;flex-direction:column;align-items:center;gap:14px;max-width:34ch;margin:0 auto;padding:64px var(--page-gutter);text-align:center;color:var(--text-muted)}
-  .fl-mobile-gate>svg{color:var(--warn)}
-  .fl-mobile-gate p{font:var(--weight-regular) var(--text-md)/1.55 var(--font-sans)}
-}
-.fl-notice{padding:9px var(--page-gutter);background:var(--warn-tint);border-bottom:var(--border-width) solid rgb(240 145 58 / .22)}
-.fl-notice__inner{display:flex;align-items:flex-start;justify-content:center;gap:8px;font:var(--weight-regular) var(--text-md)/1.45 var(--font-sans);color:var(--ink-1);text-align:left}
-.fl-notice__inner>svg{flex:none;margin-top:2px;color:var(--warn)}
-.fl-notice strong{font-weight:var(--weight-semibold);color:var(--warn)}
-.fl-notice a{display:inline-flex;align-items:center;gap:4px;color:var(--brand);text-decoration:underline;text-underline-offset:2px;white-space:nowrap}
 .fl-header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:var(--space-6);height:var(--header-height);padding:0 var(--page-gutter);border-bottom:var(--border-width) solid var(--line-1);background:var(--bg-header);backdrop-filter:var(--blur-header)}
 .fl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:var(--grid-gap)}
 .fl-navlink{transition:var(--transition-control)}
@@ -1187,9 +1172,18 @@ button { font: inherit; color: inherit; }
   .fl-deploy-form{padding:18px!important}
   .fl-deploy-actions > .fl-btn{flex:1 1 150px}
   .fl-deploy-actions > span{width:100%;margin-left:0!important}
+  .fl-deploy-cols{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .fl-deploy-cols > [style*="grid-column"]{grid-column:1/-1!important}
+  .fl-mobile-2col{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .fl-mobile-lead > :first-child{grid-column:1/-1}
+  .fl-mobile-1col,.fl-lending-split{grid-template-columns:minmax(0,1fr)!important}
+  .fl-sp-row{display:grid!important;grid-template-columns:minmax(0,1fr) 148px;row-gap:10px!important}
+  .fl-sp-row > :first-child{grid-area:1/1}
+  .fl-sp-row > button:last-child{grid-area:1/2;justify-self:end}
+  .fl-sp-row__bar{grid-area:2/1;width:100%}
+  .fl-sp-row__weight{grid-area:2/2}
 
   .fl-marketplace-filters{align-items:stretch!important}
-  .fl-marketplace-sort{width:100%;min-width:0!important;margin-left:0!important}
   .fl-card__head{gap:12px}
   .fl-card__meta{gap:12px;flex-wrap:wrap}
   .fl-card__headline{align-items:flex-start;flex-direction:column}
@@ -1238,6 +1232,7 @@ button { font: inherit; color: inherit; }
   .fl-wallet-button{font-size:var(--text-sm);padding-inline:10px}
   .fl-wallet-account{max-width:138px}
   .fl-metrics-grid{grid-template-columns:minmax(0,1fr)!important;gap:10px!important}
+  .fl-deploy-cols{grid-template-columns:minmax(0,1fr)!important}
   .fl-hired-actions{grid-template-columns:1fr 1fr}
   .fl-hired-actions .fl-btn:last-child{grid-column:1/-1}
   .fl-card__foot{align-items:stretch;flex-direction:column}

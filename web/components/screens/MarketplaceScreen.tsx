@@ -8,8 +8,8 @@
    The JSX body is unchanged; only the IIFE wrapper, the design-system
    namespace proxies and the window globals became real imports/exports. */
 import React from "react";
-import { AgentCard, Button, CATEGORY_LIST, EmptyState, FilterChip, Select } from "@/design-system";
-import { AGENTS, agentDeployKind, SORTS } from "@/lib/design-data";
+import { AgentCard, Button, CATEGORY_LIST, EmptyState, FilterChip } from "@/design-system";
+import { AGENTS, agentDeployKind } from "@/lib/design-data";
 import { DeployAgentSection } from "@/components/screens/DeployAgentScreen";
 
 const MARKETPLACE_CARD_CSS = `
@@ -29,7 +29,6 @@ const MARKETPLACE_CARD_CSS = `
 
 function MarketplaceScreen({ go, onHire, search = "" }) {
   const [filter, setFilter] = React.useState("all");
-  const [sort, setSort] = React.useState(SORTS[0]);
   const query = search.trim().toLocaleLowerCase();
   const list = AGENTS.filter((agent) => {
     const matchesFilter = filter === "all" || agent.categoryId === filter;
@@ -57,9 +56,6 @@ function MarketplaceScreen({ go, onHire, search = "" }) {
         {CATEGORY_LIST.map((c) => (
           <FilterChip key={c.id} categoryId={c.id} count={count(c.id)} active={filter === c.id} onClick={() => setFilter(c.id)} />
         ))}
-        <div className="fl-marketplace-sort" style={{ marginLeft: "auto", minWidth: 180 }}>
-          <Select value={sort} onChange={(e) => setSort(e.target.value)} options={SORTS} aria-label="Sort agents" />
-        </div>
       </div>
 
       {list.length ? (

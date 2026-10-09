@@ -176,7 +176,7 @@ function ScheduleProgressCard({ schedule, settings, nowMs, label }: { readonly s
   const totalWei = (BigInt(schedule.spentWei) + BigInt(schedule.remainingWei)).toString(10);
   const nextBuy = schedule.finished !== null ? { value: scheduleFinishedLabel(schedule.finished), note: "idle · no worker calls" } : scheduleCountdown(schedule, nowMs);
   return (
-    <section className="fl-trade-table" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.9fr) minmax(240px,0.9fr)", marginBottom: 18 }} data-testid="schedule-progress-card">
+    <section className="fl-trade-table fl-mobile-1col" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.9fr) minmax(240px,0.9fr)", marginBottom: 18 }} data-testid="schedule-progress-card">
       <div style={{ padding: "20px 24px 22px", display: "grid", gap: 16 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
           <span style={{ font: "var(--weight-semibold) var(--text-3xl)/1 var(--font-mono)", color: "var(--ink-1)" }}>{usdt2Plain(schedule.spentWei)}</span>

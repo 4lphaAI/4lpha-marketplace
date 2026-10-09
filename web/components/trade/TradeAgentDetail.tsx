@@ -862,7 +862,7 @@ function DcaCurrentRoundCard({ dca, icon, onOpenOngoing }: { readonly dca: Trade
         <Icon name="chevron-right" size={13} />
       </span>
     </button>
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 16 }}>
+    <div className="fl-mobile-2col" style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 16 }}>
       <DcaStat label="Average entry price" value={dcaPrice(round.avgCostE8)} />
       <DcaStat label="Take profit price" value={tpValue} note={tpNote} />
       <DcaStat label="Stop loss price" value="—" note={stopLossNote} />
@@ -1157,7 +1157,7 @@ function DcaRoundsHistory({ dca }: { readonly dca: TradeDcaView }) {
             <span style={{ font: "var(--weight-medium) var(--text-xs)/1 var(--font-mono)", padding: "3px 7px", borderRadius: 999, border: "1px solid var(--line-1)" }}>{exitLabel}</span>
             <span style={{ marginLeft: "auto", font: "var(--weight-regular) var(--text-xs)/1 var(--font-mono)", color: "var(--text-subtle)" }}>{row.settledAt === null ? "—" : new Date(row.settledAt).toLocaleString()}</span>
           </button>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 16 }}>
+          <div className="fl-mobile-2col" style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 16 }}>
             <Metric label="Duration" value={row.settledAt === null ? "—" : heldDuration(row.openedAt, row.settledAt)} />
             <Metric label="Filled DCA orders" value={String(row.filledLevels)} />
             <Metric label="Max DCA orders" value={String(dca.settings.maxOrders)} />

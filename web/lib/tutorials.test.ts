@@ -19,6 +19,7 @@ describe("tutorial links", () => {
     expect(TUTORIAL_LINKS.trading).toBe("https://youtu.be/Y1jobkuKXH8?si=abHJClYnCnZ30rys");
     expect(TUTORIAL_LINKS.lp).toBe("https://youtu.be/1uIeKGeg1no?si=WnNGoAryx3VNMxLR");
     expect(TUTORIAL_LINKS.health).toBe("https://youtu.be/I7wxbKY0-ac?si=ddjQBC7IBw0qpfSC");
+    expect(TUTORIAL_PLAYLIST).toBe("https://youtube.com/playlist?list=PLH-7zPRs5w2M&si=5JF7RcJMQqXGqCtP");
   });
 
   it("gives every link a distinct https destination", () => {
@@ -31,6 +32,7 @@ describe("tutorial links", () => {
     const deploy = readFileSync("components/screens/DeployAgentScreen.tsx", "utf8");
     const header = readFileSync("components/screens/KitHeader.tsx", "utf8");
     expect(deploy).toContain("TUTORIAL_LINKS[id]");
+    expect(deploy).toContain('preset === "tradfi" ? TUTORIAL_PLAYLIST');
     expect(header).toContain("TUTORIAL_PLAYLIST");
     // No hard-coded video URL may reappear beside the shared record.
     expect(deploy).not.toContain("youtu");

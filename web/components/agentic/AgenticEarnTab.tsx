@@ -81,7 +81,7 @@ export function AgenticEarnTab({ earn, refresh }: { earn: unknown; refresh: () =
       Withdrawing everything before 4lpha signs out.</div> : null}
 
     <section style={{ ...card, padding: "22px 24px", display: "grid", gap: 22 }}>
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1.3fr) repeat(3, minmax(0,1fr))", gap: 24, alignItems: "start" }}>
+      <div className="fl-mobile-2col fl-mobile-lead" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.3fr) repeat(3, minmax(0,1fr))", gap: 24, alignItems: "start" }}>
         <div style={{ display: "flex", gap: 14, alignItems: "center", minWidth: 0 }}>
           <Logo src={LOGO.usdt} size={40} />
           <EarnStat label="Earning on idle USDT" value={supplied === null ? "-" : `${f2e(supplied)} USDT`}
@@ -123,7 +123,7 @@ export function AgenticEarnTab({ earn, refresh }: { earn: unknown; refresh: () =
               <span style={{ ...mono, padding: "4px 8px", borderRadius: 999, border: "1px solid var(--line-2)", color: on ? "var(--ink-1)" : "var(--text-subtle)" }}>{on ? "SUPPLYING" : "STANDBY"}</span>
             </span>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 16, paddingTop: 14, borderTop: "1px solid var(--line-1)" }}>
+          <div className="fl-mobile-2col" style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 16, paddingTop: 14, borderTop: "1px solid var(--line-1)" }}>
             <EarnStat label="Supply APY" value={pct(p.apy)} />
             <EarnStat label="Supplied" value={usdt(p.supplied)} note={p.supplied === null && p.reason !== null ? p.reason.replace(/-/gu, " ") : "USDT"} />
             <EarnStat label="Share" value={p.supplied === null || supplied === null ? "-" : `${share(p.supplied, supplied).toFixed(0)}%`} note="of supplied USDT" />

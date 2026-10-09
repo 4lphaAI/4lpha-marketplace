@@ -14,7 +14,7 @@ import { RangeExplainer } from "@/components/explainers/RangeExplainer";
 import { CompoundExplainer } from "@/components/explainers/CompoundExplainer";
 import { Button, Checkbox, Icon, Input, SegmentedToggle, Select } from "@/design-system";
 import { RESOURCES } from "@/lib/design-resources";
-import { TUTORIAL_LINKS } from "@/lib/tutorials";
+import { TUTORIAL_LINKS, TUTORIAL_PLAYLIST } from "@/lib/tutorials";
 import { LivePoolSection, UI_PRESET_TO_GEOMETRY } from "@/components/deploy/GridLiveDeploy";
 import { DEFAULT_RELAY_FEE_PER_SUBMIT_WEI, gridCapitalFloorBnb, gridCapitalFloorBnbAtFee } from "@/lib/grid/economics";
 import { HireGridDeploy } from "@/components/deploy/HireGridDeploy";
@@ -488,12 +488,12 @@ function WeightsField({ value, onChange: setRows, values, set }) {
       </div>
       <div style={{ display: "grid", gap: 8 }}>
         {rows.map((r, i) => (
-          <div key={r.sym} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)" }}>
+          <div key={r.sym} className="fl-sp-row" style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", border: "1px solid var(--line-1)" }}>
             <SpStockPicker value={r.sym} options={[r.sym, ...avail]} icons={icons} onChange={(sym) => setRow(i, { sym })} />
-            <span style={{ flex: 1, minWidth: 40, height: 6, borderRadius: 999, background: "var(--line-1)", overflow: "hidden", display: "block" }}>
+            <span className="fl-sp-row__bar" style={{ flex: 1, minWidth: 40, height: 6, borderRadius: 999, background: "var(--line-1)", overflow: "hidden", display: "block" }}>
               <span style={{ display: "block", height: "100%", width: `${Math.min(100, parseFloat(r.w) || 0)}%`, background: "var(--cat-yield)" }} />
             </span>
-            <span style={{ width: 148, flex: "0 0 auto" }}>
+            <span className="fl-sp-row__weight" style={{ width: 148, flex: "0 0 auto" }}>
               <NumStepper value={r.w} onChange={(v) => setRow(i, { w: v })} step={5} min={SP_MIN_WEIGHT} max={100 - SP_MIN_WEIGHT * (rows.length - 1)} suffix="%" />
             </span>
             <button type="button" disabled={!canRemove} onClick={() => onChange(rows.filter((_, j) => j !== i))} aria-label={"Remove " + r.sym}
@@ -585,7 +585,7 @@ function ScheduleField({ values, set }) {
           })}
         </div>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
+      <div className="fl-deploy-cols" style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
         <div className="fl-field">
           <FieldLabel label="First buy time" tooltip={first === "Now" ? "The first cycle runs as soon as the agent is deployed, then repeats on the frequency above." : "The first cycle runs at the date and time you pick, then repeats on the frequency above."}>
             <Select value={first} options={SCHED_FIRST} onChange={(e) => set("schedFirst", e.target.value)} />
@@ -789,7 +789,7 @@ function NavGuardField({ values, set }) {
   return (
     <div style={{ display: "grid", gap: 12 }}>
       <Checkbox checked={on} onChange={(v) => set("navGuard", v)}>Guard NAV — do not buy while the token trades above the stock it tracks.</Checkbox>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
+      <div className="fl-deploy-cols" style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 16 }}>
         <div className="fl-field" style={{ opacity: on ? 1 : 0.4, pointerEvents: on ? "auto" : "none" }}>
           <FieldLabel label="Max premium to NAV" tooltip="A breach postpones that cycle instead of cancelling it: the buy is skipped for the period and the schedule resumes at the next cycle once the premium is back inside the limit — the same behaviour as a buy price range. The platform never buys above +1.5% regardless.">
             <NumStepper value={values.navPremium} onChange={(v) => set("navPremium", v)} step={0.1} min={0.5} max={1.5} suffix="%" />
@@ -1709,7 +1709,7 @@ function Group({ section, values, set, preset, overrides }) {
     <div style={{ display: "grid", gap: 14 }}>
       {section.title ? <span className="fl-eyebrow">{section.title}{section.titleSuffix ? <span style={{ letterSpacing: "0.9px" }}> {section.titleSuffix}</span> : null}</span> : null}
       {section.note ? <p style={{ font: "var(--weight-regular) var(--text-sm)/var(--leading-normal) var(--font-sans)", color: "var(--text-subtle)", marginTop: -6 }}>{section.note}</p> : null}
-      <div style={{ display: "grid", gridTemplateColumns: section.cols ? `repeat(${section.cols}, minmax(0, 1fr))` : "repeat(auto-fit, minmax(190px, 1fr))", gap: 16, alignItems: "start" }}>
+      <div className={section.cols ? "fl-deploy-cols" : undefined} style={{ display: "grid", gridTemplateColumns: section.cols ? `repeat(${section.cols}, minmax(0, 1fr))` : "repeat(auto-fit, minmax(190px, 1fr))", gap: 16, alignItems: "start" }}>
       {section.fields.filter((f) => !"check codeToggle radioCheck pool textarea skillFile liquidityChart priceRangeGroup scheduleGroup navGuard endRule modeRows tradfiModes weights".split(" ").includes(f.type)).map((f) => (
           <Field key={f.k} f={F(f)} value={values[f.k]} onChange={(v) => set(f.k, v)} values={values} set={set} preset={preset} />
         ))}
@@ -2335,7 +2335,7 @@ function DeployAgentScreen({ kind, go }) {
             <span className="fl-eyebrow">Execution model</span>
             <span className="fl-deploy-form-links">
               <a href={GUIDE_LINKS[id]} target="_blank" rel="noreferrer">Guides</a>
-              <a href={TUTORIAL_LINKS[id]} target="_blank" rel="noreferrer">Tutorial Videos</a>
+              <a href={id === "trading" && preset === "tradfi" ? TUTORIAL_PLAYLIST : TUTORIAL_LINKS[id]} target="_blank" rel="noreferrer">Tutorial Videos</a>
               <button type="button" onClick={() => { repayTouched.current = false; setRepaySuggestion(null); setPreset(DEFAULT_PRESET[id]); setValues(defaults(id, DEFAULT_PRESET[id])); setSim(null); }}>
                 Reset parameters to defaults
               </button>

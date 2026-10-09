@@ -7,10 +7,8 @@
    Next's job, so the export's `mountKit()` polling loop is dropped. */
 import React from "react";
 
-import { Icon } from "@/design-system";
 import { AGENTS } from "@/lib/design-data";
 import { KitHeader } from "@/components/screens/KitHeader";
-import { NoticeBanner } from "@/components/NoticeBanner";
 import { MarketplaceScreen } from "@/components/screens/MarketplaceScreen";
 import { DeployAgentScreen } from "@/components/screens/DeployAgentScreen";
 import { AgentDetailScreen } from "@/components/screens/AgentDetailScreen";
@@ -77,26 +75,14 @@ export function KitApp() {
 
   return (
     <div className="fl-page">
-      <NoticeBanner />
       <KitHeader route={route} go={go} search={search} onSearchChange={setSearch} />
-      {/* Below the header the app is desktop-only for now. The gate is CSS, not
-          a width read, so the server render and the first client render agree
-          and no screen has to know about it — and nothing about the desktop
-          layout moves. */}
-      <div className="fl-desktop-only">
-        {screen}
-        {hiring && (
-          <HireFlow agent={hiring} sheet={sheet} onClose={() => setHiring(null)}
-            onDone={() => { setHiring(null); setEmpty(false); dispatchSigmaPetReaction("hire.success", { force: true }); go("/account"); }} />
-        )}
-        {/* Decoration only — the pet reads no state and calls nothing. It lives
-            inside the desktop gate so the mobile notice stays alone. */}
-        <SigmaPet route={route} />
-      </div>
-      <div className="fl-mobile-gate" role="status">
-        <Icon name="info" size={22} />
-        <p>We do not support mobile yet. Please open 4lpha on a desktop browser for the best experience.</p>
-      </div>
+      {screen}
+      {hiring && (
+        <HireFlow agent={hiring} sheet={sheet} onClose={() => setHiring(null)}
+          onDone={() => { setHiring(null); setEmpty(false); dispatchSigmaPetReaction("hire.success", { force: true }); go("/account"); }} />
+      )}
+      {/* Decoration only — the pet reads no state and calls nothing. */}
+      <SigmaPet route={route} />
     </div>
   );
 }

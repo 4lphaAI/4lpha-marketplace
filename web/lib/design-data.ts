@@ -123,5 +123,3 @@ export const HIRED: HiredAgent[] = [
   { id: "health-guard", value: "+$0.00", valueTone: "flat", valueSub: "guarding $3,100", warning: true },
   { id: "range-pilot", value: "-$18.20", valueSub: "14 d", status: "paused", statusLine: "Paused by you · position left in range" },
 ];
-
-export const SORTS: string[] = ["Most hired", "Best 30d PnL", "Newest", "Lowest fee"];

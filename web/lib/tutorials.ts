@@ -11,8 +11,10 @@
    included; the only edit would be a silent one, and a link that differs from
    what was handed over is a link nobody can verify. */
 
+/* Replaced 2026-10-09 (operator) by the TradFi playlist; the deploy screen
+   also links it while the trading agent's TradFi model is selected. */
 export const TUTORIAL_PLAYLIST =
-  "https://youtube.com/playlist?list=PLOMsGmPsK-0Q&si=GwBXowz-cObb4h3i";
+  "https://youtube.com/playlist?list=PLH-7zPRs5w2M&si=5JF7RcJMQqXGqCtP";
 
 export const TUTORIAL_LINKS = {
   grid: "https://youtu.be/I5uyElPdtfo?si=kzmUTp45ZGnL7WSi",
