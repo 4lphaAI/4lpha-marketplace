@@ -76,6 +76,18 @@ export function stripFormatting(text: string): { readonly text: string; readonly
 }
 
 /**
+ * Drop each sentence that carries a number the facts do not contain (the free model kept writing numbers
+ * despite the prompt on 2026-10-09). The remaining sentences only restate numbers from the facts, so no
+ * invented number can reach the report; an empty result falls back to the template.
+ */
+export function keepGroundedSentences(text: string, facts: readonly string[]): { readonly text: string; readonly dropped: number } {
+  const allowed = numbersIn(facts.join("\n"));
+  const sentences = noDashes(text).replace(/\s+/g, " ").trim().split(/(?<=[.!?])\s+/).filter((s) => s !== "");
+  const kept = sentences.filter((s) => [...numbersIn(s)].every((n) => allowed.has(n)));
+  return { text: kept.join(" "), dropped: sentences.length - kept.length };
+}
+
+/**
  * Keep the leading whole sentences of an over-long model text that fit the cap (the free model ran to 2044
  * characters on 2026-10-09). The kept text is still checked in full by `summaryRejection`; a first sentence
  * that alone exceeds the cap leaves the text as it is, so it is refused as too long.
@@ -108,7 +120,9 @@ export async function writeSummary(
     const raw = await llm({ system: SUMMARY_SYSTEM, prompt: `FACTS:\n${facts.join("\n")}`, signal });
     const cleaned = stripFormatting(raw);
     if (cleaned.removed.length > 0) console.warn(`[desk] model summary formatting removed: ${cleaned.removed.join(", ")}`);
-    const out = fitSummary(cleaned.text);
+    const grounded = keepGroundedSentences(cleaned.text, facts);
+    if (grounded.dropped > 0) console.warn(`[desk] model summary: ${grounded.dropped} sentence(s) with a number not in the facts dropped`);
+    const out = fitSummary(grounded.text);
     const why = summaryRejection(out, facts);
     if (why !== null) {
       console.warn(`[desk] model summary rejected (${why}); the template is used`);

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { acceptSummary, fitSummary, mapFreeText, summaryRejection, SUMMARY_SYSTEM, writeSummary, type Llm } from "../src/desk/prose.js";
+import { acceptSummary, fitSummary, keepGroundedSentences, mapFreeText, summaryRejection, SUMMARY_SYSTEM, writeSummary, type Llm } from "../src/desk/prose.js";
 
 const FACTS = ["token: NVDAB", "venue price USD: 236.97", "premium to NAV: close to NAV (23 bps above)", "1h RSI: 59.4", "term days: 7"];
 
@@ -109,8 +109,21 @@ describe("fitSummary keeps whole leading sentences within the cap", () => {
     assert.equal(fitSummary(one), one);
     assert.equal((await writeSummary(async () => one, FACTS, "fallback")).by, "template");
   });
-  it("the cut text is still checked for numbers", async () => {
+  it("a sentence with an invented number is dropped before the cut; the rest is used", async () => {
     const long = "The price is 999 USD. " + Array.from({ length: 20 }, () => sentence).join(" ");
-    assert.equal((await writeSummary(async () => long, FACTS, "fallback")).by, "template");
+    const r = await writeSummary(async () => long, FACTS, "fallback");
+    assert.equal(r.by, "model");
+    assert.ok(!r.text.includes("999") && r.text.startsWith(sentence) && r.text.length <= 900);
+  });
+});
+
+describe("keepGroundedSentences", () => {
+  it("keeps sentences whose numbers are all in the facts and counts the dropped ones", () => {
+    const r = keepGroundedSentences("NVDAB is at 236.97 USD. It has 3 venues. 4. The RSI is 59.4. It is close to its NAV.", FACTS);
+    assert.deepEqual(r, { text: "NVDAB is at 236.97 USD. The RSI is 59.4. It is close to its NAV.", dropped: 2 });
+  });
+  it("returns an empty text when nothing is grounded, so the template is used", async () => {
+    assert.deepEqual(keepGroundedSentences("It costs 999 USD.", FACTS), { text: "", dropped: 1 });
+    assert.equal((await writeSummary(async () => "It costs 999 USD.", FACTS, "fallback")).by, "template");
   });
 });
