@@ -173,6 +173,7 @@ function LendingExplainer({
       cursor: "pointer"
     }
   }, playing ? "Pause" : "Play"))), /*#__PURE__*/React.createElement("div", {
+    className: "fl-explainer-visual",
     style: {
       padding: "8px 12px 0"
     }
@@ -267,6 +268,7 @@ function LendingExplainer({
       fill: danger ? LOSS : "var(--profit)"
     }
   }, "HF ", hfNow.toFixed(2), repaying ? " \u00b7 REPAYING" : danger ? " \u00b7 BELOW TRIGGER" : ""))), /*#__PURE__*/React.createElement("div", {
+    className: "fl-explainer-visual",
     style: {
       display: "flex",
       gap: 8,

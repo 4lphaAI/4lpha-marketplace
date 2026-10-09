@@ -1194,6 +1194,7 @@ button { font: inherit; color: inherit; }
   .fl-detail-cta{align-items:stretch!important}
   .fl-detail-cta .fl-btn{width:100%}
   .fl-detail-cta > span{text-align:left}
+  .fl-detail-main .fl-explainer-visual{display:none!important}
   .fl-hired-actions{width:100%;display:grid!important;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px!important}
   .fl-hired-actions .fl-btn{min-width:0;padding-inline:8px}
 

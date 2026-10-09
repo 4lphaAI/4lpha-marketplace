@@ -83,7 +83,7 @@ function AgentDetailScreen({ agent, go, onHire }) {
       </div>
 
       <div className="fl-detail-grid" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.55fr) minmax(0,1fr)", gap: 16, marginTop: 16, alignItems: "start" }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <div className="fl-detail-main" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           {agent.categoryId === "grid"
             ? <GridLadderExplainer pair={agent.pair || "BNB / USDT"} protocol={agent.protocol} budget={agent.dailyCap || "500 USDT"} />
             : agent.explainer === "compound" ? <CompoundExplainer pair={agent.pair || "BNB / USDT"} protocol={agent.protocol} />

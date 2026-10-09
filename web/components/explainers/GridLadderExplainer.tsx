@@ -242,7 +242,7 @@ function GridLadderExplainer({
         </div>
       </div>
 
-      <div style={{ padding: "8px 12px 0" }}>
+      <div className="fl-explainer-visual" style={{ padding: "8px 12px 0" }}>
         <svg viewBox={`0 0 ${VW} ${VH}`} style={{ display: "block", width: "100%", height: "auto" }}>
           {/* the two sides of the ladder */}
           <rect
@@ -366,7 +366,7 @@ function GridLadderExplainer({
         </svg>
       </div>
 
-      <div style={{ display: "flex", gap: 8, padding: "4px 20px 0", flexWrap: "wrap" }}>
+      <div className="fl-explainer-visual" style={{ display: "flex", gap: 8, padding: "4px 20px 0", flexWrap: "wrap" }}>
         {feed.map((f) => (
           <span
             key={f.at}

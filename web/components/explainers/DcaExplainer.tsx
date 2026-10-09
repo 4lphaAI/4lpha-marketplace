@@ -98,7 +98,7 @@ function DcaExplainer({ protocol = "PancakeSwap v3" }) {
         </div>
       </div>
 
-      <div style={{ padding: "8px 12px 0" }}>
+      <div className="fl-explainer-visual" style={{ padding: "8px 12px 0" }}>
         <svg viewBox={`0 0 ${VW} ${VH}`} style={{ display: "block", width: "100%", height: "auto" }}>
           <text x={X0} y={24} style={{ ...mono, fill: "var(--text-subtle)" }}>{TOKEN} / USDT</text>
 
@@ -161,7 +161,7 @@ function DcaExplainer({ protocol = "PancakeSwap v3" }) {
         </svg>
       </div>
 
-      <div style={{ display: "flex", gap: 8, padding: "4px 20px 0", flexWrap: "wrap", minHeight: 62, alignContent: "flex-start" }}>
+      <div className="fl-explainer-visual" style={{ display: "flex", gap: 8, padding: "4px 20px 0", flexWrap: "wrap", minHeight: 62, alignContent: "flex-start" }}>
         {feed.map((f) => (
           <span key={f.t} style={{ display: "inline-flex", gap: 8, alignItems: "baseline", font: "var(--type-mono-xs)", padding: "5px 10px", borderRadius: "var(--radius-sm)", border: `1px solid ${tint(f.tone)}`, background: tint(f.tone), color: "var(--ink-1)" }}>
             {f.text}<span style={{ color: "var(--text-subtle)" }}>{f.sub}</span>

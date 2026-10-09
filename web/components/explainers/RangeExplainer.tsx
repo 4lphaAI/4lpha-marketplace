@@ -175,6 +175,7 @@ function RangeExplainer({
       cursor: "pointer"
     }
   }, playing ? "Pause" : "Play"))), /*#__PURE__*/React.createElement("div", {
+    className: "fl-explainer-visual",
     style: {
       padding: "8px 12px 0"
     }
@@ -279,6 +280,7 @@ function RangeExplainer({
       fill: inRange ? "var(--profit)" : "var(--warn)"
     }
   }, inRange ? "IN RANGE" : "OUT OF RANGE", " \xB7 FEES $", fees.toFixed(2)))), /*#__PURE__*/React.createElement("div", {
+    className: "fl-explainer-visual",
     style: {
       display: "flex",
       gap: 8,

@@ -178,6 +178,7 @@ function CompoundExplainer({
       cursor: "pointer"
     }
   }, playing ? "Pause" : "Play"))), /*#__PURE__*/React.createElement("div", {
+    className: "fl-explainer-visual",
     style: {
       padding: "8px 12px 0"
     }
@@ -337,6 +338,7 @@ function CompoundExplainer({
       }
     }, s.l));
   })))), /*#__PURE__*/React.createElement("div", {
+    className: "fl-explainer-visual",
     style: {
       display: "flex",
       gap: 8,
