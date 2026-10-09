@@ -93,3 +93,17 @@ describe("buyBackdrop: the self-funding leg", () => {
     assert.equal(t.status === "failed" && t.reason, "Error");
   });
 });
+
+describe("BACKDROP_URL: the Studio buyer only pays when the 402 resource equals the requested URL", () => {
+  it("has no query string or fragment (CoinMarketCap's challenge drops them, measured 2026-10-09)", () => {
+    const u = new URL(BACKDROP_URL);
+    assert.equal(u.search, "");
+    assert.equal(u.hash, "");
+    assert.equal(u.pathname, "/x402/v3/cryptocurrency/listings/latest");
+  });
+  it("reads BTC and BNB from a Listings Latest shaped body (an array ranked by market cap)", () => {
+    const row = (symbol: string, price: number) => ({ id: 0, symbol, quote: { USD: { price, percent_change_24h: 1.5 } } });
+    const body = { status: { error_code: 0 }, data: [row("BTC", 65000), row("ETH", 3000), row("USDT", 1), row("BNB", 600), row("SOL", 150)] };
+    assert.deepEqual(readBackdrop(body).map((a) => [a.symbol, a.priceUsd]), [["BTC", 65000], ["BNB", 600]]);
+  });
+});

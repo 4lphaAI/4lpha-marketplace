@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { acceptSummary, mapFreeText, writeSummary, type Llm } from "../src/desk/prose.js";
+import { acceptSummary, mapFreeText, summaryRejection, SUMMARY_SYSTEM, writeSummary, type Llm } from "../src/desk/prose.js";
 
 const FACTS = ["token: NVDAB", "venue price USD: 236.97", "premium to NAV: close to NAV (23 bps above)", "1h RSI: 59.4", "term days: 7"];
 
@@ -72,5 +72,22 @@ describe("mapFreeText", () => {
     assert.equal(await mapFreeText(async () => "no json here", "x"), null);
     assert.equal(await mapFreeText(async () => "{broken", "x"), null);
     assert.equal(await mapFreeText(async () => { throw new Error("down"); }, "x"), null);
+  });
+});
+
+describe("summaryRejection names why a model summary is refused", () => {
+  it("gives a reason for each refusal and null for clean prose", () => {
+    assert.equal(summaryRejection("NVDAB trades close to its NAV with a neutral RSI.", FACTS), null);
+    assert.equal(summaryRejection("   ", FACTS), "empty");
+    assert.equal(summaryRejection("See [this] link.", FACTS), "markup or link");
+    assert.equal(summaryRejection("NVDAB trades at 240.10 USD.", FACTS), "number 240.1 is not in the facts");
+    assert.match(summaryRejection("x".repeat(901), FACTS) ?? "", /^too long/);
+  });
+  it("the prompt asks for words, not numbers", () => {
+    assert.match(SUMMARY_SYSTEM, /do not write any digits or numbers/i);
+  });
+  it("a number-free model summary is used as written", async () => {
+    const r = await writeSummary(async () => "NVDAB trades close to its NAV. The RSI is neutral.", FACTS, "fallback");
+    assert.deepEqual(r, { text: "NVDAB trades close to its NAV. The RSI is neutral.", by: "model" });
   });
 });

@@ -496,6 +496,11 @@ export default defineRailway(() => {
       SELLER_RATE_LIMIT_GLOBAL_MAX_REQUESTS: "120",
       SELLER_RATE_LIMIT_CALLER_MAX_REQUESTS: "20",
       SELLER_RATE_LIMIT_WINDOW_SECONDS: "60",
+      // Studio's default mainnet RPC (publicnode) refuses receipts and times out from Railway; the seller's job
+      // check also binary-searches old blocks and reads eth_getLogs. Of 14 free endpoints measured on
+      // 2026-10-09 only NodeReal's public chainlist endpoint served all three. Fallbacks avoid publicnode.
+      STUDIO_BSC_RPC: "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
+      BNBAGENT_FALLBACK_RPC_URLS: "https://bsc-dataseed2.bnbchain.org,https://bsc-dataseed3.bnbchain.org",
       WALLET_KEYSTORE_JSON: preserve(),
       WALLET_PASSWORD: preserve(),
       PIEVERSE_LLM_API_KEY: preserve(),

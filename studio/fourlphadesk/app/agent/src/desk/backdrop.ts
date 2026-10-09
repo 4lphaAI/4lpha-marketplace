@@ -1,7 +1,10 @@
 /**
  * The self-funding leg: one paid data point per job, bought from the agent's own wallet with x402.
  *
- * Endpoint: CoinMarketCap "Quotes Latest" for BTC (id 1) and BNB (id 1839), 0.01 per call. The money
+ * Endpoint: CoinMarketCap "Listings Latest" (top 100 by market cap, BTC and BNB among them), 0.01 per
+ * call. It is called WITHOUT a query string on purpose: the Studio buyer refuses to pay unless the 402
+ * challenge's `resource.url` equals the requested URL byte for byte, and CoinMarketCap's challenge drops
+ * the query string (measured 2026-10-09: "Quotes Latest?id=1,1839" was refused for that reason). The money
  * action is fixed code (`buyWithX402`, from the Studio x402 buyer recipe); the pinned payee, the
  * per-call cap (studio.toml merchant entry) and the daily cap ([budget].max_per_day_usd) are config,
  * not parameters. A failed or capped payment leaves the section out: the job still delivers.
@@ -10,7 +13,7 @@
 import { buyWithX402 } from "../x402Buyer.js";
 import { arr, noDashes, num, obj, str, type Json } from "./json.js";
 
-export const BACKDROP_URL = "https://pro-api.coinmarketcap.com/x402/v3/cryptocurrency/quotes/latest?id=1,1839&convert=USD";
+export const BACKDROP_URL = "https://pro-api.coinmarketcap.com/x402/v3/cryptocurrency/listings/latest";
 export const BACKDROP_MAX_USD = 0.05;
 export const BACKDROP_SYMBOLS = ["BTC", "BNB"] as const;
 
@@ -71,6 +74,11 @@ export function readBackdrop(json: Json): BackdropAsset[] {
   return BACKDROP_SYMBOLS.map((s) => found.get(s)).filter((a): a is BackdropAsset => a !== undefined);
 }
 
+/** One operator log line for a refused or failed purchase (the runtime's messages carry no key material). */
+function logRefusal(name: string, message: string): void {
+  console.warn(`[desk] backdrop x402 not paid: ${noDashes(name).slice(0, 60)}: ${noDashes(message).replace(/\s+/g, " ").slice(0, 200)}`);
+}
+
 /** A refused or failed purchase, by the runtime's error name (returned or thrown): ambiguous, capped or failed. */
 function classify(rawName: string): Backdrop {
   const name = rawName.replace(/[^A-Za-z0-9_]/g, "").slice(0, 60);
@@ -87,9 +95,13 @@ export async function buyBackdrop(buy: BuyFn, now: () => number = Date.now, sign
   try {
     r = await buy(BACKDROP_URL, BACKDROP_MAX_USD, "GET");
   } catch (e) {
+    logRefusal(e instanceof Error ? e.name : "error", e instanceof Error ? e.message : String(e));
     return classify(e instanceof Error ? noDashes(e.name) : "error");
   }
-  if (r.ok !== true) return classify(typeof r.error === "string" ? r.error : "error");
+  if (r.ok !== true) {
+    logRefusal(typeof r.error === "string" ? r.error : "error", typeof r.message === "string" ? r.message : "");
+    return classify(typeof r.error === "string" ? r.error : "error");
+  }
   const paid = num(r.paid_usd as Json);
   const txRaw = str(r.settlement_tx as Json);
   const tx = txRaw !== null && /^0x[0-9a-fA-F]{64}$/.test(txRaw) ? txRaw : null;
