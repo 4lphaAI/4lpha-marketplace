@@ -1,0 +1,50 @@
+{
+ "agent": "agentic-portfolio",
+ "name": "Agentic Smart Portfolio",
+ "status": "available",
+ "custody": "binance-agentic",
+ "deployUrl": "https://4lpha.tech/deploy/trading",
+ "whatItDoes": "Holds a weighted basket of tokenized stocks and rebalances back to target when a weight drifts. Deterministic.",
+ "steps": [
+  "Open https://4lpha.tech/deploy/trading (a plain link: nothing is prefilled; the TradFi preset is the default).",
+  "Pick the \"Smart Portfolio\" mode tile and set the options listed under requirements.settings.",
+  "Press Deploy and choose Agentic Wallet (not Altana).",
+  "Choose the term: 7 or 30 days.",
+  "Scan the QR with the Binance App, tap Confirm, then type the 6-character code the App shows.",
+  "Fund the Agentic Wallet with the USDT and BNB the page asks for.",
+  "Review the Binance checks and press Deploy; the page then opens your agent's public view."
+ ],
+ "requirements": {
+  "termDays": [
+   7,
+   30
+  ],
+  "binanceApp": [
+   "Connected, with Trade all tokens switched on in the Binance App.",
+   "Abnormal transactions set to AutoReject.",
+   "Max sign-in duration long enough for the term (choose 7 days if the Binance cap is short).",
+   "Daily limit of at least 10 x the capital.",
+   "x402 daily limit of at least 0.50 USDT."
+  ],
+  "funding": {
+   "usdt": "The capital you set plus 0.2 USDT (7-day term) or 0.8 USDT (30-day term) for keeping the Binance session alive.",
+   "bnb": "0.0004 BNB per transaction slot; slots = 2 x stocks + 2."
+  },
+  "settings": [
+   "2 to 5 stocks from the same 17 as Auto DCA: NVDAB, SPCXB, BABAB, TSLAB, QQQB, GOOGLB, CRCLB, SKHYB, METAB, MSFTB, TSMB, SPYB, INTCB, MSTRB, HOODB, SOXLB, SNDKB.",
+   "Whole-percent weights, each at least 10 %, adding up to 100 %.",
+   "Total capital at least 50 USDT for 2 stocks plus 25 USDT for each extra stock.",
+   "Rebalance when drift exceeds 0.5 to 15 % (steps of 0.5 %), checked every 4h, 8h, 12h, Daily."
+  ],
+  "termEnd": "Holdings are kept at term end."
+ },
+ "rules": [
+  "Use a dedicated Agentic Wallet while the agent runs; deploying records that the wallet is dedicated to this agent.",
+  "To stop the agent, sign 4lpha out in the Binance App (or sign in to that wallet anywhere else). That ends the agent for good: it cannot reconnect, and starting again takes a new hire with a new QR.",
+  "A local Binance Agentic Wallet (baw) sign-in on a hired wallet ends the agent the same way.",
+  "Holdings stay in your wallet when the agent ends or you sign out; sell them in the Binance App.",
+  "A hire lasts 7 or 30 days."
+ ],
+ "earn": null,
+ "authorises": "Hiring is a human action in the user's own browser and Binance App. This MCP cannot hire, sign, move funds or place an order; it returns the link and the numbers."
+}

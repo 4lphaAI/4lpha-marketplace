@@ -1,0 +1,24 @@
+# Keep secrets, state, history and reviews out of the build context (and so out of every layer).
+.studio
+**/.studio
+.env*
+**/.env*
+.git
+.git*
+**/.git
+fourlphadesk.gitdir
+node_modules
+**/node_modules
+dist
+**/dist
+*.md
+**/*.md
+agentcore/.env.local
+.claude
+.vscode
+.idea
+**/*.log
+**/*.pem
+**/*.key
+**/test
+scripts

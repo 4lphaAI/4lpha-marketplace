@@ -1,0 +1,366 @@
+{
+ "token": {
+  "symbol": "NVDAB",
+  "address": "0x02fca66c1d1afb4e2a7884261eb00f63598a7436",
+  "underlyingTicker": "NVDA",
+  "sectors": [
+   "mag7",
+   "ai-chips",
+   "big-tech",
+   "trending"
+  ]
+ },
+ "staleness": "fresh",
+ "market": {
+  "openState": true,
+  "reasonCode": "TRADING",
+  "nextOpenMs": null,
+  "nextCloseMs": null,
+  "session": {
+   "usEquity": true,
+   "reason": null,
+   "state": "overnight",
+   "nextBoundaryAt": 1791466200000,
+   "sessionStart": 1791417600000,
+   "lastRthCloseAt": 1791403200000
+  }
+ },
+ "price": {
+  "venuePriceUsd": 236.97,
+  "navUsd": 236.43385536160085,
+  "referencePriceUsd": 236.25,
+  "tokenToShareRatio": 1.0007782237528078,
+  "premiumBps": 23,
+  "asOf": 1791441603360
+ },
+ "depth": {
+  "venueCount": 7,
+  "deepest": {
+   "dex": "pancakeswap",
+   "version": "v3",
+   "feeTier": 2500,
+   "quote": {
+    "symbol": "USDT",
+    "address": "0x55d398326f99059ff775485246999027b3197955"
+   },
+   "liquidityUsd": 6454133.66,
+   "volume24hUsd": 2377273.65,
+   "asOf": 1791441603360
+  },
+  "deepPool": true,
+  "deepPoolThresholdUsd": 10000,
+  "priceImpact": null,
+  "priceImpactReason": "4lpha publishes no price-impact estimate: no cached source exists and a single-range guess would ignore tick crossings and aggregator or RFQ routing. Use the depth facts, and the free `baw market-order quote` for the real price of an amount."
+ },
+ "eligibility": {
+  "eligible": true,
+  "reason": "allowlist",
+  "source": "allowlist",
+  "checkedAt": 1791441613464
+ },
+ "indicators": {
+  "15m": {
+   "source": "pool",
+   "calculatedAt": 1791441068077,
+   "staleness": "fresh",
+   "coverage": {
+    "availableBars": 119,
+    "contiguousBars": 119,
+    "realBars": 119,
+    "filledBars": 0,
+    "latestClose": 1791441000000
+   },
+   "metrics": {
+    "macd": {
+     "value": -0.038286886728599256,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "atr14": {
+     "value": 2.446702477896489,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "ema12": {
+     "value": 237.6698872773054,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "ema26": {
+     "value": 237.708174164034,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "rsi14": {
+     "value": 44.704366623894245,
+     "reason": null,
+     "unit": "index"
+    },
+    "atrPct": {
+     "value": 1.0348537583900999,
+     "reason": null,
+     "unit": "percent"
+    },
+    "gapPct": {
+     "value": -0.3900164552861912,
+     "reason": null,
+     "unit": "percent"
+    },
+    "orbLow": {
+     "value": null,
+     "reason": "not_rth",
+     "unit": "usd_per_base_token"
+    },
+    "rvol20": {
+     "value": 8.709439618072496,
+     "reason": null,
+     "unit": "ratio"
+    },
+    "orbHigh": {
+     "value": null,
+     "reason": "not_rth",
+     "unit": "usd_per_base_token"
+    },
+    "signal9": {
+     "value": 0.019679664689333243,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "roc10Pct": {
+     "value": -0.26929490843917714,
+     "reason": null,
+     "unit": "percent"
+    },
+    "bbLower20": {
+     "value": 235.77944148849417,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "bbUpper20": {
+     "value": 239.775760840754,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "histogram": {
+     "value": -0.0579665514179325,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "bbMiddle20": {
+     "value": 237.7776011646241,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "momentum10": {
+     "value": -0.6384125756775347,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "stochRsi14": {
+     "value": 0.059670510350299494,
+     "reason": null,
+     "unit": "ratio"
+    },
+    "orbBreakPct": {
+     "value": null,
+     "reason": "not_rth",
+     "unit": "percent"
+    },
+    "vwapSession": {
+     "value": 238.09138266240427,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "bbPosition20": {
+     "value": 0.16273469901597665,
+     "reason": null,
+     "unit": "ratio"
+    },
+    "bbWidthPct20": {
+     "value": 1.6806963030521114,
+     "reason": null,
+     "unit": "percent"
+    },
+    "emaSpreadPct": {
+     "value": -0.016106676542881893,
+     "reason": null,
+     "unit": "percent"
+    },
+    "lastRthClose": {
+     "value": 237.35550684969766,
+     "reason": null,
+     "unit": "usd_per_base_token",
+     "asOf": 1791403200000
+    },
+    "vwapDistancePct": {
+     "value": -0.6978838664246825,
+     "reason": null,
+     "unit": "percent"
+    }
+   }
+  },
+  "1h": {
+   "source": "pool",
+   "calculatedAt": 1791439238379,
+   "staleness": "fresh",
+   "coverage": {
+    "availableBars": 119,
+    "contiguousBars": 119,
+    "realBars": 119,
+    "filledBars": 0,
+    "latestClose": 1791439200000
+   },
+   "metrics": {
+    "macd": {
+     "value": -0.11904964883379421,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "atr14": {
+     "value": 3.3787676771601807,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "ema12": {
+     "value": 238.26696514199273,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "ema26": {
+     "value": 238.38601479082652,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "rsi14": {
+     "value": 59.35311343019516,
+     "reason": null,
+     "unit": "index"
+    },
+    "atrPct": {
+     "value": 1.3999282710846923,
+     "reason": null,
+     "unit": "percent"
+    },
+    "gapPct": {
+     "value": 1.6841434495850338,
+     "reason": null,
+     "unit": "percent"
+    },
+    "orbLow": {
+     "value": null,
+     "reason": "interval_too_coarse",
+     "unit": "usd_per_base_token"
+    },
+    "rvol20": {
+     "value": 0.8694619361087915,
+     "reason": null,
+     "unit": "ratio"
+    },
+    "orbHigh": {
+     "value": null,
+     "reason": "interval_too_coarse",
+     "unit": "usd_per_base_token"
+    },
+    "signal9": {
+     "value": -0.41872486044858265,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "roc10Pct": {
+     "value": 1.6841434495850294,
+     "reason": null,
+     "unit": "percent"
+    },
+    "bbLower20": {
+     "value": 235.69342572549368,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "bbUpper20": {
+     "value": 239.8126215916734,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "histogram": {
+     "value": 0.29967521161478844,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "bbMiddle20": {
+     "value": 237.75302365858354,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "momentum10": {
+     "value": 3.9974072208385394,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "stochRsi14": {
+     "value": 1,
+     "reason": null,
+     "unit": "ratio"
+    },
+    "orbBreakPct": {
+     "value": null,
+     "reason": "interval_too_coarse",
+     "unit": "percent"
+    },
+    "vwapSession": {
+     "value": 238.40642703734326,
+     "reason": null,
+     "unit": "usd_per_base_token"
+    },
+    "bbPosition20": {
+     "value": 1.373930380807872,
+     "reason": null,
+     "unit": "ratio"
+    },
+    "bbWidthPct20": {
+     "value": 1.7325524625482542,
+     "reason": null,
+     "unit": "percent"
+    },
+    "emaSpreadPct": {
+     "value": -0.04993986284734797,
+     "reason": null,
+     "unit": "percent"
+    },
+    "lastRthClose": {
+     "value": 237.35550684969766,
+     "reason": null,
+     "unit": "usd_per_base_token",
+     "asOf": 1791403200000
+    },
+    "vwapDistancePct": {
+     "value": 1.2359092285424875,
+     "reason": null,
+     "unit": "percent"
+    }
+   }
+  }
+ },
+ "regime": {
+  "label": "unavailable",
+  "reasons": [
+   "spy: indicator_revision_pending",
+   "qqq: indicator_revision_pending"
+  ],
+  "asOf": 1791441613480,
+  "sessionState": "overnight",
+  "legs": {
+   "spy": {
+    "staleness": "fresh",
+    "available": false,
+    "reason": "indicator_revision_pending"
+   },
+   "qqq": {
+    "staleness": "fresh",
+    "available": false,
+    "reason": "indicator_revision_pending"
+   }
+  },
+  "staleness": "dead"
+ },
+ "note": "These are the indicators 4lpha AI Trade reads; AI Trade's own scoring is not published. This is data, not a recommendation or investment advice."
+}

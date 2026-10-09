@@ -1,0 +1,60 @@
+{
+ "agent": "agentic-schedule",
+ "name": "Agentic Schedule buy",
+ "status": "available",
+ "custody": "binance-agentic",
+ "deployUrl": "https://4lpha.tech/deploy/trading",
+ "whatItDoes": "Buys a fixed USDT amount of one tokenized stock on a fixed frequency. Deterministic: no model, no selling.",
+ "steps": [
+  "Open https://4lpha.tech/deploy/trading (a plain link: nothing is prefilled; the TradFi preset is the default).",
+  "Pick the \"Schedule buy\" mode tile and set the options listed under requirements.settings.",
+  "Press Deploy and choose Agentic Wallet (not Altana).",
+  "Choose the term: 7 or 30 days.",
+  "Scan the QR with the Binance App, tap Confirm, then type the 6-character code the App shows.",
+  "Fund the Agentic Wallet with the USDT and BNB the page asks for.",
+  "Review the Binance checks and press Deploy; the page then opens your agent's public view."
+ ],
+ "requirements": {
+  "termDays": [
+   7,
+   30
+  ],
+  "binanceApp": [
+   "Connected, with Trade all tokens switched on in the Binance App.",
+   "Abnormal transactions set to AutoReject.",
+   "Max sign-in duration long enough for the term (choose 7 days if the Binance cap is short).",
+   "Daily limit of at least 2 x the capital."
+  ],
+  "funding": {
+   "usdt": "The capital you set.",
+   "bnb": "0.0004 BNB per transaction slot; slots = 1 + 2 + min(planned buys, buys the term can run); 2 more slots (0.0008 BNB) if you opt in to Earn."
+  },
+  "settings": [
+   "One quoted bStock, a total budget and an amount per buy of at least 5 USDT.",
+   "The Deploy form wants the total budget to cover at least one buy plus a 5 % fee reserve.",
+   "Frequency: 1 hour, 4 hours, 8 hours, 12 hours, Daily.",
+   "First buy: now, or within the next 7 days and before the entry cutoff.",
+   "Finish: when the budget is spent, on an end date, or after 1 to 1000 runs.",
+   "Buy only while the price is within 0.5 to 1.5 % of NAV (form default 1.5 %); optional: only during US market hours."
+  ],
+  "termEnd": "Holdings are kept at term end (a Schedule buy never sells)."
+ },
+ "rules": [
+  "Use a dedicated Agentic Wallet while the agent runs; deploying records that the wallet is dedicated to this agent.",
+  "To stop the agent, sign 4lpha out in the Binance App (or sign in to that wallet anywhere else). That ends the agent for good: it cannot reconnect, and starting again takes a new hire with a new QR.",
+  "A local Binance Agentic Wallet (baw) sign-in on a hired wallet ends the agent the same way.",
+  "Holdings stay in your wallet when the agent ends or you sign out; sell them in the Binance App.",
+  "A hire lasts 7 or 30 days."
+ ],
+ "earn": {
+  "offered": true,
+  "note": "Optional.",
+  "conditions": [
+   "Spare USDT goes to Venus or Aave v3 (best rate) until a buy needs it.",
+   "Up to 60 % of capital, and only if at least 20 USDT.",
+   "Everything comes back 2 hours before the end.",
+   "A small BNB fee per move; the protocols are third parties."
+  ]
+ },
+ "authorises": "Hiring is a human action in the user's own browser and Binance App. This MCP cannot hire, sign, move funds or place an order; it returns the link and the numbers."
+}

@@ -1,0 +1,103 @@
+[project]
+name = "fourlphadesk-agent"
+
+[stack]
+# Project-lifetime facts: which runtime adapter recipe this Agent was
+# scaffolded against. doctor / dev / deploy read these to know what to
+# check, load, and route. runtime: agentcore | azure-foundry.
+runtime = "agentcore"
+# Public faces exposed by this one runtime and signer (canonical order):
+#   A2A - serveA2a: agent card + negotiate/notify_funded skills.
+#   MCP - streamable-HTTP /mcp: negotiate (signed quote) + notify_funded
+#         (verify → deliver → submit, synchronously within the tool call) +
+#         read-only chain tools.
+#   X402 or MPP - publish exactly one sibling B402 seller route (/x402 or
+#          /mpp). Payment-only still uses A2A as the cloud carrier but hides
+#          that native face at the public gateway.
+protocols = ["A2A"]
+
+[network]
+default = "bsc-mainnet"
+
+[wallet]
+# Local keystore signer. The Agent is the SOLE key-holder/signer.
+# The keystore lives at the WORKSPACE root - outside app/agent (the deploy
+# codeLocation) - so no packaging path can bundle it into a deploy artifact.
+kind = "evm-local"
+signer = "local"
+keystore_dir = "../../.studio/wallets"
+# address = "0x..."   # filled by `bag wallet new`
+address = "0x592EF127feFd45eAA56fE0D715dAAF72F998A652"
+
+[llm]
+provider = "pieverse-llm"
+model = "auto/free"
+
+[llm.pieverse]
+# Pieverse topup runs ONLY on BSC mainnet (chainId=56); decoupled from [network].default.
+network = "bsc-mainnet"
+# key_hash = "..."        # written by `bag llm activate`
+# zero-deposit default. `bag llm activate` creates the key with $0
+# allocation; switch to a paid model + `bag llm topup` only when you need it.
+initial_allocation_usd = 0
+key_hash = "a081366ca59a8e14313526a74521d0c6d9ded97830af03f3bbeffb7b33868eae"
+
+[llm.auto_renew]
+# hook auto-allocates from Pieverse Account Balance to the API key when Key
+# Credit < min_balance_usd. Account Balance is NEVER refilled automatically
+# from your wallet UNLESS you opt in via `bag budget enable` - defaults below
+# stay in allocate-only mode. This automatic hook IS the agent's LLM-credit
+# self-top-up (NOT an LLM-callable tool).
+enabled = true            # set false to opt out of in-process auto-allocate
+min_balance_usd = 0.01    # Key Credit threshold that triggers allocate
+topup_chunk_usd = 1.0     # chunk pulled from Account Balance per allocate
+max_topup_per_day_usd = 3.0   # opt-in cap; only enforced when `bag budget enable` is on
+check_interval_seconds = 60
+
+[payments]
+# Buyer spending allow-list for `bag erc8183 buy --asset`. Match a UI
+# symbol or canonical AssetId. Narrow this to lock spending to specific stables.
+allowed_payment_tokens = ["U","USD1","USDC","USDT"]
+
+[payments.seller]
+# 所有 Seller rail 与已配置资产共用同一个 USD 标价；"0" 表示 FREE。
+price_usd = "0.10"
+# 使用当前网络的 canonical AssetId；顺序会保留，允许改为任意非空子集。
+# 这里只列出当前 ERC-8183 合约栈能托管的资产。要卖更多币种，需要指向
+# 支持多 token 的部署（同时设置三个 ERC8183_*_ADDRESS），再把资产加回来。
+assets = ["U","USD1","BINANCE_PEG_USDC","BINANCE_PEG_USDT"]
+
+[payments.erc8183]
+# Seller 价格与资产来自 [payments.seller]；本表只保留 ERC-8183 行为参数。
+enabled = true
+quote_ttl_seconds = 900                        # seconds a signed quote stays valid; SDK caps at 900 (~15min work window)
+default_estimated_completion_seconds = 600
+poll_interval_seconds = 30
+auto_settle = false                            # opt-in: detect dispute-window-elapsed → settle
+
+[storage]
+# Deliverables are pinned to IPFS (a pinning service). No keys here: the operator sets
+# STORAGE_API_URL and STORAGE_API_KEY with `bag env set` (they go to .studio/.env.local).
+kind = "ipfs"
+
+[payments.x402]
+# Self-funding leg: one paid data point per job (CoinMarketCap Quotes Latest, 0.01 per call).
+# Per-job spend is one call at most; the merchant cap below is the per-call ceiling.
+max_per_request_usd = 0.05
+
+[budget]
+# Daily ceiling for x402 data buys (shared key with the Pieverse gate, which stays disabled:
+# never run `bag budget enable`).
+max_per_day_usd = 1.0
+
+[payments.x402.merchants.cmc]
+domain = "pro-api.coinmarketcap.com"
+pay_to = "0x3C5f3a6cE224BB89D72f5EB4232ecC27F67B3eeA"
+assets = ["0xcE24439F2D9C6a2289F741120FE202248B666666", "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d"]
+per_call_cap_usd = 0.02
+verified = true
+
+[wallet.signing]
+# The U and USD1 EIP-712 domains the CoinMarketCap x402 buyer signs (EIP-3009). No Permit2 entry and no
+# witness-transfer primary type: the NodeOps hosting payment that needed them is gone (review M4 closed).
+extra_domains = [[56, "0xcE24439F2D9C6a2289F741120FE202248B666666"], [56, "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d"]]

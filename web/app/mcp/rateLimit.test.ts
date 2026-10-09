@@ -108,6 +108,17 @@ describe("MCP rate limit", () => {
     expect((await POST(mcpRequest(callList(), null, undefined, { "x-forwarded-for": "6.6.6.6" }))).status).toBe(429);
   });
 
+  it("behind Cloudflare, keys on cf-connecting-ip only when x-real-ip is a Cloudflare edge address (lib/clientIp.ts)", async () => {
+    const edge = "172.64.10.1";
+    // Two visitors behind the same Cloudflare edge have separate budgets.
+    for (let i = 0; i < PER_IP_LIMIT; i += 1) await POST(mcpRequest(callList(), edge, undefined, { "cf-connecting-ip": "198.51.100.1" }));
+    expect((await POST(mcpRequest(callList(), edge, undefined, { "cf-connecting-ip": "198.51.100.1" }))).status).toBe(429);
+    expect((await POST(mcpRequest(callList(), edge, undefined, { "cf-connecting-ip": "198.51.100.2" }))).status).toBe(200);
+    // A client on the Railway domain directly cannot mint buckets by forging the header: its x-real-ip is not Cloudflare's.
+    for (let i = 0; i < PER_IP_LIMIT; i += 1) await POST(mcpRequest(callList(), "203.0.113.77", undefined, { "cf-connecting-ip": `198.51.100.${100 + i}` }));
+    expect((await POST(mcpRequest(callList(), "203.0.113.77", undefined, { "cf-connecting-ip": "198.51.100.250" }))).status).toBe(429);
+  });
+
   it("chargeToolCalls with zero calls is free and never throws", () => {
     for (let i = 0; i < 500; i += 1) expect(chargeToolCalls("zero", 0)).toEqual({ ok: true });
   });

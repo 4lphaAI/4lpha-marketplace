@@ -1,0 +1,156 @@
+{
+ "ticker": "NVDA",
+ "quotedAt": 1791441096057,
+ "ageMinutes": 9,
+ "staleness": "fresh",
+ "referencePriceUsd": 236.35,
+ "sizeUsedUsdt": 100,
+ "sizeNote": null,
+ "versions": [
+  {
+   "issuer": "bstock",
+   "symbol": "NVDAB",
+   "address": "0x02fca66c1d1afb4e2a7884261eb00f63598a7436",
+   "ratio": 1.0007782237528078,
+   "openState": true,
+   "marketStatus": null,
+   "sizes": [
+    {
+     "usdt": 100,
+     "ok": true,
+     "tokensOut": 0.42272152,
+     "shares": 0.42305049,
+     "costBps": 1,
+     "roundTripBps": 0,
+     "route": "amm",
+     "venues": [
+      "Kipseli"
+     ]
+    },
+    {
+     "usdt": 1000,
+     "ok": true,
+     "tokensOut": 4.22704744,
+     "shares": 4.23033703,
+     "costBps": 2,
+     "roundTripBps": 3,
+     "route": "amm",
+     "venues": [
+      "Elfomofi",
+      "Kipseli"
+     ]
+    },
+    {
+     "usdt": 5000,
+     "ok": true,
+     "tokensOut": 21.13388098,
+     "shares": 21.15032787,
+     "costBps": 2,
+     "roundTripBps": 5,
+     "route": "amm",
+     "venues": [
+      "Tessera V",
+      "Kipseli",
+      "Elfomofi"
+     ]
+    }
+   ]
+  },
+  {
+   "issuer": "ondo",
+   "symbol": "NVDAon",
+   "address": "0xa9ee28c80f960b889dfbd1902055218cba016f75",
+   "ratio": 1.0017152487959897,
+   "openState": true,
+   "marketStatus": "overnight",
+   "sizes": [
+    {
+     "usdt": 100,
+     "ok": true,
+     "tokensOut": 0.42285343,
+     "shares": 0.42357873,
+     "costBps": -11,
+     "roundTripBps": 2,
+     "route": "amm",
+     "venues": [
+      "Elfomofi",
+      "Uniswap V4"
+     ]
+    },
+    {
+     "usdt": 1000,
+     "ok": true,
+     "tokensOut": 4.22760196,
+     "shares": 4.23485335,
+     "costBps": -9,
+     "roundTripBps": 164,
+     "route": "amm",
+     "venues": [
+      "Elfomofi",
+      "Kipseli",
+      "Uniswap V4"
+     ]
+    },
+    {
+     "usdt": 5000,
+     "ok": true,
+     "tokensOut": 13.42058929,
+     "shares": 13.44360894,
+     "costBps": 5736,
+     "roundTripBps": 3886,
+     "route": "amm",
+     "venues": [
+      "Pancakeswap V3",
+      "Kipseli",
+      "Tessera V",
+      "Elfomofi"
+     ]
+    }
+   ]
+  }
+ ],
+ "verdicts": [
+  {
+   "usdt": 100,
+   "unreadable": false,
+   "best": null,
+   "edgeBps": 12.5,
+   "about_same": true,
+   "avoid": [],
+   "only": null
+  },
+  {
+   "usdt": 1000,
+   "unreadable": false,
+   "best": null,
+   "edgeBps": 10.7,
+   "about_same": true,
+   "avoid": [],
+   "only": null
+  },
+  {
+   "usdt": 5000,
+   "unreadable": false,
+   "best": "bstock",
+   "edgeBps": 5732.6,
+   "about_same": false,
+   "avoid": [
+    {
+     "issuer": "ondo",
+     "reasons": [
+      "buy_cost",
+      "round_trip"
+     ]
+    }
+   ],
+   "only": null
+  }
+ ],
+ "thresholds": {
+  "aboutSameBps": 20,
+  "avoidCostBps": 200,
+  "avoidRoundTripBps": 200,
+  "roundTripGapBps": 200
+ },
+ "note": "Quotes are stored and refresh about every 15 minutes at fixed sizes (100, 1000 and 5000 USDT). The Binance quote for the exact amount is the final word. Data, not a recommendation and not investment advice."
+}

@@ -14,19 +14,12 @@ const MAX_IP_KEYS = 10_000;
 const OVERFLOW_KEY = "overflow";
 
 /**
- * The header Railway's edge proxy sets with the client's remote IP. Railway's "Specs & Limits" page lists `X-Real-IP`
- * "for identifying client's remote IP", and Railway staff state the proxy "will always overwrite it" (a client can no
- * longer set it). `X-Forwarded-For` is NOT used: staff statements conflict on which end of the list is trustworthy,
- * and the first entry is client-settable. See the build report, O1.
+ * The client key lives in `lib/clientIp.ts`, shared with the desk limiter: Railway's `x-real-ip` (a client cannot set it,
+ * see the build report, O1), refined to `cf-connecting-ip` when `x-real-ip` is a Cloudflare edge address, because
+ * production sits behind Cloudflare. `X-Forwarded-For` is NOT used: staff statements conflict on which end of the list is
+ * trustworthy, and the first entry is client-settable. Requests with no usable header share one `unknown` bucket (fail closed).
  */
-export const CLIENT_IP_HEADER = "x-real-ip";
-/** Requests with no usable header (local dev, a proxy change) share one bucket: fail closed, not open. */
-export const UNKNOWN_CLIENT = "unknown";
-
-export function clientIp(headers: Pick<Headers, "get">): string {
-  const raw = headers.get(CLIENT_IP_HEADER)?.trim() ?? "";
-  return raw.length > 0 && raw.length <= 64 && /^[0-9a-fA-F:.]+$/u.test(raw) ? raw.toLowerCase() : UNKNOWN_CLIENT;
-}
+export { CLIENT_IP_HEADER, UNKNOWN_CLIENT, clientIp } from "@/lib/clientIp";
 
 type State = { perIp: Map<string, number[]>; all: number[] };
 const SLOT = "__4lphaMcpRateLimit";
