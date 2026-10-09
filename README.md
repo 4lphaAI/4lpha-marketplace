@@ -6,29 +6,13 @@
 
 Pick a strategy, give it a budget and a term, and an agent buys and sells **bStocks** (NVDAB, SPYB, QQQB, SPCXB and more) for you around the clock, from your own wallet, on BSC mainnet. You do not need to keep a computer on, run a bot or read a chart.
 
-[Live app](https://4lpha.tech) · [Judge guide](https://4lpha.tech/judge) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
+[Demo video (4 min)](https://youtu.be/MsXV2SJdHx8) · [Live app](https://4lpha.tech) · [Judge guide](https://4lpha.tech/judge) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
+
+<a href="https://youtu.be/MsXV2SJdHx8"><img src="https://i.ytimg.com/vi/MsXV2SJdHx8/hqdefault.jpg" alt="Watch the 4-minute 4lpha demo" width="480" /></a>
 
 Submitted to **BNB Hack: Tokenized Stocks Edition** (Main Track, plus the *Agentic Wallet / Wallet Skills* and *BNB Agent Studio* special prizes).
 
 </div>
-
----
-
-## Contents
-
-1. [What 4lpha is](#what-4lpha-is)
-2. [Contract](#contract)
-3. [The four strategies](#the-four-strategies)
-4. [How 4lpha meets each track](#how-4lpha-meets-each-track)
-5. [How 4lpha meets the judging rubric](#how-4lpha-meets-the-judging-rubric)
-6. [Try it in two minutes](#try-it-in-two-minutes)
-7. [On-chain evidence](#on-chain-evidence)
-8. [Screenshots](#screenshots)
-9. [Architecture](#architecture)
-10. [Repository map](#repository-map)
-11. [Limits, stated plainly](#limits-stated-plainly)
-12. [Development](#development)
-13. [Archive: the earlier agent-marketplace entry](#archive-the-earlier-agent-marketplace-entry)
 
 ---
 
