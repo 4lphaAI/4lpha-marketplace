@@ -236,6 +236,13 @@ export const GROUPS: FeatureGroup[] = [
     sub: "What stands between an LLM and a bad fill on a tokenized stock.",
     features: [
       {
+        id: "stock-allowlist",
+        title: "Curated stock allowlist",
+        status: "live",
+        what: "Agents trade only a reviewed list of 40 tokenized stocks (32 bStocks, 8 Ondo tokens). Every contract was checked on chain and admitted by a measured venue rule: a PancakeSwap V3 pool of at least $10,000, or a Binance route within 0.5 % of the reference price at $10,000. Each mode trades only its own subset.",
+        evidence: [{ label: "Full list in the docs", href: "https://docs.4lpha.tech/#stocks" }],
+      },
+      {
         id: "rwa-guard",
         title: "Stale-price and market-hours guard",
         status: "live",
