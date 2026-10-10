@@ -8,7 +8,7 @@ import { Icon } from "@/design-system";
 import { RESOURCES } from "@/lib/design-resources";
 import {
   AGENTIC_GUIDE, ASSISTANT_COMMANDS, CODE_COMMANDS, COMMANDS, DATA_REPO, DESK_COMMANDS, GROUPS, LIMITS, LIVE_AGENTS,
-  PRIZES, REPO, SITE, STATUS_LABEL, VIDEOS, type Video, addr, agentPage, erc8004, type Command, type Evidence, type GuideStep, type Status,
+  PRIZES, REPO, SITE, STATUS_LABEL, VIDEOS, FEATURED_VIDEOS, type Video, addr, agentPage, erc8004, type Command, type Evidence, type GuideStep, type Status,
 } from "@/lib/judge-data";
 import { SigmaHero } from "@/components/judge/SigmaHero";
 import { PlayIcon, runSpec, useOnLiveHost, type RunResult } from "@/components/judge/run";
@@ -105,6 +105,10 @@ const CSS = `
 .fl-jg-vframe iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
 .fl-jg-vplay{position:absolute;left:50%;top:50%;width:54px;height:54px;transform:translate(-50%,-50%);display:grid;place-items:center;border-radius:50%;background:var(--brand);color:#0b0d0f;box-shadow:0 10px 30px rgb(0 0 0 / .45);transition:transform .2s}
 .fl-jg-vframe:hover .fl-jg-vplay{transform:translate(-50%,-50%) scale(1.08)}
+.fl-jg-featured{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:20px}
+.fl-jg-video--big{gap:12px;padding:16px;border:1px solid var(--border-card);border-radius:var(--radius-md);background:var(--surface-card)}
+.fl-jg-video--big .fl-jg-vplay{width:68px;height:68px}
+.fl-jg-vbadge{display:inline-flex;align-items:center;height:22px;padding:0 9px;border-radius:var(--radius-pill);border:1px solid var(--brand-line);background:var(--brand-tint);color:var(--brand);font:var(--type-label);white-space:nowrap}
 .fl-jg-vmeta{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
 .fl-jg-prize{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);gap:28px 32px;padding:28px;border:1px solid var(--border-card);border-radius:var(--radius-md);background:var(--surface-card)}
 .fl-jg-prizeh{font:var(--weight-semibold) var(--text-2xl)/1.2 var(--font-sans);margin:0}
@@ -211,10 +215,11 @@ function Section({ id, eyebrow, title, sub, children }: { id?: string; eyebrow: 
 }
 
 /** Thumbnail first; the YouTube player (no-cookie domain) loads only after a click. */
-function VideoCard({ v }: { v: Video }) {
+function VideoCard({ v, blurb, badge }: { v: Video; blurb?: string; badge?: string }) {
   const [playing, setPlaying] = React.useState(false);
+  const big = blurb !== undefined;
   return (
-    <div className="fl-jg-video">
+    <div className={"fl-jg-video" + (big ? " fl-jg-video--big" : "")}>
       {playing ? (
         <div className="fl-jg-vframe">
           <iframe src={`https://www.youtube-nocookie.com/embed/${v.id}?autoplay=1&rel=0`} title={v.title}
@@ -223,13 +228,16 @@ function VideoCard({ v }: { v: Video }) {
       ) : (
         <button type="button" className="fl-jg-vframe" onClick={() => setPlaying(true)} aria-label={`Play: ${v.title}`}>
           <img src={`https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`} alt="" loading="lazy" />
-          <span className="fl-jg-vplay"><PlayIcon size={18} /></span>
+          <span className="fl-jg-vplay"><PlayIcon size={big ? 22 : 18} /></span>
         </button>
       )}
       <div className="fl-jg-vmeta">
-        <h3 className="fl-jg-h3">{v.mode}</h3>
+        <h3 className="fl-jg-h3" style={big ? { font: "var(--weight-semibold) var(--text-xl)/1.25 var(--font-sans)", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } : undefined}>
+          {v.mode}{badge && <span className="fl-jg-vbadge">{badge}</span>}
+        </h3>
         <a href={v.url} target="_blank" rel="noreferrer" style={{ display: "inline-flex", alignItems: "center", gap: 5, font: "var(--type-label)" }}>YouTube<Icon name="external" size={11} /></a>
       </div>
+      {blurb && <p className="fl-jg-p" style={{ font: "var(--type-body-md)" }}>{blurb}</p>}
     </div>
   );
 }
@@ -322,7 +330,7 @@ export function JudgeGuide() {
             </div>
             <div className="fl-jg-links">
               <a className="fl-jg-pill fl-jg-pill--brand" href="#run"><PlayIcon />Run it here</a>
-              <a className="fl-jg-pill" href="#videos"><PlayIcon size={11} />Watch the videos</a>
+              <a className="fl-jg-pill" href="#videos"><PlayIcon size={11} />Watch the 4-minute demo</a>
               <a className="fl-jg-pill" href="#connect"><Icon name="wallet" size={13} />Connect an Agentic Wallet</a>
               <a className="fl-jg-pill" href="#prizes"><Icon name="spark" size={13} />Prize tracks</a>
               <a className="fl-jg-pill" href={REPO} target="_blank" rel="noreferrer"><Icon name="external" size={13} />GitHub</a>
@@ -353,7 +361,11 @@ export function JudgeGuide() {
           </div>
         </Section>
 
-        <Section id="videos" eyebrow="Video walkthroughs" title="Each strategy, start to finish." sub="Short tutorials of the four strategies on the live app. Press play to watch here, or open them on YouTube.">
+        <Section id="videos" eyebrow="Video walkthroughs" title="See it before you try it." sub="Start with the 4-minute demo, then the skills and one short tutorial per strategy. Press play to watch here, or open them on YouTube.">
+          <div className="fl-jg-featured">
+            {FEATURED_VIDEOS.map((v, i) => <VideoCard key={v.id} v={v} blurb={v.blurb} badge={i === 0 ? "Start here" : "Wallet Skills prize"} />)}
+          </div>
+          <span className="fl-jg-eyebrow" style={{ color: "var(--text-subtle)", marginTop: 8 }}>One tutorial per strategy</span>
           <div className="fl-jg-videos">
             {VIDEOS.map((v) => <VideoCard key={v.id} v={v} />)}
           </div>

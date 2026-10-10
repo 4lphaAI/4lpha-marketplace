@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import { SIGMA_ANIMATIONS } from "./sigma-pet";
 import {
-  AGENTIC_GUIDE, ASSISTANT_COMMANDS, CODE_COMMANDS, COMMANDS, DESK_COMMANDS, GROUPS, LIMITS, LIVE_AGENTS, PRIZES, SIGMA_LINES, VIDEOS,
+  AGENTIC_GUIDE, ASSISTANT_COMMANDS, CODE_COMMANDS, COMMANDS, DESK_COMMANDS, GROUPS, LIMITS, LIVE_AGENTS, PRIZES, SIGMA_LINES, VIDEOS, FEATURED_VIDEOS,
 } from "./judge-data";
 
 const read = (p: string) => readFileSync(fileURLToPath(new URL(p, import.meta.url)), "utf8");
@@ -95,7 +95,8 @@ describe("Sigma and prizes", () => {
   });
   it("has one distinct video per strategy, each id matching its link", () => {
     expect(VIDEOS.map((v) => v.mode).sort()).toEqual(["AI Trade", "Auto DCA", "Schedule buy", "Smart Portfolio"]);
-    expect(new Set(VIDEOS.map((v) => v.id)).size).toBe(VIDEOS.length);
-    for (const v of VIDEOS) expect(v.url.startsWith("https://youtu.be/" + v.id + "?")).toBe(true);
+    const all = [...VIDEOS, ...FEATURED_VIDEOS];
+    expect(new Set(all.map((v) => v.id)).size).toBe(all.length);
+    for (const v of all) expect(v.url === "https://youtu.be/" + v.id || v.url.startsWith("https://youtu.be/" + v.id + "?")).toBe(true);
   });
 });

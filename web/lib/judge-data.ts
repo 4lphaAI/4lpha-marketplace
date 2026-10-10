@@ -95,6 +95,20 @@ export const VIDEOS: Video[] = [
   { mode: "Smart Portfolio", title: "TradFi Smart Portfolio Tutorial", id: "laCmUvOra7w", url: "https://youtu.be/laCmUvOra7w?si=E9D1uSYw9YgEXkNu" },
 ];
 
+export interface FeaturedVideo extends Video { blurb: string }
+
+/** Shown large above the strategy tutorials. Operator-supplied 2026-10-10, titles checked against oEmbed. */
+export const FEATURED_VIDEOS: FeaturedVideo[] = [
+  {
+    mode: "4-minute demo", title: "4lpha Trading Agent - TradFi Model", id: "MsXV2SJdHx8", url: "https://youtu.be/MsXV2SJdHx8",
+    blurb: "The whole product in four minutes: the strategies, hiring an agent and what it does on mainnet.",
+  },
+  {
+    mode: "Agentic Wallet skills", title: "4lpha Skills for Binance Agentic Wallet", id: "02__PjfewkM", url: "https://youtu.be/02__PjfewkM",
+    blurb: "The five read-only skills in an AI assistant: hire an agent, check its status, analyse and compare bStocks.",
+  },
+];
+
 export const GROUPS: FeatureGroup[] = [
   {
     id: "agentic",
@@ -304,6 +318,7 @@ export const PRIZES: Prize[] = [
       { name: "4lpha-meme-stocks", body: "Memes quoted in a bStock, grouped by stock, with lifecycle labels and risk flags." },
     ],
     links: [
+      { label: "Skills video", href: "https://youtu.be/02__PjfewkM" },
       { label: "Skills page", href: `${SITE}/skills` },
       { label: "skills/ in the repo", href: `${REPO}/tree/main/skills` },
       { label: "MCP server source", href: src("web/lib/mcp/server.ts") },
