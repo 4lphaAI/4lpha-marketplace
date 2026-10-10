@@ -58,7 +58,7 @@ describe("security dependency compatibility", () => {
     const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8")) as {
       packages: Record<string, { version?: string; name?: string }>;
     };
-    expect(lock.packages["node_modules/axios"]?.version).toBe("1.18.0");
+    expect(lock.packages["node_modules/axios"]?.version).toBe("1.20.0");
     expect(lock.packages["node_modules/decode-uri-component-patched"]).toMatchObject({ name: "decode-uri-component", version: "0.5.0" });
     const sockets = Object.entries(lock.packages).filter(([name]) => /(?:^|\/)node_modules\/ws$/u.test(name));
     expect(sockets.length).toBeGreaterThan(0);
