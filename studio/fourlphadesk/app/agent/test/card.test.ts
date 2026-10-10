@@ -36,6 +36,6 @@ describe("agent card", () => {
     for (const s of ["stock_report", "dca_plan", "rebalance_plan", "task_description", "0.10 USD"]) assert.ok(c.description.includes(s), s);
     assert.equal(c.description, DESK_DESCRIPTION);
     assert.ok(!/[\u2013\u2014]/.test(c.description));
-    assert.deepEqual(c.skills.map((s) => s.id), ["negotiate", "notify_funded"]);
+    assert.deepEqual(c.skills.map((s) => s.id), ["preview", "negotiate", "notify_funded"]);
   });
 });

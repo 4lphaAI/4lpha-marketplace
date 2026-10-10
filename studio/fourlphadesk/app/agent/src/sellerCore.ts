@@ -239,9 +239,9 @@ export class SellerCore {
     return this.signing.signQuote(request as Record<string, unknown>);
   }
 
-  /** The seller's two advertised skills. */
+  /** The seller's advertised skills: the free preview and the two paid commerce skills. */
   skills(): string[] {
-    return this.commerceSkills ? ["negotiate", "notify_funded"] : [];
+    return this.commerceSkills ? ["preview", "negotiate", "notify_funded"] : ["preview"];
   }
 
   /**

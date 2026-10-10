@@ -20,7 +20,7 @@ import { RateLimitExceeded, SlidingWindowLimiter } from "@bnbagent/sdk/utils";
 import type { NextFunction, Request, Response } from "express";
 import { clientIp, railwayClientIpMode } from "./callerIdentity.js";
 
-type CommerceOperation = "negotiate" | "notify_funded" | "sell";
+type CommerceOperation = "negotiate" | "notify_funded" | "sell" | "preview";
 
 const DEFAULT_GLOBAL_MAX = 120;
 const DEFAULT_CALLER_MAX = 20;

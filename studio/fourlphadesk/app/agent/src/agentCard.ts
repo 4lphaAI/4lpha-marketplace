@@ -6,7 +6,7 @@
  * AgentCore runtime URL (`$AGENTCORE_RUNTIME_URL`), so the `url` here is only
  * a local-dev placeholder.
  *
- * The card advertises exactly two skills - `negotiate` and `notify_funded` -
+ * The card advertises a free `preview` skill and the two paid skills `negotiate` and `notify_funded` -
  * and the OAuth2 (Cognito) security scheme buyers must satisfy: AgentCore A2A
  * endpoints require an inbound OAuth2 bearer (there is no anonymous mode).
  * The token URL + scope come from the Cognito user pool
@@ -20,6 +20,19 @@
  */
 
 import type { AgentCard, AgentSkill, SecurityScheme } from "@a2a-js/sdk";
+
+const PREVIEW: AgentSkill = {
+  id: "preview",
+  name: "Free preview of a stock report",
+  description:
+    'FREE, no payment and nothing on chain. Send a data part {"skill": "preview", "ticker": "NVDA"} ' +
+    '(optionally "usdt": 500) and receive the price, premium to NAV and where-to-buy sections of the ' +
+    "stock report as Markdown, plus the ready-to-send negotiate envelope for the full 0.10 USD report.",
+  tags: ["preview", "free", "tokenized-stocks", "bnb-chain"],
+  examples: ['{"skill": "preview", "ticker": "NVDA", "usdt": 500}'],
+  inputModes: ["application/json"],
+  outputModes: ["application/json"],
+};
 
 const NEGOTIATE: AgentSkill = {
   id: "negotiate",
@@ -68,7 +81,7 @@ export const DESK_DESCRIPTION =
   "(2) dca_plan: {\"type\":\"dca_plan\",\"ticker\":\"NVDAB\",\"usdt\":200,\"mode\":\"dca\",\"days\":7} - an Auto DCA ladder or a Schedule buy (mode dca or schedule, days 7 or 30). " +
   "(3) rebalance_plan: {\"type\":\"rebalance_plan\",\"capital\":150,\"weights\":{\"NVDA\":40,\"MSFT\":30,\"SPY\":30}} - a Smart Portfolio check with allocations. " +
   "Plain English is mapped to these formats when possible. Every number is computed by code; plans end with the plain 4lpha Deploy link. Data, not investment advice. " +
-  "The desk never trades and never holds funds.";
+  "The desk never trades and never holds funds. Free preview: send {\"skill\":\"preview\",\"ticker\":\"NVDA\"} for the price and where-to-buy sections at no cost.";
 
 /**
  * OAuth2 (Cognito client-credentials) scheme from env, or null locally.
@@ -146,7 +159,7 @@ export function buildAgentCard(
     defaultInputModes: ["application/json"],
     defaultOutputModes: ["application/json"],
     skills:
-      opts.commerceSkills === false ? [] : [NEGOTIATE, NOTIFY_FUNDED],
+      opts.commerceSkills === false ? [PREVIEW] : [PREVIEW, NEGOTIATE, NOTIFY_FUNDED],
     ...extra,
   };
 }

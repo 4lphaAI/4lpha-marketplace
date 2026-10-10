@@ -43,8 +43,15 @@ import {
   type ExecutionEventBus,
   type RequestContext,
 } from "@a2a-js/sdk/server";
-import { isCommerceRateLimitError } from "./requestLimits.js";
+import { previewStock } from "./desk/preview.js";
+import { isCommerceRateLimitError, limitCommerceOperation } from "./requestLimits.js";
 import { SellerCore } from "./sellerCore.js";
+
+/** Free preview (no payment, no signing, no chain write), behind the same per-caller and global limits. */
+async function preview(data: Record<string, unknown>): Promise<Record<string, unknown>> {
+  await limitCommerceOperation("preview");
+  return { ...(await previewStock(data)) };
+}
 
 const log = {
   error: (msg: string, e?: unknown) =>
@@ -85,6 +92,9 @@ export class SellerAgentExecutor extends SellerCore implements AgentExecutor {
       if (skill === "notify_funded") {
         return await this.notifyFunded(data);
       }
+      if (skill === "preview") {
+        return await preview(data);
+      }
       // Includes a plain text message (no skill envelope → skill is
       // undefined): the seller has no free-form skill, so prose is rejected
       // here.
@@ -115,6 +125,8 @@ export class SellerAgentExecutor extends SellerCore implements AgentExecutor {
         result = await this.negotiate(data);
       } else if (skill === "notify_funded") {
         result = await this.notifyFunded(data);
+      } else if (skill === "preview") {
+        result = await preview(data);
       } else {
         // Includes a plain text message (no DataPart → skill is undefined):
         // the seller has no free-form skill, so prose is rejected here.
