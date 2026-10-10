@@ -6,7 +6,7 @@
 
 Pick a strategy, give it a budget and a term, and an agent buys and sells **bStocks** (NVDAB, SPYB, QQQB, SPCXB and more) for you around the clock, from your own wallet, on BSC mainnet. You do not need to keep a computer on, run a bot or read a chart.
 
-[Demo video (4 min)](https://youtu.be/MsXV2SJdHx8) · [Agentic Wallet skills video](https://youtu.be/02__PjfewkM) · [Live app](https://4lpha.tech) · [Judge guide](https://4lpha.tech/judge) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
+[Demo video (4 min)](https://youtu.be/MsXV2SJdHx8) · [Live app](https://4lpha.tech) · [Judge guide](https://4lpha.tech/judge) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
 
 <a href="https://youtu.be/MsXV2SJdHx8"><img src="https://i.ytimg.com/vi/MsXV2SJdHx8/sddefault.jpg" alt="Watch the 4-minute 4lpha demo" width="480" /></a>
 
