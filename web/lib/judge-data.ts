@@ -287,7 +287,7 @@ export const GROUPS: FeatureGroup[] = [
 ];
 
 export interface PrizeItem { name: string; body: string }
-export interface DeskJob { id: string; what: string; fund: string; submit: string; cid: string; report: string; extra?: Evidence }
+export interface DeskJob { id: string; what: string; fund: string; submit: string; cid: string; report: string; extra?: Evidence; rating?: Evidence }
 
 export interface Prize {
   id: string;
@@ -360,23 +360,29 @@ export const PRIZES: Prize[] = [
         id: "56947", what: "First paid job: NVDA stock report",
         fund: tx("0xcd2318c443f829b4fa88dedf476c326d62a6db7e3b1a5849d305a20720d410f4"),
         submit: tx("0x7ffb017bdcfd51c981cd3273d97d2d81f050bb303a75caddc84d4c72590c0079"),
-        cid: "QmUavw4evR5nNzWfcHHTr2myHHhBL3mUPk9tnEXrH7TbrN", report: readable("QmUavw4evR5nNzWfcHHTr2myHHhBL3mUPk9tnEXrH7TbrN"),
+        cid: "QmUavw4evR5nNzWfcHHTr2myHHhBL3mUPk9tnEXrH7TbrN", report: readable("QmUavw4evR5nNzWfcHHTr2myHHhBL3mUPk9tnEXrH7TbrN"), rating: { label: "ERC-8004 rating 70", href: tx("0x548ee4caec294de124c4c001df1b88572a71530d15d29344844101bdaea52a79") },
       },
       {
         id: "56948", what: "NVDA report with CoinMarketCap data the desk bought over x402",
         fund: tx("0x0189cdaa512eb368e045b4fd679e19db49c9f23a3d36407fc2b2db20f62cf0b9"),
         submit: tx("0x818cdaee7a4e21046ab2d73747d673ad2e226938d5347b5d1f94561b6a172d0e"),
-        cid: "QmShGXmDkuQbwu4KRysXYftgH7FbK8Ab5t67WCSYqPARsa", report: readable("QmShGXmDkuQbwu4KRysXYftgH7FbK8Ab5t67WCSYqPARsa"),
+        cid: "QmShGXmDkuQbwu4KRysXYftgH7FbK8Ab5t67WCSYqPARsa", report: readable("QmShGXmDkuQbwu4KRysXYftgH7FbK8Ab5t67WCSYqPARsa"), rating: { label: "ERC-8004 rating 100", href: tx("0xa06f57d96fed5eff3b5a31a70887ba7b5cadc1a3144527ef066d6009f51c5d82") },
         extra: { label: "x402 payment", href: tx("0x47f38e358558a7f3115f18e568ecfaadc64ff9823f8e5e7a8f29d32c7f05bb44") },
       },
       {
         id: "56950", what: "NVDA report; the number check refused a model sentence with a figure not in the facts",
         fund: tx("0x0fe541d0b809ea6417113955b2066a9aefdd3eb193c9ad14e13c0e3d6c6a4479"),
         submit: tx("0x357debe897a6e1246aedb324e3eb389b1cf57bc8e9001182cdfddc16946fd1f7"),
-        cid: "QmU85qWJES4AB3KGj5V7829h8Ki9AkMzDwyo2gbem1fwq7", report: readable("QmU85qWJES4AB3KGj5V7829h8Ki9AkMzDwyo2gbem1fwq7"),
+        cid: "QmU85qWJES4AB3KGj5V7829h8Ki9AkMzDwyo2gbem1fwq7", report: readable("QmU85qWJES4AB3KGj5V7829h8Ki9AkMzDwyo2gbem1fwq7"), rating: { label: "ERC-8004 rating 100", href: tx("0xed421e3d04dfc4bc8fb3958be792e9b58a069f3eeb9c97c23dd7b1d5abcb9bad") },
+      },
+      {
+        id: "56965", what: "NVDA report with x402 data; the free model printed its reasoning, so the guard refused it and the fixed template summary was used",
+        fund: tx("0xdee459b6742d257fb3593d904f86a21e896cc3a8400682b3925a0e72c5e8c87b"),
+        submit: tx("0xf223e4ae888cb15cbd1459d7c3a0ab889e880fa0988640ed9731a10b8183c0bd"),
+        cid: "QmX6oRSukj3z5aoFDu4qMaMA4Dqy4GAm9N8CK7BDTm2Bjq", report: readable("QmX6oRSukj3z5aoFDu4qMaMA4Dqy4GAm9N8CK7BDTm2Bjq"), rating: { label: "ERC-8004 rating 100", href: tx("0x608da3a225352e7b22b464ddc083a00b7c89b0c6dc6b4ea577603b57c74b1401") },
       },
     ],
-    jobsNote: "Funded by our own demo buyer wallet 0xD1911E8cC7f1cA2f0b080Db89962EA1c069641f4 (not an outside customer). Settlement is optimistic: payment releases after the 7-day dispute window.",
+    jobsNote: "Funded by our own demo buyer wallet 0xD1911E8cC7f1cA2f0b080Db89962EA1c069641f4 (not an outside customer). Settlement is optimistic: payment releases after the 7-day dispute window. After delivery the buyer posts an ERC-8004 reputation entry (giveFeedback) for the desk: 8 entries on chain, scores 60 to 100 with the reason, lower where a report missed the x402 data or leaked the model's reasoning; each entry discloses that the rater is our own wallet.",
   },
 ];
 

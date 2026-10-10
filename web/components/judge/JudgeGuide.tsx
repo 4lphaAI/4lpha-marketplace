@@ -436,7 +436,7 @@ export function JudgeGuide() {
                           <tr key={j.id}>
                             <td style={{ font: "var(--weight-medium) 13px/1.4 var(--font-mono)", color: "var(--ink-1)", whiteSpace: "nowrap" }}>#{j.id}</td>
                             <td>{j.what}</td>
-                            <td><EvLinks items={[{ label: "Fund", href: j.fund }, { label: "Submit", href: j.submit }, ...(j.extra ? [j.extra] : [])]} /></td>
+                            <td><EvLinks items={[{ label: "Fund", href: j.fund }, { label: "Submit", href: j.submit }, ...(j.extra ? [j.extra] : []), ...(j.rating ? [j.rating] : [])]} /></td>
                             <td><EvLinks items={[{ label: "Report", href: j.report }, { label: "IPFS", href: ipfs(j.cid) }]} /></td>
                           </tr>
                         ))}
