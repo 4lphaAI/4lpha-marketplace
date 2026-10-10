@@ -4,8 +4,9 @@ import { describe, expect, it } from "vitest";
 
 import { SIGMA_ANIMATIONS } from "./sigma-pet";
 import {
-  AGENTIC_GUIDE, ASSISTANT_COMMANDS, CODE_COMMANDS, COMMANDS, DESK_COMMANDS, GROUPS, LIMITS, LIVE_AGENTS, PRIZES, SIGMA_LINES, VIDEOS, FEATURED_VIDEOS,
+  AGENTIC_GUIDE, ASSISTANT_COMMANDS, CODE_COMMANDS, COMMANDS, DESK_COMMANDS, GROUPS, LIMITS, LIVE_AGENTS, PRIZES, SIGMA_LINES, VIDEOS, FEATURED_VIDEOS, ipfs,
 } from "./judge-data";
+import { listedReports, loadDeskReport, parseReport } from "./desk-report";
 
 const read = (p: string) => readFileSync(fileURLToPath(new URL(p, import.meta.url)), "utf8");
 const files = ["./judge-data.ts", "../components/judge/JudgeGuide.tsx", "../components/judge/SigmaHero.tsx", "../components/judge/run.tsx", "../app/judge/page.tsx"].map(read);
@@ -90,8 +91,18 @@ describe("Sigma and prizes", () => {
     for (const j of jobs) {
       expect(j.fund).toMatch(/^https:\/\/bscscan\.com\/tx\/0x[0-9a-f]{64}$/);
       expect(j.submit).toMatch(/^https:\/\/bscscan\.com\/tx\/0x[0-9a-f]{64}$/);
-      expect(j.report).toMatch(/^https:\/\/gateway\.pinata\.cloud\/ipfs\/Qm[1-9A-HJ-NP-Za-km-z]{44}$/);
+      expect(j.cid).toMatch(/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/);
+      expect(j.report).toBe(`https://4lpha.tech/judge/report/${j.cid}`);
+      expect(ipfs(j.cid)).toBe(`https://gateway.pinata.cloud/ipfs/${j.cid}`);
     }
+    expect(new Set(jobs.map((j) => j.cid)).size).toBe(jobs.length);
+  });
+  it("parses the desk report Markdown subset and serves only listed CIDs", async () => {
+    const blocks = parseReport("# T\n## S\n- a\n- b\n\n| h1 | h2 |\n| --- | --- |\n| x | y |\n---\nplain");
+    expect(blocks.map((b) => b.kind)).toEqual(["h1", "h2", "ul", "table", "hr", "p"]);
+    expect(blocks[3]).toEqual({ kind: "table", head: ["h1", "h2"], rows: [["x", "y"]] });
+    expect(await loadDeskReport("QmNotListed1111111111111111111111111111111111")).toBe("unlisted");
+    expect(listedReports().size).toBe(PRIZES.flatMap((p) => p.jobs ?? []).length);
   });
   it("has one distinct video per strategy, each id matching its link", () => {
     expect(VIDEOS.map((v) => v.mode).sort()).toEqual(["AI Trade", "Auto DCA", "Schedule buy", "Smart Portfolio"]);

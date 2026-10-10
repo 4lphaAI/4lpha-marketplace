@@ -8,7 +8,7 @@ import { Icon } from "@/design-system";
 import { RESOURCES } from "@/lib/design-resources";
 import {
   AGENTIC_GUIDE, ASSISTANT_COMMANDS, CODE_COMMANDS, COMMANDS, DATA_REPO, DESK_COMMANDS, GROUPS, LIMITS, LIVE_AGENTS,
-  PRIZES, REPO, SITE, STATUS_LABEL, VIDEOS, FEATURED_VIDEOS, type Video, addr, agentPage, erc8004, type Command, type Evidence, type GuideStep, type Status,
+  PRIZES, REPO, SITE, STATUS_LABEL, VIDEOS, FEATURED_VIDEOS, type Video, addr, agentPage, erc8004, ipfs, type Command, type Evidence, type GuideStep, type Status,
 } from "@/lib/judge-data";
 import { SigmaHero } from "@/components/judge/SigmaHero";
 import { PlayIcon, runSpec, useOnLiveHost, type RunResult } from "@/components/judge/run";
@@ -437,7 +437,7 @@ export function JudgeGuide() {
                             <td style={{ font: "var(--weight-medium) 13px/1.4 var(--font-mono)", color: "var(--ink-1)", whiteSpace: "nowrap" }}>#{j.id}</td>
                             <td>{j.what}</td>
                             <td><EvLinks items={[{ label: "Fund", href: j.fund }, { label: "Submit", href: j.submit }, ...(j.extra ? [j.extra] : [])]} /></td>
-                            <td><EvLinks items={[{ label: "Report", href: j.report }]} /></td>
+                            <td><EvLinks items={[{ label: "Report", href: j.report }, { label: "IPFS", href: ipfs(j.cid) }]} /></td>
                           </tr>
                         ))}
                       </tbody>

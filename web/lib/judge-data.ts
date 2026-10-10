@@ -287,7 +287,7 @@ export const GROUPS: FeatureGroup[] = [
 ];
 
 export interface PrizeItem { name: string; body: string }
-export interface DeskJob { id: string; what: string; fund: string; submit: string; report: string; extra?: Evidence }
+export interface DeskJob { id: string; what: string; fund: string; submit: string; cid: string; report: string; extra?: Evidence }
 
 export interface Prize {
   id: string;
@@ -302,7 +302,9 @@ export interface Prize {
   jobsNote?: string;
 }
 
-const ipfs = (cid: string) => `https://gateway.pinata.cloud/ipfs/${cid}`;
+export const ipfs = (cid: string) => `https://gateway.pinata.cloud/ipfs/${cid}`;
+/** Readable view of a listed deliverable (the raw IPFS manifest is one escaped JSON line). */
+const readable = (cid: string) => `${SITE}/judge/report/${cid}`;
 
 /** Special prize tracks. */
 export const PRIZES: Prize[] = [
@@ -358,23 +360,23 @@ export const PRIZES: Prize[] = [
         id: "56947", what: "First paid job: NVDA stock report",
         fund: tx("0xcd2318c443f829b4fa88dedf476c326d62a6db7e3b1a5849d305a20720d410f4"),
         submit: tx("0x7ffb017bdcfd51c981cd3273d97d2d81f050bb303a75caddc84d4c72590c0079"),
-        report: ipfs("QmUavw4evR5nNzWfcHHTr2myHHhBL3mUPk9tnEXrH7TbrN"),
+        cid: "QmUavw4evR5nNzWfcHHTr2myHHhBL3mUPk9tnEXrH7TbrN", report: readable("QmUavw4evR5nNzWfcHHTr2myHHhBL3mUPk9tnEXrH7TbrN"),
       },
       {
         id: "56948", what: "NVDA report with CoinMarketCap data the desk bought over x402",
         fund: tx("0x0189cdaa512eb368e045b4fd679e19db49c9f23a3d36407fc2b2db20f62cf0b9"),
         submit: tx("0x818cdaee7a4e21046ab2d73747d673ad2e226938d5347b5d1f94561b6a172d0e"),
-        report: ipfs("QmShGXmDkuQbwu4KRysXYftgH7FbK8Ab5t67WCSYqPARsa"),
+        cid: "QmShGXmDkuQbwu4KRysXYftgH7FbK8Ab5t67WCSYqPARsa", report: readable("QmShGXmDkuQbwu4KRysXYftgH7FbK8Ab5t67WCSYqPARsa"),
         extra: { label: "x402 payment", href: tx("0x47f38e358558a7f3115f18e568ecfaadc64ff9823f8e5e7a8f29d32c7f05bb44") },
       },
       {
         id: "56950", what: "NVDA report; the number check refused a model sentence with a figure not in the facts",
         fund: tx("0x0fe541d0b809ea6417113955b2066a9aefdd3eb193c9ad14e13c0e3d6c6a4479"),
         submit: tx("0x357debe897a6e1246aedb324e3eb389b1cf57bc8e9001182cdfddc16946fd1f7"),
-        report: ipfs("QmU85qWJES4AB3KGj5V7829h8Ki9AkMzDwyo2gbem1fwq7"),
+        cid: "QmU85qWJES4AB3KGj5V7829h8Ki9AkMzDwyo2gbem1fwq7", report: readable("QmU85qWJES4AB3KGj5V7829h8Ki9AkMzDwyo2gbem1fwq7"),
       },
     ],
-    jobsNote: "Funded by a separate buyer wallet. Settlement is optimistic: payment releases after the 7-day dispute window.",
+    jobsNote: "Funded by our own demo buyer wallet 0xD1911E8cC7f1cA2f0b080Db89962EA1c069641f4 (not an outside customer). Settlement is optimistic: payment releases after the 7-day dispute window.",
   },
 ];
 
@@ -415,6 +417,17 @@ export const COMMANDS: Command[] = [
 
 /** The desk agent sends no CORS headers, so these stay terminal commands. */
 export const DESK_COMMANDS: Command[] = [
+  {
+    id: "desk-preview",
+    title: "Free preview: price and where to buy for one stock, no wallet needed",
+    cmd: `curl -s -X POST ${DESK_URL}/ -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","messageId":"judge-p","role":"user","parts":[{"kind":"data","data":{"skill":"preview","ticker":"NVDA","usdt":500}}]}}}'`,
+  },
+  {
+    id: "desk-buy",
+    title: "Buy a full report with real money (0.10 U): run inside a Studio project whose wallet holds U and a little BNB",
+    note: "Negotiate, open and fund the ERC-8183 job with bag, notify the desk, wait for the on-chain delivery and print the report. Add --preview for the free part only, or --job <id> to print a delivered report.",
+    cmd: `node studio/fourlphadesk/buyer/buy-report.mjs NVDA 500`,
+  },
   {
     id: "desk-card",
     title: "Health check and A2A card",
