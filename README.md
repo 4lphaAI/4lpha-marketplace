@@ -6,7 +6,7 @@
 
 Pick a strategy, give it a budget and a term, and an agent buys and sells **bStocks** (NVDAB, SPYB, QQQB, SPCXB and more) for you around the clock, from your own wallet, on BSC mainnet. You do not need to keep a computer on, run a bot or read a chart.
 
-[Demo video (4 min)](https://youtu.be/MsXV2SJdHx8) · [Live app](https://4lpha.tech) · [Judge guide](https://4lpha.tech/judge) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
+[Demo video (4 min)](https://youtu.be/MsXV2SJdHx8) · [Agentic Wallet skills video](https://youtu.be/02__PjfewkM) · [Live app](https://4lpha.tech) · [Judge guide](https://4lpha.tech/judge) · [Agent Skills](https://4lpha.tech/skills) · [MCP server](https://4lpha.tech/mcp) · [bStock Desk (Studio agent)](https://desk.4lpha.tech/.well-known/agent-card.json) · [Docs](https://docs.4lpha.tech) · [Market-data repo](https://github.com/4lphaAI/4lpha-market-data)
 
 <a href="https://youtu.be/MsXV2SJdHx8"><img src="https://i.ytimg.com/vi/MsXV2SJdHx8/sddefault.jpg" alt="Watch the 4-minute 4lpha demo" width="480" /></a>
 
@@ -80,6 +80,8 @@ Special prizes are awarded across all submissions, with no separate entry.
 | **Best Use of BNB Agent Studio** | Agent identity, autonomous runtime, self-funding via x402 | Entered | **4lpha bStock Desk**, scaffolded with `bag init`, registered as [ERC-8004 #369195](https://8004scan.io/agents/bsc/369195), sells research through ERC-8183 jobs, buys its own CMC data over x402 ([tx](https://bscscan.com/tx/0x47f38e358558a7f3115f18e568ecfaadc64ff9823f8e5e7a8f29d32c7f05bb44)). Source in [`studio/fourlphadesk`](studio/fourlphadesk). |
 
 ### Agentic Wallet / Wallet Skills, in detail
+
+Video walkthrough: [4lpha Skills for Binance Agentic Wallet](https://youtu.be/02__PjfewkM).
 
 - Four strategies (AI Trade, Schedule buy, Auto DCA, Smart Portfolio) run on the user's own Agentic Wallet, hired with one pairing in Binance Wallet.
 - Funds never move to 4lpha. To stop, the user signs out of the session in Binance Wallet; holdings stay in the wallet.
