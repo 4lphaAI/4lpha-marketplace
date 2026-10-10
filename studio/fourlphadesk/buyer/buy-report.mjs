@@ -10,7 +10,7 @@
 //   2. `bag erc8183 buy --provider <desk wallet> --quote-json quote.json`: create, register, budget, fund;
 //   3. A2A notify_funded: the desk verifies the funded job and starts the work;
 //   4. poll `bag erc8183 status` until SUBMITTED, then print the report from IPFS.
-// Studio's default mainnet RPC does not serve receipts, so STUDIO_BSC_RPC defaults to a BNB Chain dataseed.
+// Studio's default mainnet RPC does not serve receipts: writes default to a BNB Chain dataseed, the status read to publicnode.
 
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
@@ -23,9 +23,14 @@ const GATEWAY = "https://gateway.pinata.cloud/ipfs/";
 
 const args = process.argv.slice(2);
 const preview = args.includes("--preview");
-const [tickerArg, usdtArg] = args.filter((a) => !a.startsWith("--"));
+const jobArg = args.includes("--job") ? args[args.indexOf("--job") + 1] : undefined;
+const [tickerArg, usdtArg] = jobArg === undefined ? args.filter((a) => !a.startsWith("--")) : ["NVDA", undefined];
+if (jobArg !== undefined && !/^\d{1,12}$/.test(jobArg)) {
+  console.error("usage: node buy-report.mjs --job <job id>   prints a delivered report");
+  process.exit(2);
+}
 if (!tickerArg || !/^[A-Za-z]{1,8}$/.test(tickerArg)) {
-  console.error("usage: node buy-report.mjs <TICKER> [USDT] [--preview]   e.g. node buy-report.mjs NVDA 500");
+  console.error("usage: node buy-report.mjs <TICKER> [USDT] [--preview]   e.g. node buy-report.mjs NVDA 500\n       node buy-report.mjs --job <job id>             prints a delivered report");
   process.exit(2);
 }
 const ticker = tickerArg.toUpperCase();
@@ -48,10 +53,17 @@ async function a2a(data) {
   return json.result?.parts?.find((p) => p.kind === "data")?.data ?? {};
 }
 
-function bag(argv) {
+// Writes need receipts (BNB Chain dataseed serves them); the status read needs eth_getLogs for the deliverable
+// URL (dataseed refuses getLogs, publicnode serves recent logs). Measured 2026-10-10.
+const WRITE_RPC = process.env.STUDIO_BSC_RPC ?? "https://bsc-dataseed1.bnbchain.org";
+const READ_RPC = process.env.DESK_READ_RPC ?? "https://bsc-rpc.publicnode.com";
+
+function bag(argv, rpc = WRITE_RPC) {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env, STUDIO_BSC_RPC: process.env.STUDIO_BSC_RPC ?? "https://bsc-dataseed1.bnbchain.org" };
-    const child = spawn("bag", argv, { env, shell: process.platform === "win32" });
+    const env = { ...process.env, STUDIO_BSC_RPC: rpc };
+    // one command string (args are fixed tokens and a space-free path), so no shell-with-args deprecation warning
+    const line = ["bag", ...argv].map((a) => (/[\s"&|<>^]/.test(a) ? `"${a}"` : a)).join(" ");
+    const child = process.platform === "win32" ? spawn(line, { env, shell: true }) : spawn("bag", argv, { env });
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => process.stderr.write(d));
@@ -63,7 +75,33 @@ function bag(argv) {
 const field = (out, name) => out.match(new RegExp(`^${name}:\\s*(\\S+)`, "m"))?.[1] ?? null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Print the report of a SUBMITTED job; false while the job is not delivered or its URL is not readable yet. */
+async function printDelivered(jobId) {
+  const st = await bag(["erc8183", "status", jobId, "--network", "bsc-mainnet"], READ_RPC).catch(() => "");
+  const url = field(st, "deliverable_url");
+  if (field(st, "status") !== "SUBMITTED" || url === null || !url.startsWith("ipfs://")) return false;
+  const cid = url.slice("ipfs://".length);
+  console.log(`    delivered: ${url}\n    open: ${GATEWAY}${cid}\n`);
+  // public gateways rate-limit busy IPs (HTTP 429 or a browser challenge), so try a few before giving up
+  for (const g of [GATEWAY, "https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://w3s.link/ipfs/"]) {
+    const doc = await fetch(`${g}${cid}`, { signal: AbortSignal.timeout(30_000) })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (doc?.response?.content) {
+      console.log(doc.response.content);
+      return true;
+    }
+  }
+  console.log("    (the IPFS gateways are rate-limiting this machine right now; open the link above in a browser)");
+  return true;
+}
+
 async function main() {
+  if (jobArg !== undefined) {
+    if (await printDelivered(jobArg)) return 0;
+    console.error(`job ${jobArg} is not delivered yet (or its deliverable could not be read)`);
+    return 1;
+  }
   if (preview) {
     const p = await a2a({ skill: "preview", ticker, ...(usdt === undefined ? {} : { usdt }) });
     if (p.status !== "ok") {
@@ -103,17 +141,9 @@ async function main() {
   console.log("4/4 waiting for the desk to deliver on chain (usually under a minute)");
   for (let i = 0; i < 40; i++) {
     await sleep(10_000);
-    const st = await bag(["erc8183", "status", jobId, "--network", "bsc-mainnet"]).catch(() => "");
-    if (field(st, "status") === "SUBMITTED") {
-      const url = field(st, "deliverable_url");
-      const cid = url?.replace(/^ipfs:\/\//, "");
-      console.log(`    delivered: ${url}\n    open: ${GATEWAY}${cid}\n`);
-      const doc = await (await fetch(`${GATEWAY}${cid}`, { signal: AbortSignal.timeout(60_000) })).json().catch(() => null);
-      if (doc?.response?.content) console.log(doc.response.content);
-      return 0;
-    }
+    if (await printDelivered(jobId)) return 0;
   }
-  console.log(`    not delivered yet; check later with: bag erc8183 status ${jobId} --network bsc-mainnet`);
+  console.log(`    not delivered yet; check later with: node buy-report.mjs --job ${jobId}`);
   return 0;
 }
 
