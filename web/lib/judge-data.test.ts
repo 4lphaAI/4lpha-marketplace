@@ -53,15 +53,17 @@ describe("judge guide content", () => {
   });
 
   it("runs in the browser only same-origin, and exactly the request the curl line shows", () => {
-    const runnable = COMMANDS.filter((c) => c.run);
-    expect(runnable.length).toBe(COMMANDS.length);
+    const runnable = [...COMMANDS, ...DESK_COMMANDS].filter((c) => c.run);
+    expect(runnable.length).toBe(COMMANDS.length + 1);
+    // the one runnable desk command goes through the same-origin MCP, never to the desk host itself
+    expect(DESK_COMMANDS.filter((c) => c.run).map((c) => c.run!.path)).toEqual(["/mcp"]);
     for (const c of runnable) {
       const run = c.run!;
       expect(run.path.startsWith("/") && !run.path.startsWith("//")).toBe(true);
       expect(c.cmd).toContain(`https://4lpha.tech${run.path}`);
       if (run.body !== undefined) expect(c.cmd).toContain(`-d '${JSON.stringify(run.body)}'`);
     }
-    for (const c of [...DESK_COMMANDS, ...ASSISTANT_COMMANDS, ...CODE_COMMANDS]) expect(c.run).toBeUndefined();
+    for (const c of [...DESK_COMMANDS.filter((d) => d.id !== "mcp-desk-preview"), ...ASSISTANT_COMMANDS, ...CODE_COMMANDS]) expect(c.run).toBeUndefined();
   });
 
   it("points every screenshot at a file in public/", () => {

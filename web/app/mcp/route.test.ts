@@ -3,8 +3,9 @@ import { NextRequest } from "next/server";
 import { GET, POST } from "./route";
 import { PROTOCOL_VERSION, SERVER_INFO, TOOLS } from "@/lib/mcp/server";
 import { DATA_TOOLS } from "@/lib/mcp/dataTools";
+import { DESK_TOOLS } from "@/lib/mcp/deskTools";
 import { AGENTIC_PRODUCT_IDS } from "@/lib/mcp/agenticProducts";
-import { ORIGIN, WALLET, callBody, installDataPlane, installExecPlane, mcpRequest, resetAll } from "./fixtures";
+import { ORIGIN, WALLET, callBody, installDataPlane, installDesk, installExecPlane, mcpRequest, resetAll } from "./fixtures";
 
 const post = async (body: unknown, ip?: string | null) => POST(ip === undefined ? mcpRequest(body) : mcpRequest(body, ip));
 const call = (name: string, args: Record<string, unknown> = {}) => post(callBody(name, args));
@@ -26,6 +27,7 @@ it("initialize echoes a supported protocol version and identifies the server", a
 const SAMPLE_ARGS: Record<string, Record<string, unknown>> = {
   explain_strategy: { agent: "lp" }, get_hire_link: { agent: "lp" }, list_agents: {},
   agent_status: { wallet: WALLET }, bstock_analysis: { token: "NVDAB" }, meme_stocks: {}, stock_compare: { ticker: "NVDA" },
+  desk_preview: { ticker: "NVDA" }, desk_quote: { ticker: "NVDA" },
 };
 
 /**
@@ -42,12 +44,13 @@ it("implements every tool it advertises, flag off and flag on", async () => {
   installExecPlane(); // replaces fetch: agent_status reads the execution plane
   const on = await (await post({ jsonrpc: "2.0", id: 1, method: "tools/list" })).json();
   const names: string[] = on.result.tools.map((tool: { name: string }) => tool.name);
-  expect(names).toEqual([...TOOLS, ...DATA_TOOLS].map((tool) => tool.name));
+  expect(names).toEqual([...TOOLS, ...DATA_TOOLS, ...DESK_TOOLS].map((tool) => tool.name));
   for (const tool of on.result.tools as { name: string; inputSchema: { required?: string[] } }[]) {
     const args = SAMPLE_ARGS[tool.name]!;
     for (const required of tool.inputSchema.required ?? []) expect(Object.keys(args), `${tool.name} sample must supply ${required}`).toContain(required);
     if (tool.name === "bstock_analysis" || tool.name === "meme_stocks" || tool.name === "stock_compare") installDataPlane();
     else if (tool.name === "agent_status") installExecPlane();
+    else if (tool.name === "desk_preview" || tool.name === "desk_quote") installDesk();
     const body = await (await call(tool.name, args)).json();
     expect(body.error, `${tool.name} must be implemented`).toBeUndefined();
     expect(body.result.content[0].type).toBe("text");
@@ -60,7 +63,7 @@ it("hides the data tools everywhere when the flag is off, and answers -32602 lik
   const descriptor = await (await GET(new NextRequest(`${ORIGIN}/mcp`))).json();
   expect(descriptor.tools.map((tool: { name: string }) => tool.name)).toEqual(["explain_strategy", "list_agents", "get_hire_link"]);
   const { fetcher } = installDataPlane();
-  for (const name of ["agent_status", "bstock_analysis", "meme_stocks", "stock_compare"]) {
+  for (const name of ["agent_status", "bstock_analysis", "meme_stocks", "stock_compare", "desk_preview", "desk_quote"]) {
     const body = await (await call(name, SAMPLE_ARGS[name])).json();
     expect(body.error.code, name).toBe(-32602);
   }
@@ -70,7 +73,7 @@ it("hides the data tools everywhere when the flag is off, and answers -32602 lik
 it("lists agent_status only when the Agentic Wallet flag is also on", async () => {
   vi.stubEnv("MCP_DATA_TOOLS_ENABLED", "true");
   const noWallet = await (await post({ jsonrpc: "2.0", id: 1, method: "tools/list" })).json();
-  expect(noWallet.result.tools.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS.map((t) => t.name), "bstock_analysis", "meme_stocks", "stock_compare"]);
+  expect(noWallet.result.tools.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS.map((t) => t.name), "bstock_analysis", "meme_stocks", "stock_compare", "desk_preview", "desk_quote"]);
   expect((await (await call("agent_status", { wallet: WALLET })).json()).error.code).toBe(-32602);
   vi.stubEnv("MCP_DATA_TOOLS_ENABLED", "yes");
   vi.stubEnv("NEXT_PUBLIC_AGENTIC_WALLET_ENABLED", "true");
@@ -81,7 +84,7 @@ it("lists agent_status only when the Agentic Wallet flag is also on", async () =
 it("GET lists the data tools too when they are on", async () => {
   dataOn();
   const body = await (await GET(new NextRequest(`${ORIGIN}/mcp`))).json();
-  expect(body.tools.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS, ...DATA_TOOLS].map((tool) => tool.name));
+  expect(body.tools.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS, ...DATA_TOOLS, ...DESK_TOOLS].map((tool) => tool.name));
 });
 
 it.each(["grid", "lp", "trade"])("explains %s without accessing live services", async (agent) => {

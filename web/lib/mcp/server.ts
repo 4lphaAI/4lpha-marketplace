@@ -25,7 +25,8 @@
  */
 
 import { AGENTIC_NOTE, AGENTIC_PRODUCTS, AGENTIC_PRODUCT_IDS, hireGuide, isAgenticAvailable, type AgenticProductId } from "./agenticProducts";
-import { DATA_TOOLS, DATA_TOOL_NAMES, isDataToolListed, runDataTool, type DataToolName } from "./dataTools";
+import { DATA_TOOLS, DATA_TOOL_NAMES, dataToolsEnabled, isDataToolListed, runDataTool, type DataToolName } from "./dataTools";
+import { DESK_TOOLS, DESK_TOOL_NAMES, runDeskTool, type DeskToolName } from "./deskTools";
 import { STRATEGIES } from "./strategies";
 
 export const PROTOCOL_VERSION = "2025-06-18";
@@ -115,7 +116,7 @@ export const TOOLS = [
 
 /** What `tools/list` and the GET descriptor show right now: the static tools plus the data tools whose flags are on. */
 export function listTools(env: Env = process.env) {
-  return [...TOOLS, ...DATA_TOOLS.filter((tool) => isDataToolListed(tool.name, env))];
+  return [...TOOLS, ...DATA_TOOLS.filter((tool) => isDataToolListed(tool.name, env)), ...(dataToolsEnabled(env) ? DESK_TOOLS : [])];
 }
 
 type Json = Record<string, unknown>;
@@ -145,6 +146,7 @@ function text(value: unknown): Json {
 }
 
 const isDataTool = (name: unknown): name is DataToolName => typeof name === "string" && (DATA_TOOL_NAMES as readonly string[]).includes(name);
+const isDeskTool = (name: unknown): name is DeskToolName => typeof name === "string" && (DESK_TOOL_NAMES as readonly string[]).includes(name);
 
 /** null = the caller named a tool we do not implement (or that is switched off), or arguments we refuse. */
 async function callTool(name: unknown, args: Json, origin: string, env: Env): Promise<Json | null> {
@@ -168,6 +170,7 @@ async function callTool(name: unknown, args: Json, origin: string, env: Env): Pr
     return agent ? text({ agent: agent.id, name: agent.name, status: agent.status, deployUrl: agent.deployUrl, authorises: HIRE_NOTE }) : null;
   }
   if (isDataTool(name) && isDataToolListed(name, env)) return (await runDataTool(name, args, origin)) as Json | null;
+  if (isDeskTool(name) && dataToolsEnabled(env)) return (await runDeskTool(name, args)) as Json | null;
   return null;
 }
 

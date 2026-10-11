@@ -133,3 +133,19 @@ export function installExecPlane(data: unknown = { wallet: WALLET, custody: "bin
   vi.stubGlobal("fetch", fetcher);
   return { fetcher, calls };
 }
+
+/** Stub the bStock Desk A2A endpoint: answers `preview` and `negotiate` like the live desk. */
+export function installDesk(reply?: (data: Record<string, unknown>) => unknown) {
+  const calls: Record<string, unknown>[] = [];
+  const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) !== "https://desk.4lpha.tech/") return new Response("unexpected host", { status: 500 });
+    const data = JSON.parse(String(init?.body)).params.message.parts[0].data as Record<string, unknown>;
+    calls.push(data);
+    const answer = reply?.(data) ?? (data.skill === "preview"
+      ? { status: "ok", ticker: data.ticker, markdown: `# 4lpha bStock Desk: free preview, ${String(data.ticker)}` }
+      : { request: {}, response: { accepted: true, terms: { price: "100000000000000000", currency: "0xcE24439F2D9C6a2289F741120FE202248B666666" }, quote_expires_at: 1791550022 }, negotiation_hash: "0x" + "11".repeat(32), provider_sig: "0x" + "22".repeat(65), chain_id: 56 });
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: "mcp", result: { kind: "message", parts: [{ kind: "data", data: answer }] } }), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetcher);
+  return { fetcher, calls };
+}

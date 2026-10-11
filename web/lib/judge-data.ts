@@ -423,6 +423,7 @@ export const COMMANDS: Command[] = [
 
 /** The desk agent sends no CORS headers, so these stay terminal commands. */
 export const DESK_COMMANDS: Command[] = [
+  { ...mcpCall(9, "Through the 4lpha MCP: the desk's free preview (press Run)", "desk_preview", { ticker: "NVDA", usdt: 500 }), id: "mcp-desk-preview" },
   {
     id: "desk-preview",
     title: "Free preview: price and where to buy for one stock, no wallet needed",

@@ -120,6 +120,12 @@ Jobs were funded by our own demo buyer wallet `0xD1911E8cC7f1cA2f0b080Db89962EA1
 curl -s -X POST https://desk.4lpha.tech/ -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","messageId":"p1","role":"user","parts":[{"kind":"data","data":{"skill":"preview","ticker":"NVDA","usdt":500}}]}}}'
 ```
 
+**Through the 4lpha MCP.** Any assistant connected to `https://4lpha.tech/mcp` (or using the skills, `desk-preview` / `desk-quote`) reaches the desk without an A2A client: `desk_preview` returns the free preview, `desk_quote` a wallet-signed quote for the full report plus the steps to buy it with a BNB Agent Studio wallet. The MCP never pays or signs.
+
+```bash
+curl -s -X POST https://4lpha.tech/mcp -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desk_preview","arguments":{"ticker":"NVDA","usdt":500}}}'
+```
+
 A full report with real money (0.10 U): from a BNB Agent Studio project folder whose wallet holds U and a little BNB, run `node studio/fourlphadesk/buyer/buy-report.mjs NVDA 500`. It negotiates, opens and funds the ERC-8183 job with `bag`, notifies the desk, waits for the on-chain delivery and prints the report (`--preview` for the free part, `--job <id>` to print a delivered report).
 
 ---

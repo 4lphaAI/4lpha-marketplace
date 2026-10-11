@@ -15,7 +15,7 @@ description: |
 license: MIT
 metadata:
   author: 4lpha
-  version: "1.0"
+  version: "1.1"
 ---
 
 # 4lpha bStock Analysis Skill
@@ -59,6 +59,11 @@ both. Equivalent MCP tool: `bstock_analysis` on `https://4lpha.tech/mcp`.
 4. **Deep report (optional, paid)**: BNB Chain's Stock Analyze Agent writes a fundamentals +
    technicals report on the underlying ticker for about 0.1 U, delivered in 2 to 5 minutes. Only with
    the user's explicit yes after stating the price; flow in `references/external-sources.md`.
+   4lpha's own BNB Agent Studio agent, the **bStock Desk** (ERC-8004 #369195), is the other option:
+   `desk-preview ticker=NVDA usdt=500` is free (price, premium, where to buy as Markdown); for its full
+   report (0.10 U through an ERC-8183 job) `desk-quote ticker=NVDA usdt=500` returns a signed quote and
+   the buying steps, which need the user's own BNB Agent Studio wallet (`bag` CLI). Never buy on the
+   user's behalf; show the price and the steps and let them run it.
 5. **Real buy or sell price (optional, free)**: 4lpha does not estimate price impact. For the price the
    user would actually get, a `baw market-order quote` through the `binance-agentic-wallet` skill is
    free and places nothing. Before suggesting it, run `4lpha-agent-status` for that wallet: if a 4lpha

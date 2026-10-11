@@ -24,6 +24,8 @@ const COMMANDS = {
   'bstock-analysis': { tool: 'bstock_analysis', args: ['token', 'interval'], required: ['token'] },
   'meme-stocks': { tool: 'meme_stocks', args: ['limit', 'orderBy'], required: [], numeric: ['limit'] },
   'stock-compare': { tool: 'stock_compare', args: ['ticker', 'usdt'], required: [], decimal: ['usdt'] },
+  'desk-preview': { tool: 'desk_preview', args: ['ticker', 'usdt'], required: ['ticker'], decimal: ['usdt'] },
+  'desk-quote': { tool: 'desk_quote', args: ['ticker', 'usdt'], required: ['ticker'], decimal: ['usdt'] },
 };
 
 function usageError(message) {
