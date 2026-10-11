@@ -386,9 +386,31 @@ export const PRIZES: Prize[] = [
         fund: tx("0xfbff62e3d0fc86a6a8f4432f559377ea80bba58f221d5afa2504da0728453f11"),
         submit: tx("0xf31c9aa5c198334205d99fe36e848d195cf425d0e9f06d997cd522c88fbb8b26"),
         cid: "QmXLYEF1xw6udkTdcek1NU4aNwhYXL9z38smUuLg3fBNHe", report: readable("QmXLYEF1xw6udkTdcek1NU4aNwhYXL9z38smUuLg3fBNHe"), rating: { label: "ERC-8004 rating 100", href: tx("0xdc30435db37573d7e1597f75291f35dfba8c582456b3df94859de6c10b180292") },
+        extra: { label: "x402 payment", href: tx("0xe1b4585a96a1f4b1ed3ab9eb25a288c69bcef872b526f8a2a90afbe294bd80e3") },
+      },
+      {
+        id: "56971", what: "SPCX report at 100 USDT: bStock and Ondo about the same",
+        fund: tx("0x87730568cc52df22d6ac371724ec4bd5356b88046d6bce2db241492a45dab476"),
+        submit: tx("0xab036dc6f47c647ca2e5be34096b980a9b71f95687bf077f8ccafacc07a85353"),
+        cid: "QmPBojKwHNRPt8Uj8xwBYiZaah4HkPP6Mt2hjMkrvovzPg", report: readable("QmPBojKwHNRPt8Uj8xwBYiZaah4HkPP6Mt2hjMkrvovzPg"), rating: { label: "ERC-8004 rating 100", href: tx("0x5f4527291fbda805744263ad1c513cbde2e10a706bc099d3288ab0ddd32d022e") },
+        extra: { label: "x402 payment", href: tx("0x7124ecd668e663db20434cdb50164b72693cb7317abd007023f14829fa670a55") },
+      },
+      {
+        id: "56972", what: "SPCX report at 1000 USDT: bStock and Ondo about the same",
+        fund: tx("0xc1764528e4e6958f9a87888c08b3ba098f1e247609d28076ae57ee5f1bfdd6a6"),
+        submit: tx("0x9e7d0e41572913f0362881618349cf7ae8ff4d1d56157c25ea1d5efb8124b367"),
+        cid: "QmSC5Pd1SWc3VqVFB3YpZZYXFzGEudFcH2g69yewJR4QbP", report: readable("QmSC5Pd1SWc3VqVFB3YpZZYXFzGEudFcH2g69yewJR4QbP"), rating: { label: "ERC-8004 rating 100", href: tx("0x61a64efc54f2f895ef4c8e462875ec9bdce4a8bc6c98f20aaf6ae31d128ab760") },
+        extra: { label: "x402 payment", href: tx("0x9f277b96a93f4ba2615bd81aadfbcdee5b10475c144507ce4224b2d4880b282d") },
+      },
+      {
+        id: "56973", what: "SPCX report at 5000 USDT: bStock the better buy, the Ondo version flagged to avoid",
+        fund: tx("0x0ff1ea42761e5532d077177ab0b79bb76c9d02506cbd118a48676c1100f210b4"),
+        submit: tx("0xedbea45f43cff2864a2d11f067c6f8da9bebf7d8175d70e836b02e6dbfc10b4f"),
+        cid: "QmSoTHiwA88AGWdX2jQK13G88UFooUmzAvaAc59Ai8gDGV", report: readable("QmSoTHiwA88AGWdX2jQK13G88UFooUmzAvaAc59Ai8gDGV"), rating: { label: "ERC-8004 rating 100", href: tx("0xb38988a5e57cce35a1a40962aeba2c1edaba496846fbfe7dc3d4ff33708980f6") },
+        extra: { label: "x402 payment", href: tx("0x9222caca7f5c47fe94d892eb6fcd541b08e3616b03d158a85573a424c2863782") },
       },
     ],
-    jobsNote: "Funded by our own demo buyer wallet 0xD1911E8cC7f1cA2f0b080Db89962EA1c069641f4 (not an outside customer). Settlement is optimistic: payment releases after the 7-day dispute window. After delivery the buyer posts an ERC-8004 reputation entry (giveFeedback) for the desk: 9 entries on chain, scores 60 to 100 with the reason, lower where a report missed the x402 data or leaked the model's reasoning; each entry discloses that the rater is our own wallet.",
+    jobsNote: "Funded by our own demo buyer wallet 0xD1911E8cC7f1cA2f0b080Db89962EA1c069641f4 (not an outside customer). Settlement is optimistic: payment releases after the 7-day dispute window. After delivery the buyer posts an ERC-8004 reputation entry (giveFeedback) for the desk: 12 entries on chain, scores 60 to 100 with the reason, lower where a report missed the x402 data or leaked the model's reasoning; each entry discloses that the rater is our own wallet.",
   },
 ];
 
