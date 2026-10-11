@@ -385,10 +385,10 @@ export const PRIZES: Prize[] = [
         id: "56970", what: "SPCX report bought with a quote taken through the 4lpha MCP (desk_quote), with x402 data",
         fund: tx("0xfbff62e3d0fc86a6a8f4432f559377ea80bba58f221d5afa2504da0728453f11"),
         submit: tx("0xf31c9aa5c198334205d99fe36e848d195cf425d0e9f06d997cd522c88fbb8b26"),
-        cid: "QmXLYEF1xw6udkTdcek1NU4aNwhYXL9z38smUuLg3fBNHe", report: readable("QmXLYEF1xw6udkTdcek1NU4aNwhYXL9z38smUuLg3fBNHe"),
+        cid: "QmXLYEF1xw6udkTdcek1NU4aNwhYXL9z38smUuLg3fBNHe", report: readable("QmXLYEF1xw6udkTdcek1NU4aNwhYXL9z38smUuLg3fBNHe"), rating: { label: "ERC-8004 rating 100", href: tx("0xdc30435db37573d7e1597f75291f35dfba8c582456b3df94859de6c10b180292") },
       },
     ],
-    jobsNote: "Funded by our own demo buyer wallet 0xD1911E8cC7f1cA2f0b080Db89962EA1c069641f4 (not an outside customer). Settlement is optimistic: payment releases after the 7-day dispute window. After delivery the buyer posts an ERC-8004 reputation entry (giveFeedback) for the desk: 8 entries on chain, scores 60 to 100 with the reason, lower where a report missed the x402 data or leaked the model's reasoning; each entry discloses that the rater is our own wallet.",
+    jobsNote: "Funded by our own demo buyer wallet 0xD1911E8cC7f1cA2f0b080Db89962EA1c069641f4 (not an outside customer). Settlement is optimistic: payment releases after the 7-day dispute window. After delivery the buyer posts an ERC-8004 reputation entry (giveFeedback) for the desk: 9 entries on chain, scores 60 to 100 with the reason, lower where a report missed the x402 data or leaked the model's reasoning; each entry discloses that the rater is our own wallet.",
   },
 ];
 
