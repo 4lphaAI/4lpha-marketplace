@@ -33,7 +33,7 @@
     "@types/react-dom": "19.1.9",
     "happy-dom": "^20.13.2",
     "typescript": "7.0.2",
-    "vitest": "4.1.11"
+    "vitest": "4.1.12"
   },
   "engines": {
     "node": ">=22.12.0",
