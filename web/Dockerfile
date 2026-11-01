@@ -14,7 +14,7 @@
 # execution service (EXECUTION_NETWORK / chain / EXECUTION_ENV_SALT) or every
 # EIP-712 owner signature is rejected on the domain salt.
 
-FROM node:22-bookworm-slim AS deps
+FROM node:22.23.4-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json .npmrc ./
 COPY vendor ./vendor
@@ -22,7 +22,7 @@ COPY vendor ./vendor
 # (@coinbase/cdp-sdk -> @solana/kit wants typescript ^5) that npm 11 accepts.
 RUN npm ci --legacy-peer-deps --no-audit --no-fund
 
-FROM node:22-bookworm-slim AS build
+FROM node:22.23.4-bookworm-slim AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -45,7 +45,7 @@ ENV NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID=$NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID \
     NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
-FROM node:22-bookworm-slim AS run
+FROM node:22.23.4-bookworm-slim AS run
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \

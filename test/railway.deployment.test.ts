@@ -235,7 +235,7 @@ test("Docker and C launcher pin the Railway security boundary", async () => {
   ]);
   assert.match(dockerfile, /USER 10001:10001/u);
   assert.match(dockerfile, /ENTRYPOINT \["\/usr\/local\/bin\/railway-launcher"\]/u);
-  assert.equal((dockerfile.match(/sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96/gu) ?? []).length, 4);
+  assert.equal((dockerfile.match(/sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2/gu) ?? []).length, 4);
   assert.match(launcher, /O_CREAT \| O_EXCL \| O_NOFOLLOW \| O_CLOEXEC/u);
   assert.match(launcher, /execve\(selected\[0\], selected, clean\)/u);
   assert.match(launcher, /strstr\(environ\[index\], raw_values\[name\]\)/u);

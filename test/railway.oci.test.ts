@@ -18,9 +18,9 @@ const run = promisify(execFile);
 const ROOT = resolve(import.meta.dirname, "..");
 const BASE_PROVENANCE_FIXTURE = resolve(
   ROOT,
-  "test/fixtures/railway/node-22.23.2-bookworm-slim-amd64",
+  "test/fixtures/railway/node-22.23.4-bookworm-slim-amd64",
 );
-const BASE_CONFIG_DIGEST = "sha256:6e6261159fd399ebe5a3d556b7d89da9c85c873f3f270918aad6c8107da8b411";
+const BASE_CONFIG_DIGEST = "sha256:c469fbffcbb0086ddfb92598192d3e09eab25f2d81b9750a00f77f0910fed744";
 
 function digest(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -76,7 +76,7 @@ async function ociFixture(root: string): Promise<string> {
     architecture: "amd64",
     os: "linux",
     config: {
-      Env: ["NODE_VERSION=22.23.2", "NODE_ENV=production"],
+      Env: ["NODE_VERSION=22.23.4", "NODE_ENV=production"],
       WorkingDir: "/app",
       User: "10001:10001",
       Entrypoint: ["/usr/local/bin/railway-launcher"],
@@ -114,7 +114,7 @@ test("OCI layout derives manifest/config/layer/rootfs identity and applies white
     try {
       assert.match(artifact.imageDigest, /^sha256:[0-9a-f]{64}$/u);
       assert.equal(artifact.platform, "linux/amd64");
-      assert.equal(artifact.nodeVersion, "22.23.2");
+      assert.equal(artifact.nodeVersion, "22.23.4");
       assert.equal(await readFile(join(artifact.rootfs, "measured.txt"), "utf8"), "artifact-derived");
       await assert.rejects(readFile(join(artifact.rootfs, "base.txt")));
       assert.equal(artifact.layerDigests.length, 2);
@@ -171,6 +171,13 @@ test("official two-blob base provenance derives the pinned five-layer chain", as
     assert.ok(layer.size > 0);
   }
   for (const diffId of verified.diffIds) assert.match(diffId, /^sha256:[0-9a-f]{64}$/u);
+});
+
+test("current base pin refuses intact historical official provenance", async () => {
+  await assert.rejects(verifyRailwayBaseProvenance(resolve(
+    ROOT,
+    "test/fixtures/railway/node-22.23.2-bookworm-slim-amd64",
+  )), /Pinned Railway base manifest refused/u);
 });
 
 test("official base provenance refuses raw-blob mutation and exact-census drift", async () => {

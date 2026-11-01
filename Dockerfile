@@ -1,4 +1,4 @@
-FROM node:22.23.2-bookworm-slim@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96 AS builder
+FROM node:22.23.4-bookworm-slim@sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2 AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev \
@@ -42,12 +42,12 @@ RUN curl --fail --silent --show-error --location \
     && test "$(od -An -tx1 -N4 /tmp/aws_signing_helper | tr -d ' \n')" = "7f454c46" \
     && chmod 0555 /tmp/aws_signing_helper
 
-FROM node:22.23.2-bookworm-slim@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96
+FROM node:22.23.4-bookworm-slim@sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2
 
 ENV NODE_ENV=production
-LABEL org.opencontainers.image.base.name="docker.io/library/node:22.23.2-bookworm-slim" \
-      org.opencontainers.image.base.digest="sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96" \
-      org.4lpha.base-manifest-digest="sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96"
+LABEL org.opencontainers.image.base.name="docker.io/library/node:22.23.4-bookworm-slim" \
+      org.opencontainers.image.base.digest="sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2" \
+      org.4lpha.base-manifest-digest="sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2"
 
 WORKDIR /app
 COPY --from=builder --chown=0:0 /image-app/package.json ./package.json

@@ -26,7 +26,9 @@ describe("security dependency compatibility", () => {
 
   it("resolves the patched upstream decoder through both module systems", () => {
     const output = execFileSync(process.execPath, ["--input-type=module", "-e",
-      "import decode from 'decode-uri-component'; import fixed from 'decode-uri-component-patched'; if(decode!==fixed)throw Error('bridge mismatch'); console.log(decode('%E2%9C%93'));"],
+      "import decode from 'decode-uri-component'; import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url'; " +
+      "const r = createRequire(import.meta.resolve('decode-uri-component')); const { default: fixed } = await import(pathToFileURL(r.resolve('decode-uri-component-patched')).href); " +
+      "if(decode!==fixed)throw Error('bridge mismatch'); console.log(decode('%E2%9C%93'));"],
     { cwd: webRoot, timeout: 5_000, encoding: "utf8" });
     expect(output.trim()).toBe("✓");
   });
@@ -59,10 +61,15 @@ describe("security dependency compatibility", () => {
       packages: Record<string, { version?: string; name?: string }>;
     };
     expect(lock.packages["node_modules/axios"]?.version).toBe("1.20.0");
-    expect(lock.packages["node_modules/decode-uri-component-patched"]).toMatchObject({ name: "decode-uri-component", version: "0.5.0" });
+    expect(lock.packages["vendor/decode-uri-component-compat/node_modules/decode-uri-component-patched"]).toMatchObject({ name: "decode-uri-component", version: "0.5.1" });
     const sockets = Object.entries(lock.packages).filter(([name]) => /(?:^|\/)node_modules\/ws$/u.test(name));
     expect(sockets.length).toBeGreaterThan(0);
-    for (const [, value] of sockets) expect(["8.21.0", "7.5.13"]).toContain(value.version);
+    const svmSocketPath = "node_modules/@x402/svm/node_modules/ws";
+    expect(lock.packages[svmSocketPath]?.version).toBe("8.22.1");
+    for (const [name, value] of sockets) {
+      if (name === svmSocketPath) expect(value.version).toBe("8.22.1");
+      else expect(["8.21.0", "7.5.13"]).toContain(value.version);
+    }
   });
 
   it("bounds fragmented websocket messages without a real socket", async () => {

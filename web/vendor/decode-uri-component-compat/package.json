@@ -14,6 +14,6 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
-    "decode-uri-component-patched": "npm:decode-uri-component@0.5.0"
+    "decode-uri-component-patched": "npm:decode-uri-component@0.5.1"
   }
 }

@@ -1,7 +1,7 @@
-export const RAILWAY_NODE_VERSION = "22.23.2";
+export const RAILWAY_NODE_VERSION = "22.23.4";
 export const RAILWAY_PLATFORM = "linux/amd64";
 export const RAILWAY_BASE_MANIFEST_DIGEST =
-  "sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96";
+  "sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2";
 
 export const AWS_SIGNING_HELPER = Object.freeze({
   version: "1.8.4",

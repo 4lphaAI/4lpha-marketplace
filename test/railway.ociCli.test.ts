@@ -482,10 +482,10 @@ test("synthetic trust hook is literal, test-only, unshipped and unreachable from
   const scripts = packageJson["scripts"] as Readonly<Record<string, unknown>>;
   assert.equal(Object.values(scripts).some((value) => typeof value === "string" && /railwaySynthetic|RAILWAY_SYNTHETIC/u.test(value)), false);
 
-  assert.equal(RAILWAY_NODE_VERSION, "22.23.2");
+  assert.equal(RAILWAY_NODE_VERSION, "22.23.4");
   assert.equal(RAILWAY_PLATFORM, "linux/amd64");
   assert.equal(RAILWAY_BASE_MANIFEST_DIGEST,
-    "sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96");
+    "sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2");
   assert.deepEqual(AWS_SIGNING_HELPER, {
     version: "1.8.4",
     path: "/usr/local/bin/aws_signing_helper",
