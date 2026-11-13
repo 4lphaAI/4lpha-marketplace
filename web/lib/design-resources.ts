@@ -19,6 +19,7 @@ export const RESOURCES = {
   modeDca: "/design/mode-dca.png",
   modeSmart: "/design/mode-smart.png",
   bnbChain: "/design/protocols/bnb-chain.png",
+  nearChain: "/design/protocols/near-white.svg",
   erc8004: "/design/erc8004.png",
   altana: "/design/altana.png",
   zeroG: "/design/0g.svg",

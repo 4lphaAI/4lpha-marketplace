@@ -64,6 +64,12 @@ function KitHeader({ route, go, search, onSearchChange }: {
                 <img src={RESOURCES.bnbChain} alt="" style={{ width: 16, height: 16, flex: "0 0 auto" }} />
                 <span>BNB CHAIN</span>
               </li>
+              <li role="option" aria-selected="false" style={{ listStyle: "none" }}>
+                <a href="https://near.4lpha.tech/" target="_blank" rel="noreferrer" className="fl-netmenu__opt" style={{ textDecoration: "none" }}>
+                  <img src={RESOURCES.nearChain} alt="" style={{ width: 16, height: 16, flex: "0 0 auto" }} />
+                  <span>NEAR</span>
+                </a>
+              </li>
             </ul>
           )}
         </span>
