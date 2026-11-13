@@ -47,7 +47,7 @@
   },
   "dependencies": {
     "@altananetwork/sdk": "0.7.0",
-    "@hono/node-server": "^2.1.5",
+    "@hono/node-server": "^2.1.6",
     "@x402/core": "2.29.0",
     "@x402/evm": "2.29.0",
     "@x402/fetch": "2.29.0",
